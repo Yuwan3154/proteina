@@ -324,6 +324,17 @@ class PDBDataSplitter:
                 cluster_rep_splits=splits,
                 clusterid_to_seqid_mapping=clusterid_to_seqid_mapping,
             )
+            valid_id_list = set(df_data.id.tolist())
+            self.dfs_splits = {split: df.loc[df.id.isin(valid_id_list)] for split, df in self.dfs_splits.items()}
+            # filter clusterid_to_seqid_mappings to only include seqids in df_data
+            clusterid_to_seqid_mappings_splits = {}
+            for split, clusterid_to_seqid_mapping in self.clusterid_to_seqid_mappings.items():
+                clusterid_to_seqid_mappings_splits[split] = {}
+                for clusterid, seqids in clusterid_to_seqid_mapping.items():
+                    clusterid_to_seqid_mappings_splits[split][clusterid] = [seqid for seqid in seqids if seqid in valid_id_list]
+                    if len(clusterid_to_seqid_mappings_splits[split][clusterid]) == 0:
+                        clusterid_to_seqid_mappings_splits[split].pop(clusterid)
+            self.clusterid_to_seqid_mappings = clusterid_to_seqid_mappings_splits
         return (
             self.dfs_splits,
             self.clusterid_to_seqid_mappings,
@@ -429,6 +440,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
         batch_size: int = 32,
         num_workers: int = 32,
         pin_memory: bool = False,
+        prefetch_factor: int = 2,
         **kwargs,
     ):
         """Initializes the PDBLightningDataModule.
@@ -466,6 +478,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
             batch_size (int, optional): Batch size used for dataloaders. Defaults to 32.
             num_workers (int, optional): Number of workers used for dataloading. Defaults to 32.
             pin_memory (bool, optional): Whether memory should be pinned. Defaults to False.
+            prefetch_factor (int, optional): Number of batches to prefetch. Defaults to 2.
         """
         super().__init__(
             batch_padding=batch_padding,
@@ -476,6 +489,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
             batch_size=batch_size,
             num_workers=num_workers,
             pin_memory=pin_memory,
+            prefetch_factor=prefetch_factor,
             **kwargs,
         )
         self.data_dir = pathlib.Path(data_dir)

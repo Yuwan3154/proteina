@@ -244,7 +244,7 @@ class CATHLabelTransform(T.BaseTransform):
         """
         cath_ids = self.pdbchain_to_cathid_mapping.get(graph.id, None)
         if cath_ids:
-            cath_code = [self.cathid_to_cathcode_mapping.get(cath_id, None) for cath_id in cath_ids]
+            cath_code = [self.cathid_to_cathcode_mapping.get(cath_id, "x.x.x.x") for cath_id in cath_ids]
         else:
             cath_code = None
         if cath_code:  # check for list of Nones in cath code list

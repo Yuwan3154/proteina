@@ -103,6 +103,30 @@ class GenDataset(Dataset):
         return result
 
 
+class GenDatasetWithSeq(Dataset):
+    def __init__(self, pt, cath_codes, dt=0.005, nsamples=10):
+        super(GenDatasetWithSeq, self).__init__()
+        self.pt = pt
+        self.dt = dt
+        self.nsamples = nsamples
+        self.cath_codes = cath_codes
+
+    def __len__(self):
+        return len(self.cath_codes)
+        
+    def __getitem__(self, index):
+        cath_code = [[self.cath_codes[index]] for _ in range(self.nsamples)]
+        residue_type = self.pt.residue_type
+        result = {
+            "nres": residue_type.shape[-1],
+            "dt": self.dt,
+            "nsamples": self.nsamples,
+            "cath_code": cath_code,
+            "residue_type": residue_type,
+        }
+        return result
+
+
 def split_nlens(nlens_dict, max_nsamples=16, n_replica=1):
     """
     Split nlens into data points (len, nsample) as val dataset and guarantee that
@@ -215,6 +239,13 @@ if __name__ == "__main__":
         default=0,
         help="Leave as 0.",
     )
+    parser.add_argument(
+        "--pt",
+        type=str,
+        default=None,
+        help="pt name containing the protein sequence to generate.",
+    )
+    
     args = parser.parse_args()
     logger.info(" ".join(sys.argv))
 
@@ -250,6 +281,8 @@ if __name__ == "__main__":
 
     # Set root path for this inference run
     root_path = f"./inference/{config_name}"
+    if cfg.seq_cond:
+        root_path = os.path.join(root_path, args.pt)
     if os.path.exists(root_path):
         shutil.rmtree(root_path)
     os.makedirs(root_path, exist_ok=True)
@@ -295,17 +328,28 @@ if __name__ == "__main__":
     model.configure_inference(cfg, nn_ag=nn_ag)
 
     # Create length dataset
-    nlens_dict = parse_nlens_cfg(cfg)
-    lens_sample, nsamples = split_nlens(
-        nlens_dict, max_nsamples=cfg.max_nsamples, n_replica=1
-    )  # Assume running on 1 GPU
-    if cfg.fold_cond:
-        len_cath_codes = parse_len_cath_code(cfg)
+    if cfg.seq_cond:
+        pt = torch.load(f"{cfg.data_dir}/processed/{args.pt}.pt")
+        cath_codes = pd.read_csv(f"{cfg.data_dir}/{cfg.cath_code_file}")["cath_code"].tolist()
+        assert args.pt is not None, "pt must be provided if seq_cond is True"
+        dataset = GenDatasetWithSeq(
+            pt=pt,
+            cath_codes=cath_codes,
+            dt=cfg.dt,
+            nsamples=cfg.nsamples_per_len
+        )
     else:
-        len_cath_codes = None
-    dataset = GenDataset(
-        nres=lens_sample, nsamples=nsamples, dt=cfg.dt, len_cath_codes=len_cath_codes
-    )
+        nlens_dict = parse_nlens_cfg(cfg)
+        lens_sample, nsamples = split_nlens(
+            nlens_dict, max_nsamples=cfg.max_nsamples, n_replica=1
+        )  # Assume running on 1 GPU
+        if cfg.fold_cond:
+            len_cath_codes = parse_len_cath_code(cfg)
+        else:
+            len_cath_codes = None
+        dataset = GenDataset(
+            nres=lens_sample, nsamples=nsamples, dt=cfg.dt, len_cath_codes=len_cath_codes
+        )
     dataloader = DataLoader(dataset, batch_size=1)
     # Note: Batch size should be left as 1, it is not the actual batch size.
     # Each sample returned by this loader is a 3-tuple (L, nsamples, dt) where
@@ -325,100 +369,126 @@ if __name__ == "__main__":
     trainer = L.Trainer(accelerator="gpu", devices=1)
     predictions = trainer.predict(model, dataloader)
 
-    # Code for designability and
-    # Store samples generated as pdbs and also scRMSD
-    if cfg.compute_designability:
-
-        # Add some columns to store per-sample results
-        columns += ["id_gen", "pdb_path", "L"]
-        if cfg.compute_designability:
-            columns += ["_res_scRMSD", "_res_scRMSD_all"]
-
-        results = []
+    if cfg.seq_cond:
+        aatype = np.array(pt.residue_type).astype(int)
         samples_per_length = {}
         for pred in predictions:
-            coors_atom37 = pred  # [b, n, 37, 3], prediction_step returns atom37
-            n = coors_atom37.shape[-3]
-            if n not in samples_per_length:
-                samples_per_length[n] = 0
+            coors_atom37, cath_codes = pred  # [b, n, 37, 3], prediction_step returns atom37
 
             # Save each generation as a pdb file
             for i in range(coors_atom37.shape[0]):
                 # Create directory where everything related to this sample will be stored
-                dir_name = f"n_{n}_id_{samples_per_length[n]}"
-                samples_per_length[n] += 1
-                sample_root_path = os.path.join(
-                    root_path, dir_name
+                fname = f"{args.pt}_cath_{cath_codes[i][0]}_{i}.pdb"
+                pdb_path = os.path.join(
+                    root_path, fname
                 )  # ./inference/conf_{}/n_{}_id_{}
-                os.makedirs(sample_root_path, exist_ok=False)
 
                 # Save generated structure as pdb
-                fname = dir_name + ".pdb"
-                pdb_path = os.path.join(sample_root_path, fname)
                 write_prot_to_pdb(
                     coors_atom37[i].numpy(),
                     pdb_path,
+                    aatype=aatype,
                     overwrite=True,
                     no_indexing=True,
                 )
-
-                res_row = list(flat_dict.values()) + [i, pdb_path, n]
-
-                # If needed run designability, storing all intermediate values generated in sample_root_path
-                if cfg.compute_designability:
-                    res_designability = scRMSD(
-                        pdb_path, ret_min=False, tmp_path=sample_root_path
-                    )
-                    res_row += [min(res_designability), res_designability]
-                    print(res_designability)
-
-                results.append(res_row)
-
-        # Create the dataframe with results
-        df = pd.DataFrame(results, columns=columns)
-
-    # Code for FID
-    if cfg.compute_fid:
-        # Create directory to store all samples
-        samples_dir_fid = os.path.join(root_path, "samples_fid")
-        os.makedirs(samples_dir_fid, exist_ok=True)
-
-        # Store samples
-        list_of_pdbs = []
-        for pred in predictions:
-            coors_atom37 = pred  # [b, n, 37, 3], prediction_step returns atom37
-            for i in range(coors_atom37.shape[0]):
-                pdb_path = os.path.join(samples_dir_fid, f"{len(list_of_pdbs)}_fid.pdb")
-                write_prot_to_pdb(
-                    coors_atom37[i].numpy(),
-                    pdb_path,
-                    overwrite=True,
-                    no_indexing=True,
-                )
-                list_of_pdbs.append(pdb_path)
-
-        # Initialize row with results
-        res_row = list(flat_dict.values())
-
-        # Compute metrics and add respective columns and values
-        for cfg_mf in cfg.metric_factory:
-            if isinstance(model, Proteina):
-                assert cfg_mf.ca_only == True, "Please turn on ca_only for CAFlow model"
-            metric_factory = GenerationMetricFactory(**cfg_mf).cuda()
-            metrics = generation_metric_from_list(list_of_pdbs, metric_factory)
-            for k, v in metrics.items():
-                columns += ["_res_" + k]
-                res_row += [v.cpu().item()]
-
-        # Create dataframe
-        df = pd.DataFrame([res_row], columns=columns)
-        df = df.drop("metric_factory", axis=1)  # For nicer table
-
-    # Write results to csv file
-    if cfg.compute_fid:
-        df.to_csv(
-            os.path.join(root_path, "..", f"results_{config_name}_fid.csv"), index=False
-        )
     else:
-        csv_file = os.path.join(root_path, "..", f"results_{config_name}.csv")
-        df.to_csv(csv_file, index=False)
+        # Code for designability and
+        # Store samples generated as pdbs and also scRMSD
+        if cfg.compute_designability:
+
+            # Add some columns to store per-sample results
+            columns += ["id_gen", "pdb_path", "L"]
+            if cfg.compute_designability:
+                columns += ["_res_scRMSD", "_res_scRMSD_all"]
+
+            results = []
+            samples_per_length = {}
+            for pred in predictions:
+                coors_atom37, cath_codes = pred  # [b, n, 37, 3], prediction_step returns atom37
+                n = coors_atom37.shape[-3]
+                if n not in samples_per_length:
+                    samples_per_length[n] = 0
+
+                # Save each generation as a pdb file
+                for i in range(coors_atom37.shape[0]):
+                    # Create directory where everything related to this sample will be stored
+                    if cfg.seq_cond:
+                        dir_name = f"n_{n}_{args.pt}_cath_{cath_codes[i]}"
+                    else:
+                        dir_name = f"n_{n}_id_{samples_per_length[n]}"
+                    samples_per_length[n] += 1
+                    sample_root_path = os.path.join(
+                        root_path, dir_name
+                    )  # ./inference/conf_{}/n_{}_id_{}
+                    os.makedirs(sample_root_path, exist_ok=False)
+
+                    # Save generated structure as pdb
+                    fname = dir_name + ".pdb"
+                    pdb_path = os.path.join(sample_root_path, fname)
+                    write_prot_to_pdb(
+                        coors_atom37[i].numpy(),
+                        pdb_path,
+                        overwrite=True,
+                        no_indexing=True,
+                    )
+
+                    res_row = list(flat_dict.values()) + [i, pdb_path, n]
+
+                    # If needed run designability, storing all intermediate values generated in sample_root_path
+                    if cfg.compute_designability:
+                        res_designability = scRMSD(
+                            pdb_path, ret_min=False, tmp_path=sample_root_path
+                        )
+                        res_row += [min(res_designability), res_designability]
+                        print(res_designability)
+
+                    results.append(res_row)
+
+            # Create the dataframe with results
+            df = pd.DataFrame(results, columns=columns)
+
+        # Code for FID
+        if cfg.compute_fid:
+            # Create directory to store all samples
+            samples_dir_fid = os.path.join(root_path, "samples_fid")
+            os.makedirs(samples_dir_fid, exist_ok=True)
+
+            # Store samples
+            list_of_pdbs = []
+            for pred in predictions:
+                coors_atom37 = pred  # [b, n, 37, 3], prediction_step returns atom37
+                for i in range(coors_atom37.shape[0]):
+                    pdb_path = os.path.join(samples_dir_fid, f"{len(list_of_pdbs)}_fid.pdb")
+                    write_prot_to_pdb(
+                        coors_atom37[i].numpy(),
+                        pdb_path,
+                        overwrite=True,
+                        no_indexing=True,
+                    )
+                    list_of_pdbs.append(pdb_path)
+
+            # Initialize row with results
+            res_row = list(flat_dict.values())
+
+            # Compute metrics and add respective columns and values
+            for cfg_mf in cfg.metric_factory:
+                if isinstance(model, Proteina):
+                    assert cfg_mf.ca_only == True, "Please turn on ca_only for CAFlow model"
+                metric_factory = GenerationMetricFactory(**cfg_mf).cuda()
+                metrics = generation_metric_from_list(list_of_pdbs, metric_factory)
+                for k, v in metrics.items():
+                    columns += ["_res_" + k]
+                    res_row += [v.cpu().item()]
+
+            # Create dataframe
+            df = pd.DataFrame([res_row], columns=columns)
+            df = df.drop("metric_factory", axis=1)  # For nicer table
+
+        # Write results to csv file
+        if cfg.compute_fid:
+            df.to_csv(
+                os.path.join(root_path, "..", f"results_{config_name}_fid.csv"), index=False
+            )
+        else:
+            csv_file = os.path.join(root_path, "..", f"results_{config_name}.csv")
+            df.to_csv(csv_file, index=False)

@@ -24,7 +24,7 @@ from jaxtyping import Bool, Float
 from loguru import logger
 from torch import Dict, Tensor
 
-from proteinfoundation.utils.ff_utils.pdb_utils import mask_cath_code_by_level
+from proteinfoundation.utils.ff_utils.pdb_utils import mask_cath_code_by_level, mask_seq
 
 
 class ModelTrainerBase(L.LightningModule):
@@ -52,9 +52,24 @@ class ModelTrainerBase(L.LightningModule):
         self.motif_conditioning = cfg_exp.training.get("motif_conditioning", False)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(
-            [p for p in self.parameters() if p.requires_grad], lr=self.cfg_exp.opt.lr
-        )
+        if self.cfg_exp.training.finetune_seq_cond:
+            opt_params = []
+            opt_params_names = []
+            for name, param in self.named_parameters():
+                if "residue_type" in name or "lora" in name:
+                    param.requires_grad = True
+                    opt_params.append(param)
+                    opt_params_names.append(name)
+                else:
+                    param.requires_grad = False
+            optimizer = torch.optim.Adam(
+                opt_params, lr=self.cfg_exp.opt.lr
+            )
+            print(f"Finetuning {opt_params_names}")
+        else:
+            optimizer = torch.optim.Adam(
+                [p for p in self.parameters() if p.requires_grad], lr=self.cfg_exp.opt.lr
+            )
         return optimizer
 
     def _nn_out_to_x_clean(self, nn_out, batch):
@@ -262,6 +277,9 @@ class ModelTrainerBase(L.LightningModule):
             bs = x_1.shape[0]
             cath_code_list = batch.cath_code
             for i in range(bs):
+                if cath_code_list[i] is None:
+                    cath_code_list[i] = ["x.x.x.x"]
+                    continue
                 # Progressively mask T, A, C levels
                 cath_code_list[i] = mask_cath_code_by_level(
                     cath_code_list[i], level="H"
@@ -282,6 +300,16 @@ class ModelTrainerBase(L.LightningModule):
         else:
             if "cath_code" in batch:
                 batch.pop("cath_code")
+
+        # Sequence conditional training
+        if self.cfg_exp.training.seq_cond:
+            # Get the sequence from the batch
+            seq = batch["residue_type"]
+            seq[seq == -1] = 20
+            # Mask the sequence
+            for i in range(len(seq)):
+                seq[i] = mask_seq(seq[i], self.cfg_exp.training.mask_seq_proportion)
+            batch["residue_type"] = seq
 
         # Prediction for self-conditioning
         if random.random() > 0.5 and self.cfg_exp.training.self_cond:
@@ -491,6 +519,7 @@ class ModelTrainerBase(L.LightningModule):
             dt=batch["dt"].to(dtype=torch.float32),
             self_cond=self.inf_cfg.self_cond,
             cath_code=cath_code,
+            residue_type=batch["residue_type"],
             guidance_weight=guidance_weight,
             autoguidance_ratio=autoguidance_ratio,
             dtype=torch.float32,
@@ -507,7 +536,7 @@ class ModelTrainerBase(L.LightningModule):
             fixed_sequence_mask = fixed_sequence_mask,
             fixed_structure_mask = fixed_structure_mask,
         )
-        return self.samples_to_atom37(x)  # [b, n, 37, 3]
+        return self.samples_to_atom37(x), cath_code  # [b, n, 37, 3]
 
     def generate(
         self,
@@ -516,6 +545,7 @@ class ModelTrainerBase(L.LightningModule):
         dt: float,
         self_cond: bool,
         cath_code: List[List[str]],
+        residue_type: List[List[int]],
         guidance_weight: float = 1.0,
         autoguidance_ratio: float = 0.0,
         dtype: torch.dtype = None,
@@ -549,6 +579,7 @@ class ModelTrainerBase(L.LightningModule):
             n=n,
             self_cond=self_cond,
             cath_code=cath_code,
+            residue_type=residue_type,
             device=self.device,
             mask=mask,
             dtype=dtype,

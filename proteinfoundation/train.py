@@ -11,6 +11,12 @@
 import os
 import sys
 
+# # Set CUDA environment variables
+# os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+# os.environ["TORCH_USE_CUDA_DSA"] = "1"
+# # Disable CUDA graph capture
+# os.environ["CUDA_ENABLE_GRAPH_CAPTURE"] = "0"
+
 root = os.path.abspath(".")
 sys.path.append(root)  # Adds project's root directory
 
@@ -23,10 +29,12 @@ import hydra
 import lightning as L
 import loralib as lora
 import torch
+torch._dynamo.config.optimize_ddp = False
 import wandb
 from dotenv import load_dotenv
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.utilities import rank_zero_only
+from lightning.pytorch.strategies import DDPStrategy
 from loguru import logger
 from omegaconf import OmegaConf
 
@@ -44,6 +52,9 @@ from proteinfoundation.utils.training_analysis_utils import (
     LogSetpTimeCallback,
     SkipNanGradCallback,
 )
+@rank_zero_only
+def wandb_login():
+    wandb.login()
 
 
 # Things that should only be done by a single process
@@ -205,7 +216,7 @@ if __name__ == "__main__":
     # Set logger
     wandb_logger = None
     if cfg_exp.log.log_wandb and not args.nolog:
-        wandb_logger = WandbLogger(project=cfg_exp.log.wandb_project, id=run_name)
+        wandb_logger = WandbLogger(entity="kryst3154-massachusetts-institute-of-technology", project=cfg_exp.log.wandb_project, id=run_name)
         callbacks.append(LogEpochTimeCallback())
         callbacks.append(LogSetpTimeCallback())
 
@@ -262,7 +273,7 @@ if __name__ == "__main__":
     model = Proteina(cfg_exp, store_dir=root_run)
 
     # If LoRA is tunred on, replace Linear with LoRA layers
-    if cfg_exp.get("lora") and cfg_exp.lora.get("r"):
+    if cfg_exp.get("lora") and cfg_exp.lora.get("use") and cfg_exp.lora.get("r"):
         replace_lora_layers(
             model, cfg_exp.lora.r, cfg_exp.lora.lora_alpha, cfg_exp.lora.lora_dropout
         )
@@ -289,7 +300,12 @@ if __name__ == "__main__":
         default_root_dir=root_run,
         check_val_every_n_epoch=None,  # Leave like this
         val_check_interval=cfg_exp.opt.val_check_interval,
-        strategy=cfg_exp.opt.dist_strategy,
+        strategy=DDPStrategy(
+            process_group_backend=cfg_exp.opt.dist_backend,
+            find_unused_parameters=cfg_exp.training.finetune_seq_cond,
+            gradient_as_bucket_view=True,  # Memory optimization
+            static_graph=False  # Disable static graph optimization
+        ) if cfg_exp.opt.dist_strategy == "ddp" else cfg_exp.opt.dist_strategy,
         enable_progress_bar=show_prog_bar,
         plugins=plugins,
         accumulate_grad_batches=cfg_exp.opt.accumulate_grad_batches,

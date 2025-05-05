@@ -355,3 +355,17 @@ def mask_cath_code_by_level(
         code[mapping[level]] = "x"
         _cath_code.append(".".join(code))
     return _cath_code
+
+def mask_seq(seq: np.ndarray, mask_seq_proportion: float) -> np.ndarray:
+    """Mask sequence.
+
+    Args:
+      seq: Sequence.
+      mask_seq_proportion: Proportion of sequence to be masked.
+    """
+    if mask_seq_proportion == 0:
+        return seq
+    seq_len = seq.shape[0]
+    mask_idx = np.random.choice(range(seq_len), size=int(seq_len * mask_seq_proportion), replace=False)
+    seq[mask_idx] = 20
+    return seq

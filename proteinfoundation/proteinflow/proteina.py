@@ -198,6 +198,7 @@ class Proteina(ModelTrainerBase):
                 batch_size=mask.shape[0],
                 sync_dist=True,
                 add_dataloader_idx=False,
+                rank_zero_only=True,
             )
         return loss
 
@@ -318,6 +319,7 @@ class Proteina(ModelTrainerBase):
                 batch_size=mask.shape[0],
                 sync_dist=True,
                 add_dataloader_idx=False,
+                rank_zero_only=True,
             )
         elif motif_aux_loss_weight:
             mask_to_use = batch["fixed_sequence_mask"] * batch["mask"]
@@ -344,6 +346,7 @@ class Proteina(ModelTrainerBase):
                 batch_size=mask.shape[0],
                 sync_dist=True,
                 add_dataloader_idx=False,
+                rank_zero_only=True,
             )
 
         self.log(
@@ -356,6 +359,7 @@ class Proteina(ModelTrainerBase):
             batch_size=mask.shape[0],
             sync_dist=True,
             add_dataloader_idx=False,
+            rank_zero_only=True,
         )
         self.log(
             f"{log_prefix}/dist_mat_loss",
@@ -367,6 +371,7 @@ class Proteina(ModelTrainerBase):
             batch_size=mask.shape[0],
             sync_dist=True,
             add_dataloader_idx=False,
+            rank_zero_only=True,
         )
         self.log(
             f"{log_prefix}/auxiliary_loss",
@@ -378,6 +383,7 @@ class Proteina(ModelTrainerBase):
             batch_size=mask.shape[0],
             sync_dist=True,
             add_dataloader_idx=False,
+            rank_zero_only=True,
         )
         self.log(
             f"{log_prefix}/auxiliary_loss_no_w",
@@ -389,6 +395,7 @@ class Proteina(ModelTrainerBase):
             batch_size=mask.shape[0],
             sync_dist=True,
             add_dataloader_idx=False,
+            rank_zero_only=True,
         )
         return auxiliary_loss
 

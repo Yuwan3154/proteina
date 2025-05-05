@@ -23,3 +23,6 @@ wandb/
 tmp/*
 *.fasta
 inference/*
+data/
+proteinfoundation.egg-info/
+store/

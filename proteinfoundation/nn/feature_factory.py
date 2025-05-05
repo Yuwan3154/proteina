@@ -271,7 +271,6 @@ class FoldEmbeddingSeqFeat(Feature):
             ] * bs  # If no cath code provided, return null embeddings
         else:
             cath_code = batch["cath_code"]
-
         cath_code_list = self.parse_label(cath_code)
         if self.multilabel_mode == "sample":
             cath_code_list = self.sample(
@@ -347,6 +346,36 @@ class TimeEmbeddingPairFeat(Feature):
         t_emb = get_time_embedding(t, edim=self.dim)  # [b, t_emb_dim]
         t_emb = t_emb[:, None, None, :]  # [b, 1, 1, t_emb_dim]
         return t_emb.expand((t_emb.shape[0], n, n, t_emb.shape[3]))  # [b, n, t_emb_dim]
+
+
+class ResidueTypeEmbeddingSeqFeat(Feature):
+    """Computes sequence embedding and returns sequence feature of shape [b, n, seq_emb_dim]."""
+
+    def __init__(self, seq_emb_dim, **kwargs):
+        super().__init__(dim=seq_emb_dim)
+        self.embedding = torch.nn.Embedding(21, seq_emb_dim)
+
+    def forward(self, batch):
+        seq = batch["residue_type"]  # [b, n]
+        n = seq.shape[1]
+        seq_emb = self.embedding(seq)  # [b, n, seq_emb_dim]
+        return seq_emb  # [b, n, seq_emb_dim]
+
+
+class ResidueTypeEmbeddingPairFeat(Feature):
+    """Computes sequence embedding and returns pair feature of shape [b, n, n, seq_emb_dim]."""
+
+    def __init__(self, seq_emb_dim, **kwargs):
+        super().__init__(dim=seq_emb_dim)
+        self.embedding_1 = torch.nn.Embedding(21, seq_emb_dim)
+        self.embedding_2 = torch.nn.Embedding(21, seq_emb_dim)
+
+    def forward(self, batch):
+        seq = batch["residue_type"]  # [b, n]
+        n = seq.shape[1]
+        seq_emb_1 = self.embedding_1(seq)  # [b, n, seq_emb_dim]
+        seq_emb_2 = self.embedding_2(seq)  # [b, n, seq_emb_dim]
+        return seq_emb_1[:, :, None, :] * seq_emb_2[:, None, :, :]  # [b, n, n, seq_emb_dim]
 
 
 class IdxEmbeddingSeqFeat(Feature):
@@ -562,6 +591,7 @@ class FeatureFactory(torch.nn.Module):
         dim_feats_out: int,
         use_ln_out: bool,
         mode: Literal["seq", "pair"],
+        use_residue_type_emb: bool = False,
         **kwargs,
     ):
         """
@@ -580,6 +610,7 @@ class FeatureFactory(torch.nn.Module):
         """
         super().__init__()
         self.mode = mode
+        self.use_residue_type_emb = use_residue_type_emb
 
         self.ret_zero = True if (feats is None or len(feats) == 0) else False
         if self.ret_zero:
@@ -596,7 +627,12 @@ class FeatureFactory(torch.nn.Module):
         self.linear_out = torch.nn.Linear(
             sum([c.get_dim() for c in self.feat_creators]), dim_feats_out, bias=False
         )
-
+        if self.use_residue_type_emb:
+            self.residue_type_feat_creator = self.get_creator("residue_type_emb", **kwargs)
+            self.residue_type_out = torch.nn.Linear(
+                self.residue_type_feat_creator.get_dim(), dim_feats_out, bias=False
+            )
+    
     def get_creator(self, f, **kwargs):
         """Returns the right class for the requested feature f (a string)."""
 
@@ -615,6 +651,8 @@ class FeatureFactory(torch.nn.Module):
                 return MotifX1SeqFeat(**kwargs)
             elif f == "motif_sequence_mask":
                 return MotifMaskSeqFeat(**kwargs)
+            elif f == "residue_type_emb":
+                return ResidueTypeEmbeddingSeqFeat(**kwargs)
             else:
                 raise IOError(f"Sequence feature {f} not implemented.")
 
@@ -631,6 +669,8 @@ class FeatureFactory(torch.nn.Module):
                 return MotifX1PairwiseDistancesPairFeat(**kwargs)
             elif f == "motif_structure_mask":
                 return MotifStructureMaskFeat(**kwargs)
+            elif f == "residue_type_emb":
+                return ResidueTypeEmbeddingPairFeat(**kwargs)
             else:
                 raise IOError(f"Pair feature {f} not implemented.")
 
@@ -682,8 +722,13 @@ class FeatureFactory(torch.nn.Module):
         )  # [b, n, dim_f] or [b, n, n, dim_f]
 
         # Linear layer and mask
+        features_out = self.linear_out(features)
+        if self.use_residue_type_emb:
+            features_out += self.residue_type_out(
+                self.residue_type_feat_creator(batch)
+                )
         features_proc = self.ln_out(
-            self.linear_out(features)
+            features_out
         )  # [b, n, dim_f] or [b, n, n, dim_f]
         return self.apply_padding_mask(
             features_proc, batch["mask"]

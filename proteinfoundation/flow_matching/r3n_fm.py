@@ -406,6 +406,7 @@ class R3NFlowMatcher:
         n: int,
         self_cond: bool,
         cath_code: List[List[str]],
+        residue_type: List[List[int]],
         device: torch.device,
         mask: Bool[Tensor, "* n"],
         schedule_mode: Literal[
@@ -516,6 +517,8 @@ class R3NFlowMatcher:
                     nn_in["cath_code"] = cath_code
                 if step > 0 and self_cond:
                     nn_in["x_sc"] = x_1_pred  # Self-conditioning
+                if residue_type is not None:
+                    nn_in["residue_type"] = residue_type
 
                 x_1_pred, v = predict_clean_n_v(nn_in)
 

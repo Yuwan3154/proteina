@@ -1,0 +1,33 @@
+defaults:
+  - inference_base
+  - _self_
+
+run_name_: seq_cond_cath_codes
+ckpt_name: finetune_v1.6_128-seq-emb-cond_r16-lora_32-effective-batch_last.ckpt
+
+self_cond: True
+fold_cond: True
+cath_code_level: "T"  # Guidance level -- C, A, or T
+seq_cond: True
+data_dir: ${oc.env:DATA_PATH}/pdb_train/ # Directory where the dataset is stored
+cath_code_file: test_cath_code.csv
+
+# Sampling
+dt: 0.005
+nsamples_per_len: 3
+max_nsamples: 5
+
+# LoRA -- if you use lora, set the same parameters as for training
+lora:
+  use: True
+  lora_alpha: 32.0
+  lora_dropout: 0.0
+  r: 16
+  train_bias: "none"
+
+sampling_caflow:
+  sampling_mode: sc  # "vf" for ODE sampling, "sc" for SDE sampling
+  sc_scale_noise: 0.45  # noise scale, used if sampling_mode == "sc"
+
+compute_designability: False
+compute_fid: False
