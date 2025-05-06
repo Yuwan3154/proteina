@@ -26,7 +26,7 @@ datamodule:
     molecule_type: "protein" # Type of molecule for which to select
     experiment_types: ["diffraction", "EM"] # other options are "NMR" and "other"
     min_length: 50 # Exclude peptides of length smaller than 50
-    max_length: 512 # Exclude polypeptides greater than length 512
+    max_length: 256 # Exclude polypeptides greater than length 256
     oligomeric_min: null 
     oligomeric_max: null 
     best_resolution: 0.0  # Include only proteins with resolution >= 0.0
