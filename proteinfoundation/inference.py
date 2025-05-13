@@ -25,6 +25,7 @@ import lightning as L
 import numpy as np
 import pandas as pd
 import torch
+torch.set_float32_matmul_precision("medium")
 from dotenv import load_dotenv
 from loguru import logger
 from omegaconf import OmegaConf
@@ -103,25 +104,41 @@ class GenDataset(Dataset):
         return result
 
 
-class GenDatasetWithSeq(Dataset):
-    def __init__(self, pt, cath_codes, dt=0.005, nsamples=10):
-        super(GenDatasetWithSeq, self).__init__()
+class GenDatasetWithSeqCath(Dataset):
+    def __init__(self, pt, cath_codes, dt=0.005, nsamples_per_len=10, max_nsamples=10):
+        super(GenDatasetWithSeqCath, self).__init__()
         self.pt = pt
         self.dt = dt
-        self.nsamples = nsamples
+        self.nsamples_per_len = nsamples_per_len
+        self.max_nsamples = max_nsamples
         self.cath_codes = cath_codes
 
+        self.num_batches_per_cath = (nsamples_per_len + max_nsamples - 1) // max_nsamples # Equivalent to math.ceil
+
     def __len__(self):
-        return len(self.cath_codes)
+        return len(self.cath_codes) * self.num_batches_per_cath
         
     def __getitem__(self, index):
-        cath_code = [[self.cath_codes[index]] for _ in range(self.nsamples)]
+        cath_idx = index // self.num_batches_per_cath
+        batch_idx_for_cath = index % self.num_batches_per_cath
+        
+        current_cath_code = self.cath_codes[cath_idx]
+
+        start_sample_idx = batch_idx_for_cath * self.max_nsamples
+        end_sample_idx = start_sample_idx + self.max_nsamples
+
+        if end_sample_idx > self.nsamples_per_len:
+            num_samples_for_batch = self.nsamples_per_len - start_sample_idx
+        else:
+            num_samples_for_batch = self.max_nsamples
+            
+        cath_code_batch = [[current_cath_code] for _ in range(num_samples_for_batch)]
         residue_type = self.pt.residue_type
         result = {
             "nres": residue_type.shape[-1],
             "dt": self.dt,
-            "nsamples": self.nsamples,
-            "cath_code": cath_code,
+            "nsamples": num_samples_for_batch,
+            "cath_code": cath_code_batch,
             "residue_type": residue_type,
         }
         return result
@@ -332,11 +349,12 @@ if __name__ == "__main__":
         pt = torch.load(f"{cfg.data_dir}/processed/{args.pt}.pt")
         cath_codes = pd.read_csv(f"{cfg.data_dir}/{cfg.cath_code_file}")["cath_code"].tolist()
         assert args.pt is not None, "pt must be provided if seq_cond is True"
-        dataset = GenDatasetWithSeq(
+        dataset = GenDatasetWithSeqCath(
             pt=pt,
-            cath_codes=cath_codes,
+            cath_codes=cath_codes if cfg.fold_cond else ["x.x.x.x"],
             dt=cfg.dt,
-            nsamples=cfg.nsamples_per_len
+            nsamples_per_len=cfg.nsamples_per_len,
+            max_nsamples=cfg.max_nsamples
         )
     else:
         nlens_dict = parse_nlens_cfg(cfg)
@@ -373,12 +391,21 @@ if __name__ == "__main__":
         aatype = np.array(pt.residue_type).astype(int)
         samples_per_length = {}
         for pred in predictions:
-            coors_atom37, cath_codes = pred  # [b, n, 37, 3], prediction_step returns atom37
+            coors_atom37, cath_codes_batch = pred  # [b, n, 37, 3], prediction_step returns atom37
 
             # Save each generation as a pdb file
             for i in range(coors_atom37.shape[0]):
                 # Create directory where everything related to this sample will be stored
-                fname = f"{args.pt}_cath_{cath_codes[i][0]}_{i}.pdb"
+                current_cath_code = cath_codes_batch[i][0] # Get the actual CATH code string
+                
+                # Initialize counter for this pt and cath_code if not present
+                sample_key = (args.pt, current_cath_code)
+                if sample_key not in samples_per_length:
+                    samples_per_length[sample_key] = 0
+                
+                sample_idx = samples_per_length[sample_key]
+                
+                fname = f"{args.pt}_cath_{current_cath_code}_{sample_idx}.pdb"
                 pdb_path = os.path.join(
                     root_path, fname
                 )  # ./inference/conf_{}/n_{}_id_{}
@@ -391,6 +418,7 @@ if __name__ == "__main__":
                     overwrite=True,
                     no_indexing=True,
                 )
+                samples_per_length[sample_key] += 1
     else:
         # Code for designability and
         # Store samples generated as pdbs and also scRMSD

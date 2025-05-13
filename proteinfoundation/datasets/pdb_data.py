@@ -589,6 +589,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
             f"_rnsr{ds.remove_non_standard_residues}_rpu{ds.remove_pdb_unavailable}"
             f"_l{''.join(ds.labels) if ds.labels else ''}"
             f"_rcu{ds.remove_cath_unavailable}"
+            f"_ex{len(ds.exclude_ids) if ds.exclude_ids else 0}"
         )
         return file_identifier
 

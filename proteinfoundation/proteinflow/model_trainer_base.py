@@ -498,7 +498,7 @@ class ModelTrainerBase(L.LightningModule):
         sampling_args = self.inf_cfg.sampling_caflow
 
         cath_code = (
-            _extract_cath_code(batch) if self.inf_cfg.get("fold_cond", False) else None
+            _extract_cath_code(batch) if self.inf_cfg.get("fold_cond", False) else [["x.x.x.x"] for _ in range(batch["nsamples"])]
         )  # When using unconditional model, don't use cath_code
         guidance_weight = self.inf_cfg.get("guidance_weight", 1.0)
         autoguidance_ratio = self.inf_cfg.get("autoguidance_ratio", 0.0)
