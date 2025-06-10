@@ -54,7 +54,7 @@ training:
   fold_label_sample_ratio: [0.5, 0.1, 0.15, 0.25]   # Training proportion for [None, C, CA, CAT]. If specified, will override mask_{C,A,T}_prob
   seq_cond: True
   mask_seq_proportion: 0.3
-  finetune_seq_cond: True
+  finetune_seq_cond_lora_only: True
 
 lora:
   use: True

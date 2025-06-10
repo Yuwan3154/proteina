@@ -52,7 +52,7 @@ class ModelTrainerBase(L.LightningModule):
         self.motif_conditioning = cfg_exp.training.get("motif_conditioning", False)
 
     def configure_optimizers(self):
-        if self.cfg_exp.training.finetune_seq_cond:
+        if self.cfg_exp.training.finetune_seq_cond_lora_only:
             opt_params = []
             opt_params_names = []
             for name, param in self.named_parameters():
@@ -67,8 +67,10 @@ class ModelTrainerBase(L.LightningModule):
             )
             print(f"Finetuning {opt_params_names}")
         else:
+            for param in self.parameters():
+                param.requires_grad = True
             optimizer = torch.optim.Adam(
-                [p for p in self.parameters() if p.requires_grad], lr=self.cfg_exp.opt.lr
+                self.parameters(), lr=self.cfg_exp.opt.lr
             )
         return optimizer
 

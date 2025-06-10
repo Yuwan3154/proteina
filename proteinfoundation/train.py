@@ -302,7 +302,7 @@ if __name__ == "__main__":
         val_check_interval=cfg_exp.opt.val_check_interval,
         strategy=DDPStrategy(
             process_group_backend=cfg_exp.opt.dist_backend,
-            find_unused_parameters=cfg_exp.training.finetune_seq_cond,
+            find_unused_parameters=cfg_exp.training.finetune_seq_cond_lora_only,
             gradient_as_bucket_view=True,  # Memory optimization
             static_graph=False  # Disable static graph optimization
         ) if cfg_exp.opt.dist_strategy == "ddp" else cfg_exp.opt.dist_strategy,

@@ -1,0 +1,33 @@
+defaults:
+  - inference_base
+  - _self_
+
+run_name_: seq_cond_cath_codes
+ckpt_name: finetune_v1.6_default-fold_21-seq-S30_lora-r2_32-effective-batch_purge-7bny_last.ckpt
+
+self_cond: True
+fold_cond: False
+cath_code_level: "T"  # Guidance level -- C, A, or T
+seq_cond: True
+data_dir: ${oc.env:DATA_PATH}/pdb_train/ # Directory where the dataset is stored
+cath_code_file: cath_codes_train_0.5_df_pdb_f1_minl50_maxl256_mtprotein_etdiffractionEM_minoNone_maxoNone_minr0.0_maxr5.0_hl_rl_rnsrTrue_rpuTrue_l_rcuFalse.csv # test_cath_code.csv
+
+# Sampling
+dt: 0.005
+nsamples_per_len: 25000
+max_nsamples: 8
+
+# LoRA -- if you use lora, set the same parameters as for training
+lora:
+  use: True
+  lora_alpha: 32.0
+  lora_dropout: 0.0
+  r: 2
+  train_bias: "none"
+
+sampling_caflow:
+  sampling_mode: sc  # "vf" for ODE sampling, "sc" for SDE sampling
+  sc_scale_noise: 0.60  # noise scale, used if sampling_mode == "sc"
+
+compute_designability: False
+compute_fid: False

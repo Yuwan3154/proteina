@@ -1,11 +1,11 @@
-run_name_: train_run_finetune_v1.6_default-fold_21-seq-S30_lora-r8_32-effective-batch
-pretrain_ckpt_path: /home/jupyter-chenxi/proteina/data/weights/proteina_v1.6_DFS_200M_notri_long_chain_generation.ckpt
+run_name_: train_run_finetune-all_v1.6_default-fold_21-seq-S30_32-effective-batch_purge-7bny
+pretrain_ckpt_path: /home/jupyter-chenxi/proteina/data/weights/finetune_v1.6_default-fold_21-seq-S30_32-effective-batch_purge-7bny_last.ckpt
 
 hardware:
   ncpus_per_task_train_: 8  # Number of CPUs per task during training
   ncpus_per_task_prepro_: 16  # Number of CPUs used for data preprocessing run
   accelerator: gpu
-  ngpus_per_node_: 1  # Number of GPUs per node
+  ngpus_per_node_: 3  # Number of GPUs per node
   nnodes_: 1  # Number of nodes
 
 # Below, for t_distribution, options are
@@ -40,7 +40,7 @@ model:
     seq_emb_dim: 21
 
 # Dataset params
-dataset: pdb_train_S30
+dataset: pdb_train_S30_purge-7bny
 dataset_config_subdir: pdb
 
 force_precision_f32: False  # If false will use bf16-mixed precision
@@ -54,13 +54,13 @@ training:
   fold_label_sample_ratio: [0.5, 0.1, 0.15, 0.25]   # Training proportion for [None, C, CA, CAT]. If specified, will override mask_{C,A,T}_prob
   seq_cond: True
   mask_seq_proportion: 0.3
-  finetune_seq_cond_lora_only: True
+  finetune_seq_cond_lora_only: False
 
 lora:
-  use: True
+  use: False
   lora_alpha: 32.0
   lora_dropout: 0.0
-  r: 8
+  r: 0
   train_bias: "none"
 
 
