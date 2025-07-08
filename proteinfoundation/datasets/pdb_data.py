@@ -10,6 +10,9 @@
 
 import pathlib
 from typing import Callable, Dict, List, Literal, Optional, Tuple, Union
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import functools
 
 import pandas as pd
 import torch
@@ -431,6 +434,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
         overwrite: bool = False,
         store_het: bool = False,
         store_bfactor: bool = True,
+        use_multiprocessing: bool = True,
         # arguments for BaseLightningDataModule
         batch_padding: bool = True,
         sampling_mode: Literal["random", "cluster-random", "cluster-reps"] = "random",
@@ -461,6 +465,8 @@ class PDBLightningDataModule(BaseLightningDataModule):
             store_het (bool, optional): Whether to store heteroatoms in the processed data.
                 Defaults to False.
             store_bfactor (bool, optional): Whether to store B factors in the processed data.
+                Defaults to True.
+            use_multiprocessing (bool, optional): Whether to use multiprocessing for data processing.
                 Defaults to True.
             batch_padding (bool, optional): Whether batches should be padded to a dense representation
                 with the length being either a pre-specified max length or the maximum length of the
@@ -505,6 +511,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
         self.in_memory = in_memory
         self.store_het = store_het
         self.store_bfactor = store_bfactor
+        self.use_multiprocessing = use_multiprocessing
         self.df_data = None
         self.dfs_splits = None
         self.clusterid_to_seqid_mappings = None
@@ -623,7 +630,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
             self.test_ds = self.test_dataset()
 
     def _process_structure_data(self, pdb_codes, chains):
-        """Process raw data sequentially instead of using multiprocessing."""
+        """Process raw data using multiprocessing for improved performance."""
         if chains is not None:
             index_pdb_tuples = [
                 (i, pdb, chains[i])
@@ -637,14 +644,143 @@ class PDBLightningDataModule(BaseLightningDataModule):
                 if not (self.processed_dir / f"{pdb}.pt").exists()
             ]
 
+        if not index_pdb_tuples:
+            logger.info("No structures to process - all files already exist.")
+            return []
+
         file_names = []
+        
+        # Use multiprocessing if enabled, there are multiple files to process and multiple workers
+        if self.use_multiprocessing and len(index_pdb_tuples) > 1 and self.num_workers > 1:
+            logger.info(f"Processing {len(index_pdb_tuples)} structures using {self.num_workers} workers...")
+            
+            # Create a partial function with fixed arguments
+            process_func = functools.partial(
+                self._process_single_pdb,
+                raw_dir=self.raw_dir,
+                processed_dir=self.processed_dir,
+                format_type=self.format,
+                store_het=self.store_het,
+                store_bfactor=self.store_bfactor,
+                pre_transform=self.pre_transform,
+                pre_filter=self.pre_filter,
+            )
+            
+            # Use ProcessPoolExecutor for multiprocessing
+            with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
+                # Submit all tasks
+                future_to_tuple = {
+                    executor.submit(process_func, tuple_): tuple_ 
+                    for tuple_ in index_pdb_tuples
+                }
+                
+                # Process completed tasks with progress bar
+                with tqdm(total=len(index_pdb_tuples), desc="Processing structures", unit="file") as pbar:
+                    for future in as_completed(future_to_tuple):
+                        try:
+                            result = future.result()
+                            if result is not None:
+                                file_names.append(result)
+                        except Exception as e:
+                            tuple_ = future_to_tuple[future]
+                            logger.warning(f"Failed to process {tuple_}: {e}")
+                        finally:
+                            pbar.update(1)
+        else:
+            # Fall back to sequential processing for single files or single worker
+            logger.info(f"Processing {len(index_pdb_tuples)} structures sequentially...")
         for tuple_ in tqdm(index_pdb_tuples, desc="Processing structures", unit="file"):
             result = self._load_and_process_pdb(tuple_)
             if result is not None:
                 file_names.append(result)
         
-        logger.info("Completed processing.")
+        logger.info(f"Completed processing. Successfully processed {len(file_names)} structures.")
         return file_names
+
+    @staticmethod
+    def _process_single_pdb(
+        index_pdb_tuple: Union[Tuple[int, str], Tuple[int, str, str]],
+        raw_dir: pathlib.Path,
+        processed_dir: pathlib.Path,
+        format_type: str,
+        store_het: bool,
+        store_bfactor: bool,
+        pre_transform: Optional[Callable] = None,
+        pre_filter: Optional[Callable] = None,
+    ) -> Optional[str]:
+        """
+        Static method for processing a single PDB file - suitable for multiprocessing.
+        
+        Args:
+            index_pdb_tuple: Tuple containing index, pdb code, and optionally chain
+            raw_dir: Path to raw data directory
+            processed_dir: Path to processed data directory  
+            format_type: File format (e.g., 'cif', 'pdb')
+            store_het: Whether to store heteroatoms
+            store_bfactor: Whether to store B factors
+            pre_transform: Optional pre-transform function
+            pre_filter: Optional pre-filter function
+            
+        Returns:
+            Optional[str]: The filename of the saved processed graph, or None if processing failed.
+        """
+        try:
+            if len(index_pdb_tuple) == 3:
+                i, pdb, chains = index_pdb_tuple
+            elif len(index_pdb_tuple) == 2:
+                i, pdb = index_pdb_tuple
+                chains = "all"
+            else:
+                raise ValueError("index_pdb_tuple must have 2 or 3 elements")
+
+            path = raw_dir / f"{pdb}.{format_type}"
+            if path.exists():
+                path = str(path)
+            elif path.with_suffix("." + format_type + ".gz").exists():
+                path = str(path.with_suffix("." + format_type + ".gz"))
+            else:
+                raise FileNotFoundError(
+                    f"{pdb} not found in raw directory. Are you sure it's downloaded and has the format {format_type}?"
+                )
+
+            fill_value_coords = 1e-5
+            graph = protein_to_pyg(
+                path=path,
+                chain_selection=chains,
+                keep_insertions=True,
+                store_het=store_het,
+                store_bfactor=store_bfactor,
+                fill_value_coords=fill_value_coords,
+            )
+
+            fname = f"{pdb}.pt" if chains == "all" else f"{pdb}_{chains}.pt"
+
+            graph.id = fname.split(".")[0]
+            coord_mask = graph.coords != fill_value_coords
+            graph.coord_mask = coord_mask[..., 0]
+            graph.residue_type = torch.tensor(
+                [resname_to_idx[residue] for residue in graph.residues]
+            ).long()
+            graph.database = "pdb"
+            graph.bfactor_avg = torch.mean(graph.bfactor, dim=-1)
+            graph.residue_pdb_idx = torch.tensor(
+                [int(s.split(":")[2]) for s in graph.residue_id], dtype=torch.long
+            )
+            graph.seq_pos = torch.arange(graph.coords.shape[0]).unsqueeze(-1)
+
+            if pre_transform:
+                graph = pre_transform(graph)
+
+            if pre_filter:
+                if pre_filter(graph) is not True:
+                    return None
+
+            torch.save(graph, processed_dir / fname)
+            return fname
+
+        except Exception as e:
+            logger.warning(f"Error processing {pdb} {chains if 'chains' in locals() else 'all'}: {e}")
+            return None
 
     def _load_and_process_pdb(
         self, index_pdb_tuple: Union[Tuple[int, str], Tuple[int, str, str]]
