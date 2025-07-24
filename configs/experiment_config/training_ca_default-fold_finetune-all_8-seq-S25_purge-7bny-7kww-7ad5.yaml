@@ -1,11 +1,11 @@
-run_name_: train_run_finetune-all_v1.6_default-fold_21-seq-S25_32-effective-batch_purge-7bny-7kww-7ad5
+run_name_: train_run_finetune-all_v1.6_default-fold_8-seq-S25_32-effective-batch_purge-7bny-7kww-7ad5
 pretrain_ckpt_path: /home/jupyter-chenxi/proteina/data/weights/proteina_v1.6_DFS_200M_notri_long_chain_generation.ckpt
 
 hardware:
-  ncpus_per_task_train_: 48  # Number of CPUs per task during training
-  ncpus_per_task_prepro_: 48  # Number of CPUs used for data preprocessing run
+  ncpus_per_task_train_: 8  # Number of CPUs per task during training
+  ncpus_per_task_prepro_: 8  # Number of CPUs used for data preprocessing run
   accelerator: gpu
-  ngpus_per_node_: 1  # Number of GPUs per node
+  ngpus_per_node_: 4  # Number of GPUs per node
   nnodes_: 1  # Number of nodes
 
 # Below, for t_distribution, options are
@@ -68,7 +68,7 @@ opt:
   lr: 0.0001
   max_epochs: 1000
   log_every_n_steps: 100  # For wandb
-  accumulate_grad_batches: 8  # effective batch size = 1*4*8 = 32
+  accumulate_grad_batches: 16  # effective batch size = 4*2*16 = 128
   val_check_interval: 500  # Number of training steps after which we check validation loss
   skip_nan_grad: False  # Skip updates with nan gradient
   grad_and_weight_analysis: False  # Log some statistics of gradients and weights

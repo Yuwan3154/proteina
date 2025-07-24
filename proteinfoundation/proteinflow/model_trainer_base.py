@@ -312,6 +312,11 @@ class ModelTrainerBase(L.LightningModule):
             for i in range(len(seq)):
                 seq[i] = mask_seq(seq[i], self.cfg_exp.training.mask_seq_proportion)
             batch["residue_type"] = seq
+        else:
+            # Remove residue_type from batch when seq_cond is False
+            if "residue_type" in batch:
+                batch.pop("residue_type")
+                print("residue_type removed from batch")
 
         # Prediction for self-conditioning
         if random.random() > 0.5 and self.cfg_exp.training.self_cond:
@@ -502,6 +507,7 @@ class ModelTrainerBase(L.LightningModule):
         cath_code = (
             _extract_cath_code(batch) if self.inf_cfg.get("fold_cond", False) else [["x.x.x.x"] for _ in range(batch["nsamples"])]
         )  # When using unconditional model, don't use cath_code
+        residue_type = batch["residue_type"] if self.inf_cfg.get("seq_cond", False) else None
         guidance_weight = self.inf_cfg.get("guidance_weight", 1.0)
         autoguidance_ratio = self.inf_cfg.get("autoguidance_ratio", 0.0)
         
@@ -521,7 +527,7 @@ class ModelTrainerBase(L.LightningModule):
             dt=batch["dt"].to(dtype=torch.float32),
             self_cond=self.inf_cfg.self_cond,
             cath_code=cath_code,
-            residue_type=batch["residue_type"],
+            residue_type=residue_type,
             guidance_weight=guidance_weight,
             autoguidance_ratio=autoguidance_ratio,
             dtype=torch.float32,

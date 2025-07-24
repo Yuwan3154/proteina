@@ -13,8 +13,8 @@ datamodule:
     - _target_: "proteinfoundation.datasets.transforms.CATHLabelTransform" # activate for fold-conditional training
       root_dir: ${oc.env:DATA_PATH}/cathdata/ # Root directory for CATH labels
     - _target_: "proteinfoundation.datasets.transforms.PaddingTransform"
-      max_size: 384
-  batch_size: 4 # Batch size for dataloader
+      max_size: 320
+  batch_size: 1 # Batch size for dataloader
   num_workers: 8 # Number of workers for dataloader
   pin_memory: True # Pin memory for dataloader
   prefetch_factor: 2 # Prefetch factor for dataloader
@@ -26,7 +26,7 @@ datamodule:
     molecule_type: "protein" # Type of molecule for which to select
     experiment_types: ["diffraction", "EM"] # other options are "NMR" and "other"
     min_length: 50 # Exclude peptides of length smaller than 50
-    max_length: 384 # Exclude polypeptides greater than length 384
+    max_length: 320 # Exclude polypeptides greater than length 320
     oligomeric_min: null 
     oligomeric_max: null 
     best_resolution: 0.0  # Include only proteins with resolution >= 0.0

@@ -723,7 +723,7 @@ class FeatureFactory(torch.nn.Module):
 
         # Linear layer and mask
         features_out = self.linear_out(features)
-        if self.use_residue_type_emb:
+        if self.use_residue_type_emb and "residue_type" in batch:
             features_out += self.residue_type_out(
                 self.residue_type_feat_creator(batch)
                 )

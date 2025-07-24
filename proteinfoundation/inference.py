@@ -344,30 +344,28 @@ if __name__ == "__main__":
 
     model.configure_inference(cfg, nn_ag=nn_ag)
 
-    # Create length dataset
-    if cfg.seq_cond:
-        pt = torch.load(f"{cfg.data_dir}/processed/{args.pt}.pt")
-        cath_codes = pd.read_csv(f"{cfg.data_dir}/{cfg.cath_code_file}")["cath_code"].tolist()
-        assert args.pt is not None, "pt must be provided if seq_cond is True"
-        dataset = GenDatasetWithSeqCath(
-            pt=pt,
-            cath_codes=cath_codes if cfg.fold_cond else ["x.x.x.x"],
-            dt=cfg.dt,
-            nsamples_per_len=cfg.nsamples_per_len,
-            max_nsamples=cfg.max_nsamples
-        )
-    else:
-        nlens_dict = parse_nlens_cfg(cfg)
-        lens_sample, nsamples = split_nlens(
-            nlens_dict, max_nsamples=cfg.max_nsamples, n_replica=1
-        )  # Assume running on 1 GPU
-        if cfg.fold_cond:
-            len_cath_codes = parse_len_cath_code(cfg)
-        else:
-            len_cath_codes = None
-        dataset = GenDataset(
-            nres=lens_sample, nsamples=nsamples, dt=cfg.dt, len_cath_codes=len_cath_codes
-        )
+    # Create inference dataset
+    pt = torch.load(f"{cfg.data_dir}/processed/{args.pt}.pt")
+    cath_codes = pd.read_csv(f"{cfg.data_dir}/{cfg.cath_code_file}")["cath_code"].tolist()
+    assert args.pt is not None, "pt must be provided if seq_cond is True"
+    dataset = GenDatasetWithSeqCath(
+        pt=pt,
+        cath_codes=cath_codes if cfg.fold_cond else ["x.x.x.x"],
+        dt=cfg.dt,
+        nsamples_per_len=cfg.nsamples_per_len,
+        max_nsamples=cfg.max_nsamples
+    )
+    # nlens_dict = parse_nlens_cfg(cfg)
+    # lens_sample, nsamples = split_nlens(
+    #     nlens_dict, max_nsamples=cfg.max_nsamples, n_replica=1
+    # )  # Assume running on 1 GPU
+    # if cfg.fold_cond:
+    #     len_cath_codes = parse_len_cath_code(cfg)
+    # else:
+    #     len_cath_codes = None
+    # dataset = GenDataset(
+    #     nres=lens_sample, nsamples=nsamples, dt=cfg.dt, len_cath_codes=len_cath_codes
+    # )
     dataloader = DataLoader(dataset, batch_size=1)
     # Note: Batch size should be left as 1, it is not the actual batch size.
     # Each sample returned by this loader is a 3-tuple (L, nsamples, dt) where
@@ -387,39 +385,44 @@ if __name__ == "__main__":
     trainer = L.Trainer(accelerator="gpu", devices=1)
     predictions = trainer.predict(model, dataloader)
 
-    if cfg.seq_cond:
+    if pt is not None:
         aatype = np.array(pt.residue_type).astype(int)
-        samples_per_length = {}
-        for pred in predictions:
-            coors_atom37, cath_codes_batch = pred  # [b, n, 37, 3], prediction_step returns atom37
-
-            # Save each generation as a pdb file
-            for i in range(coors_atom37.shape[0]):
-                # Create directory where everything related to this sample will be stored
-                current_cath_code = cath_codes_batch[i][0] # Get the actual CATH code string
-                
-                # Initialize counter for this pt and cath_code if not present
-                sample_key = (args.pt, current_cath_code)
-                if sample_key not in samples_per_length:
-                    samples_per_length[sample_key] = 0
-                
-                sample_idx = samples_per_length[sample_key]
-                
-                fname = f"{args.pt}_cath_{current_cath_code}_{sample_idx}.pdb"
-                pdb_path = os.path.join(
-                    root_path, fname
-                )  # ./inference/conf_{}/n_{}_id_{}
-
-                # Save generated structure as pdb
-                write_prot_to_pdb(
-                    coors_atom37[i].numpy(),
-                    pdb_path,
-                    aatype=aatype,
-                    overwrite=True,
-                    no_indexing=True,
-                )
-                samples_per_length[sample_key] += 1
     else:
+        aatype = None
+    
+    samples_per_length = {}
+    for pred in predictions:
+        coors_atom37, cath_codes_batch = pred  # [b, n, 37, 3], prediction_step returns atom37
+
+        # Save each generation as a pdb file
+        for i in range(coors_atom37.shape[0]):
+            # Create directory where everything related to this sample will be stored
+            current_cath_code = cath_codes_batch[i][0] # Get the actual CATH code string
+            
+            # Initialize counter for this pt and cath_code if not present
+            sample_key = (args.pt, current_cath_code)
+            if sample_key not in samples_per_length:
+                samples_per_length[sample_key] = 0
+            
+            sample_idx = samples_per_length[sample_key]
+            
+            fname = f"{args.pt}_cath_{current_cath_code}_{sample_idx}.pdb"
+            pdb_path = os.path.join(
+                root_path, fname
+            )  # ./inference/conf_{}/n_{}_id_{}
+
+            # Save generated structure as pdb
+            write_prot_to_pdb(
+                coors_atom37[i].numpy(),
+                pdb_path,
+                aatype=aatype,
+                overwrite=True,
+                no_indexing=True,
+            )
+            samples_per_length[sample_key] += 1
+    
+    if cfg.compute_fid or cfg.compute_designability:
+
         # Code for designability and
         # Store samples generated as pdbs and also scRMSD
         if cfg.compute_designability:

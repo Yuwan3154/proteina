@@ -37,45 +37,67 @@ class CheckGradientsCallback(Callback):
 class LogEpochTimeCallback(Callback):
     """Simple callback that logs how long each epoch takes, in seconds, to a pytorch lightning log"""
 
+    def __init__(self):
+        super().__init__()
+        self.epoch_start = None
+
     def on_train_epoch_start(self, trainer, pl_module):
         self.epoch_start = time.time()
 
     def on_train_epoch_end(self, trainer, pl_module):
-        curr_time = time.time()
-        duration = curr_time - self.epoch_start
-        pl_module.log(
-            "train_info/epoch_duration_secs",
-            duration,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=False,
-            logger=True,
-            sync_dist=True,
-        )
-        if pl_module.current_epoch % 10 == 0:
-            logger.info(
-                f"Done training epoch {pl_module.current_epoch}, epoch took {duration} seconds"
+        if self.epoch_start is not None:
+            curr_time = time.time()
+            duration = curr_time - self.epoch_start
+            pl_module.log(
+                "train_info/epoch_duration_secs",
+                duration,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                logger=True,
+                sync_dist=True,
             )
+            if pl_module.current_epoch % 10 == 0:
+                logger.info(
+                    f"Done training epoch {pl_module.current_epoch}, epoch took {duration} seconds"
+                )
+
+    def on_save_checkpoint(self, trainer, pl_module, checkpoint):
+        checkpoint["epoch_start"] = self.epoch_start
+
+    def on_load_checkpoint(self, trainer, pl_module, checkpoint):
+        self.epoch_start = checkpoint.get("epoch_start", None)
 
 
 class LogSetpTimeCallback(Callback):
     """Simple callback that logs how long each training step takes, in seconds, to a pytorch lightning log"""
 
+    def __init__(self):
+        super().__init__()
+        self.step_start = None
+
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
         self.step_start = time.time()
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        curr_time = time.time()
-        duration = curr_time - self.step_start
-        pl_module.log(
-            "train_info/step_duration_secs",
-            duration,
-            on_step=True,
-            on_epoch=False,
-            prog_bar=False,
-            logger=True,
-            sync_dist=True,
-        )
+        if self.step_start is not None:
+            curr_time = time.time()
+            duration = curr_time - self.step_start
+            pl_module.log(
+                "train_info/step_duration_secs",
+                duration,
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+                logger=True,
+                sync_dist=True,
+            )
+
+    def on_save_checkpoint(self, trainer, pl_module, checkpoint):
+        checkpoint["step_start"] = self.step_start
+
+    def on_load_checkpoint(self, trainer, pl_module, checkpoint):
+        self.step_start = checkpoint.get("step_start", None)
 
 
 class GradAndWeightAnalysisCallback(Callback):
@@ -188,6 +210,14 @@ class SkipNanGradCallback(Callback):
             print("Nan grad, skipping update", self.count, self.iter)
             print(pl_module.losses[-5:])
             pl_module.zero_grad()
+
+    def on_save_checkpoint(self, trainer, pl_module, checkpoint):
+        checkpoint["nan_grad_count"] = self.count
+        checkpoint["nan_grad_iter"] = self.iter
+
+    def on_load_checkpoint(self, trainer, pl_module, checkpoint):
+        self.count = checkpoint.get("nan_grad_count", 0)
+        self.iter = checkpoint.get("nan_grad_iter", 0)
 
 
 class RandomStateCheckpoint(Callback):

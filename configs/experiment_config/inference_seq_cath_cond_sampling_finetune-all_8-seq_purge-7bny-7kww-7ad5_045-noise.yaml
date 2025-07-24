@@ -3,18 +3,18 @@ defaults:
   - _self_
 
 run_name_: seq_cond
-ckpt_name: finetune-all_v1.6_default-fold_21-seq-S30_32-effective-batch_purge-7bny_last.ckpt
+ckpt_name: finetune-all_v1.6_default-fold_8-seq-S25_32-effective-batch_purge-7bny-7kww-7ad5_last.ckpt
 
 self_cond: True
-fold_cond: False
+fold_cond: True
 cath_code_level: "T"  # Guidance level -- C, A, or T
 seq_cond: True
 data_dir: ${oc.env:DATA_PATH}/pdb_train/ # Directory where the dataset is stored
-cath_code_file: cath_codes_train_0.5_df_pdb_f1_minl50_maxl256_mtprotein_etdiffractionEM_minoNone_maxoNone_minr0.0_maxr5.0_hl_rl_rnsrTrue_rpuTrue_l_rcuFalse.csv # test_cath_code.csv
+cath_code_file: cath_codes_train_df_pdb_f1_minl50_maxl384_mtprotein_etdiffractionEM_minoNone_maxoNone_minr0.0_maxr5.0_hl_rl_rnsrTrue_rpuTrue_l_rcuFalse_ex11.csv # test_cath_code.csv
 
 # Sampling
 dt: 0.005
-nsamples_per_len: 25000
+nsamples_per_len: 8
 max_nsamples: 150
 
 # LoRA -- if you use lora, set the same parameters as for training
@@ -30,4 +30,4 @@ sampling_caflow:
   sc_scale_noise: 0.45  # noise scale, used if sampling_mode == "sc"
 
 compute_designability: False
-compute_fid: False
+compute_fid: False 
