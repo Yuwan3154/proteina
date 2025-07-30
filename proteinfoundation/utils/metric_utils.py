@@ -33,6 +33,26 @@ def transform_global_percentage_to_mask_dropout(fold_label_sample_ratio):
     return mask_T_prob, mask_A_prob, mask_C_prob
 
 
+def transform_cirpin_sample_ratio_to_mask_prob(cirpin_label_sample_ratio):
+    """
+    Convert CIRPIN label sample ratio to masking probability.
+    
+    Args:
+        cirpin_label_sample_ratio (float): Proportion of samples that should have CIRPIN conditioning.
+                                         Value between 0.0 and 1.0.
+                                         
+    Returns:
+        float: Probability of masking CIRPIN labels (i.e., 1 - cirpin_label_sample_ratio)
+    """
+    assert 0.0 <= cirpin_label_sample_ratio <= 1.0, f"cirpin_label_sample_ratio should be between 0.0 and 1.0, got {cirpin_label_sample_ratio}"
+    
+    # If cirpin_label_sample_ratio = 1.0, we want mask_prob = 0.0 (never mask)
+    # If cirpin_label_sample_ratio = 0.0, we want mask_prob = 1.0 (always mask)
+    mask_prob = 1.0 - cirpin_label_sample_ratio
+    
+    return mask_prob
+
+
 def load_alpha_carbon_coordinates(pdb_file):
     prot = from_pdb_file(pdb_file)
     mask = torch.Tensor(prot.atom_mask).long().bool()  # [n, 37]

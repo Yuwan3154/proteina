@@ -104,6 +104,55 @@ class GenDataset(Dataset):
         return result
 
 
+class GenDatasetWithSeqCathCirpin(Dataset):
+    def __init__(self, pt, cath_codes, protein_ids=None, dt=0.005, nsamples_per_len=10, max_nsamples=10):
+        super(GenDatasetWithSeqCathCirpin, self).__init__()
+        self.pt = pt
+        self.dt = dt
+        self.nsamples_per_len = nsamples_per_len
+        self.max_nsamples = max_nsamples
+        self.cath_codes = cath_codes
+        self.protein_ids = protein_ids
+
+        self.num_batches_per_cath = (nsamples_per_len + max_nsamples - 1) // max_nsamples # Equivalent to math.ceil
+
+    def __len__(self):
+        return len(self.cath_codes) * self.num_batches_per_cath
+        
+    def __getitem__(self, index):
+        cath_idx = index // self.num_batches_per_cath
+        batch_idx_for_cath = index % self.num_batches_per_cath
+        
+        current_cath_code = self.cath_codes[cath_idx]
+
+        start_sample_idx = batch_idx_for_cath * self.max_nsamples
+        end_sample_idx = start_sample_idx + self.max_nsamples
+
+        if end_sample_idx > self.nsamples_per_len:
+            num_samples_for_batch = self.nsamples_per_len - start_sample_idx
+        else:
+            num_samples_for_batch = self.max_nsamples
+            
+        cath_code_batch = [[current_cath_code] for _ in range(num_samples_for_batch)]
+        residue_type = self.pt.residue_type
+        
+        result = {
+            "nres": residue_type.shape[-1],
+            "dt": self.dt,
+            "nsamples": num_samples_for_batch,
+            "cath_code": cath_code_batch,
+            "residue_type": residue_type,
+        }
+        
+        # Add protein_id for CIRPIN conditioning
+        if self.protein_ids is not None:
+            # Use the current protein_id for all samples in the batch
+            protein_id_batch = [self.protein_ids[cath_idx] for _ in range(num_samples_for_batch)]
+            result["protein_id"] = protein_id_batch
+        
+        return result
+
+
 class GenDatasetWithSeqCath(Dataset):
     def __init__(self, pt, cath_codes, dt=0.005, nsamples_per_len=10, max_nsamples=10):
         super(GenDatasetWithSeqCath, self).__init__()
@@ -348,9 +397,27 @@ if __name__ == "__main__":
     pt = torch.load(f"{cfg.data_dir}/processed/{args.pt}.pt")
     cath_codes = pd.read_csv(f"{cfg.data_dir}/{cfg.cath_code_file}")["cath_code"].tolist()
     assert args.pt is not None, "pt must be provided if seq_cond is True"
-    dataset = GenDatasetWithSeqCath(
+    
+    # Prepare protein_ids for CIRPIN conditioning if needed
+    protein_ids = None
+    if cfg.get("cirpin_cond", False):
+        # For CIRPIN conditioning, we need protein IDs
+        # This assumes your dataset has a way to provide protein IDs
+        # You may need to adapt this based on your data structure
+        if hasattr(pt, 'protein_id'):
+            # If the pt object has protein_id attribute
+            protein_ids = [pt.protein_id for _ in cath_codes]
+        elif args.pt:
+            # Use the pt filename as protein_id
+            protein_ids = [args.pt for _ in cath_codes]
+        else:
+            logger.warning("CIRPIN conditioning enabled but no protein_id available, using placeholder")
+            protein_ids = ["unknown" for _ in cath_codes]
+    
+    dataset = GenDatasetWithSeqCathCirpin(
         pt=pt,
         cath_codes=cath_codes if cfg.fold_cond else ["x.x.x.x"],
+        protein_ids=protein_ids,  # Will be None if CIRPIN conditioning is disabled
         dt=cfg.dt,
         nsamples_per_len=cfg.nsamples_per_len,
         max_nsamples=cfg.max_nsamples

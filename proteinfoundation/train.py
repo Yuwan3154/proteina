@@ -44,6 +44,7 @@ from proteinfoundation.utils.fetch_last_ckpt import fetch_last_ckpt
 from proteinfoundation.utils.lora_utils import replace_lora_layers
 from proteinfoundation.utils.metric_utils import (
     transform_global_percentage_to_mask_dropout,
+    transform_cirpin_sample_ratio_to_mask_prob,
 )
 from proteinfoundation.utils.seed_callback import SeedCallback
 from proteinfoundation.utils.training_analysis_utils import (
@@ -154,6 +155,20 @@ if __name__ == "__main__":
                 cfg_exp.training.mask_T_prob,
                 cfg_exp.training.mask_A_prob,
                 cfg_exp.training.mask_C_prob,
+            )
+        )
+
+    # Set training CIRPIN labels dropout rate based on global percentage
+    if cfg_exp.training.get("cirpin_label_sample_ratio") is not None:
+        log_info("Setting CIRPIN mask probability based on cirpin_label_sample_ratio")
+        cfg_exp.training.mask_cirpin_prob = transform_cirpin_sample_ratio_to_mask_prob(
+            cfg_exp.training.cirpin_label_sample_ratio
+        )
+        log_info(
+            "Set mask_cirpin_prob: %.3f (cirpin_label_sample_ratio: %.3f)"
+            % (
+                cfg_exp.training.mask_cirpin_prob,
+                cfg_exp.training.cirpin_label_sample_ratio,
             )
         )
 

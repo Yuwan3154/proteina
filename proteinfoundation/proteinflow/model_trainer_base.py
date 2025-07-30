@@ -318,6 +318,32 @@ class ModelTrainerBase(L.LightningModule):
                 batch.pop("residue_type")
                 print("residue_type removed from batch")
 
+        # CIRPIN conditional training
+        if self.cfg_exp.training.get("cirpin_cond", False):
+            # CIRPIN conditioning is handled by the feature factory
+            # We just need to ensure protein_id is available in the batch
+            # The feature factory will handle loading the appropriate embeddings
+            if "protein_id" not in batch:
+                # If protein_id is not available, try to extract from other batch fields
+                # This depends on your dataset structure - you may need to adapt this
+                logger.warning("protein_id not found in batch for CIRPIN conditioning")
+            else:
+                # Apply CIRPIN masking based on mask_cirpin_prob
+                mask_cirpin_prob = self.cfg_exp.training.get("mask_cirpin_prob", 0.0)
+                if mask_cirpin_prob > 0.0:
+                    bs = x_1.shape[0]
+                    protein_id_list = batch["protein_id"]
+                    for i in range(bs):
+                        if random.random() < mask_cirpin_prob:
+                            # Mask CIRPIN by setting protein_id to None or a placeholder
+                            # This will cause the feature factory to use zero embeddings
+                            protein_id_list[i] = None
+                    batch["protein_id"] = protein_id_list
+        else:
+            # Remove protein_id from batch when cirpin_cond is False (optional cleanup)
+            if "protein_id" in batch:
+                batch.pop("protein_id")
+
         # Prediction for self-conditioning
         if random.random() > 0.5 and self.cfg_exp.training.self_cond:
             x_pred_sc, _ = self.predict_clean(batch)
