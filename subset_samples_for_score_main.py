@@ -108,11 +108,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--inference_path", "-i", type=str, required=True)
     parser.add_argument("--aln_file", "-f", type=str, required=True)
-    parser.add_argument("--pt_name", "-p", type=str, required=True)
     parser.add_argument("--bin_num", "-b", type=int, default=10)
     parser.add_argument("--num_samples_per_bin", "-n", type=int, default=10)
     args = parser.parse_args()
 
-    inference_path = Path(args.inference_path) / args.pt_name
+    inference_path = Path(args.inference_path)
     aln_df = pd.read_csv(inference_path / args.aln_file, sep="\t")
-    subset_samples(inference_path, aln_df, bin_num=args.bin_num, num_samples_per_bin=args.num_samples_per_bin) 
+    subset_samples(inference_path, aln_df, bin_num=args.bin_num, num_samples_per_bin=args.num_samples_per_bin)
+    

@@ -8,14 +8,13 @@ SCRIPT_DIR="$HOME/proteina"
 MAIN_SCRIPT="$SCRIPT_DIR/subset_samples_for_score_main.py"
 CONVERT_SCRIPT="$SCRIPT_DIR/convert_cg2all_files.py"
 ALN_FILE="aln.tsv"
-PT_NAME="7ad5_A"
 BIN_NUM=10
 NUM_SAMPLES_PER_BIN=10
 
 # Directories to process
 DIRECTORIES=(
-    "$HOME/proteina/inference/inference_seq_cath_cond_sampling_finetune-all_8-seq_purge-7bny-7kww-7ad5_045-noise/"
-    "$HOME/proteina/inference/inference_seq_cond_sampling_finetune-all_8-seq_purge-7bny-7kww-7ad5_045-noise/"
+    "$HOME/proteina/inference/inference_seq_cath_cond_sampling_finetune-all_8-seq_purge-7bny-7kww-7ad5_045-noise/7ad5_A/"
+    "$HOME/proteina/inference/inference_seq_cond_sampling_finetune-all_8-seq_purge-7bny-7kww-7ad5_045-noise/7ad5_A/"
 )
 
 # Function to run the main sampling script
@@ -28,7 +27,6 @@ run_main_sampling() {
     conda run -n proteina python "$MAIN_SCRIPT" \
         -i "$dir" \
         -f "$ALN_FILE" \
-        -p "$PT_NAME" \
         -b "$BIN_NUM" \
         -n "$NUM_SAMPLES_PER_BIN"
     
@@ -49,7 +47,7 @@ run_convert_cg2all() {
     
     # Activate the cg2all conda environment and run the conversion
     conda run -n cg2all python "$CONVERT_SCRIPT" \
-        -i "$dir/$PT_NAME" \
+        -i "$dir" \
         -f "$ALN_FILE"
     
     if [ $? -eq 0 ]; then

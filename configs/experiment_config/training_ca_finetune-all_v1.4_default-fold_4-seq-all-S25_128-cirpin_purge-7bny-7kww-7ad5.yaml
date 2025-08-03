@@ -44,7 +44,7 @@ model:
     cirpin_emb_dim: 128
 
 # Dataset params
-dataset: pdb_train
+dataset: pdb_train_S25_max320_purge-test
 dataset_config_subdir: pdb
 
 force_precision_f32: False  # If false will use bf16-mixed precision
