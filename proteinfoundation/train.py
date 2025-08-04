@@ -44,7 +44,6 @@ from proteinfoundation.utils.fetch_last_ckpt import fetch_last_ckpt
 from proteinfoundation.utils.lora_utils import replace_lora_layers
 from proteinfoundation.utils.metric_utils import (
     transform_global_percentage_to_mask_dropout,
-    transform_cirpin_sample_ratio_to_mask_prob,
 )
 from proteinfoundation.utils.seed_callback import SeedCallback
 from proteinfoundation.utils.training_analysis_utils import (
@@ -158,19 +157,7 @@ if __name__ == "__main__":
             )
         )
 
-    # Set training CIRPIN labels dropout rate based on global percentage
-    if cfg_exp.training.get("cirpin_label_sample_ratio") is not None:
-        log_info("Setting CIRPIN mask probability based on cirpin_label_sample_ratio")
-        cfg_exp.training.mask_cirpin_prob = transform_cirpin_sample_ratio_to_mask_prob(
-            cfg_exp.training.cirpin_label_sample_ratio
-        )
-        log_info(
-            "Set mask_cirpin_prob: %.3f (cirpin_label_sample_ratio: %.3f)"
-            % (
-                cfg_exp.training.mask_cirpin_prob,
-                cfg_exp.training.cirpin_label_sample_ratio,
-            )
-        )
+
 
     # Set run name and root directory for the run, used to store things
     run_name = cfg_exp.run_name_
@@ -316,8 +303,11 @@ if __name__ == "__main__":
         check_val_every_n_epoch=None,  # Leave like this
         val_check_interval=cfg_exp.opt.val_check_interval,
         strategy=DDPStrategy(
-            process_group_backend=cfg_exp.opt.dist_backend,
-            find_unused_parameters=cfg_exp.training.finetune_seq_cond_lora_only,
+            process_group_backend=cfg_exp.opt.get("dist_backend", "nccl"),
+            find_unused_parameters=(
+                cfg_exp.training.finetune_seq_cond_lora_only or 
+                cfg_exp.training.get("cirpin_cond", False)  # Enable for CIRPIN conditioning
+            ),
             gradient_as_bucket_view=True,  # Memory optimization
             static_graph=False  # Disable static graph optimization
         ) if cfg_exp.opt.dist_strategy == "ddp" else cfg_exp.opt.dist_strategy,

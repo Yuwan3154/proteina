@@ -125,7 +125,7 @@ class ZeroFeat(Feature):
         if self.mode == "seq":
             return torch.zeros((b, n, self.dim), device=xt.device)
         elif self.mode == "pair":
-            torch.zeros((b, n, n, self.dim_feats_out), device=xt.device)
+            return torch.zeros((b, n, n, self.dim), device=xt.device)
         else:
             raise IOError(f"Mode {self.mode} wrong for zero feature")
 
@@ -321,19 +321,24 @@ class FoldEmbeddingSeqFeat(Feature):
 class CirpinEmbeddingSeqFeat(Feature):
     """Computes CIRPIN embedding and returns as sequence feature of shape [b, n, cirpin_emb_dim]."""
 
-    def __init__(self, cirpin_emb_dim, cirpin_emb_path, **kwargs):
+    def __init__(self, cirpin_emb_dim, cirpin_emb_path=None, **kwargs):
         """
         Args:
             cirpin_emb_dim (int): Dimension of CIRPIN embeddings (should be 128)
-            cirpin_emb_path (str): Path to the .pt file containing CIRPIN embeddings
+            cirpin_emb_path (str, optional): Path to the .pt file containing CIRPIN embeddings.
+                                           If None, will use zero embeddings for all proteins.
         """
         super().__init__(dim=cirpin_emb_dim)
         self.cirpin_emb_path = cirpin_emb_path
         self.cirpin_emb_dim = cirpin_emb_dim
         self.register_buffer("_device_param", torch.tensor(0), persistent=False)
         
-        # Load CIRPIN embeddings
-        self.load_cirpin_embeddings()
+        # Load CIRPIN embeddings if path is provided
+        if self.cirpin_emb_path is not None:
+            self.load_cirpin_embeddings()
+        else:
+            logger.warning("No CIRPIN embeddings path provided, will use zero embeddings for all proteins")
+            self.id_to_embedding = {}
         
         # Create a learnable projection layer to adapt CIRPIN embeddings if needed
         self.projection = torch.nn.Linear(128, cirpin_emb_dim)  # Input size is always 128 based on requirements
@@ -429,6 +434,136 @@ class CirpinEmbeddingSeqFeat(Feature):
         # Expand to all residues (per-residue conditioning)
         cirpin_emb = cirpin_emb[:, None, :]  # [b, 1, cirpin_emb_dim]
         return cirpin_emb.expand((bs, n, self.cirpin_emb_dim))  # [b, n, cirpin_emb_dim]
+
+
+class CirpinEmbeddingPairFeat(Feature):
+    """Computes CIRPIN embedding and returns as pair feature of shape [b, n, n, cirpin_emb_dim]."""
+
+    def __init__(self, cirpin_emb_dim, cirpin_emb_path=None, **kwargs):
+        """
+        Args:
+            cirpin_emb_dim (int): Dimension of CIRPIN embeddings (should be 128)
+            cirpin_emb_path (str, optional): Path to the .pt file containing CIRPIN embeddings.
+                                           If None, will use zero embeddings for all proteins.
+        """
+        super().__init__(dim=cirpin_emb_dim)
+        self.cirpin_emb_path = cirpin_emb_path
+        self.cirpin_emb_dim = cirpin_emb_dim
+        self.register_buffer("_device_param", torch.tensor(0), persistent=False)
+        
+        # Load CIRPIN embeddings if path is provided
+        if self.cirpin_emb_path is not None:
+            self.load_cirpin_embeddings()
+        else:
+            logger.warning("No CIRPIN embeddings path provided, will use zero embeddings for all proteins")
+            self.id_to_embedding = {}
+        
+        # Create learnable projection layers for pair features
+        self.projection_1 = torch.nn.Linear(128, cirpin_emb_dim)  # First embedding
+        self.projection_2 = torch.nn.Linear(128, cirpin_emb_dim)  # Second embedding
+    
+    @property
+    def device(self):
+        return next(self.buffers()).device
+    
+    def load_cirpin_embeddings(self):
+        """Load CIRPIN embeddings from the .pt file."""
+        if not os.path.exists(self.cirpin_emb_path):
+            raise IOError(f"CIRPIN embeddings file {self.cirpin_emb_path} does not exist")
+        
+        logger.info(f"Loading CIRPIN embeddings from {self.cirpin_emb_path}")
+        cirpin_data = torch.load(self.cirpin_emb_path, map_location='cpu')
+        
+        # Validate the format
+        if 'ids' not in cirpin_data or 'embeddings' not in cirpin_data:
+            raise ValueError("CIRPIN embeddings file must contain 'ids' and 'embeddings' fields")
+        
+        ids = cirpin_data['ids']
+        embeddings = cirpin_data['embeddings']
+        
+        # Validate shapes
+        if not isinstance(ids, list):
+            raise ValueError("CIRPIN 'ids' must be a list of strings")
+        
+        if not isinstance(embeddings, torch.Tensor):
+            embeddings = torch.tensor(embeddings)
+        
+        if len(embeddings.shape) != 2:
+            raise ValueError(f"CIRPIN embeddings must have shape [num_proteins, 128], got {embeddings.shape}")
+        
+        if embeddings.shape[1] != 128:
+            raise ValueError(f"CIRPIN embeddings must have dimension 128, got {embeddings.shape[1]}")
+        
+        if len(ids) != embeddings.shape[0]:
+            raise ValueError(f"Number of IDs ({len(ids)}) must match number of embeddings ({embeddings.shape[0]})")
+        
+        # Create ID to embedding mapping
+        self.id_to_embedding = {}
+        for i, protein_id in enumerate(ids):
+            self.id_to_embedding[protein_id] = embeddings[i]
+        
+        logger.info(f"Loaded CIRPIN embeddings for {len(self.id_to_embedding)} proteins")
+    
+    def get_cirpin_embedding(self, protein_ids):
+        """
+        Get CIRPIN embeddings for a batch of protein IDs.
+        
+        Args:
+            protein_ids (List[str]): List of protein IDs
+            
+        Returns:
+            torch.Tensor: CIRPIN embeddings of shape [batch_size, 128]
+        """
+        batch_embeddings = []
+        
+        for protein_id in protein_ids:
+            # Handle None protein_id (used for masking)
+            if protein_id is None:
+                logger.debug("CIRPIN protein_id is None (masked), using zero embedding")
+                embedding = torch.zeros(128)
+            else:
+                # Clean the protein ID (remove .pt suffix if present)
+                clean_id = protein_id.replace('.pt', '') if protein_id.endswith('.pt') else protein_id
+                
+                if clean_id in self.id_to_embedding:
+                    embedding = self.id_to_embedding[clean_id]
+                else:
+                    # Use zero embedding for unknown proteins
+                    logger.warning(f"CIRPIN embedding not found for protein {protein_id}, using zero embedding")
+                    embedding = torch.zeros(128)
+            
+            batch_embeddings.append(embedding)
+        
+        return torch.stack(batch_embeddings).to(self.device)
+    
+    def forward(self, batch):
+        xt = batch["x_t"]  # [b, n, 3]
+        bs = xt.shape[0]
+        n = xt.shape[1]
+        
+        # Get protein IDs from batch
+        if "protein_id" not in batch:
+            # If no protein IDs provided, use zero embeddings
+            logger.warning("No protein_id found in batch for CIRPIN conditioning, using zero embeddings")
+            protein_ids = ["unknown"] * bs
+        else:
+            protein_ids = batch["protein_id"]
+            if isinstance(protein_ids, torch.Tensor):
+                protein_ids = protein_ids.tolist()
+        
+        # Get CIRPIN embeddings
+        cirpin_emb = self.get_cirpin_embedding(protein_ids)  # [b, 128]
+        
+        # Project to desired dimension using two different projections
+        cirpin_emb_1 = self.projection_1(cirpin_emb)  # [b, cirpin_emb_dim]
+        cirpin_emb_2 = self.projection_2(cirpin_emb)  # [b, cirpin_emb_dim]
+        
+        # Expand to sequence length first, then create pair representation
+        cirpin_emb_1 = cirpin_emb_1[:, None, :].expand(bs, n, self.cirpin_emb_dim)  # [b, n, cirpin_emb_dim]
+        cirpin_emb_2 = cirpin_emb_2[:, None, :].expand(bs, n, self.cirpin_emb_dim)  # [b, n, cirpin_emb_dim]
+        
+        # Create pair representation by outer product (similar to ResidueTypeEmbeddingPairFeat)
+        return cirpin_emb_1[:, :, None, :] * cirpin_emb_2[:, None, :, :]  # [b, n, n, cirpin_emb_dim]
 
 
 class TimeEmbeddingSeqFeat(Feature):
@@ -793,6 +928,8 @@ class FeatureFactory(torch.nn.Module):
                 return MotifStructureMaskFeat(**kwargs)
             elif f == "residue_type_emb":
                 return ResidueTypeEmbeddingPairFeat(**kwargs)
+            elif f == "cirpin_emb":
+                return CirpinEmbeddingPairFeat(**kwargs)
             else:
                 raise IOError(f"Pair feature {f} not implemented.")
 

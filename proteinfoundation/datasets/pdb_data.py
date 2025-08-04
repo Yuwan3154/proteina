@@ -756,6 +756,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
             fname = f"{pdb}.pt" if chains == "all" else f"{pdb}_{chains}.pt"
 
             graph.id = fname.split(".")[0]
+            graph.protein_id = graph.id  # Add protein_id for CIRPIN conditioning
             coord_mask = graph.coords != fill_value_coords
             graph.coord_mask = coord_mask[..., 0]
             graph.residue_type = torch.tensor(
