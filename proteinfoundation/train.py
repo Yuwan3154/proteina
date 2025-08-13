@@ -305,8 +305,9 @@ if __name__ == "__main__":
         strategy=DDPStrategy(
             process_group_backend=cfg_exp.opt.get("dist_backend", "nccl"),
             find_unused_parameters=(
-                cfg_exp.training.finetune_seq_cond_lora_only or 
-                cfg_exp.training.get("cirpin_cond", False)  # Enable for CIRPIN conditioning
+                cfg_exp.training.get("finetune_seq_cond_lora_only", False)
+                # or 
+                # cfg_exp.training.get("cirpin_cond", False)  # Enable for CIRPIN conditioning
             ),
             gradient_as_bucket_view=True,  # Memory optimization
             static_graph=False  # Disable static graph optimization

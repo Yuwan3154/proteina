@@ -321,10 +321,10 @@ class ModelTrainerBase(L.LightningModule):
         # CIRPIN conditional training
         if self.cfg_exp.training.get("cirpin_cond", False):
             # CIRPIN conditioning is handled by the feature factory
-            # We just need to ensure protein_id is available in the batch
+            # We just need to ensure id is available in the batch
             # The feature factory will handle loading the appropriate embeddings
             if "id" not in batch:
-                # If protein_id is not available, try to extract from other batch fields
+                # If id is not available, try to extract from other batch fields
                 # This depends on your dataset structure - you may need to adapt this
                 logger.warning("id not found in batch for CIRPIN conditioning")
             else:
@@ -332,15 +332,15 @@ class ModelTrainerBase(L.LightningModule):
                 mask_cirpin_prob = self.cfg_exp.training.get("mask_cirpin_prob", 0.0)
                 if mask_cirpin_prob > 0.0:
                     bs = x_1.shape[0]
-                    protein_id_list = batch["id"]
+                    id_list = batch["id"]
                     for i in range(bs):
                         if random.random() < mask_cirpin_prob:
-                            # Mask CIRPIN by setting protein_id to None or a placeholder
+                            # Mask CIRPIN by setting id to None or a placeholder
                             # This will cause the feature factory to use zero embeddings
-                            protein_id_list[i] = None
-                    batch["id"] = protein_id_list
+                            id_list[i] = None
+                    batch["id"] = id_list
         else:
-            # Remove protein_id from batch when cirpin_cond is False (optional cleanup)
+            # Remove id from batch when cirpin_cond is False (optional cleanup)
             if "id" in batch:
                 batch.pop("id")
 
@@ -348,6 +348,8 @@ class ModelTrainerBase(L.LightningModule):
         if random.random() > 0.5 and self.cfg_exp.training.self_cond:
             x_pred_sc, _ = self.predict_clean(batch)
             batch["x_sc"] = self.detach_gradients(x_pred_sc)
+        else:
+            batch["x_sc"] = torch.zeros_like(x_1)
 
         x_1_pred, nn_out = self.predict_clean(batch)
 
