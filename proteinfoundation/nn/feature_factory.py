@@ -23,9 +23,6 @@ from torch_scatter import scatter_mean
 from proteinfoundation.utils.ff_utils.pdb_utils import extract_cath_code_by_level
 from proteinfoundation.utils.ff_utils.idx_emb_utils import get_index_embedding, get_time_embedding
 
-# Global cache for CIRPIN embeddings to avoid loading the same file multiple times
-_CIRPIN_CACHE = {}
-
 
 # ################################
 # # # Some auxiliary functions # #
@@ -322,132 +319,36 @@ class FoldEmbeddingSeqFeat(Feature):
 
 
 class CirpinEmbeddingSeqFeat(Feature):
-    """Computes CIRPIN embedding and returns as sequence feature of shape [b, n, cirpin_emb_dim]."""
+    """Computes CIRPIN embedding and returns as sequence feature of shape [b, n, cirpin_emb_dim].
+    
+    Expects pre-loaded CIRPIN embeddings in batch["cirpin_emb"] of shape [b, 128].
+    """
 
-    def __init__(self, cirpin_emb_dim, cirpin_emb_path=None, **kwargs):
+    def __init__(self, cirpin_emb_dim, **kwargs):
         """
         Args:
-            cirpin_emb_dim (int): Dimension of CIRPIN embeddings (should be 128)
-            cirpin_emb_path (str, optional): Path to the .pt file containing CIRPIN embeddings.
-                                           If None, will use zero embeddings for all proteins.
+            cirpin_emb_dim (int): Dimension of CIRPIN embeddings after projection
         """
         super().__init__(dim=cirpin_emb_dim)
-        self.cirpin_emb_path = cirpin_emb_path
         self.cirpin_emb_dim = cirpin_emb_dim
-        self.register_buffer("_device_param", torch.tensor(0), persistent=False)
-        
-        # Load CIRPIN embeddings if path is provided
-        if self.cirpin_emb_path is not None:
-            self.load_cirpin_embeddings()
-        else:
-            logger.warning("No CIRPIN embeddings path provided, will use zero embeddings for all proteins")
-            self.id_to_index = {}
         
         # Create a learnable projection layer to adapt CIRPIN embeddings if needed
-        self.projection = torch.nn.Linear(128, cirpin_emb_dim)  # Input size is always 128 based on requirements
-    
-    @property
-    def device(self):
-        return next(self.buffers()).device
-    
-    def load_cirpin_embeddings(self):
-        """Load CIRPIN embeddings from the .pt file and cache in GPU memory."""
-        if not os.path.exists(self.cirpin_emb_path):
-            raise IOError(f"CIRPIN embeddings file {self.cirpin_emb_path} does not exist")
-        
-        print(f"CIRPIN SEQ LOAD #{hash(self)} - Loading CIRPIN embeddings from {self.cirpin_emb_path}")
-        cirpin_data = torch.load(self.cirpin_emb_path, map_location='cpu', weights_only=False)
-        
-        # Validate the format
-        if 'ids' not in cirpin_data or 'embeddings' not in cirpin_data:
-            raise ValueError("CIRPIN embeddings file must contain 'ids' and 'embeddings' fields")
-        
-        ids = cirpin_data['ids']
-        print(f"CIRPIN SEQ: Loaded {len(ids)} IDs, first 3: {ids[:3]}")
-        embeddings = cirpin_data['embeddings']
-        
-        # Validate shapes
-        if len(ids) != embeddings.shape[0]:
-            raise ValueError(f"Number of IDs ({len(ids)}) does not match number of embeddings ({embeddings.shape[0]})")
-        
-        if embeddings.shape[1] != 128:
-            raise ValueError(f"CIRPIN embeddings must have dimension 128, got {embeddings.shape[1]}")
-        
-        # Create mapping from protein ID to embedding INDEX (not the embedding itself)
-        self.id_to_index = {}
-        for i, id in enumerate(ids):
-            # Remove .pt suffix if present for consistent mapping
-            clean_id = id.replace('.pt', '') if id.endswith('.pt') else id
-            self.id_to_index[clean_id] = i
-        
-        # Store embeddings as a registered buffer for automatic device handling
-        self.register_buffer('cirpin_embeddings', embeddings.clone())
-        
-        logger.info(f"Loaded CIRPIN embeddings for {len(self.id_to_index)} proteins")
-        logger.debug(f"id_to_index: {len(self.id_to_index)}")
-        logger.debug(f"ids: {ids[:3]}")
-        logger.debug(f"indices: {[self.id_to_index.get(ids[i], -1) for i in range(3)]}")
-    
-    def get_cirpin_embedding(self, ids):
-        """
-        Get CIRPIN embeddings for a batch of protein IDs using efficient tensor indexing.
-        
-        Args:
-            ids (List[str]): List of protein IDs
-            
-        Returns:
-            torch.Tensor: CIRPIN embeddings of shape [batch_size, 128]
-        """
-        print(f"rank {torch.distributed.get_rank()}: Start getting CIRPIN embeddings for {ids}")
-        batch_size = len(ids)
-        
-        # Create indices for batch lookup (vectorized approach)
-        indices = []
-        for id in ids:
-            print(f"rank {torch.distributed.get_rank()}: id: {id}")
-            if id is None:
-                indices.append(-1)  # Use -1 to indicate zero embedding
-            else:
-                indices.append(self.id_to_index.get(id, -1))
-            print(f"rank {torch.distributed.get_rank()}: id: {id}, index: {indices[-1]}")
-        
-        print(f"rank {torch.distributed.get_rank()}: Finished getting indices for {ids}")
-        # Convert to tensor for efficient indexing
-        indices = torch.tensor(indices, dtype=torch.long, device=self.device)
-        print(f"rank {torch.distributed.get_rank()}: Finished converting indices to tensor for {ids}")
-        # Use advanced indexing to get all embeddings at once
-        valid_mask = indices >= 0
-        print(f"rank {torch.distributed.get_rank()}: Finished creating valid mask for {ids}")
-        # Create result tensor with correct dtype to match embeddings
-        if hasattr(self, 'cirpin_embeddings'):
-            result = torch.zeros(batch_size, 128, dtype=self.cirpin_embeddings.dtype, device=self.device)
-        else:
-            result = torch.zeros(batch_size, 128, dtype=torch.bfloat16, device=self.device)
-        print(f"rank {torch.distributed.get_rank()}: Finished creating result tensor for {ids}")
-        if valid_mask.any():
-            valid_indices = indices[valid_mask]
-            result[valid_mask] = self.cirpin_embeddings[valid_indices]
-        print(f"rank {torch.distributed.get_rank()}: Finished assigning embeddings to result tensor for {ids}")
-        print(f"rank {torch.distributed.get_rank()}: Finished getting CIRPIN embeddings for {ids}")
-        return result
+        self.projection = torch.nn.Linear(128, cirpin_emb_dim)  # Input size is always 128
     
     def forward(self, batch):
         xt = batch["x_t"]  # [b, n, 3]
         bs = xt.shape[0]
         n = xt.shape[1]
         
-        # Get protein IDs from batch (use id field set by our data processing)
-        if "id" not in batch:
-            # If no protein IDs provided, use zero embeddings
-            logger.warning("No id found in batch for CIRPIN conditioning, using zero embeddings")
-            ids = [None] * bs
+        # Get CIRPIN embeddings from batch
+        if "cirpin_emb" not in batch:
+            # If no CIRPIN embeddings provided, use zero embeddings
+            logger.warning("No cirpin_emb found in batch for CIRPIN conditioning, using zero embeddings")
+            cirpin_emb = torch.zeros(bs, 128, dtype=xt.dtype, device=xt.device)
         else:
-            ids = batch["id"]
-            if isinstance(ids, torch.Tensor):
-                ids = ids.tolist()
-        
-        # Get CIRPIN embeddings efficiently
-        cirpin_emb = self.get_cirpin_embedding(ids)  # [b, 128]
+            cirpin_emb = batch["cirpin_emb"]  # [b, 128]
+            if cirpin_emb.shape != (bs, 128):
+                raise ValueError(f"Expected cirpin_emb shape [{bs}, 128], got {cirpin_emb.shape}")
         
         # Project to desired dimension
         cirpin_emb = self.projection(cirpin_emb)  # [b, cirpin_emb_dim]
@@ -458,133 +359,37 @@ class CirpinEmbeddingSeqFeat(Feature):
 
 
 class CirpinEmbeddingPairFeat(Feature):
-    """Computes CIRPIN embedding and returns as pair feature of shape [b, n, n, cirpin_emb_dim]."""
+    """Computes CIRPIN embedding and returns as pair feature of shape [b, n, n, cirpin_emb_dim].
+    
+    Expects pre-loaded CIRPIN embeddings in batch["cirpin_emb"] of shape [b, 128].
+    """
 
-    def __init__(self, cirpin_emb_dim, cirpin_emb_path=None, **kwargs):
+    def __init__(self, cirpin_emb_dim, **kwargs):
         """
         Args:
-            cirpin_emb_dim (int): Dimension of CIRPIN embeddings (should be 128)
-            cirpin_emb_path (str, optional): Path to the .pt file containing CIRPIN embeddings.
-                                           If None, will use zero embeddings for all proteins.
+            cirpin_emb_dim (int): Dimension of CIRPIN embeddings after projection
         """
         super().__init__(dim=cirpin_emb_dim)
-        self.cirpin_emb_path = cirpin_emb_path
         self.cirpin_emb_dim = cirpin_emb_dim
-        self.register_buffer("_device_param", torch.tensor(0), persistent=False)
-        
-        # Load CIRPIN embeddings if path is provided
-        if self.cirpin_emb_path is not None:
-            self.load_cirpin_embeddings()
-        else:
-            logger.warning("No CIRPIN embeddings path provided, will use zero embeddings for all proteins")
-            self.id_to_index = {}
         
         # Create learnable projection layers for pair features
         self.projection_1 = torch.nn.Linear(128, cirpin_emb_dim)  # First embedding
         self.projection_2 = torch.nn.Linear(128, cirpin_emb_dim)  # Second embedding
-    
-    @property
-    def device(self):
-        return next(self.buffers()).device
-    
-    def load_cirpin_embeddings(self):
-        """Load CIRPIN embeddings from the .pt file and cache in GPU memory."""
-        if not os.path.exists(self.cirpin_emb_path):
-            raise IOError(f"CIRPIN embeddings file {self.cirpin_emb_path} does not exist")
-        
-        print(f"CIRPIN PAIR LOAD #{hash(self)} - Loading CIRPIN embeddings from {self.cirpin_emb_path}")
-        cirpin_data = torch.load(self.cirpin_emb_path, map_location='cpu', weights_only=False)
-        
-        # Validate the format
-        if 'ids' not in cirpin_data or 'embeddings' not in cirpin_data:
-            raise ValueError("CIRPIN embeddings file must contain 'ids' and 'embeddings' fields")
-        
-        ids = cirpin_data['ids']
-        print(f"CIRPIN PAIR: Loaded {len(ids)} IDs, first 3: {ids[:3]}")
-        embeddings = cirpin_data['embeddings']
-        
-        # Validate shapes
-        if len(ids) != embeddings.shape[0]:
-            raise ValueError(f"Number of IDs ({len(ids)}) does not match number of embeddings ({embeddings.shape[0]})")
-        
-        if embeddings.shape[1] != 128:
-            raise ValueError(f"CIRPIN embeddings must have dimension 128, got {embeddings.shape[1]}")
-        
-        # Create mapping from protein ID to embedding INDEX (not the embedding itself)
-        self.id_to_index = {}
-        for i, id in enumerate(ids):
-            # Remove .pt suffix if present for consistent mapping
-            clean_id = id.replace('.pt', '') if id.endswith('.pt') else id
-            self.id_to_index[clean_id] = i
-        
-        # Store embeddings as a registered buffer for automatic device handling
-        self.register_buffer('cirpin_embeddings', embeddings.clone())
-        
-        logger.info(f"Loaded CIRPIN embeddings for {len(self.id_to_index)} proteins")
-        logger.debug(f"id_to_index: {len(self.id_to_index)}")
-        logger.debug(f"ids: {ids[:3]}")
-        logger.debug(f"indices: {[self.id_to_index.get(ids[i], -1) for i in range(3)]}")
-    
-    def get_cirpin_embedding(self, ids):
-        """
-        Get CIRPIN embeddings for a batch of protein IDs using efficient tensor indexing.
-        
-        Args:
-            ids (List[str]): List of protein IDs
-            
-        Returns:
-            torch.Tensor: CIRPIN embeddings of shape [batch_size, 128]
-        """
-        print(f"rank {torch.distributed.get_rank()}: Start getting CIRPIN embeddings for {ids}")
-        batch_size = len(ids)
-        
-        # Create indices for batch lookup (vectorized approach)
-        indices = []
-        for id in ids:
-            print(f"rank {torch.distributed.get_rank()}: id: {id}")
-            if id is None:
-                indices.append(-1)  # Use -1 to indicate zero embedding
-            else:
-                indices.append(self.id_to_index.get(id, -1))
-            print(f"rank {torch.distributed.get_rank()}: id: {id}, index: {indices[-1]}")
-        
-        print(f"rank {torch.distributed.get_rank()}: Finished getting indices for {ids}")
-        # Convert to tensor for efficient indexing
-        indices = torch.tensor(indices, dtype=torch.long, device=self.device)
-        print(f"rank {torch.distributed.get_rank()}: Finished converting indices to tensor for {ids}")
-        # Use advanced indexing to get all embeddings at once
-        valid_mask = indices >= 0
-        print(f"rank {torch.distributed.get_rank()}: Finished creating valid mask for {ids}")
-        # Create result tensor with correct dtype to match embeddings
-        if hasattr(self, 'cirpin_embeddings'):
-            result = torch.zeros(batch_size, 128, dtype=self.cirpin_embeddings.dtype, device=self.device)
-        else:
-            result = torch.zeros(batch_size, 128, dtype=torch.bfloat16, device=self.device)
-        print(f"rank {torch.distributed.get_rank()}: Finished creating result tensor for {ids}")
-        if valid_mask.any():
-            valid_indices = indices[valid_mask]
-            result[valid_mask] = self.cirpin_embeddings[valid_indices]
-        print(f"rank {torch.distributed.get_rank()}: Finished assigning embeddings to result tensor for {ids}")
-        print(f"rank {torch.distributed.get_rank()}: Finished getting CIRPIN embeddings for {ids}")
-        return result
     
     def forward(self, batch):
         xt = batch["x_t"]  # [b, n, 3]
         bs = xt.shape[0]
         n = xt.shape[1]
         
-        # Get protein IDs from batch (use id field set by our data processing)
-        if "id" not in batch:
-            # If no protein IDs provided, use zero embeddings
-            logger.warning("No id found in batch for CIRPIN conditioning, using zero embeddings")
-            ids = [None] * bs
+        # Get CIRPIN embeddings from batch
+        if "cirpin_emb" not in batch:
+            # If no CIRPIN embeddings provided, use zero embeddings
+            logger.warning("No cirpin_emb found in batch for CIRPIN conditioning, using zero embeddings")
+            cirpin_emb = torch.zeros(bs, 128, dtype=xt.dtype, device=xt.device)
         else:
-            ids = batch["id"]
-            if isinstance(ids, torch.Tensor):
-                ids = ids.tolist()
-        
-        # Get CIRPIN embeddings efficiently
-        cirpin_emb = self.get_cirpin_embedding(ids)  # [b, 128]
+            cirpin_emb = batch["cirpin_emb"]  # [b, 128]
+            if cirpin_emb.shape != (bs, 128):
+                raise ValueError(f"Expected cirpin_emb shape [{bs}, 128], got {cirpin_emb.shape}")
         
         # Project to desired dimension using two different projections
         cirpin_emb_1 = self.projection_1(cirpin_emb)  # [b, cirpin_emb_dim]
@@ -1018,7 +823,7 @@ class FeatureFactory(torch.nn.Module):
             features_out += self.residue_type_out(
                 self.residue_type_feat_creator(batch)
                 )
-        if self.use_cirpin_emb and "id" in batch:
+        if self.use_cirpin_emb and "cirpin_emb" in batch:
             features_out += self.cirpin_out(
                 self.cirpin_feat_creator(batch)
                 )

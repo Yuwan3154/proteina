@@ -31,6 +31,7 @@ from loguru import logger
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, Dataset
 from proteinfoundation.utils.lora_utils import replace_lora_layers
+from proteinfoundation.utils.cirpin_utils import CirpinEmbeddingLoader
 
 
 from proteinfoundation.metrics.designability import scRMSD
@@ -105,16 +106,29 @@ class GenDataset(Dataset):
 
 
 class GenDatasetWithSeqCathCirpin(Dataset):
-    def __init__(self, pt, cath_codes, protein_ids=None, dt=0.005, nsamples_per_len=10, max_nsamples=10):
+    """
+    Dataset for sequence + CATH + CIRPIN conditioning inference.
+    
+    This dataset generates samples for a single protein with CATH fold conditioning
+    and CIRPIN conditioning using embeddings from a CIRPIN embeddings file.
+    """
+    def __init__(self, pt, cath_codes=None, cirpin_emb_file=None, dt=0.005, nsamples_per_len=10, max_nsamples=10):
         super(GenDatasetWithSeqCathCirpin, self).__init__()
         self.pt = pt
         self.dt = dt
         self.nsamples_per_len = nsamples_per_len
         self.max_nsamples = max_nsamples
-        self.cath_codes = cath_codes
-        self.protein_ids = protein_ids
-
+        self.cath_codes = cath_codes if cath_codes is not None else ["x.x.x.x"]
         self.num_batches_per_cath = (nsamples_per_len + max_nsamples - 1) // max_nsamples # Equivalent to math.ceil
+
+        # Load CIRPIN embeddings if provided
+        self.cirpin_loader = None
+        if cirpin_emb_file is not None:
+            self.cirpin_loader = CirpinEmbeddingLoader(cirpin_emb_file)
+            self.cirpin_ids = self.cirpin_loader.get_all_protein_ids()
+            logger.info(f"Loaded CIRPIN embeddings for {len(self.cirpin_ids)} proteins")
+            if len(self.cath_codes) == 1:
+                self.cath_codes = self.cath_codes * len(self.cirpin_ids)
 
     def __len__(self):
         return len(self.cath_codes) * self.num_batches_per_cath
@@ -124,6 +138,7 @@ class GenDatasetWithSeqCathCirpin(Dataset):
         batch_idx_for_cath = index % self.num_batches_per_cath
         
         current_cath_code = self.cath_codes[cath_idx]
+        current_id = self.cirpin_ids[cath_idx]
 
         start_sample_idx = batch_idx_for_cath * self.max_nsamples
         end_sample_idx = start_sample_idx + self.max_nsamples
@@ -144,11 +159,17 @@ class GenDatasetWithSeqCathCirpin(Dataset):
             "residue_type": residue_type,
         }
         
-        # Add protein_id for CIRPIN conditioning
-        if self.protein_ids is not None:
-            # Use the current protein_id for all samples in the batch
-            protein_id_batch = [self.protein_ids[cath_idx] for _ in range(num_samples_for_batch)]
-            result["protein_id"] = protein_id_batch
+        # Add CIRPIN embeddings if available
+        if self.cirpin_loader is not None:
+            # Get CIRPIN embedding for this protein
+            protein_ids = [current_id for _ in range(num_samples_for_batch)]
+            cirpin_emb = self.cirpin_loader.get_embeddings_by_ids(
+                protein_ids, 
+                fill_missing=True,  # Fill with zeros if not found
+                dtype=torch.float32
+            )
+            result["cirpin_emb"] = cirpin_emb
+            result["cirpin_ids"] = protein_ids
         
         return result
 
@@ -361,7 +382,7 @@ if __name__ == "__main__":
 
     # Check if using lora and load model
     if not cfg.lora.use:
-        model = Proteina.load_from_checkpoint(ckpt_file)
+        model = Proteina.load_from_checkpoint(ckpt_file, strict=False)
     
     else: # If using lora, create lora layers and reload the state_dict
         model = Proteina.load_from_checkpoint(ckpt_file, strict=False)
@@ -398,26 +419,10 @@ if __name__ == "__main__":
     cath_codes = pd.read_csv(f"{cfg.data_dir}/{cfg.cath_code_file}")["cath_code"].tolist()
     assert args.pt is not None, "pt must be provided if seq_cond is True"
     
-    # Prepare protein_ids for CIRPIN conditioning if needed
-    protein_ids = None
-    if cfg.get("cirpin_cond", False):
-        # For CIRPIN conditioning, we need protein IDs
-        # This assumes your dataset has a way to provide protein IDs
-        # You may need to adapt this based on your data structure
-        if hasattr(pt, 'protein_id'):
-            # If the pt object has protein_id attribute
-            protein_ids = [pt.protein_id for _ in cath_codes]
-        elif args.pt:
-            # Use the pt filename as protein_id
-            protein_ids = [args.pt for _ in cath_codes]
-        else:
-            logger.warning("CIRPIN conditioning enabled but no protein_id available, using placeholder")
-            protein_ids = ["unknown" for _ in cath_codes]
-    
     dataset = GenDatasetWithSeqCathCirpin(
         pt=pt,
         cath_codes=cath_codes if cfg.fold_cond else ["x.x.x.x"],
-        protein_ids=protein_ids,  # Will be None if CIRPIN conditioning is disabled
+        cirpin_emb_file=cfg.cirpin.cirpin_emb_path if cfg.get("cirpin_cond", False) else None,
         dt=cfg.dt,
         nsamples_per_len=cfg.nsamples_per_len,
         max_nsamples=cfg.max_nsamples
@@ -459,21 +464,22 @@ if __name__ == "__main__":
     
     samples_per_length = {}
     for pred in predictions:
-        coors_atom37, cath_codes_batch = pred  # [b, n, 37, 3], prediction_step returns atom37
+        coors_atom37, cath_codes_batch, cirpin_ids_batch = pred  # [b, n, 37, 3], prediction_step returns atom37
 
         # Save each generation as a pdb file
         for i in range(coors_atom37.shape[0]):
             # Create directory where everything related to this sample will be stored
             current_cath_code = cath_codes_batch[i][0] # Get the actual CATH code string
-            
+            current_cirpin_id = cirpin_ids_batch[i]
+
             # Initialize counter for this pt and cath_code if not present
-            sample_key = (args.pt, current_cath_code)
+            sample_key = (args.pt, current_cath_code, current_cirpin_id)
             if sample_key not in samples_per_length:
                 samples_per_length[sample_key] = 0
             
             sample_idx = samples_per_length[sample_key]
             
-            fname = f"{args.pt}_cath_{current_cath_code}_{sample_idx}.pdb"
+            fname = f"{args.pt}_cath_{current_cath_code}_cirpin_{current_cirpin_id}_{sample_idx}.pdb"
             pdb_path = os.path.join(
                 root_path, fname
             )  # ./inference/conf_{}/n_{}_id_{}

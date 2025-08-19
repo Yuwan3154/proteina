@@ -320,29 +320,28 @@ class ModelTrainerBase(L.LightningModule):
 
         # CIRPIN conditional training
         if self.cfg_exp.training.get("cirpin_cond", False):
-            # CIRPIN conditioning is handled by the feature factory
-            # We just need to ensure id is available in the batch
-            # The feature factory will handle loading the appropriate embeddings
-            if "id" not in batch:
-                # If id is not available, try to extract from other batch fields
-                # This depends on your dataset structure - you may need to adapt this
-                logger.warning("id not found in batch for CIRPIN conditioning")
+            # CIRPIN conditioning now expects cirpin_emb directly in the batch
+            # The dataset should have already loaded the embeddings
+            if "cirpin_emb" not in batch:
+                # If cirpin_emb is not available, create zero embeddings
+                logger.warning("cirpin_emb not found in batch for CIRPIN conditioning, using zero embeddings")
+                bs = x_1.shape[0]
+                batch["cirpin_emb"] = torch.zeros(bs, 128, dtype=x_1.dtype, device=x_1.device)
             else:
                 # Apply CIRPIN masking based on mask_cirpin_prob
                 mask_cirpin_prob = self.cfg_exp.training.get("mask_cirpin_prob", 0.0)
                 if mask_cirpin_prob > 0.0:
                     bs = x_1.shape[0]
-                    id_list = batch["id"]
+                    cirpin_emb = batch["cirpin_emb"]
                     for i in range(bs):
                         if random.random() < mask_cirpin_prob:
-                            # Mask CIRPIN by setting id to None or a placeholder
-                            # This will cause the feature factory to use zero embeddings
-                            id_list[i] = None
-                    batch["id"] = id_list
+                            # Mask CIRPIN by setting embedding to zero
+                            cirpin_emb[i] = torch.zeros(128, dtype=cirpin_emb.dtype, device=cirpin_emb.device)
+                    batch["cirpin_emb"] = cirpin_emb
         else:
-            # Remove id from batch when cirpin_cond is False (optional cleanup)
-            if "id" in batch:
-                batch.pop("id")
+            # Remove cirpin_emb from batch when cirpin_cond is False (optional cleanup)
+            if "cirpin_emb" in batch:
+                batch.pop("cirpin_emb")
 
         # Prediction for self-conditioning
         if random.random() > 0.5 and self.cfg_exp.training.self_cond:
@@ -572,7 +571,7 @@ class ModelTrainerBase(L.LightningModule):
             fixed_sequence_mask = fixed_sequence_mask,
             fixed_structure_mask = fixed_structure_mask,
         )
-        return self.samples_to_atom37(x), cath_code  # [b, n, 37, 3]
+        return self.samples_to_atom37(x), cath_code, batch["cirpin_ids"]  # [b, n, 37, 3]
 
     def generate(
         self,
