@@ -147,21 +147,21 @@ class PDBDataSelector:
             pdb_manager.experiment_types(self.experiment_types, update=True)
 
         if self.max_length:
-            logger.info(f"Removing chains longer than {self.max_length}...")
+            rank_zero_info(f"Removing chains longer than {self.max_length}...")
             pdb_manager.length_shorter_than(self.max_length, update=True)
-            logger.info(f"{len(pdb_manager.df)} chains remaining")
+            rank_zero_info(f"{len(pdb_manager.df)} chains remaining")
 
         if self.min_length:
-            logger.info(f"Removing chains shorter than {self.min_length}...")
+            rank_zero_info(f"Removing chains shorter than {self.min_length}...")
             pdb_manager.length_longer_than(self.min_length, update=True)
-            logger.info(f"{len(pdb_manager.df)} chains remaining")
+            rank_zero_info(f"{len(pdb_manager.df)} chains remaining")
 
         if self.molecule_type:
-            logger.info(
+            rank_zero_info(
                 f"Removing chains molecule types not in selection: {self.molecule_type}..."
             )
             pdb_manager.molecule_type(self.molecule_type, update=True)
-            logger.info(f"{len(pdb_manager.df)} chains remaining")
+            rank_zero_info(f"{len(pdb_manager.df)} chains remaining")
 
         rank_zero_info(
             f"Removing chains oligomeric state not in selection: {self.oligomeric_min} - {self.oligomeric_max}..."
@@ -170,7 +170,7 @@ class PDBDataSelector:
             pdb_manager.oligomeric(self.oligomeric_min, "greater", update=True)
         if self.oligomeric_max:
             pdb_manager.oligomeric(self.oligomeric_max, "less", update=True)
-        logger.info(f"{len(pdb_manager.df)} chains remaining")
+        rank_zero_info(f"{len(pdb_manager.df)} chains remaining")
 
         rank_zero_info(
             f"Removing chains with resolution not in selection: {self.best_resolution} - {self.worst_resolution}..."
@@ -183,35 +183,35 @@ class PDBDataSelector:
             pdb_manager.resolution_worse_than_or_equal_to(
                 self.best_resolution, update=True
             )
-        logger.info(f"{len(pdb_manager.df)} chains remaining")
+        rank_zero_info(f"{len(pdb_manager.df)} chains remaining")
 
         if self.remove_ligands:
-            logger.info(
+            rank_zero_info(
                 f"Removing chains with ligands in selection: {self.remove_ligands}..."
             )
             pdb_manager.has_ligands(self.remove_ligands, inverse=True, update=True)
-            logger.info(f"{len(pdb_manager.df)} chains remaining")
+            rank_zero_info(f"{len(pdb_manager.df)} chains remaining")
 
         if self.has_ligands:
-            logger.info(
+            rank_zero_info(
                 f"Removing chains without ligands in selection: {self.has_ligands}..."
             )
             pdb_manager.has_ligands(self.has_ligands, update=True)
-            logger.info(f"{len(pdb_manager.df)} chains remaining")
+            rank_zero_info(f"{len(pdb_manager.df)} chains remaining")
 
         if self.remove_non_standard_residues:
-            logger.info("Removing chains with non-standard residues...")
+            rank_zero_info("Removing chains with non-standard residues...")
             pdb_manager.remove_non_standard_alphabet_sequences(update=True)
-            logger.info(f"{len(pdb_manager.df)} chains remaining")
+            rank_zero_info(f"{len(pdb_manager.df)} chains remaining")
         if self.remove_pdb_unavailable:
-            logger.info("Removing chains with PDB unavailable...")
+            rank_zero_info("Removing chains with PDB unavailable...")
             pdb_manager.remove_unavailable_pdbs(update=True)
-            logger.info(f"{len(pdb_manager.df)} chains remaining")
+            rank_zero_info(f"{len(pdb_manager.df)} chains remaining")
         if self.remove_cath_unavailable:
-            logger.info("Removing chains with cath code unavailable...")
+            rank_zero_info("Removing chains with cath code unavailable...")
             mask = ~pdb_manager.df["cath_code"].isna()
             pdb_manager.df = pdb_manager.df[mask]
-            logger.info(f"{len(pdb_manager.df)} chains remaining")
+            rank_zero_info(f"{len(pdb_manager.df)} chains remaining")
 
         all_exclude_ids = set()
         # Add IDs from direct list if present
@@ -223,11 +223,11 @@ class PDBDataSelector:
                 file_ids = {line.strip() for line in f if line.strip()}
             all_exclude_ids.update(file_ids)
 
-        logger.info(f"Removing excluded chains ({len(all_exclude_ids)} gathered)")
+        rank_zero_info(f"Removing excluded chains ({len(all_exclude_ids)} gathered)")
 
         mask = ~pdb_manager.df["id"].isin(all_exclude_ids)
         pdb_manager.df = pdb_manager.df[mask]
-        logger.info(f"{len(pdb_manager.df)} chains remaining")
+        rank_zero_info(f"{len(pdb_manager.df)} chains remaining")
         self.df_data = pdb_manager.df
         return self.df_data
 
@@ -280,17 +280,17 @@ class PDBDataSplitter:
             dfs_splits (Dict): dictionary containing the train/val/test splits of the dataframe.
         """
         if self.split_type == "random":
-            logger.info(
+            rank_zero_info(
                 f"Splitting dataset via random split into {self.train_val_test}..."
             )
             self.dfs_splits = split_dataframe(df_data, self.splits, self.train_val_test)
             self.clusterid_to_seqid_mappings = None
 
         elif self.split_type == "sequence_similarity":
-            logger.info(
+            rank_zero_info(
                 f"Splitting dataset via sequence-similarity split into {self.train_val_test}..."
             )
-            logger.info(
+            rank_zero_info(
                 f"Using {self.split_sequence_similarity} sequence similarity for split"
             )
             input_fasta_filepath, cluster_fasta_filepath, cluster_tsv_filepath = (
@@ -302,11 +302,11 @@ class PDBDataSplitter:
             )
 
             if not input_fasta_filepath.exists() or self.overwrite_sequence_clusters:
-                logger.info("Retrieving sequences and writing them to fasta file...")
+                rank_zero_info("Retrieving sequences and writing them to fasta file...")
                 df_to_fasta(df=df_data, output_file=input_fasta_filepath)
 
             if not cluster_fasta_filepath.exists() or self.overwrite_sequence_clusters:
-                logger.info("Clustering sequences via mmseqs2...")
+                rank_zero_info("Clustering sequences via mmseqs2...")
                 cluster_sequences(
                     fasta_input_filepath=input_fasta_filepath,
                     cluster_output_filepath=cluster_fasta_filepath,
@@ -387,7 +387,7 @@ class PDBDataset(Dataset):
         self.sequence_id_to_idx = None
 
         if self.in_memory:
-            logger.info("Reading data into memory")
+            rank_zero_info("Reading data into memory")
             self.data = [torch.load(self.processed_dir / f) for f in tqdm(file_names)]
 
     def __len__(self):
@@ -523,13 +523,13 @@ class PDBLightningDataModule(BaseLightningDataModule):
             file_identifier = self._get_file_identifier(self.dataselector)
             df_data_name = f"{file_identifier}.csv"
             if not self.overwrite and (self.data_dir / df_data_name).exists():
-                logger.info(
+                rank_zero_info(
                     f"{df_data_name} already exists, skipping data selection and processing stage."
                 )
             else:
-                logger.info(f"{df_data_name} does not exist yet, creating dataset now.")
+                rank_zero_info(f"{df_data_name} does not exist yet, creating dataset now.")
                 df_data = self.dataselector.create_dataset()
-                logger.info(
+                rank_zero_info(
                     f"Dataset created with {len(df_data)} entries. Now downloading structure data..."
                 )
                 self._download_structure_data(df_data["pdb"].tolist())
@@ -539,17 +539,17 @@ class PDBLightningDataModule(BaseLightningDataModule):
                 )
 
                 # save df_data to disk for later use (in splitting, dataloading etc)
-                logger.info(f"Saving dataset csv to {df_data_name}")
+                rank_zero_info(f"Saving dataset csv to {df_data_name}")
                 df_data.to_csv(self.data_dir / df_data_name, index=False)
 
         else:  # user-provided dataset
             df_data_name = f"{self.data_dir.name}.csv"
             if not self.overwrite and (self.data_dir / df_data_name).exists():
-                logger.info(
+                rank_zero_info(
                     f"{df_data_name} already exists, skipping data selection and processing stage."
                 )
             else:
-                logger.info(f"{df_data_name} does not exist yet, creating dataset now.")
+                rank_zero_info(f"{df_data_name} does not exist yet, creating dataset now.")
                 df_data = self._load_pdb_folder_data(self.raw_dir)
                 # process pdb files into seperate chains and save processed objects as .pt files
                 self._process_structure_data(
@@ -557,7 +557,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
                     chains=None,
                 )
                 # save df_data to disk for later use (in splitting, dataloading etc)
-                logger.info(f"Saving dataset csv to {df_data_name}")
+                rank_zero_info(f"Saving dataset csv to {df_data_name}")
                 df_data.to_csv(self.data_dir / df_data_name, index=False)
             
     def _load_pdb_folder_data(self, data_dir: pathlib.Path) -> pd.DataFrame:
@@ -582,7 +582,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
         if len(df_data) == 0:
             raise ValueError(f"No files with extension .{self.format} found in {data_dir}")
             
-        logger.info(f"Found {len(df_data)} {self.format} files in {data_dir}")
+        rank_zero_info(f"Found {len(df_data)} {self.format} files in {data_dir}")
         
         return df_data
 
@@ -615,7 +615,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
                 file_identifier = self.data_dir.name
 
             df_data_name = f"{file_identifier}.csv"
-            logger.info(f"Loading dataset csv from {df_data_name}")
+            rank_zero_info(f"Loading dataset csv from {df_data_name}")
             self.df_data = pd.read_csv(self.data_dir / df_data_name)
 
         # split the dataset into train, val and test and set attributes that are used for dataset creation
@@ -646,14 +646,14 @@ class PDBLightningDataModule(BaseLightningDataModule):
             ]
 
         if not index_pdb_tuples:
-            logger.info("No structures to process - all files already exist.")
+            rank_zero_info("No structures to process - all files already exist.")
             return []
 
         file_names = []
         
         # Use multiprocessing if enabled, there are multiple files to process and multiple workers
         if self.use_multiprocessing and len(index_pdb_tuples) > 1 and self.num_workers > 1:
-            logger.info(f"Processing {len(index_pdb_tuples)} structures using {self.num_workers} workers...")
+            rank_zero_info(f"Processing {len(index_pdb_tuples)} structures using {self.num_workers} workers...")
             
             # Create a partial function with fixed arguments
             process_func = functools.partial(
@@ -689,13 +689,13 @@ class PDBLightningDataModule(BaseLightningDataModule):
                             pbar.update(1)
         else:
             # Fall back to sequential processing for single files or single worker
-            logger.info(f"Processing {len(index_pdb_tuples)} structures sequentially...")
+            rank_zero_info(f"Processing {len(index_pdb_tuples)} structures sequentially...")
         for tuple_ in tqdm(index_pdb_tuples, desc="Processing structures", unit="file"):
             result = self._load_and_process_pdb(tuple_)
             if result is not None:
                 file_names.append(result)
         
-        logger.info(f"Completed processing. Successfully processed {len(file_names)} structures.")
+        rank_zero_info(f"Completed processing. Successfully processed {len(file_names)} structures.")
         return file_names
 
     @staticmethod
@@ -879,7 +879,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
             to_download = list(set(to_download))
             # Determine whether to download raw structures
             if to_download:
-                logger.info(
+                rank_zero_info(
                     f"Downloading {len(to_download)} structures to {self.processed_dir}"
                 )
                 file_format = (
@@ -897,7 +897,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
                     chunksize=chunksize,
                 )
             else:
-                logger.info(
+                rank_zero_info(
                     f"No structures to download, all {len(pdb_codes)} structure files already present"
                 )
 
