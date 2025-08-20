@@ -45,7 +45,7 @@ model:
     cirpin_emb_path: "/home/jupyter-chenxi/progres/progres/databases/v_0_2_1/pdb_max384.pt"
 
 # Dataset params
-dataset: pdb_train_S25_max320_purge-test_cirpin
+dataset: pdb_train_S25_max320_purge-test
 dataset_config_subdir: pdb
 
 force_precision_f32: False  # If false will use bf16-mixed precision
@@ -66,6 +66,7 @@ training:
 # CIRPIN conditioning parameters
 cirpin:
   cirpin_emb_path: "/home/jupyter-chenxi/progres/progres/databases/v_0_2_1/pdb_max384.pt"  # Path to CIRPIN embeddings .pt file
+  embedding_mode: "self"  # "self" for protein's own embedding, "sample" for random from same CAT code
 
 opt:
   lr: 0.0001

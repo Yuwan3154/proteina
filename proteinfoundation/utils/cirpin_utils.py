@@ -11,6 +11,8 @@
 import os
 import torch
 import numpy as np
+import random
+from collections import defaultdict
 from loguru import logger
 from typing import List, Optional, Dict, Union
 
@@ -67,6 +69,99 @@ class CirpinEmbeddingLoader:
             self.id_to_index[clean_id] = i
         
         logger.info(f"Loaded CIRPIN embeddings for {len(self.id_to_index)} proteins")
+        
+        # Initialize empty CAT code mappings (will be populated from training data if needed)
+        self.cat_to_proteins = defaultdict(list)
+        self.protein_to_cat = {}
+        logger.info("CAT code mappings initialized (will be built from training data when available)")
+    
+    @staticmethod
+    def _extract_cat_code_from_cath(cath_code: str) -> Optional[str]:
+        """
+        Extract CAT code (first 3 parts) from a full CATH code.
+        
+        Args:
+            cath_code (str): Full CATH code like "3.30.70.20"
+            
+        Returns:
+            str: CAT code like "3.30.70" or None if invalid
+        """
+        parts = cath_code.split('.')
+        if len(parts) >= 3:
+            try:
+                # Validate that first 3 parts are numeric
+                for i in range(3):
+                    int(parts[i])
+                return '.'.join(parts[:3])
+            except ValueError:
+                return None
+        return None
+    
+    def build_cat_mappings_from_training_data(self, protein_to_cath_mapping: Dict[str, str]):
+        """
+        Build CAT code mappings from training data that contains CATH codes.
+        
+        Args:
+            protein_to_cath_mapping (Dict[str, str]): Mapping from protein ID to full CATH code
+        """
+        self.cat_to_proteins = defaultdict(list)
+        self.protein_to_cat = {}
+        
+        for protein_id, cath_code in protein_to_cath_mapping.items():
+            # Extract CAT code using the static method
+            cat_code = self._extract_cat_code_from_cath(cath_code)
+            
+            if cat_code:
+                clean_id = protein_id.replace('.pt', '') if protein_id.endswith('.pt') else protein_id
+                if clean_id in self.id_to_index:  # Only add if we have embeddings for this protein
+                    self.protein_to_cat[clean_id] = cat_code
+                    self.cat_to_proteins[cat_code].append(clean_id)
+        
+        logger.info(f"Built CAT code mappings from training data: {len(self.cat_to_proteins)} unique CAT codes")
+        self._log_cat_code_statistics()
+    
+    def _log_cat_code_statistics(self):
+        """Log statistics about CAT code distribution."""
+        if not self.cat_to_proteins:
+            logger.info("No CAT code mappings available yet. Use build_cat_mappings_from_training_data() to enable CAT-based sampling.")
+            return
+        
+        logger.info("CAT code statistics:")
+        sorted_cats = sorted(self.cat_to_proteins.items(), key=lambda x: len(x[1]), reverse=True)
+        
+        for cat_code, proteins in sorted_cats[:10]:  # Log top 10
+            logger.info(f"  CAT {cat_code}: {len(proteins)} proteins")
+        
+        if len(sorted_cats) > 10:
+            logger.info(f"  ... and {len(sorted_cats) - 10} more CAT codes")
+    
+    def get_cat_code_statistics(self) -> Dict[str, int]:
+        """
+        Get statistics about protein counts per CAT code.
+        
+        Returns:
+            Dict[str, int]: Mapping from CAT code to protein count
+        """
+        return {cat: len(proteins) for cat, proteins in self.cat_to_proteins.items()}
+    
+    def sample_embedding_by_cat_code(self, target_cat_code: str) -> Optional[torch.Tensor]:
+        """
+        Sample a random CIRPIN embedding from proteins with the same CAT code.
+        
+        Args:
+            target_cat_code (str): CAT code to sample from
+            
+        Returns:
+            torch.Tensor: Random CIRPIN embedding from the CAT code, or None if not found
+        """
+        if target_cat_code not in self.cat_to_proteins:
+            return None
+        
+        # Randomly sample a protein from this CAT code
+        proteins = self.cat_to_proteins[target_cat_code]
+        sampled_protein = random.choice(proteins)
+        
+        return self.get_embedding_by_id(sampled_protein)
     
     def get_embedding_by_id(self, protein_id: str) -> Optional[torch.Tensor]:
         """

@@ -12,6 +12,11 @@ datamodule:
     - _target_: "proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform"
     - _target_: "proteinfoundation.datasets.transforms.CATHLabelTransform" # activate for fold-conditional training
       root_dir: ${oc.env:DATA_PATH}/cathdata/ # Root directory for CATH labels
+    - _target_: "proteinfoundation.utils.cirpin_transform.CirpinEmbeddingTransformWithMapping" # Add CIRPIN embeddings
+      cirpin_emb_path: "/home/jupyter-chenxi/progres/progres/databases/v_0_2_1/pdb_max384.pt"
+      protein_id_field: "id"
+      mode: ${oc.env:CIRPIN_EMBEDDING_MODE,sample}  # Mode set by training script from training config
+      build_mappings: true
     - _target_: "proteinfoundation.datasets.transforms.PaddingTransform"
       max_size: 320
   batch_size: 1 # Batch size for dataloader

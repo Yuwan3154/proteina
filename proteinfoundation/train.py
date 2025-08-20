@@ -194,6 +194,11 @@ if __name__ == "__main__":
         L.seed_everything(cfg_exp.seed)
 
     # Load data config
+    # Set CIRPIN embedding mode environment variable for dataset config
+    if cfg_exp.get("cirpin", {}).get("embedding_mode"):
+        os.environ["CIRPIN_EMBEDDING_MODE"] = cfg_exp.cirpin.embedding_mode
+        log_info(f"Set CIRPIN_EMBEDDING_MODE={cfg_exp.cirpin.embedding_mode}")
+    
     dataset_config_subdir = cfg_exp.get("dataset_config_subdir", None)
     if dataset_config_subdir is not None:
         # if args.dataset_config_subdir:
