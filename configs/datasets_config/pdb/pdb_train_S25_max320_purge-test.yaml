@@ -16,7 +16,7 @@ datamodule:
       cirpin_emb_path: "/home/jupyter-chenxi/progres/progres/databases/v_0_2_1/pdb_max384.pt"
       protein_id_field: "id"
       mode: ${oc.env:CIRPIN_EMBEDDING_MODE,sample}  # Mode set by training script from training config
-      build_mappings: true
+      cath_data_dir: ${oc.env:DATA_PATH}/cathdata/ # Same as CATHLabelTransform root_dir
     - _target_: "proteinfoundation.datasets.transforms.PaddingTransform"
       max_size: 320
   batch_size: 1 # Batch size for dataloader

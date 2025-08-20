@@ -21,6 +21,7 @@ import numpy as np
 import torch
 import wget
 from loguru import logger
+from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_warn
 from scipy.spatial.transform import Rotation as Scipy_Rotation
 from torch_geometric import transforms as T
 from torch_geometric.data import Data
@@ -221,16 +222,16 @@ class CATHLabelTransform(T.BaseTransform):
             os.makedirs(self.root_dir, exist_ok=True)
 
         if not os.path.exists(self.root_dir / self.pdb_chain_cath_uniprot_filename):
-            logger.info("Downloading Uniprot/PDB CATH map...")
+            rank_zero_info("Downloading Uniprot/PDB CATH map...")
             wget.download(self.pdb_chain_cath_uniprot_url, out=str(self.root_dir))
 
         if not os.path.exists(self.root_dir / self.cath_id_cath_code_filename):
-            logger.info("Downloading CATH ID to CATH code map...")
+            rank_zero_info("Downloading CATH ID to CATH code map...")
             wget.download(self.cath_id_cath_code_url, out=str(self.root_dir))
 
-        logger.info("Processing Uniprot/PDB CATH map...")
+        rank_zero_info("Processing Uniprot/PDB CATH map...")
         self.pdbchain_to_cathid_mapping = self._parse_cath_id()
-        logger.info("Processing CATH ID to CATH code map...")
+        rank_zero_info("Processing CATH ID to CATH code map...")
         self.cathid_to_cathcode_mapping, self.cathid_to_segment_mapping = self._parse_cath_code()
 
     def __call__(self, graph: Data) -> Data:
@@ -272,7 +273,7 @@ class CATHLabelTransform(T.BaseTransform):
                     key = f"{pdb}_{chain}"
                     pdbchain_to_cathid_mapping[key].append(cath_id)
                 except ValueError as e:
-                    logger.warning(e)
+                    rank_zero_warn(str(e))
                     continue
         return pdbchain_to_cathid_mapping
 
@@ -339,7 +340,7 @@ class CATHLabelTransform(T.BaseTransform):
                     cathid_to_segment_mapping[cath_id] = segment_info
 
                 except ValueError as e:
-                    logger.warning(e)
+                    rank_zero_warn(str(e))
                     continue
 
         return cathid_to_cathcode_mapping, cathid_to_segment_mapping

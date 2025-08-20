@@ -17,6 +17,7 @@ import functools
 import pandas as pd
 import torch
 from loguru import logger
+from lightning.pytorch.utilities.rank_zero import rank_zero_info
 from torch.utils.data import Dataset
 from torch_geometric.data import Data
 from tqdm import tqdm
@@ -127,20 +128,20 @@ class PDBDataSelector:
             return self.df_data
 
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Initializing PDBManager in {self.data_dir}...")
+        rank_zero_info(f"Initializing PDBManager in {self.data_dir}...")
         pdb_manager = PDBManager(root_dir=self.data_dir, labels=self.labels)
 
         num_chains = len(pdb_manager.df)
-        logger.info(f"Starting with: {num_chains} chains")
+        rank_zero_info(f"Starting with: {num_chains} chains")
 
         # subsample dataframe based on provided fraction
         if self.fraction != 1.0:
-            logger.info(f"Subsampling data to {self.fraction} fraction")
+            rank_zero_info(f"Subsampling data to {self.fraction} fraction")
             pdb_manager.df = pdb_manager.df.sample(frac=self.fraction)
-            logger.info(f"{len(pdb_manager.df)} chains remaining")
+            rank_zero_info(f"{len(pdb_manager.df)} chains remaining")
 
         if self.experiment_types:
-            logger.info(
+            rank_zero_info(
                 f"Removing chains that are not in one of the following experiment types: {self.experiment_types}"
             )
             pdb_manager.experiment_types(self.experiment_types, update=True)
@@ -162,7 +163,7 @@ class PDBDataSelector:
             pdb_manager.molecule_type(self.molecule_type, update=True)
             logger.info(f"{len(pdb_manager.df)} chains remaining")
 
-        logger.info(
+        rank_zero_info(
             f"Removing chains oligomeric state not in selection: {self.oligomeric_min} - {self.oligomeric_max}..."
         )
         if self.oligomeric_min:
@@ -171,7 +172,7 @@ class PDBDataSelector:
             pdb_manager.oligomeric(self.oligomeric_max, "less", update=True)
         logger.info(f"{len(pdb_manager.df)} chains remaining")
 
-        logger.info(
+        rank_zero_info(
             f"Removing chains with resolution not in selection: {self.best_resolution} - {self.worst_resolution}..."
         )
         if self.worst_resolution:

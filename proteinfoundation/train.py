@@ -219,6 +219,10 @@ if __name__ == "__main__":
 
     # create datamodule containing default train and val dataloader
     datamodule = hydra.utils.instantiate(cfg_data.datamodule)
+    
+    # Ensure data preparation only happens on rank 0 to avoid duplicate processing
+    if hasattr(datamodule, 'prepare_data'):
+        datamodule.prepare_data = rank_zero_only(datamodule.prepare_data)
 
     # Set logger
     wandb_logger = None
@@ -290,7 +294,7 @@ if __name__ == "__main__":
     pretrain_ckpt_path = cfg_exp.get("pretrain_ckpt_path", None)
     if last_ckpt_path is None and pretrain_ckpt_path is not None:
         log_info(f"Loading from pre-trained checkpoint path {pretrain_ckpt_path}")
-        ckpt = torch.load(pretrain_ckpt_path, map_location="cpu")
+        ckpt = torch.load(pretrain_ckpt_path, map_location="cpu", weights_only=False)
         model.load_state_dict(ckpt["state_dict"], strict=False)
 
     # Train

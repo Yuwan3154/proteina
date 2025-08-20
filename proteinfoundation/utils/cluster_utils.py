@@ -12,7 +12,7 @@
 
 import math
 import pathlib
-import random
+# import random  # Removed to use torch.randint for reproducibility
 import shutil
 import subprocess
 from datetime import datetime
@@ -119,7 +119,9 @@ class ClusterSampler(Sampler):
                 for cluster_name_idx in indices:
                     cluster_name = self.cluster_names[cluster_name_idx]
                     sequences = self.clusterid_to_seqid_mapping[cluster_name]
-                    sequence_id = random.choice(sequences)
+                    # Use torch random generator for reproducibility across DDP
+                    idx = torch.randint(0, len(sequences), (1,)).item()
+                    sequence_id = sequences[idx]
                     if self.log_clusters:
                         # log first sampling
                         logger.info(
@@ -134,7 +136,9 @@ class ClusterSampler(Sampler):
         else:
             # Non-distributed mode
             if self.shuffle:
-                random.shuffle(self.cluster_names)
+                # Use torch generator for reproducible shuffling
+                perm = torch.randperm(len(self.cluster_names))
+                self.cluster_names = [self.cluster_names[i] for i in perm]
             if self.sampling_mode == "cluster-reps":
                 # Assumes that cluster_names are the IDs of the representative (longest) sequences (true for mmseqs2 clusters)
                 for cluster_name in self.cluster_names:
@@ -142,7 +146,9 @@ class ClusterSampler(Sampler):
             elif self.sampling_mode == "cluster-random":
                 for cluster_name in self.cluster_names:
                     sequences = self.clusterid_to_seqid_mapping[cluster_name]
-                    sequence_id = random.choice(sequences)
+                    # Use torch random generator for reproducibility across DDP
+                    idx = torch.randint(0, len(sequences), (1,)).item()
+                    sequence_id = sequences[idx]
                     if self.log_clusters:
                         # log first sampling
                         logger.info(

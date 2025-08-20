@@ -11,10 +11,10 @@
 import os
 import torch
 import numpy as np
-import random
 from collections import defaultdict
 from loguru import logger
 from typing import List, Optional, Dict, Union
+from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_warn
 
 
 class CirpinEmbeddingLoader:
@@ -45,7 +45,7 @@ class CirpinEmbeddingLoader:
         if not os.path.exists(self.cirpin_emb_path):
             raise FileNotFoundError(f"CIRPIN embeddings file not found: {self.cirpin_emb_path}")
         
-        logger.info(f"Loading CIRPIN embeddings from {self.cirpin_emb_path}")
+        rank_zero_info(f"Loading CIRPIN embeddings from {self.cirpin_emb_path}")
         cirpin_data = torch.load(self.cirpin_emb_path, map_location='cpu', weights_only=False)
         
         # Validate the format
@@ -68,12 +68,12 @@ class CirpinEmbeddingLoader:
             clean_id = protein_id.replace('.pt', '') if protein_id.endswith('.pt') else protein_id
             self.id_to_index[clean_id] = i
         
-        logger.info(f"Loaded CIRPIN embeddings for {len(self.id_to_index)} proteins")
+        rank_zero_info(f"Loaded CIRPIN embeddings for {len(self.id_to_index)} proteins")
         
         # Initialize empty CAT code mappings (will be populated from training data if needed)
         self.cat_to_proteins = defaultdict(list)
         self.protein_to_cat = {}
-        logger.info("CAT code mappings initialized (will be built from training data when available)")
+        rank_zero_info("CAT code mappings initialized (will be built from training data when available)")
     
     @staticmethod
     def _extract_cat_code_from_cath(cath_code: str) -> Optional[str]:
@@ -117,23 +117,23 @@ class CirpinEmbeddingLoader:
                     self.protein_to_cat[clean_id] = cat_code
                     self.cat_to_proteins[cat_code].append(clean_id)
         
-        logger.info(f"Built CAT code mappings from training data: {len(self.cat_to_proteins)} unique CAT codes")
+        rank_zero_info(f"Built CAT code mappings from training data: {len(self.cat_to_proteins)} unique CAT codes")
         self._log_cat_code_statistics()
     
     def _log_cat_code_statistics(self):
         """Log statistics about CAT code distribution."""
         if not self.cat_to_proteins:
-            logger.info("No CAT code mappings available yet. Use build_cat_mappings_from_training_data() to enable CAT-based sampling.")
+            rank_zero_info("No CAT code mappings available yet. Use build_cat_mappings_from_training_data() to enable CAT-based sampling.")
             return
         
-        logger.info("CAT code statistics:")
+        rank_zero_info("CAT code statistics:")
         sorted_cats = sorted(self.cat_to_proteins.items(), key=lambda x: len(x[1]), reverse=True)
         
         for cat_code, proteins in sorted_cats[:10]:  # Log top 10
-            logger.info(f"  CAT {cat_code}: {len(proteins)} proteins")
+            rank_zero_info(f"  CAT {cat_code}: {len(proteins)} proteins")
         
         if len(sorted_cats) > 10:
-            logger.info(f"  ... and {len(sorted_cats) - 10} more CAT codes")
+            rank_zero_info(f"  ... and {len(sorted_cats) - 10} more CAT codes")
     
     def get_cat_code_statistics(self) -> Dict[str, int]:
         """
@@ -157,9 +157,10 @@ class CirpinEmbeddingLoader:
         if target_cat_code not in self.cat_to_proteins:
             return None
         
-        # Randomly sample a protein from this CAT code
+        # Randomly sample a protein from this CAT code using torch generator for reproducibility
         proteins = self.cat_to_proteins[target_cat_code]
-        sampled_protein = random.choice(proteins)
+        idx = torch.randint(0, len(proteins), (1,)).item()
+        sampled_protein = proteins[idx]
         
         return self.get_embedding_by_id(sampled_protein)
     
@@ -214,7 +215,7 @@ class CirpinEmbeddingLoader:
             if embedding is not None:
                 result[i] = embedding.to(device=device, dtype=dtype)
             elif not fill_missing:
-                logger.warning(f"Protein ID '{protein_id}' not found in CIRPIN embeddings")
+                rank_zero_warn(f"Protein ID '{protein_id}' not found in CIRPIN embeddings")
         
         return result
     
