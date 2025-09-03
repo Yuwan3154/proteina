@@ -376,6 +376,8 @@ if __name__ == "__main__":
 
     # Load model from checkpoint
     ckpt_path = cfg.ckpt_path
+    if isinstance(ckpt_path, str) and ckpt_path.startswith('~/'):
+        ckpt_path = os.path.expanduser(ckpt_path)
     ckpt_file = os.path.join(ckpt_path, cfg.ckpt_name)
     logger.info(f"Using checkpoint {ckpt_file}")
     assert os.path.exists(ckpt_file), f"Not a valid checkpoint {ckpt_file}"
@@ -470,7 +472,7 @@ if __name__ == "__main__":
         for i in range(coors_atom37.shape[0]):
             # Create directory where everything related to this sample will be stored
             current_cath_code = cath_codes_batch[i][0] # Get the actual CATH code string
-            current_cirpin_id = cirpin_ids_batch[i]
+            current_cirpin_id = cirpin_ids_batch[i][0]
 
             # Initialize counter for this pt and cath_code if not present
             sample_key = (args.pt, current_cath_code, current_cirpin_id)

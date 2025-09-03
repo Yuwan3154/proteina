@@ -1,5 +1,5 @@
 run_name_:
-ckpt_path: "/home/jupyter-chenxi/proteina/data/weights"
+ckpt_path: "~/proteina/data/weights"
 ckpt_name: 
 
 ncpus_: 24
