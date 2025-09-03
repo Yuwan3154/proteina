@@ -1,0 +1,37 @@
+defaults:
+  - inference_base
+  - _self_
+
+run_name_: seq_cond
+ckpt_name: finetune-all_v1.4_default-fold_4-seq-all-S25_64-cirpin-sample_32-effective-batch_purge-7bny-7kww-7ad5-7b76_last.ckpt
+
+self_cond: True
+fold_cond: False
+cath_code_level: "T"  # Guidance level -- C, A, or T
+seq_cond: True
+cirpin_cond: True
+data_dir: ${oc.env:DATA_PATH}/pdb_train/ # Directory where the dataset is stored
+cath_code_file: cath_codes_train_df_pdb_f1_minl50_maxl384_mtprotein_etdiffractionEM_minoNone_maxoNone_minr0.0_maxr5.0_hl_rl_rnsrTrue_rpuTrue_l_rcuFalse_ex11.csv # test_cath_code.csv
+
+cirpin:
+  cirpin_emb_path: "/home/jupyter-chenxi/data/cath_v4-4/by_fold/3.30.70/3.30.70.pt"  # Path to CIRPIN embeddings .pt file
+
+# Sampling
+dt: 0.005
+nsamples_per_len: 8
+max_nsamples: 150
+
+# LoRA -- if you use lora, set the same parameters as for training
+lora:
+  use: False
+  lora_alpha: 32.0
+  lora_dropout: 0.0
+  r: 0
+  train_bias: "none"
+
+sampling_caflow:
+  sampling_mode: sc  # "vf" for ODE sampling, "sc" for SDE sampling
+  sc_scale_noise: 0.45  # noise scale, used if sampling_mode == "sc"
+
+compute_designability: False
+compute_fid: False 
