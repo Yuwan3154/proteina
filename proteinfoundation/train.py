@@ -294,7 +294,7 @@ if __name__ == "__main__":
     pretrain_ckpt_path = cfg_exp.get("pretrain_ckpt_path", None)
     if last_ckpt_path is None and pretrain_ckpt_path is not None:
         log_info(f"Loading from pre-trained checkpoint path {pretrain_ckpt_path}")
-        ckpt = torch.load(pretrain_ckpt_path, map_location="cpu", weights_only=False)
+        ckpt = torch.load(os.path.expanduser(pretrain_ckpt_path), map_location="cpu", weights_only=False)
         model.load_state_dict(ckpt["state_dict"], strict=False)
 
     # Train

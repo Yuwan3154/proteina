@@ -14,7 +14,7 @@ datamodule:
       root_dir: ${oc.env:DATA_PATH}/cathdata/ # Root directory for CATH labels
     - _target_: "proteinfoundation.datasets.transforms.PaddingTransform"
       max_size: 384
-  batch_size: 1 # Batch size for dataloader
+  batch_size: 2 # Batch size for dataloader
   num_workers: 8 # Number of workers for dataloader
   pin_memory: True # Pin memory for dataloader
   prefetch_factor: 2 # Prefetch factor for dataloader
@@ -35,7 +35,7 @@ datamodule:
     remove_ligands: [] # Exclude specific ligands from any available protein-ligand complexes
     remove_non_standard_residues: True # Include only proteins containing standard amino acid residues
     remove_pdb_unavailable: True # Include only proteins that are available to download
-    exclude_ids: ["7ll9_C", "7ll9_D", "7ll9_G", "7ll9_H", "7bny_A", "7bny_B", "7bny_C", "7bny_D", "7kww_A", "7kww_B", "7ad5_A"]   # IDs can be excluded here like ["9b57", "1crr"]
+    exclude_ids: ["7ll9_C", "7ll9_D", "7ll9_G", "7ll9_H", "7bny_A", "7bny_B", "7bny_C", "7bny_D", "7kww_A", "7kww_B", "7ad5_A", "7b76_A"]   # IDs can be excluded here like ["9b57", "1crr"]
 
   datasplitter:
     _target_: "proteinfoundation.datasets.pdb_data.PDBDataSplitter"
