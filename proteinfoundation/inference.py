@@ -421,14 +421,24 @@ if __name__ == "__main__":
     cath_codes = pd.read_csv(f"{cfg.data_dir}/{cfg.cath_code_file}")["cath_code"].tolist()
     assert args.pt is not None, "pt must be provided if seq_cond is True"
     
-    dataset = GenDatasetWithSeqCathCirpin(
-        pt=pt,
-        cath_codes=cath_codes if cfg.fold_cond else ["x.x.x.x"],
-        cirpin_emb_file=cfg.cirpin.cirpin_emb_path if cfg.get("cirpin_cond", False) else None,
-        dt=cfg.dt,
-        nsamples_per_len=cfg.nsamples_per_len,
-        max_nsamples=cfg.max_nsamples
-    )
+    # Choose the appropriate dataset class based on CIRPIN conditioning
+    if cfg.get("cirpin_cond", False):
+        dataset = GenDatasetWithSeqCathCirpin(
+            pt=pt,
+            cath_codes=cath_codes if cfg.fold_cond else ["x.x.x.x"],
+            cirpin_emb_file=cfg.cirpin.cirpin_emb_path,
+            dt=cfg.dt,
+            nsamples_per_len=cfg.nsamples_per_len,
+            max_nsamples=cfg.max_nsamples
+        )
+    else:
+        dataset = GenDatasetWithSeqCath(
+            pt=pt,
+            cath_codes=cath_codes if cfg.fold_cond else ["x.x.x.x"],
+            dt=cfg.dt,
+            nsamples_per_len=cfg.nsamples_per_len,
+            max_nsamples=cfg.max_nsamples
+        )
     # nlens_dict = parse_nlens_cfg(cfg)
     # lens_sample, nsamples = split_nlens(
     #     nlens_dict, max_nsamples=cfg.max_nsamples, n_replica=1
@@ -472,7 +482,7 @@ if __name__ == "__main__":
         for i in range(coors_atom37.shape[0]):
             # Create directory where everything related to this sample will be stored
             current_cath_code = cath_codes_batch[i][0] # Get the actual CATH code string
-            current_cirpin_id = cirpin_ids_batch[i][0]
+            current_cirpin_id = cirpin_ids_batch[i][0] if cirpin_ids_batch[i] is not None else "unknown"
 
             # Initialize counter for this pt and cath_code if not present
             sample_key = (args.pt, current_cath_code, current_cirpin_id)
@@ -481,7 +491,14 @@ if __name__ == "__main__":
             
             sample_idx = samples_per_length[sample_key]
             
-            fname = f"{args.pt}_cath_{current_cath_code}_cirpin_{current_cirpin_id}_{sample_idx}.pdb"
+            # Create simple filename based on conditioning
+            filename_parts = [args.pt]
+            if cfg.fold_cond and current_cath_code != "x.x.x.x":
+                filename_parts.append(f"cath_{current_cath_code}")
+            if cfg.get("cirpin_cond", False) and current_cirpin_id != "unknown":
+                filename_parts.append(f"cirpin_{current_cirpin_id}")
+            filename_parts.append(str(sample_idx))
+            fname = "_".join(filename_parts) + ".pdb"
             pdb_path = os.path.join(
                 root_path, fname
             )  # ./inference/conf_{}/n_{}_id_{}

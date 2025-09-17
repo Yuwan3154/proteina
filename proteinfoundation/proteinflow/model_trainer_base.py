@@ -575,7 +575,8 @@ class ModelTrainerBase(L.LightningModule):
             fixed_sequence_mask = fixed_sequence_mask,
             fixed_structure_mask = fixed_structure_mask,
         )
-        return self.samples_to_atom37(x), cath_code, batch["cirpin_ids"]  # [b, n, 37, 3]
+        cirpin_ids = batch.get("cirpin_ids", [None] * len(cath_code))
+        return self.samples_to_atom37(x), cath_code, cirpin_ids  # [b, n, 37, 3]
 
     def generate(
         self,
