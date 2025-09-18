@@ -56,8 +56,12 @@ def extract_sequence_from_cif(cif_file: str, chain_id: str) -> Optional[List[str
         parser = MMCIFParser(QUIET=True)
         structure = parser.get_structure('protein', cif_file)
         
+        # Collect all available chains for debugging
+        available_chains = []
+        
         for model in structure:
             for chain in model:
+                available_chains.append(chain.id)
                 if chain.id == chain_id:
                     sequence = []
                     for residue in chain:
@@ -70,7 +74,32 @@ def extract_sequence_from_cif(cif_file: str, chain_id: str) -> Optional[List[str
                                 sequence.append('X')  # Unknown residue
                     return sequence
         
-        logger.error(f"Chain {chain_id} not found in {cif_file}")
+        # If exact chain not found, try common mappings
+        # Many CIF files use different chain naming conventions
+        chain_mappings = {
+            'A': ['X', '1', 'a'],  # Common mappings for chain A
+            'B': ['Y', '2', 'b'],  # Common mappings for chain B  
+            'C': ['Z', '3', 'c'],  # Common mappings for chain C
+        }
+        
+        if chain_id in chain_mappings:
+            for alt_chain in chain_mappings[chain_id]:
+                for model in structure:
+                    for chain in model:
+                        if chain.id == alt_chain:
+                            logger.info(f"Found chain {chain_id} as {alt_chain} in {cif_file}")
+                            sequence = []
+                            for residue in chain:
+                                if residue.id[0] == ' ':  # Standard residue (not heteroatom)
+                                    resname = residue.get_resname()
+                                    if resname in restype_3to1:
+                                        sequence.append(restype_3to1[resname])
+                                    else:
+                                        logger.warning(f"Unknown residue {resname} in {cif_file}, chain {alt_chain}")
+                                        sequence.append('X')  # Unknown residue
+                            return sequence
+        
+        logger.error(f"Chain {chain_id} not found in {cif_file}. Available chains: {available_chains}")
         return None
         
     except Exception as e:
@@ -160,9 +189,10 @@ def convert_from_csv(csv_file: str, cif_dir: str, output_dir: str, processed_sub
     # Read CSV file
     df = pd.read_csv(csv_file)
     
-    # Use shared DATA_PATH from environment instead of output_dir to avoid double processed/
+    # Use shared DATA_PATH from environment, matching inference script expectations
     data_path = os.environ.get('DATA_PATH', '/home/jupyter-chenxi/proteina/data')
-    processed_dir = os.path.join(data_path, processed_subdir)
+    # Inference script expects files in DATA_PATH/pdb_train/processed/
+    processed_dir = os.path.join(data_path, 'pdb_train', processed_subdir)
     os.makedirs(processed_dir, exist_ok=True)
     
     logger.info(f"Saving PT files to shared data path: {processed_dir}")
