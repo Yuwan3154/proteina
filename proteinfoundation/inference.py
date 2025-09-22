@@ -417,8 +417,10 @@ if __name__ == "__main__":
     model.configure_inference(cfg, nn_ag=nn_ag)
 
     # Create inference dataset
-    pt = torch.load(f"{cfg.data_dir}/processed/{args.pt}.pt")
-    cath_codes = pd.read_csv(f"{cfg.data_dir}/{cfg.cath_code_file}")["cath_code"].tolist()
+    # Fix path concatenation to handle trailing slashes
+    data_dir_clean = cfg.data_dir.rstrip('/')
+    pt = torch.load(f"{data_dir_clean}/processed/{args.pt}.pt")
+    cath_codes = pd.read_csv(f"{data_dir_clean}/{cfg.cath_code_file}")["cath_code"].tolist()
     assert args.pt is not None, "pt must be provided if seq_cond is True"
     
     # Choose the appropriate dataset class based on CIRPIN conditioning
