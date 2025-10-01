@@ -79,12 +79,10 @@ def run_af2rank_scoring(protein_name, reference_cif, inference_output_dir, recyc
 {conda_cmd} && cd /home/jupyter-chenxi/proteina/af2rank_evaluation && python -c "
 import sys
 import os
-import json
-from pathlib import Path
 sys.path.append('/home/jupyter-chenxi/proteina/af2rank_evaluation')
 
 # Import AF2Rank components
-from af2rank_scorer import score_proteina_structures, plot_af2rank_results, save_af2rank_scores
+from af2rank_scorer import run_af2rank_analysis
 
 print('Starting AF2Rank scoring for {protein_name} with ColabDesign environment')
 
@@ -95,98 +93,70 @@ pdb_id, chain_id = protein_id.split('_')
 os.environ['ALPHAFOLD_DATA_DIR'] = os.path.expanduser('~/params')
 os.environ['AF_PARAMS_DIR'] = os.path.expanduser('~/params')
 
-# Score structures with AF2Rank  
-scores = score_proteina_structures(
-    protein_id=protein_id,
-    reference_cif='{reference_cif}',
-    inference_output_dir='{inference_output_dir}',
-    chain=chain_id,
-    recycles={recycles},
-    verbose=False
-)
-
-if not scores:
-    print(f'ERROR: No scores generated for {{protein_id}}')
-    sys.exit(1)
-
 # Create AF2Rank output directory
 af2rank_dir = '{inference_output_dir}/af2rank_analysis'
 os.makedirs(af2rank_dir, exist_ok=True)
 
-# Save scores
-scores_csv_path = save_af2rank_scores(scores, af2rank_dir, protein_id)
+# Run complete AF2Rank analysis with new metrics
+result = run_af2rank_analysis(
+    protein_id=protein_id,
+    reference_cif='{reference_cif}',
+    inference_output_dir='{inference_output_dir}',
+    output_dir=af2rank_dir,
+    chain=chain_id,
+    recycles={recycles},
+    verbose=False,
+    regenerate_summary=True
+)
 
-# Generate plots
-plot_af2rank_results(scores, af2rank_dir, protein_id)
-
-# Create summary
-summary = {{
-    'protein_id': protein_id,
-    'total_structures': len(scores),
-    'successful_scores': len([s for s in scores if 'error' not in s]),
-    'failed_scores': len([s for s in scores if 'error' in s]),
-    'reference_structure': '{reference_cif}',
-    'inference_directory': '{inference_output_dir}',
-    'af2rank_directory': af2rank_dir,
-    'chain': chain_id,
-    'recycles': {recycles},
-    'scores_csv': scores_csv_path
-}}
-
-summary_file = os.path.join(af2rank_dir, f'af2rank_summary_{{protein_id}}.json')
-with open(summary_file, 'w') as f:
-    json.dump(summary, f, indent=2)
-
-successful_count = len([s for s in scores if 'error' not in s])
-total_count = len(scores)
-print(f'AF2Rank scoring completed for {{protein_id}} ({{successful_count}}/{{total_count}} structures)')
-print(f'Results saved to: {{af2rank_dir}}')
+if result:
+    print(f'Successfully completed AF2Rank analysis for {{protein_id}}')
+    print(f'Results saved to: {{af2rank_dir}}')
+else:
+    print(f'ERROR: AF2Rank analysis failed for {{protein_id}}')
+    sys.exit(1)
 "
 """
     
     result = subprocess.run(python_cmd, shell=True, capture_output=True, text=True, executable='/bin/bash')
     return result
 
-def run_af2rank_plot_only(protein_name, reference_cif, inference_output_dir):
-    """Regenerate plots only for existing AF2Rank scores."""
+def run_af2rank_plot_only(protein_name, reference_cif, inference_output_dir, recycles=3):
+    """Regenerate plots only for existing AF2Rank scores and update summary."""
     conda_cmd = setup_conda_environment()
     
     python_cmd = f"""
 {conda_cmd} && cd /home/jupyter-chenxi/proteina/af2rank_evaluation && python -c "
 import sys
 import os
-import json
-import pandas as pd
-from pathlib import Path
 sys.path.append('/home/jupyter-chenxi/proteina/af2rank_evaluation')
 
 # Import AF2Rank components
-from af2rank_scorer import plot_af2rank_results
+from af2rank_scorer import run_af2rank_plot_only
 
-print('Regenerating plots for {protein_name}')
+print('Regenerating plots and summary for {protein_name}')
 
 protein_id = '{protein_name}'
 pdb_id, chain_id = protein_id.split('_')
 
-# Load existing scores
+# Run plot regeneration with summary update
 af2rank_dir = '{inference_output_dir}/af2rank_analysis'
-scores_csv = os.path.join(af2rank_dir, f'af2rank_scores_{{protein_id}}.csv')
+result = run_af2rank_plot_only(
+    protein_id=protein_id,
+    reference_cif='{reference_cif}',
+    inference_output_dir='{inference_output_dir}',
+    output_dir=af2rank_dir,
+    chain=chain_id,
+    recycles={recycles},
+    regenerate_summary=True
+)
 
-if not os.path.exists(scores_csv):
-    print(f'ERROR: No existing scores found at {{scores_csv}}')
+if result:
+    print(f'Successfully regenerated plots and summary for {{protein_id}}')
+    print(f'Results saved to: {{af2rank_dir}}')
+else:
+    print(f'ERROR: Failed to regenerate plots for {{protein_id}}')
     sys.exit(1)
-
-# Load scores from CSV
-df = pd.read_csv(scores_csv)
-scores = df.to_dict('records')
-
-print(f'Loaded {{len(scores)}} scores from existing CSV')
-
-# Generate plots
-correlations = plot_af2rank_results(scores, af2rank_dir, protein_id)
-
-print(f'Regenerated plots for {{protein_id}} with {{len(correlations)}} correlations')
-print(f'Plots saved to: {{af2rank_dir}}')
 "
 """
     
@@ -223,8 +193,8 @@ def process_single_protein_af2rank(args):
         # Check if we should do plot-only regeneration
         af2rank_csv = Path(inference_output_dir) / "af2rank_analysis" / f"af2rank_scores_{protein_name}.csv"
         if regenerate_plots and af2rank_csv.exists():
-            logger.info(f"[GPU {gpu_id}] Regenerating plots only for {protein_name}")
-            result = run_af2rank_plot_only(protein_name, reference_cif, inference_output_dir)
+            logger.info(f"[GPU {gpu_id}] Skipping plot regeneration (will be handled by CPU workers)")
+            return {'protein': protein_name, 'gpu': gpu_id, 'status': 'skipped', 'reason': 'plot_regeneration_deferred'}
         else:
             # Run full AF2Rank scoring
             logger.info(f"[GPU {gpu_id}] Running full AF2Rank scoring for {protein_name}")
@@ -256,11 +226,49 @@ def process_single_protein_af2rank(args):
         logger.error(f"[GPU {gpu_id}] ❌ Failed AF2Rank scoring for {protein_name}: {e}")
         return {'protein': protein_name, 'gpu': gpu_id, 'status': 'failed', 'error': str(e)}
 
+
+def process_single_protein_plot_regeneration(args):
+    """Process plot regeneration for a single protein (CPU-only, no GPU needed)."""
+    protein_name, cif_dir, inference_config, recycles = args
+    
+    logger.info(f"[CPU] Regenerating plots and summary for {protein_name}")
+    
+    try:
+        # Find reference CIF file
+        reference_cif = find_reference_cif(protein_name, cif_dir)
+        
+        # Generate output directory
+        inference_output_dir = generate_protein_output_dir(inference_config, protein_name)
+        
+        # Check if CSV file exists
+        af2rank_csv = Path(inference_output_dir) / "af2rank_analysis" / f"af2rank_scores_{protein_name}.csv"
+        if not af2rank_csv.exists():
+            logger.warning(f"[CPU] No AF2Rank scores found for {protein_name}")
+            return {'protein': protein_name, 'status': 'skipped', 'reason': 'no_csv_file'}
+        
+        # Run plot regeneration (CPU-only)
+        result = run_af2rank_plot_only(protein_name, reference_cif, inference_output_dir, recycles)
+        
+        if result.returncode == 0:
+            logger.info(f"[CPU] ✅ Plot regeneration completed for {protein_name}")
+            return {'protein': protein_name, 'status': 'success'}
+        else:
+            logger.error(f"[CPU] ❌ Plot regeneration failed for {protein_name}")
+            logger.error(f"[CPU] Error output: {result.stderr}")
+            return {'protein': protein_name, 'status': 'failed', 'error': result.stderr}
+        
+    except Exception as e:
+        logger.error(f"[CPU] ❌ Failed plot regeneration for {protein_name}: {e}")
+        return {'protein': protein_name, 'status': 'failed', 'error': str(e)}
+
+
 def get_protein_names(csv_file):
     """Extract protein names from CSV file."""
     df = pd.read_csv(csv_file)
+    # Strip whitespace from column names
+    df.columns = df.columns.str.strip()
     proteins = df['natives_rcsb'].dropna().unique().tolist()
-    return [p for p in proteins if p.strip()]
+    return [p.strip() for p in proteins if p and p.strip()]
 
 def find_proteins_needing_af2rank(csv_file, inference_config, regenerate_plots=False):
     """Find proteins from CSV that need AF2Rank scoring or plot regeneration."""
@@ -350,86 +358,125 @@ def main():
     
     logger.info(f"Using {args.num_gpus} GPU(s) for parallel AF2Rank scoring")
     
-    # Create work items
-    work_items = []
-    for i, protein_name in enumerate(protein_names):
-        gpu_id = i % args.num_gpus
-        work_items.append((protein_name, args.cif_dir, args.inference_config, args.recycles, gpu_id, args.regenerate_plots))
+    # Separate proteins needing scoring vs plot regeneration
+    proteins_needing_scoring = []
+    proteins_needing_plots = []
+    
+    for protein_name in protein_names:
+        protein_dir = Path(f"/home/jupyter-chenxi/proteina/inference/{args.inference_config}/{protein_name}")
+        af2rank_csv = protein_dir / "af2rank_analysis" / f"af2rank_scores_{protein_name}.csv"
+        
+        if af2rank_csv.exists() and args.regenerate_plots:
+            proteins_needing_plots.append(protein_name)
+        elif not af2rank_csv.exists():
+            proteins_needing_scoring.append(protein_name)
+    
+    logger.info(f"Proteins needing AF2Rank scoring: {len(proteins_needing_scoring)}")
+    logger.info(f"Proteins needing plot regeneration: {len(proteins_needing_plots)}")
     
     # Process proteins in parallel
     start_time = time.time()
-    results = []
+    all_results = []
     
-    with ProcessPoolExecutor(max_workers=args.num_gpus) as executor:
-        # Submit all jobs
-        future_to_protein = {executor.submit(process_single_protein_af2rank, item): item[0] for item in work_items}
+    # GPU workers for AF2Rank scoring
+    if proteins_needing_scoring:
+        logger.info(f"Starting GPU-based AF2Rank scoring with {args.num_gpus} workers")
         
-        # Collect results as they complete
-        for future in as_completed(future_to_protein):
-            protein_name = future_to_protein[future]
-            try:
-                result = future.result()
-                results.append(result)
-                
-                completed = len(results)
-                total = len(protein_names)
-                elapsed = time.time() - start_time
-                
-                if result['status'] == 'success':
-                    summary = result.get('summary', {})
-                    successful_scores = summary.get('successful_scores', 0)
-                    total_structures = summary.get('total_structures', 0)
-                    logger.info(f"✅ Progress: {completed}/{total} proteins completed ({successful_scores}/{total_structures} structures scored, {elapsed:.1f}s elapsed)")
-                else:
-                    logger.error(f"❌ {protein_name} failed: {result.get('error', 'Unknown error')}")
+        scoring_work_items = []
+        for i, protein_name in enumerate(proteins_needing_scoring):
+            gpu_id = i % args.num_gpus
+            scoring_work_items.append((protein_name, args.cif_dir, args.inference_config, args.recycles, gpu_id, False))
+        
+        with ProcessPoolExecutor(max_workers=args.num_gpus) as executor:
+            future_to_protein = {executor.submit(process_single_protein_af2rank, item): item[0] for item in scoring_work_items}
+            
+            for future in as_completed(future_to_protein):
+                protein_name = future_to_protein[future]
+                try:
+                    result = future.result()
+                    all_results.append(result)
                     
-            except Exception as e:
-                logger.error(f"❌ {protein_name} failed with exception: {e}")
-                results.append({'protein': protein_name, 'status': 'failed', 'error': str(e)})
+                    completed = len([r for r in all_results if r['status'] == 'success'])
+                    total = len(scoring_work_items)
+                    elapsed = time.time() - start_time
+                    
+                    if result['status'] == 'success':
+                        summary = result.get('summary', {})
+                        successful_scores = summary.get('successful_scores', 0)
+                        total_structures = summary.get('total_structures', 0)
+                        logger.info(f"✅ GPU Progress: {completed}/{total} proteins completed ({successful_scores}/{total_structures} structures scored, {elapsed:.1f}s elapsed)")
+                    else:
+                        logger.error(f"❌ {protein_name} failed: {result.get('error', 'Unknown error')}")
+                        
+                except Exception as e:
+                    logger.error(f"❌ {protein_name} failed with exception: {e}")
+                    all_results.append({'protein': protein_name, 'status': 'failed', 'error': str(e)})
+    
+    # CPU workers for plot regeneration (much faster)
+    if proteins_needing_plots:
+        logger.info(f"Starting CPU-based plot regeneration with {min(len(proteins_needing_plots), 8)} workers")
+        
+        plot_work_items = []
+        for protein_name in proteins_needing_plots:
+            plot_work_items.append((protein_name, args.cif_dir, args.inference_config, args.recycles))
+        
+        # Use more CPU workers since this is lightweight
+        max_cpu_workers = min(len(proteins_needing_plots), 8)
+        
+        with ProcessPoolExecutor(max_workers=max_cpu_workers) as executor:
+            future_to_protein = {executor.submit(process_single_protein_plot_regeneration, item): item[0] for item in plot_work_items}
+            
+            for future in as_completed(future_to_protein):
+                protein_name = future_to_protein[future]
+                try:
+                    result = future.result()
+                    all_results.append(result)
+                    
+                    completed = len([r for r in all_results if r['status'] == 'success'])
+                    total = len(plot_work_items)
+                    elapsed = time.time() - start_time
+                    
+                    if result['status'] == 'success':
+                        logger.info(f"✅ CPU Progress: {completed}/{total} plots regenerated ({elapsed:.1f}s elapsed)")
+                    else:
+                        logger.error(f"❌ {protein_name} plot regeneration failed: {result.get('error', 'Unknown error')}")
+                        
+                except Exception as e:
+                    logger.error(f"❌ {protein_name} plot regeneration failed with exception: {e}")
+                    all_results.append({'protein': protein_name, 'status': 'failed', 'error': str(e)})
     
     # Summary
     total_time = time.time() - start_time
-    successful = len([r for r in results if r['status'] == 'success'])
-    failed = len([r for r in results if r['status'] == 'failed'])
+    successful = len([r for r in all_results if r['status'] == 'success'])
+    failed = len([r for r in all_results if r['status'] == 'failed'])
+    skipped = len([r for r in all_results if r['status'] == 'skipped'])
     
     # Calculate total structures scored
     total_structures_scored = 0
-    for result in results:
+    for result in all_results:
         if result['status'] == 'success':
             summary = result.get('summary', {})
             total_structures_scored += summary.get('successful_scores', 0)
     
-    logger.info(f"🎯 AF2Rank scoring completed in {total_time:.1f}s")
-    logger.info(f"✅ Successful proteins: {successful}")
-    logger.info(f"❌ Failed proteins: {failed}")
-    logger.info(f"📊 Total structures scored: {total_structures_scored}")
+    logger.info(f"\n📊 AF2Rank Processing Results:")
+    logger.info(f"✅ Successful: {successful}")
+    logger.info(f"❌ Failed: {failed}")
+    logger.info(f"⏭️  Skipped: {skipped}")
+    logger.info(f"📈 Total structures scored: {total_structures_scored}")
+    logger.info(f"⏱️  Total time: {total_time:.1f}s")
+    logger.info(f"📊 Average time per protein: {total_time/len(all_results):.1f}s")
     
-    if failed > 0:
-        logger.info("Failed proteins:")
-        for result in results:
+    if failed:
+        logger.error("Failed proteins:")
+        for result in all_results:
             if result['status'] == 'failed':
-                logger.info(f"  - {result['protein']}: {result.get('error', 'Unknown error')}")
+                logger.error(f"  - {result['protein']}: {result.get('error', 'Unknown error')}")
     
-    # Save summary report
-    summary_report = {
-        'total_proteins': len(protein_names),
-        'successful_proteins': successful,
-        'failed_proteins': failed,
-        'total_structures_scored': total_structures_scored,
-        'execution_time_seconds': total_time,
-        'inference_config': args.inference_config,
-        'recycles': args.recycles,
-        'results': results
-    }
+    if successful:
+        logger.info(f"🎉 Successfully processed {successful} proteins!")
+        logger.info(f"📁 Results saved to: /home/jupyter-chenxi/proteina/inference/{args.inference_config}/")
     
-    summary_file = f"/home/jupyter-chenxi/proteina/af2rank_evaluation/af2rank_summary_{args.inference_config}.json"
-    with open(summary_file, 'w') as f:
-        json.dump(summary_report, f, indent=2)
-    
-    logger.info(f"📄 Summary report saved to: {summary_file}")
-    
-    # Return appropriate exit code
-    sys.exit(0 if failed == 0 else 1)
+    sys.exit(0 if not failed else 1)
 
 if __name__ == '__main__':
     main()

@@ -23,24 +23,19 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 import numpy as np
 import pandas as pd
+from Bio.PDB import MMCIFParser, PDBIO, Select
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from loguru import logger
 
-# Try to import JAX/ColabDesign components
-try:
-    import jax
-    import jax.numpy as jnp
-    from colabdesign import mk_af_model, clear_mem
-    from colabdesign.af.contrib import predict
-    from colabdesign.shared.protein import _np_rmsd
-    from colabdesign.shared.utils import copy_dict
-    from colabdesign.af.prep import prep_pdb
-    from colabdesign.af.alphafold.common import residue_constants
-    JAX_AVAILABLE = True
-except ImportError as e:
-    logger.warning(f"JAX/ColabDesign not available: {e}")
-    JAX_AVAILABLE = False
+import jax
+import jax.numpy as jnp
+from colabdesign import mk_af_model, clear_mem
+from colabdesign.af.contrib import predict
+from colabdesign.shared.protein import _np_rmsd
+from colabdesign.shared.utils import copy_dict
+from colabdesign.af.prep import prep_pdb
+from colabdesign.af.alphafold.common import residue_constants
 
 
 def get_pdb_fn(pdb_code):
@@ -61,21 +56,37 @@ def get_pdb_fn(pdb_code):
 
 
 def get_available_models(pdb_file):
-    """Get list of available model numbers in a PDB file."""
+    """Get list of available model numbers in a PDB/CIF file."""
     models = []
-    with open(pdb_file, 'r') as f:
-        for line in f:
-            if line.startswith('MODEL'):
-                model_str = line[5:].strip()
-                try:
-                    model_num = int(model_str)
-                    if model_num not in models:
-                        models.append(model_num)
-                except ValueError:
-                    continue
-    # If no MODEL records found, assume it's a single model (model 1)
-    if not models:
-        models = [1]
+    is_cif_file = pdb_file.lower().endswith('.cif')
+    
+    if is_cif_file:
+        # For CIF files, use BioPython to detect models
+        try:
+            parser = MMCIFParser(QUIET=True)
+            structure = parser.get_structure('protein', pdb_file)
+            models = [model.id for model in structure.get_models()]
+            # CIF models are usually numbered starting from 0 or 1
+            if not models:
+                models = [1]  # Default fallback
+        except:
+            models = [1]  # Default fallback
+    else:
+        # For PDB files, parse MODEL records
+        with open(pdb_file, 'r') as f:
+            for line in f:
+                if line.startswith('MODEL'):
+                    model_str = line[5:].strip()
+                    try:
+                        model_num = int(model_str)
+                        if model_num not in models:
+                            models.append(model_num)
+                    except ValueError:
+                        continue
+        # If no MODEL records found, assume it's a single model (model 1)
+        if not models:
+            models = [1]
+    
     return sorted(models)
 
 
@@ -105,11 +116,25 @@ def robust_get_template_feats(pdbs, chains, query_seq, **kwargs):
         # If that failed or returned empty, detect available models
         available_models = get_available_models(pdb_file)
         
-        # Try each available model
+        # Try each available model, including model 0
         for model_num in available_models:
-            result = original_protein_pdb_to_string(pdb_file, chains=chains, models=[model_num], auth_chains=auth_chains)
-            if len(result.strip()) > 0:
-                return result
+            try:
+                result = original_protein_pdb_to_string(pdb_file, chains=chains, models=[model_num], auth_chains=auth_chains)
+                if len(result.strip()) > 0:
+                    return result
+            except Exception as e:
+                # If specific model fails, try the next one
+                continue
+        
+        # Special handling for CIF files that might have model 0
+        if pdb_file.lower().endswith('.cif') and 0 in available_models:
+            try:
+                # For CIF files with model 0, try without specifying models
+                result = original_protein_pdb_to_string(pdb_file, chains=chains, models=None, auth_chains=auth_chains)
+                if len(result.strip()) > 0:
+                    return result
+            except Exception as e:
+                pass
         
         # If all models failed, fall back to no model specification
         return original_protein_pdb_to_string(pdb_file, chains=chains, models=None, auth_chains=auth_chains)
@@ -136,40 +161,134 @@ def run_do_not_align(query_sequence, target_sequence, **kwargs):
     return [query_sequence, target_sequence], [0, 0]
 
 
+def convert_cif_to_pdb_for_colabdesign(cif_file, chain_id=None):
+    """Convert CIF file to PDB format that ColabDesign can handle."""
+    import tempfile
+    import os
+    
+    try:
+        from Bio.PDB import MMCIFParser
+        
+        # Parse CIF file
+        parser = MMCIFParser(QUIET=True)
+        structure = parser.get_structure('protein', cif_file)
+        
+        # Create a temporary PDB file
+        temp_pdb = tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False)
+        temp_pdb.close()
+        
+        # Write to PDB format
+        io = PDBIO()
+        io.set_structure(structure)
+        
+        if chain_id:
+            # Only write specific chain if requested
+            class ChainSelect(Select):
+                def accept_chain(self, chain):
+                    return chain.id == chain_id
+            io.save(temp_pdb.name, ChainSelect())
+        else:
+            io.save(temp_pdb.name)
+        
+        return temp_pdb.name
+    except Exception as e:
+        raise ValueError(f"Failed to convert CIF to PDB: {e}")
+
+
 def get_sequence_from_pdb(pdb_file, chain=None):
-    """Get sequence from PDB using predict.get_template_feats approach."""
-    # If no chain specified, detect the first chain or default to "A"
-    if chain is None:
-        with open(pdb_file, 'r') as f:
-            for line in f:
-                if line.startswith('ATOM'):
-                    chain = line[21]
+    """Get sequence from PDB/CIF using predict.get_template_feats approach."""
+    # Detect file type based on extension
+    is_cif_file = pdb_file.lower().endswith('.cif')
+    temp_pdb_file = None
+    
+    try:
+        # For CIF files, convert to PDB format first
+        if is_cif_file:
+            # Detect available chains and map if needed
+            detected_chain = None
+            try:
+                from Bio.PDB import MMCIFParser
+                parser = MMCIFParser(QUIET=True)
+                structure = parser.get_structure('protein', pdb_file)
+                available_chains = []
+                for model in structure:
+                    for struct_chain in model:
+                        available_chains.append(struct_chain.id)
                     break
-        if chain is None:
-            chain = "A"  # Default fallback
-    
-    # Create a dummy query sequence of similar length for alignment
-    with open(pdb_file, 'r') as f:
-        atom_count = sum(1 for line in f 
-                       if line.startswith('ATOM') and line[12:16].strip() == 'CA'
-                       and line[21] == chain)
-    
-    dummy_query = "A" * max(50, atom_count)  # Dummy sequence for extraction
-    
-    # Use robust get_template_feats to properly parse the PDB
-    batch = robust_get_template_feats(
-        pdbs=[pdb_file],
-        chains=[chain],  # Always pass a valid chain identifier
-        query_seq=dummy_query,
-        copies=1,
-        use_seq=True,  # We want the sequence
-        align_fn=run_do_not_align
-    )
-    
-    # Extract sequence from aatype
-    sequence = "".join([predict.residue_constants.restypes[aa] if aa < 20 else "X" 
-                       for aa in batch["aatype"]])
-    return sequence
+                
+                # If chain specified, try to find it or map it
+                if chain is not None:
+                    if chain in available_chains:
+                        detected_chain = chain
+                    else:
+                        # Try chain mapping (A->E, A->N, etc.)
+                        chain_mappings = {
+                            'A': ['E', 'N', 'X', '1', 'a'],
+                            'B': ['F', 'O', 'Y', '2', 'b'],
+                            'C': ['G', 'P', 'Z', '3', 'c']
+                        }
+                        if chain in chain_mappings:
+                            for alt_chain in chain_mappings[chain]:
+                                if alt_chain in available_chains:
+                                    detected_chain = alt_chain
+                                    break
+                        
+                        if detected_chain is None:
+                            detected_chain = available_chains[0] if available_chains else 'A'
+                else:
+                    # No chain specified, use first available
+                    detected_chain = available_chains[0] if available_chains else 'A'
+                    
+            except:
+                detected_chain = "A"  # Default fallback
+            
+            # Convert CIF to PDB format for ColabDesign compatibility
+            temp_pdb_file = convert_cif_to_pdb_for_colabdesign(pdb_file, detected_chain)
+            working_file = temp_pdb_file
+            working_chain = detected_chain  # Use the actual chain we found
+        else:
+            working_file = pdb_file
+            working_chain = chain
+            
+            # If no chain specified for PDB files, detect the first chain
+            if working_chain is None:
+                with open(pdb_file, 'r') as f:
+                    for line in f:
+                        if line.startswith('ATOM'):
+                            working_chain = line[21]
+                            break
+                if working_chain is None:
+                    working_chain = "A"  # Default fallback
+        
+        # Create a dummy query sequence of similar length for alignment
+        with open(working_file, 'r') as f:
+            atom_count = sum(1 for line in f 
+                           if line.startswith('ATOM') and line[12:16].strip() == 'CA'
+                           and line[21] == working_chain)
+        
+        dummy_query = "A" * max(50, atom_count)  # Dummy sequence for extraction
+        
+        # Use robust get_template_feats to properly parse the file
+        batch = robust_get_template_feats(
+            pdbs=[working_file],
+            chains=[working_chain],  # Always pass a valid chain identifier
+            query_seq=dummy_query,
+            copies=1,
+            use_seq=True,  # We want the sequence
+            align_fn=run_do_not_align
+        )
+        
+        # Extract sequence from aatype
+        sequence = "".join([predict.residue_constants.restypes[aa] if aa < 20 else "X" 
+                           for aa in batch["aatype"]])
+        return sequence
+        
+    finally:
+        # Clean up temporary PDB file if created
+        if temp_pdb_file:
+            import os
+            if os.path.exists(temp_pdb_file):
+                os.unlink(temp_pdb_file)
 
 
 def tmscore(x, y, tmscore_exe="USalign"):
@@ -222,9 +341,6 @@ class ModernAF2Rank:
     
     def __init__(self, reference_pdb, chain=None, model_type="auto", debug=False):
         """Initialize AF2Rank with reference structure."""
-        if not JAX_AVAILABLE:
-            raise ImportError("JAX/ColabDesign not available. Please ensure colabdesign environment is activated.")
-        
         self.reference_pdb = reference_pdb
         if chain is None:
             self.chain = "A"
@@ -303,65 +419,126 @@ class ModernAF2Rank:
         self.af.set_msa(msa, deletion_matrix)
         
     def _get_coords_from_pdb(self, pdb_file, chain=None):
-        """Extract CA coordinates from PDB file using prep_pdb."""
-        # Auto-detect chain if not specified
-        if chain is None:
-            with open(pdb_file, 'r') as f:
-                for line in f:
-                    if line.startswith('ATOM'):
-                        chain = line[21]
+        """Extract CA coordinates from PDB/CIF file using prep_pdb."""
+        # Detect file type
+        is_cif_file = pdb_file.lower().endswith('.cif')
+        temp_pdb_file = None
+        
+        try:
+            # For CIF files, convert to PDB format first
+            if is_cif_file:
+                # Detect available chains and map if needed
+                detected_chain = None
+                try:
+                    from Bio.PDB import MMCIFParser
+                    parser = MMCIFParser(QUIET=True)
+                    structure = parser.get_structure('protein', pdb_file)
+                    available_chains = []
+                    for model in structure:
+                        for struct_chain in model:
+                            available_chains.append(struct_chain.id)
                         break
-        if chain is None: 
-                chain = 'A'  # Default fallback
-        
-        # Apply our robust PDB handling
-        from colabdesign.shared import protein
-        from colabdesign.af import prep
-        
-        # Store original functions
-        original_protein_pdb_to_string = protein.pdb_to_string
-        original_prep_pdb_to_string = prep.pdb_to_string
-        
-        def robust_pdb_to_string(pdb_file, chains=None, models=None, auth_chains=True):
-            """Robust version of pdb_to_string that handles different model numbers."""
+                    
+                    # If chain specified, try to find it or map it
+                    if chain is not None:
+                        if chain in available_chains:
+                            detected_chain = chain
+                        else:
+                            # Try chain mapping (A->E, A->N, etc.)
+                            chain_mappings = {
+                                'A': ['E', 'N', 'X', '1', 'a'],
+                                'B': ['F', 'O', 'Y', '2', 'b'],
+                                'C': ['G', 'P', 'Z', '3', 'c']
+                            }
+                            if chain in chain_mappings:
+                                for alt_chain in chain_mappings[chain]:
+                                    if alt_chain in available_chains:
+                                        detected_chain = alt_chain
+                                        break
+                            
+                            if detected_chain is None:
+                                detected_chain = available_chains[0] if available_chains else 'A'
+                    else:
+                        # No chain specified, use first available
+                        detected_chain = available_chains[0] if available_chains else 'A'
+                        
+                except:
+                    detected_chain = 'A'  # Default fallback
+                
+                # Convert CIF to PDB format for ColabDesign compatibility
+                temp_pdb_file = convert_cif_to_pdb_for_colabdesign(pdb_file, detected_chain)
+                working_file = temp_pdb_file
+                working_chain = detected_chain  # Use the actual chain we found
+            else:
+                working_file = pdb_file
+                working_chain = chain
+                
+                # If no chain specified for PDB files, detect the first chain
+                if working_chain is None:
+                    with open(pdb_file, 'r') as f:
+                        for line in f:
+                            if line.startswith('ATOM'):
+                                working_chain = line[21]
+                                break
+                if working_chain is None: 
+                    working_chain = 'A'  # Default fallback
             
-            # If models is not specified, use the original function
-            if models is None:
-                return original_protein_pdb_to_string(pdb_file, chains=chains, models=models, auth_chains=auth_chains)
+            # Apply our robust PDB handling
+            from colabdesign.shared import protein
+            from colabdesign.af import prep
+            from colabdesign.af.alphafold.common import residue_constants
             
-            # Try with the specified models first
-            result = original_protein_pdb_to_string(pdb_file, chains=chains, models=models, auth_chains=auth_chains)
-            if len(result.strip()) > 0:
-                return result
+            # Store original functions
+            original_protein_pdb_to_string = protein.pdb_to_string
+            original_prep_pdb_to_string = prep.pdb_to_string
             
-            # If that failed or returned empty, detect available models
-            available_models = get_available_models(pdb_file)
-            
-            # Try each available model
-            for model_num in available_models:
-                result = original_protein_pdb_to_string(pdb_file, chains=chains, models=[model_num], auth_chains=auth_chains)
+            def robust_pdb_to_string(pdb_file, chains=None, models=None, auth_chains=True):
+                """Robust version of pdb_to_string that handles different model numbers."""
+                
+                # If models is not specified, use the original function
+                if models is None:
+                    return original_protein_pdb_to_string(pdb_file, chains=chains, models=models, auth_chains=auth_chains)
+                
+                # Try with the specified models first
+                result = original_protein_pdb_to_string(pdb_file, chains=chains, models=models, auth_chains=auth_chains)
                 if len(result.strip()) > 0:
                     return result
+                
+                # If that failed or returned empty, detect available models
+                available_models = get_available_models(pdb_file)
+                
+                # Try each available model
+                for model_num in available_models:
+                    result = original_protein_pdb_to_string(pdb_file, chains=chains, models=[model_num], auth_chains=auth_chains)
+                    if len(result.strip()) > 0:
+                        return result
+                
+                # If all models failed, fall back to no model specification
+                return original_protein_pdb_to_string(pdb_file, chains=chains, models=None, auth_chains=auth_chains)
             
-            # If all models failed, fall back to no model specification
-            return original_protein_pdb_to_string(pdb_file, chains=chains, models=None, auth_chains=auth_chains)
-        
-        # Temporarily replace with our robust version
-        protein.pdb_to_string = robust_pdb_to_string
-        prep.pdb_to_string = robust_pdb_to_string
-        
-        # Use prep_pdb to extract PDB information  
-        info = prep_pdb(pdb_file, chain=chain, ignore_missing=True)
-        
-        # Restore original functions
-        protein.pdb_to_string = original_protein_pdb_to_string
-        prep.pdb_to_string = original_prep_pdb_to_string
-        
-        # Extract CA coordinates from all_atom_positions
-        ca_idx = residue_constants.atom_order["CA"]
-        coords = info["batch"]["all_atom_positions"][:, ca_idx, :]
-        
-        return coords
+            # Temporarily replace with our robust version
+            protein.pdb_to_string = robust_pdb_to_string
+            prep.pdb_to_string = robust_pdb_to_string
+            
+            # Use prep_pdb to extract PDB information  
+            info = prep_pdb(working_file, chain=working_chain, ignore_missing=True)
+            
+            # Restore original functions
+            protein.pdb_to_string = original_protein_pdb_to_string
+            prep.pdb_to_string = original_prep_pdb_to_string
+            
+            # Extract CA coordinates from all_atom_positions
+            ca_idx = residue_constants.atom_order["CA"]
+            coords = info["batch"]["all_atom_positions"][:, ca_idx, :]
+            
+            return coords
+            
+        finally:
+            # Clean up temporary PDB file if created
+            if temp_pdb_file:
+                import os
+                if os.path.exists(temp_pdb_file):
+                    os.unlink(temp_pdb_file)
         
     def score_structure(self, decoy_pdb, decoy_chain=None, 
                 rm_seq=True, rm_sc=True, rm_ic=False,
@@ -396,7 +573,7 @@ class ModernAF2Rank:
             query_a3m=None,  # No MSA for AF2Rank
             copies=1,
             propagate_to_copies=False,
-            use_seq=not rm_seq,  # AF2Rank protocol: remove sequence
+            use_seq=not rm_seq,  # Same as official: use_seq=not rm_sequence
             align_fn=run_do_not_align  # No alignment needed
         )
         
@@ -431,8 +608,10 @@ class ModernAF2Rank:
         # Run prediction exactly like predict.ipynb
         if verbose:
             logger.debug("Starting AF2 prediction...")
-            
-        self.af.predict(verbose=verbose)
+        
+        # CRITICAL: Use model_1_ptm which supports templates
+        # Only model_1_ptm and model_2_ptm support templates in monomer mode
+        self.af.predict(models=["model_1_ptm"], verbose=verbose)
         
         if verbose:
             logger.debug("AF2 prediction completed successfully")
@@ -515,10 +694,6 @@ def score_proteina_structures(protein_id: str, reference_cif: str, inference_out
     Returns:
         List of score dictionaries
     """
-    if not JAX_AVAILABLE:
-        logger.error("JAX/ColabDesign not available. Cannot perform AF2Rank scoring.")
-        return []
-    
     # Find all PDB files in the inference directory
     pdb_files = glob.glob(os.path.join(inference_output_dir, "*.pdb"))
     
@@ -578,51 +753,118 @@ def score_proteina_structures(protein_id: str, reference_cif: str, inference_out
 
 def run_af2rank_analysis(protein_id: str, reference_cif: str, inference_output_dir: str,
                         output_dir: str, chain: str = "A", recycles: int = 3, 
-                        verbose: bool = False) -> str:
+                        verbose: bool = False, regenerate_summary: bool = False) -> str:
     """
     Run complete AF2Rank analysis including scoring and visualization.
+    
+    Args:
+        regenerate_summary: If True, force regenerate summary even if it exists
     
     Returns:
         Path to the generated scores CSV file
     """
-    if not JAX_AVAILABLE:
-        logger.error("JAX/ColabDesign not available. Cannot perform AF2Rank analysis.")
-        return None
-    
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
     
-    # Score structures
-    scores = score_proteina_structures(
-        protein_id=protein_id,
-        reference_cif=reference_cif,
-        inference_output_dir=inference_output_dir,
-        chain=chain,
-        recycles=recycles,
-        verbose=verbose
-    )
+    # Check if summary exists and if we should regenerate
+    summary_path = os.path.join(output_dir, f"af2rank_summary_{protein_id}.json")
+    scores_csv_path = os.path.join(output_dir, f"af2rank_scores_{protein_id}.csv")
     
-    if not scores:
-        logger.warning(f"No scores generated for {protein_id}")
-        return None
+    # Load existing scores if available, otherwise generate new ones
+    if os.path.exists(scores_csv_path) and not regenerate_summary:
+        logger.info(f"Loading existing scores for {protein_id}")
+        scores = load_af2rank_scores_from_csv(scores_csv_path)
+    else:
+        logger.info(f"Generating new scores for {protein_id}")
+        # Score structures
+        scores = score_proteina_structures(
+            protein_id=protein_id,
+            reference_cif=reference_cif,
+            inference_output_dir=inference_output_dir,
+            chain=chain,
+            recycles=recycles,
+            verbose=verbose
+        )
+        
+        if not scores:
+            logger.warning(f"No scores generated for {protein_id}")
+            return None
+        
+        # Save scores to CSV
+        scores_csv_path = save_af2rank_scores(scores, output_dir, protein_id)
     
-    # Save scores to CSV
-    scores_csv_path = save_af2rank_scores(scores, output_dir, protein_id)
+    # Generate plots (if regenerate_summary is True, this will regenerate plots)
+    if regenerate_summary or not os.path.exists(os.path.join(output_dir, f"af2rank_template_quality_vs_composite_{protein_id}.png")):
+        plot_af2rank_results(scores, output_dir, protein_id)
     
-    # Generate plots
-    plot_af2rank_results(scores, output_dir, protein_id)
+    # Calculate additional metrics for successful scores
+    successful_scores = [s for s in scores if "error" not in s]
+    
+    # Initialize additional metrics
+    spearman_rho_composite = None
+    spearman_rho_ptm = None  # NEW: pTM vs tm_ref_pred correlation
+    max_tm_ref_template = None
+    tm_ref_template_at_max_composite = None
+    tm_ref_pred_at_max_composite = None
+    tm_ref_pred_at_max_ptm = None  # NEW: Prediction quality at highest pTM
+    
+    if len(successful_scores) > 1:
+        # Extract metrics
+        tm_ref_template_scores = []
+        tm_ref_pred_scores = []
+        composite_scores = []
+        ptm_scores = []
+        
+        for score in successful_scores:
+            if ('tm_ref_template' in score and 'composite' in score and 
+                'tm_ref_pred' in score and 'ptm' in score):
+                tm_ref_template_scores.append(score['tm_ref_template'])
+                tm_ref_pred_scores.append(score['tm_ref_pred'])
+                composite_scores.append(score['composite'])
+                ptm_scores.append(score['ptm'])
+        
+        if len(tm_ref_template_scores) > 1:
+            from scipy.stats import spearmanr
+            
+            # Correlation 1: composite vs tm_ref_template (template quality)
+            correlation_result = spearmanr(tm_ref_template_scores, composite_scores)
+            spearman_rho_composite = correlation_result.correlation
+            
+            # Correlation 2: pTM vs tm_ref_pred (prediction quality)
+            correlation_result_ptm = spearmanr(tm_ref_pred_scores, ptm_scores)
+            spearman_rho_ptm = correlation_result_ptm.correlation
+            
+            # Find maximum tm_ref_template score
+            max_tm_ref_template = max(tm_ref_template_scores)
+            
+            # Find scores for sample with highest composite score
+            max_composite_idx = composite_scores.index(max(composite_scores))
+            tm_ref_template_at_max_composite = tm_ref_template_scores[max_composite_idx]
+            tm_ref_pred_at_max_composite = tm_ref_pred_scores[max_composite_idx]
+            
+            # Find scores for sample with highest pTM
+            max_ptm_idx = ptm_scores.index(max(ptm_scores))
+            tm_ref_pred_at_max_ptm = tm_ref_pred_scores[max_ptm_idx]
     
     # Save summary
     summary = {
         "protein_id": protein_id,
         "total_structures": len(scores),
-        "successful_scores": len([s for s in scores if "error" not in s]),
+        "successful_scores": len(successful_scores),
         "failed_scores": len([s for s in scores if "error" in s]),
         "reference_structure": reference_cif,
         "inference_directory": inference_output_dir,
         "output_directory": output_dir,
+        "af2rank_directory": output_dir,
         "chain": chain,
-        "recycles": recycles
+        "recycles": recycles,
+        "spearman_correlation_rho_composite": spearman_rho_composite,  # composite vs tm_ref_template
+        "spearman_correlation_rho_ptm": spearman_rho_ptm,  # NEW: pTM vs tm_ref_pred
+        "max_tm_ref_template": max_tm_ref_template,
+        "tm_ref_template_at_max_composite": tm_ref_template_at_max_composite,
+        "tm_ref_pred_at_max_composite": tm_ref_pred_at_max_composite,
+        "tm_ref_pred_at_max_ptm": tm_ref_pred_at_max_ptm,  # NEW: prediction quality at best pTM
+        "scores_csv": scores_csv_path
     }
     
     summary_path = os.path.join(output_dir, f"af2rank_summary_{protein_id}.json")
@@ -796,12 +1038,123 @@ def save_af2rank_scores(scores: List[Dict], output_dir: str, protein_id: str) ->
     return csv_path
 
 
-if __name__ == "__main__":
-    # Test functionality
-    if not JAX_AVAILABLE:
-        print("JAX/ColabDesign not available. Cannot run AF2Rank scorer.")
-        sys.exit(1)
+def load_af2rank_scores_from_csv(csv_path: str) -> List[Dict]:
+    """Load AF2Rank scores from CSV file."""
+    df = pd.read_csv(csv_path)
+    scores = df.to_dict('records')
+    logger.info(f"Loaded {len(scores)} scores from: {csv_path}")
+    return scores
+
+
+def run_af2rank_plot_only(protein_id: str, reference_cif: str, inference_output_dir: str,
+                          output_dir: str, chain: str = "A", recycles: int = 3, 
+                          regenerate_summary: bool = True) -> str:
+    """
+    Generate only AF2Rank plots (no scoring) from existing CSV data.
+    Also regenerates summary with updated metrics if regenerate_summary=True.
     
+    Returns:
+        Path to the scores CSV file
+    """
+    scores_csv_path = os.path.join(output_dir, f"af2rank_scores_{protein_id}.csv")
+    
+    if not os.path.exists(scores_csv_path):
+        logger.error(f"No existing scores found for {protein_id} at {scores_csv_path}")
+        return None
+    
+    # Load scores from CSV
+    scores = load_af2rank_scores_from_csv(scores_csv_path)
+    
+    logger.info(f"Loaded {len(scores)} scores for {protein_id}")
+    
+    # Generate plots
+    plot_af2rank_results(scores, output_dir, protein_id)
+    
+    # Regenerate summary with updated metrics if requested
+    if regenerate_summary:
+        logger.info(f"Regenerating summary for {protein_id}")
+        
+        # Calculate additional metrics for successful scores
+        successful_scores = [s for s in scores if "error" not in s]
+        
+        # Initialize additional metrics
+        spearman_rho_composite = None
+        spearman_rho_ptm = None
+        max_tm_ref_template = None
+        tm_ref_template_at_max_composite = None
+        tm_ref_pred_at_max_composite = None
+        tm_ref_pred_at_max_ptm = None
+        
+        if len(successful_scores) > 1:
+            # Extract metrics
+            tm_ref_template_scores = []
+            tm_ref_pred_scores = []
+            composite_scores = []
+            ptm_scores = []
+            
+            for score in successful_scores:
+                if ('tm_ref_template' in score and 'composite' in score and 
+                    'tm_ref_pred' in score and 'ptm' in score):
+                    tm_ref_template_scores.append(score['tm_ref_template'])
+                    tm_ref_pred_scores.append(score['tm_ref_pred'])
+                    composite_scores.append(score['composite'])
+                    ptm_scores.append(score['ptm'])
+            
+            if len(tm_ref_template_scores) > 1:
+                from scipy.stats import spearmanr
+                
+                # Correlation 1: composite vs tm_ref_template
+                correlation_result = spearmanr(tm_ref_template_scores, composite_scores)
+                spearman_rho_composite = correlation_result.correlation
+                
+                # Correlation 2: pTM vs tm_ref_pred
+                correlation_result_ptm = spearmanr(tm_ref_pred_scores, ptm_scores)
+                spearman_rho_ptm = correlation_result_ptm.correlation
+                
+                # Find maximum tm_ref_template score
+                max_tm_ref_template = max(tm_ref_template_scores)
+                
+                # Find scores for sample with highest composite score
+                max_composite_idx = composite_scores.index(max(composite_scores))
+                tm_ref_template_at_max_composite = tm_ref_template_scores[max_composite_idx]
+                tm_ref_pred_at_max_composite = tm_ref_pred_scores[max_composite_idx]
+                
+                # Find scores for sample with highest pTM
+                max_ptm_idx = ptm_scores.index(max(ptm_scores))
+                tm_ref_pred_at_max_ptm = tm_ref_pred_scores[max_ptm_idx]
+        
+        # Save updated summary
+        summary = {
+            "protein_id": protein_id,
+            "total_structures": len(scores),
+            "successful_scores": len(successful_scores),
+            "failed_scores": len([s for s in scores if "error" in s]),
+            "reference_structure": reference_cif,
+            "inference_directory": inference_output_dir,
+            "output_directory": output_dir,
+            "af2rank_directory": output_dir,
+            "chain": chain,
+            "recycles": recycles,
+            "spearman_correlation_rho_composite": spearman_rho_composite,
+            "spearman_correlation_rho_ptm": spearman_rho_ptm,
+            "max_tm_ref_template": max_tm_ref_template,
+            "tm_ref_template_at_max_composite": tm_ref_template_at_max_composite,
+            "tm_ref_pred_at_max_composite": tm_ref_pred_at_max_composite,
+            "tm_ref_pred_at_max_ptm": tm_ref_pred_at_max_ptm,
+            "scores_csv": scores_csv_path
+        }
+        
+        summary_path = os.path.join(output_dir, f"af2rank_summary_{protein_id}.json")
+        with open(summary_path, 'w') as f:
+            json.dump(summary, f, indent=2)
+        
+        logger.info(f"Updated summary saved to: {summary_path}")
+    
+    logger.info(f"Completed plot generation for {protein_id}")
+    return scores_csv_path
+
+
+if __name__ == "__main__":    
     print("AF2Rank scorer module loaded successfully!")
     print(f"JAX version: {jax.__version__}")
     print(f"JAX devices: {jax.devices()}")

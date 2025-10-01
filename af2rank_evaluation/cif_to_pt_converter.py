@@ -77,9 +77,9 @@ def extract_sequence_from_cif(cif_file: str, chain_id: str) -> Optional[List[str
         # If exact chain not found, try common mappings
         # Many CIF files use different chain naming conventions
         chain_mappings = {
-            'A': ['X', '1', 'a'],  # Common mappings for chain A
-            'B': ['Y', '2', 'b'],  # Common mappings for chain B  
-            'C': ['Z', '3', 'c'],  # Common mappings for chain C
+            'A': ['X', '1', 'a', 'E', 'N'],  # Common mappings for chain A (expanded for 1ugh, 2i24)
+            'B': ['Y', '2', 'b', 'F', 'O'],  # Common mappings for chain B  
+            'C': ['Z', '3', 'c', 'G', 'P'],  # Common mappings for chain C
         }
         
         if chain_id in chain_mappings:
