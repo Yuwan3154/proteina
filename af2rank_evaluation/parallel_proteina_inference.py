@@ -15,9 +15,29 @@ import multiprocessing as mp
 from pathlib import Path
 import time
 import logging
+import signal
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import tempfile
 import shutil
+
+# Global flag for graceful shutdown
+shutdown_requested = False
+
+def signal_handler(signum, frame):
+    """Handle interrupt signals for graceful shutdown."""
+    global shutdown_requested
+    if not shutdown_requested:
+        shutdown_requested = True
+        logger.warning("\n⚠️  Interrupt received! Gracefully shutting down...")
+        logger.warning("⚠️  Waiting for current tasks to complete...")
+        logger.warning("⚠️  Press Ctrl+C again to force quit (not recommended)")
+    else:
+        logger.error("\n❌ Force quit requested. Terminating immediately...")
+        sys.exit(1)
+
+# Register signal handlers
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 # Try to import dotenv, but don't fail if it's not available
 try:
@@ -273,12 +293,20 @@ def main():
     start_time = time.time()
     results = []
     
-    with ProcessPoolExecutor(max_workers=args.num_gpus) as executor:
+    executor = ProcessPoolExecutor(max_workers=args.num_gpus)
+    try:
         # Submit all jobs
         future_to_protein = {executor.submit(process_single_protein, item): item[0] for item in work_items}
         
         # Collect results as they complete
         for future in as_completed(future_to_protein):
+            # Check for shutdown request
+            if shutdown_requested:
+                logger.warning("⚠️  Shutdown requested, cancelling remaining tasks...")
+                for f in future_to_protein:
+                    f.cancel()
+                break
+            
             protein_name = future_to_protein[future]
             try:
                 result = future.result()
@@ -296,6 +324,9 @@ def main():
             except Exception as e:
                 logger.error(f"❌ {protein_name} failed with exception: {e}")
                 results.append({'protein': protein_name, 'status': 'failed', 'error': str(e)})
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+        logger.info("✓ Executor shut down cleanly")
     
     # Summary
     total_time = time.time() - start_time
@@ -311,6 +342,12 @@ def main():
         for result in results:
             if result['status'] == 'failed':
                 logger.info(f"  - {result['protein']}: {result.get('error', 'Unknown error')}")
+    
+    # Check if shutdown was requested
+    if shutdown_requested:
+        logger.warning("\n⚠️  Pipeline interrupted by user")
+        logger.info(f"Processed {successful} proteins before interruption")
+        sys.exit(130)  # Standard exit code for Ctrl+C
     
     # Return appropriate exit code
     sys.exit(0 if failed == 0 else 1)

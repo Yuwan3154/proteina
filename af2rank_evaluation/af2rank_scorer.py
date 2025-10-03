@@ -15,6 +15,12 @@ Key Features:
 """
 
 import os
+# CRITICAL: Set JAX memory fraction BEFORE any JAX/TF imports
+# Without this, JAX grabs ALL available GPU memory by default!
+# For parallel processing on 4 GPUs with 49GB each, allocate conservatively
+# to allow multiple processes per GPU if needed
+os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.9'
+
 import sys
 import glob
 import json
@@ -398,16 +404,13 @@ class ModernAF2Rank:
         model_opts = self.model_opts.copy()
         model_opts['data_dir'] = params_path
         
-        # Initialize fresh model
-        self.af = mk_af_model(use_mlm=False, **model_opts)
+        self.af = mk_af_model(use_mlm=False, model_names=['model_1_ptm'], **model_opts)
         
         # Prepare inputs exactly like predict.ipynb
         self.af.prep_inputs(self.reference_lengths, copies=1, seed=0)
         
         # Set single sequence MSA (AF2Rank protocol)
         self._setup_single_sequence_msa()
-        
-        logger.info("✓ AF2Rank model initialized")
         
     def _setup_single_sequence_msa(self):
         """Setup single sequence MSA following predict.ipynb approach."""
