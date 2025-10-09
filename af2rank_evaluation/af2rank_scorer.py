@@ -807,6 +807,7 @@ def run_af2rank_analysis(protein_id: str, reference_cif: str, inference_output_d
     spearman_rho_composite = None
     spearman_rho_ptm = None  # NEW: pTM vs tm_ref_pred correlation
     max_tm_ref_template = None
+    max_tm_ref_pred = None
     tm_ref_template_at_max_composite = None
     tm_ref_pred_at_max_composite = None
     tm_ref_pred_at_max_ptm = None  # NEW: Prediction quality at highest pTM
@@ -842,12 +843,21 @@ def run_af2rank_analysis(protein_id: str, reference_cif: str, inference_output_d
             
             # Find scores for sample with highest composite score
             max_composite_idx = composite_scores.index(max(composite_scores))
+            max_tm_ref_pred = max(tm_ref_pred_scores)
             tm_ref_template_at_max_composite = tm_ref_template_scores[max_composite_idx]
             tm_ref_pred_at_max_composite = tm_ref_pred_scores[max_composite_idx]
             
             # Find scores for sample with highest pTM
             max_ptm_idx = ptm_scores.index(max(ptm_scores))
             tm_ref_pred_at_max_ptm = tm_ref_pred_scores[max_ptm_idx]
+    
+            # Find scores for top 1 and top 5 tm_ref_template
+            top_1_tm_ref_template = tm_ref_template_scores[np.argmax(composite_scores)]
+            top_5_tm_ref_template = max([tm_ref_template_scores[index] for index in np.argsort(-np.array(composite_scores))[:5]])
+            
+            # Find scores for top 1 and top 5 tm_ref_pred
+            top_1_tm_ref_pred = tm_ref_pred_scores[np.argmax(ptm_scores)]
+            top_5_tm_ref_pred = max([tm_ref_pred_scores[index] for index in np.argsort(-np.array(ptm_scores))[:5]])
     
     # Save summary
     summary = {
@@ -864,10 +874,15 @@ def run_af2rank_analysis(protein_id: str, reference_cif: str, inference_output_d
         "spearman_correlation_rho_composite": spearman_rho_composite,  # composite vs tm_ref_template
         "spearman_correlation_rho_ptm": spearman_rho_ptm,  # NEW: pTM vs tm_ref_pred
         "max_tm_ref_template": max_tm_ref_template,
+        "max_tm_ref_pred": max_tm_ref_pred,
         "tm_ref_template_at_max_composite": tm_ref_template_at_max_composite,
         "tm_ref_pred_at_max_composite": tm_ref_pred_at_max_composite,
         "tm_ref_pred_at_max_ptm": tm_ref_pred_at_max_ptm,  # NEW: prediction quality at best pTM
-        "scores_csv": scores_csv_path
+        "scores_csv": scores_csv_path,
+        "top_1_tm_ref_template": top_1_tm_ref_template,
+        "top_5_tm_ref_template": top_5_tm_ref_template,
+        "top_1_tm_ref_pred": top_1_tm_ref_pred,
+        "top_5_tm_ref_pred": top_5_tm_ref_pred,
     }
     
     summary_path = os.path.join(output_dir, f"af2rank_summary_{protein_id}.json")
@@ -1084,9 +1099,14 @@ def run_af2rank_plot_only(protein_id: str, reference_cif: str, inference_output_
         spearman_rho_composite = None
         spearman_rho_ptm = None
         max_tm_ref_template = None
+        max_tm_ref_pred = None
         tm_ref_template_at_max_composite = None
         tm_ref_pred_at_max_composite = None
         tm_ref_pred_at_max_ptm = None
+        top_1_tm_ref_template = None
+        top_5_tm_ref_template = None
+        top_1_tm_ref_pred = None
+        top_5_tm_ref_pred = None
         
         if len(successful_scores) > 1:
             # Extract metrics
@@ -1116,7 +1136,8 @@ def run_af2rank_plot_only(protein_id: str, reference_cif: str, inference_output_
                 
                 # Find maximum tm_ref_template score
                 max_tm_ref_template = max(tm_ref_template_scores)
-                
+                max_tm_ref_pred = max(tm_ref_pred_scores)
+
                 # Find scores for sample with highest composite score
                 max_composite_idx = composite_scores.index(max(composite_scores))
                 tm_ref_template_at_max_composite = tm_ref_template_scores[max_composite_idx]
@@ -1125,6 +1146,14 @@ def run_af2rank_plot_only(protein_id: str, reference_cif: str, inference_output_
                 # Find scores for sample with highest pTM
                 max_ptm_idx = ptm_scores.index(max(ptm_scores))
                 tm_ref_pred_at_max_ptm = tm_ref_pred_scores[max_ptm_idx]
+
+                # Find scores for top 1 and top 5 tm_ref_template
+                top_1_tm_ref_template = tm_ref_template_scores[np.argmax(composite_scores)]
+                top_5_tm_ref_template = max([tm_ref_template_scores[index] for index in np.argsort(-np.array(composite_scores))[:5]])
+                
+                # Find scores for top 1 and top 5 tm_ref_pred
+                top_1_tm_ref_pred = tm_ref_pred_scores[np.argmax(ptm_scores)]
+                top_5_tm_ref_pred = max([tm_ref_pred_scores[index] for index in np.argsort(-np.array(ptm_scores))[:5]])
         
         # Save updated summary
         summary = {
@@ -1141,10 +1170,15 @@ def run_af2rank_plot_only(protein_id: str, reference_cif: str, inference_output_
             "spearman_correlation_rho_composite": spearman_rho_composite,
             "spearman_correlation_rho_ptm": spearman_rho_ptm,
             "max_tm_ref_template": max_tm_ref_template,
+            "max_tm_ref_pred": max_tm_ref_pred,
             "tm_ref_template_at_max_composite": tm_ref_template_at_max_composite,
             "tm_ref_pred_at_max_composite": tm_ref_pred_at_max_composite,
             "tm_ref_pred_at_max_ptm": tm_ref_pred_at_max_ptm,
-            "scores_csv": scores_csv_path
+            "scores_csv": scores_csv_path,
+            "top_1_tm_ref_template": top_1_tm_ref_template,
+            "top_5_tm_ref_template": top_5_tm_ref_template,
+            "top_1_tm_ref_pred": top_1_tm_ref_pred,
+            "top_5_tm_ref_pred": top_5_tm_ref_pred
         }
         
         summary_path = os.path.join(output_dir, f"af2rank_summary_{protein_id}.json")

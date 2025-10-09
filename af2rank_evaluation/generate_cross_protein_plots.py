@@ -62,9 +62,14 @@ def load_summary_data(summary_files: List[str]) -> pd.DataFrame:
             spearman_rho_composite = summary.get('spearman_correlation_rho_composite') or summary.get('spearman_correlation_rho')  # Backward compat
             spearman_rho_ptm = summary.get('spearman_correlation_rho_ptm')
             max_tm_ref_template = summary.get('max_tm_ref_template')
+            max_tm_ref_pred = summary.get('max_tm_ref_pred')
             tm_ref_template_at_max_composite = summary.get('tm_ref_template_at_max_composite')
             tm_ref_pred_at_max_composite = summary.get('tm_ref_pred_at_max_composite')
             tm_ref_pred_at_max_ptm = summary.get('tm_ref_pred_at_max_ptm')
+            top_1_tm_ref_template = summary.get('top_1_tm_ref_template')
+            top_5_tm_ref_template = summary.get('top_5_tm_ref_template')
+            top_1_tm_ref_pred = summary.get('top_1_tm_ref_pred')
+            top_5_tm_ref_pred = summary.get('top_5_tm_ref_pred')
             successful_scores = summary.get('successful_scores', 0)
             total_structures = summary.get('total_structures', 0)
             
@@ -78,9 +83,14 @@ def load_summary_data(summary_files: List[str]) -> pd.DataFrame:
                     'spearman_rho_composite': spearman_rho_composite,
                     'spearman_rho_ptm': spearman_rho_ptm,
                     'max_tm_ref_template': max_tm_ref_template,
+                    'max_tm_ref_pred': max_tm_ref_pred,
                     'tm_ref_template_at_max_composite': tm_ref_template_at_max_composite,
                     'tm_ref_pred_at_max_composite': tm_ref_pred_at_max_composite,
                     'tm_ref_pred_at_max_ptm': tm_ref_pred_at_max_ptm,
+                    'top_1_tm_ref_template': top_1_tm_ref_template,
+                    'top_5_tm_ref_template': top_5_tm_ref_template,
+                    'top_1_tm_ref_pred': top_1_tm_ref_pred,
+                    'top_5_tm_ref_pred': top_5_tm_ref_pred,
                     'successful_scores': successful_scores,
                     'total_structures': total_structures,
                     'success_rate': successful_scores / total_structures if total_structures > 0 else 0
@@ -108,8 +118,8 @@ def create_summary_plots(df: pd.DataFrame, output_dir: str) -> None:
     # Set up the plotting style
     plt.style.use('default')
     
-    # Create figure with four subplots (2x2 grid)
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(18, 14))
+    # Create first figure with four subplots (2x2 grid) for correlation analysis
+    fig1, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(18, 18))
     
     # Plot 1: Max TM-score vs Spearman correlation (composite vs template quality)
     valid_data_1 = df.dropna(subset=['max_tm_ref_template', 'spearman_rho_composite'])
@@ -118,8 +128,6 @@ def create_summary_plots(df: pd.DataFrame, output_dir: str) -> None:
         scatter1 = ax1.scatter(
             valid_data_1['max_tm_ref_template'], 
             valid_data_1['spearman_rho_composite'],
-            c=valid_data_1['successful_scores'], 
-            cmap='viridis', 
             alpha=0.7, 
             s=60
         )
@@ -128,10 +136,6 @@ def create_summary_plots(df: pd.DataFrame, output_dir: str) -> None:
         ax1.set_ylabel('Spearman ρ (Composite vs Template Quality)', fontsize=12)
         ax1.set_title('Max TM Score vs. Template-Composite Correlation\n(How well does AF2 rank template quality?)', fontsize=13)
         ax1.grid(True, alpha=0.3)
-        
-        # Add colorbar for successful scores
-        cbar1 = plt.colorbar(scatter1, ax=ax1)
-        cbar1.set_label('Successful Scores', fontsize=10)
         
         # Add correlation line if there's enough data
         if len(valid_data_1) > 2:
@@ -152,8 +156,6 @@ def create_summary_plots(df: pd.DataFrame, output_dir: str) -> None:
         scatter2 = ax2.scatter(
             valid_data_2['tm_ref_template_at_max_composite'], 
             valid_data_2['spearman_rho_composite'],
-            c=valid_data_2['successful_scores'], 
-            cmap='viridis', 
             alpha=0.7, 
             s=60
         )
@@ -162,10 +164,6 @@ def create_summary_plots(df: pd.DataFrame, output_dir: str) -> None:
         ax2.set_ylabel('Spearman ρ (Composite vs Template Quality)', fontsize=12)
         ax2.set_title('Template Quality of Best AF2 Score vs. Correlation\n(Does AF2\'s best match real best?)', fontsize=13)
         ax2.grid(True, alpha=0.3)
-        
-        # Add colorbar for successful scores
-        cbar2 = plt.colorbar(scatter2, ax=ax2)
-        cbar2.set_label('Successful Scores', fontsize=10)
         
         # Add correlation line if there's enough data
         if len(valid_data_2) > 2:
@@ -186,8 +184,6 @@ def create_summary_plots(df: pd.DataFrame, output_dir: str) -> None:
         scatter3 = ax3.scatter(
             valid_data_3['tm_ref_pred_at_max_ptm'], 
             valid_data_3['spearman_rho_ptm'],
-            c=valid_data_3['successful_scores'], 
-            cmap='plasma', 
             alpha=0.7, 
             s=60
         )
@@ -196,10 +192,6 @@ def create_summary_plots(df: pd.DataFrame, output_dir: str) -> None:
         ax3.set_ylabel('Spearman ρ (pTM vs Prediction Quality)', fontsize=12)
         ax3.set_title('Prediction Quality of Best pTM vs. Correlation\n(Does pTM correlate with prediction quality?)', fontsize=13)
         ax3.grid(True, alpha=0.3)
-        
-        # Add colorbar for successful scores
-        cbar3 = plt.colorbar(scatter3, ax=ax3)
-        cbar3.set_label('Successful Scores', fontsize=10)
         
         # Add correlation line if there's enough data
         if len(valid_data_3) > 2:
@@ -220,8 +212,6 @@ def create_summary_plots(df: pd.DataFrame, output_dir: str) -> None:
         scatter4 = ax4.scatter(
             valid_data_4['spearman_rho_composite'], 
             valid_data_4['spearman_rho_ptm'],
-            c=valid_data_4['successful_scores'], 
-            cmap='coolwarm', 
             alpha=0.7, 
             s=60
         )
@@ -234,10 +224,6 @@ def create_summary_plots(df: pd.DataFrame, output_dir: str) -> None:
         # Add diagonal line for reference
         ax4.plot([-1, 1], [-1, 1], 'k--', alpha=0.3, linewidth=1)
         
-        # Add colorbar for successful scores
-        cbar4 = plt.colorbar(scatter4, ax=ax4)
-        cbar4.set_label('Successful Scores', fontsize=10)
-        
         # Add correlation if there's enough data
         if len(valid_data_4) > 2:
             corr = np.corrcoef(valid_data_4['spearman_rho_composite'], valid_data_4['spearman_rho_ptm'])[0,1]
@@ -246,10 +232,86 @@ def create_summary_plots(df: pd.DataFrame, output_dir: str) -> None:
     
     plt.tight_layout()
     
-    # Save the plot
-    plot_path = os.path.join(output_dir, "cross_protein_af2rank_analysis.png")
-    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-    logger.info(f"Saved cross-protein plot: {plot_path}")
+    # Save the first plot
+    plot_path_1 = os.path.join(output_dir, "cross_protein_af2rank_correlation_analysis.png")
+    plt.savefig(plot_path_1, dpi=600, bbox_inches='tight')
+    logger.info(f"Saved cross-protein correlation plot: {plot_path_1}")
+    
+    plt.close()
+    
+    # Create second figure with four subplots (2x2 grid) for top analysis
+    fig2, ((ax5, ax6), (ax7, ax8)) = plt.subplots(2, 2, figsize=(18, 18))
+
+    # Plot 5: Max TM-score vs Top 1 Template TM-score By Composite
+    valid_data_5 = df.dropna(subset=['max_tm_ref_template','top_1_tm_ref_template'])
+    
+    if len(valid_data_5) > 0:
+        scatter5 = ax5.scatter(
+            valid_data_5['max_tm_ref_template'], 
+            valid_data_5['top_1_tm_ref_template'],
+            alpha=0.7, 
+            s=60
+        )
+        line5 = ax5.plot([0, 1], [0, 1], 'r--', alpha=0.75, linewidth=3)
+        ax5.set_xlabel('Max Template TM Score', fontsize=12)
+        ax5.set_ylabel('Top 1 Template TM Score By Composite', fontsize=12)
+        ax5.set_title('Max Template TM Score vs. Top 1 Template TM Score By Composite', fontsize=13)
+        ax5.grid(True, alpha=0.3)
+
+    # Plot 6: Max TM-score vs Top 5 Template TM-score By Composite
+    valid_data_6 = df.dropna(subset=['max_tm_ref_template','top_5_tm_ref_template'])
+    
+    if len(valid_data_6) > 0:
+        scatter6 = ax6.scatter(
+            valid_data_6['max_tm_ref_template'], 
+            valid_data_6['top_5_tm_ref_template'],
+            alpha=0.7, 
+            s=60
+        )
+        line6 = ax6.plot([0, 1], [0, 1], 'r--', alpha=0.75, linewidth=3)
+        ax6.set_xlabel('Max Template TM Score', fontsize=12)
+        ax6.set_ylabel('Top 5 Template TM Score By Composite', fontsize=12)
+        ax6.set_title('Max Template TM Score vs. Top 5 Template TM Score By Composite', fontsize=13)
+        ax6.grid(True, alpha=0.3)
+        
+    # Plot 7: Max TM-score vs Top 1 Template TM-score By pTM
+    valid_data_7 = df.dropna(subset=['max_tm_ref_pred','top_1_tm_ref_pred'])
+    
+    if len(valid_data_7) > 0:
+        scatter7 = ax7.scatter(
+            valid_data_7['max_tm_ref_pred'], 
+            valid_data_7['top_1_tm_ref_pred'],
+            alpha=0.7, 
+            s=60
+        )
+        line7 = ax7.plot([0, 1], [0, 1], 'r--', alpha=0.75, linewidth=3)
+        ax7.set_xlabel('Max Prediction TM Score', fontsize=12)
+        ax7.set_ylabel('Top 1 Prediction TM Score By pTM', fontsize=12)
+        ax7.set_title('Max Prediction TM Score vs. Top 1 Prediction TM Score By pTM', fontsize=13)
+        ax7.grid(True, alpha=0.3)
+        
+    # Plot 8: Max TM-score vs Top 5 Template TM-score By pTM
+    valid_data_8 = df.dropna(subset=['max_tm_ref_pred','top_5_tm_ref_pred'])
+    
+    if len(valid_data_8) > 0:
+        scatter8 = ax8.scatter(
+            valid_data_8['max_tm_ref_pred'], 
+            valid_data_8['top_5_tm_ref_pred'],
+            alpha=0.7, 
+            s=60
+        )
+        line8 = ax8.plot([0, 1], [0, 1], 'r--', alpha=0.75, linewidth=3)
+        ax8.set_xlabel('Max Prediction TM Score', fontsize=12)
+        ax8.set_ylabel('Top 5 Prediction TM Score By pTM', fontsize=12)
+        ax8.set_title('Max Prediction TM Score vs. Top 5 Prediction TM Score By pTM', fontsize=13)
+        ax8.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    
+    # Save the second plot
+    plot_path_2 = os.path.join(output_dir, "cross_protein_af2rank_top_analysis.png")
+    plt.savefig(plot_path_2, dpi=600, bbox_inches='tight')
+    logger.info(f"Saved cross-protein top analysis plot: {plot_path_2}")
     
     plt.close()
     

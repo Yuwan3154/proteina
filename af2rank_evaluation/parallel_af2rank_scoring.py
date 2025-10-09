@@ -146,7 +146,7 @@ def run_af2rank_plot_only(protein_name, reference_cif, inference_output_dir, rec
     conda_cmd = setup_conda_environment()
     
     python_cmd = f"""
-{conda_cmd} && cd /home/jupyter-chenxi/proteina/af2rank_evaluation && python -c "
+{conda_cmd} && cd /home/jupyter-chenxi/proteina/af2rank_evaluation && python -u -c "
 import sys
 import os
 sys.path.append('/home/jupyter-chenxi/proteina/af2rank_evaluation')
@@ -154,7 +154,7 @@ sys.path.append('/home/jupyter-chenxi/proteina/af2rank_evaluation')
 # Import AF2Rank components
 from af2rank_scorer import run_af2rank_plot_only
 
-print('Regenerating plots and summary for {protein_name}')
+print('Regenerating plots and summary for {protein_name}', flush=True)
 
 protein_id = '{protein_name}'
 pdb_id, chain_id = protein_id.split('_')
@@ -172,15 +172,15 @@ result = run_af2rank_plot_only(
 )
 
 if result:
-    print(f'Successfully regenerated plots and summary for {{protein_id}}')
-    print(f'Results saved to: {{af2rank_dir}}')
+    print(f'Successfully regenerated plots and summary for {{protein_id}}', flush=True)
+    print(f'Results saved to: {{af2rank_dir}}', flush=True)
 else:
-    print(f'ERROR: Failed to regenerate plots for {{protein_id}}')
+    print(f'ERROR: Failed to regenerate plots for {{protein_id}}', flush=True)
     sys.exit(1)
 "
 """
     
-    result = subprocess.run(python_cmd, shell=True, capture_output=True, text=True, executable='/bin/bash')
+    result = subprocess.run(python_cmd, shell=True, capture_output=False, text=True, executable='/bin/bash')
     return result
 
 def process_single_protein_af2rank(args):
