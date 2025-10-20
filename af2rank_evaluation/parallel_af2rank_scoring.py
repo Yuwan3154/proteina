@@ -12,6 +12,7 @@ import argparse
 import pandas as pd
 import subprocess
 import multiprocessing as mp
+import builtins
 from pathlib import Path
 import time
 import logging
@@ -378,39 +379,73 @@ def main():
         args.num_gpus = gpu_count
     
     logger.info(f"Using {args.num_gpus} GPU(s) for parallel AF2Rank scoring")
-    
+
     # Separate proteins needing scoring vs plot regeneration
     proteins_needing_scoring = []
     proteins_needing_plots = []
-    
+
     for protein_name in protein_names:
         protein_dir = Path(f"/home/jupyter-chenxi/proteina/inference/{args.inference_config}/{protein_name}")
         af2rank_csv = protein_dir / "af2rank_analysis" / f"af2rank_scores_{protein_name}.csv"
-        
+
         if af2rank_csv.exists() and args.regenerate_plots:
             proteins_needing_plots.append(protein_name)
         elif not af2rank_csv.exists():
             proteins_needing_scoring.append(protein_name)
-    
+
     logger.info(f"Proteins needing AF2Rank scoring: {len(proteins_needing_scoring)}")
     logger.info(f"Proteins needing plot regeneration: {len(proteins_needing_plots)}")
-    
-    # Process proteins in parallel
+
+    # Process proteins in parallel with proper GPU assignment
     start_time = time.time()
     all_results = []
-    
-    # GPU workers for AF2Rank scoring
+
+    # GPU workers for AF2Rank scoring (fixed GPU assignment)
     if proteins_needing_scoring:
         logger.info(f"Starting GPU-based AF2Rank scoring with {args.num_gpus} workers")
-        
-        scoring_work_items = []
-        for i, protein_name in enumerate(proteins_needing_scoring):
-            gpu_id = i % args.num_gpus
-            scoring_work_items.append((protein_name, args.cif_dir, args.inference_config, args.recycles, gpu_id, False))
-        
-        executor = ProcessPoolExecutor(max_workers=args.num_gpus)
+
+        # Create shared counter for worker initialization
+        manager = mp.Manager()
+        worker_counter = manager.Value('i', 0)
+        worker_lock = manager.Lock()
+
+        # Use initializer to assign each worker a fixed GPU
+        def worker_init(counter, lock, num_gpus):
+            """Initialize worker with a specific GPU assignment."""
+            with lock:
+                worker_id = counter.value
+                counter.value += 1
+
+            gpu_id = worker_id % num_gpus
+            os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+            # Store GPU ID in a process-local variable
+            builtins._worker_gpu_id = gpu_id
+            logger.info(f"AF2Rank Worker {worker_id} initialized with GPU {gpu_id}")
+
+        executor = ProcessPoolExecutor(
+            max_workers=args.num_gpus,
+            initializer=worker_init,
+            initargs=(worker_counter, worker_lock, args.num_gpus)
+        )
+
+        # Modified process function that gets GPU from worker initialization
+        def process_single_protein_af2rank_wrapper(args_tuple):
+            """Wrapper that uses the GPU assigned during worker init."""
+            protein_name, cif_dir, inference_config, recycles = args_tuple
+
+            # Get GPU ID from process-local variable set by worker_init
+            gpu_id = getattr(builtins, '_worker_gpu_id', 0)
+
+            # Call the actual processing function
+            full_args = (protein_name, cif_dir, inference_config, recycles, gpu_id, False)
+            return process_single_protein_af2rank(full_args)
+
         try:
-            future_to_protein = {executor.submit(process_single_protein_af2rank, item): item[0] for item in scoring_work_items}
+            # Submit all jobs (GPU assignment happens via worker init)
+            scoring_work_items = [(protein_name, args.cif_dir, args.inference_config, args.recycles)
+                                  for protein_name in proteins_needing_scoring]
+            future_to_protein = {executor.submit(process_single_protein_af2rank_wrapper, item): scoring_work_items[i][0]
+                                for i, item in enumerate(scoring_work_items)}
             
             for future in as_completed(future_to_protein):
                 # Check for shutdown request

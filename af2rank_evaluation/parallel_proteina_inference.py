@@ -12,6 +12,7 @@ import argparse
 import pandas as pd
 import subprocess
 import multiprocessing as mp
+import builtins
 from pathlib import Path
 import time
 import logging
@@ -335,8 +336,7 @@ def main():
     results = []
     
     # Create shared counter for worker initialization
-    from multiprocessing import Manager
-    manager = Manager()
+    manager = mp.Manager()
     worker_counter = manager.Value('i', 0)
     worker_lock = manager.Lock()
     
@@ -350,7 +350,6 @@ def main():
         gpu_id = worker_id % num_gpus
         os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
         # Store GPU ID in a process-local variable
-        import builtins
         builtins._worker_gpu_id = gpu_id
         logger.info(f"Worker {worker_id} initialized with GPU {gpu_id}")
     
@@ -366,7 +365,6 @@ def main():
         protein_name, csv_file, csv_column, cif_dir, inference_config, usalign_path = args_tuple
         
         # Get GPU ID from process-local variable set by worker_init
-        import builtins
         gpu_id = getattr(builtins, '_worker_gpu_id', 0)
         
         # Call the actual processing function
