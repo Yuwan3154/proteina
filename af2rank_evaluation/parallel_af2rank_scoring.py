@@ -91,6 +91,69 @@ def find_reference_cif(protein_name, cif_dir):
     
     raise FileNotFoundError(f"CIF file not found for {pdb_id} in {cif_dir}")
 
+def process_single_protein_af2rank(args):
+    """Process AF2Rank scoring for a single protein."""
+    protein_name, cif_dir, inference_config, recycles, gpu_id, regenerate_plots = args
+    
+    # Set GPU for this process
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+    
+    logger.info(f"[GPU {gpu_id}] Starting AF2Rank scoring for {protein_name}")
+    
+    try:
+        # Find reference CIF file
+        reference_cif = find_reference_cif(protein_name, cif_dir)
+        logger.info(f"[GPU {gpu_id}] Found reference CIF: {reference_cif}")
+        
+        # Get inference output directory
+        inference_output_dir = generate_protein_output_dir(inference_config, protein_name)
+        
+        if not os.path.exists(inference_output_dir):
+            raise FileNotFoundError(f"Inference output directory not found: {inference_output_dir}")
+        
+        # Check if PDB files exist
+        pdb_files = list(Path(inference_output_dir).glob(f"{protein_name}_*.pdb"))
+        if not pdb_files:
+            raise FileNotFoundError(f"No PDB files found in {inference_output_dir}")
+        
+        logger.info(f"[GPU {gpu_id}] Found {len(pdb_files)} PDB files to score")
+        
+        # Check if we should do plot-only regeneration
+        af2rank_csv = Path(inference_output_dir) / "af2rank_analysis" / f"af2rank_scores_{protein_name}.csv"
+        if regenerate_plots and af2rank_csv.exists():
+            logger.info(f"[GPU {gpu_id}] Skipping plot regeneration (will be handled by CPU workers)")
+            return {'protein': protein_name, 'gpu': gpu_id, 'status': 'skipped', 'reason': 'plot_regeneration_deferred'}
+        else:
+            # Run full AF2Rank scoring
+            logger.info(f"[GPU {gpu_id}] Running full AF2Rank scoring for {protein_name}")
+            result = run_af2rank_scoring(protein_name, reference_cif, inference_output_dir, recycles)
+        
+        if result.returncode != 0:
+            raise Exception(f"AF2Rank scoring failed: {result.stderr}")
+        
+        logger.info(f"[GPU {gpu_id}] ✅ AF2Rank scoring completed for {protein_name}")
+        
+        # Parse output for summary info
+        af2rank_dir = f"{inference_output_dir}/af2rank_analysis"
+        summary_file = f"{af2rank_dir}/af2rank_summary_{protein_name}.json"
+        
+        summary_info = {}
+        if os.path.exists(summary_file):
+            with open(summary_file, 'r') as f:
+                summary_info = json.load(f)
+        
+        return {
+            'protein': protein_name, 
+            'gpu': gpu_id, 
+            'status': 'success', 
+            'output_dir': af2rank_dir,
+            'summary': summary_info
+        }
+        
+    except Exception as e:
+        logger.error(f"[GPU {gpu_id}] ❌ Failed AF2Rank scoring for {protein_name}: {e}")
+        return {'protein': protein_name, 'gpu': gpu_id, 'status': 'failed', 'error': str(e)}
+
 def run_af2rank_scoring(protein_name, reference_cif, inference_output_dir, recycles=3):
     """Run AF2Rank scoring for a single protein."""
     conda_cmd = setup_conda_environment()
@@ -183,69 +246,6 @@ else:
     result = subprocess.run(python_cmd, shell=True, capture_output=False, text=True, executable='/bin/bash')
     return result
 
-def process_single_protein_af2rank(args):
-    """Process AF2Rank scoring for a single protein."""
-    protein_name, cif_dir, inference_config, recycles, gpu_id, regenerate_plots = args
-    
-    # Set GPU for this process
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
-    
-    logger.info(f"[GPU {gpu_id}] Starting AF2Rank scoring for {protein_name}")
-    
-    try:
-        # Find reference CIF file
-        reference_cif = find_reference_cif(protein_name, cif_dir)
-        logger.info(f"[GPU {gpu_id}] Found reference CIF: {reference_cif}")
-        
-        # Get inference output directory
-        inference_output_dir = generate_protein_output_dir(inference_config, protein_name)
-        
-        if not os.path.exists(inference_output_dir):
-            raise FileNotFoundError(f"Inference output directory not found: {inference_output_dir}")
-        
-        # Check if PDB files exist
-        pdb_files = list(Path(inference_output_dir).glob(f"{protein_name}_*.pdb"))
-        if not pdb_files:
-            raise FileNotFoundError(f"No PDB files found in {inference_output_dir}")
-        
-        logger.info(f"[GPU {gpu_id}] Found {len(pdb_files)} PDB files to score")
-        
-        # Check if we should do plot-only regeneration
-        af2rank_csv = Path(inference_output_dir) / "af2rank_analysis" / f"af2rank_scores_{protein_name}.csv"
-        if regenerate_plots and af2rank_csv.exists():
-            logger.info(f"[GPU {gpu_id}] Skipping plot regeneration (will be handled by CPU workers)")
-            return {'protein': protein_name, 'gpu': gpu_id, 'status': 'skipped', 'reason': 'plot_regeneration_deferred'}
-        else:
-            # Run full AF2Rank scoring
-            logger.info(f"[GPU {gpu_id}] Running full AF2Rank scoring for {protein_name}")
-            result = run_af2rank_scoring(protein_name, reference_cif, inference_output_dir, recycles)
-        
-        if result.returncode != 0:
-            raise Exception(f"AF2Rank scoring failed: {result.stderr}")
-        
-        logger.info(f"[GPU {gpu_id}] ✅ AF2Rank scoring completed for {protein_name}")
-        
-        # Parse output for summary info
-        af2rank_dir = f"{inference_output_dir}/af2rank_analysis"
-        summary_file = f"{af2rank_dir}/af2rank_summary_{protein_name}.json"
-        
-        summary_info = {}
-        if os.path.exists(summary_file):
-            with open(summary_file, 'r') as f:
-                summary_info = json.load(f)
-        
-        return {
-            'protein': protein_name, 
-            'gpu': gpu_id, 
-            'status': 'success', 
-            'output_dir': af2rank_dir,
-            'summary': summary_info
-        }
-        
-    except Exception as e:
-        logger.error(f"[GPU {gpu_id}] ❌ Failed AF2Rank scoring for {protein_name}: {e}")
-        return {'protein': protein_name, 'gpu': gpu_id, 'status': 'failed', 'error': str(e)}
-
 
 def process_single_protein_plot_regeneration(args):
     """Process plot regeneration for a single protein (CPU-only, no GPU needed)."""
@@ -282,18 +282,18 @@ def process_single_protein_plot_regeneration(args):
         return {'protein': protein_name, 'status': 'failed', 'error': str(e)}
 
 
-def get_protein_names(csv_file):
+def get_protein_names(csv_file, csv_column):
     """Extract protein names from CSV file."""
     df = pd.read_csv(csv_file)
     # Strip whitespace from column names
     df.columns = df.columns.str.strip()
-    proteins = df['natives_rcsb'].dropna().unique().tolist()
+    proteins = df[csv_column].dropna().unique().tolist()
     return [p.strip() for p in proteins if p and p.strip()]
 
-def find_proteins_needing_af2rank(csv_file, inference_config, regenerate_plots=False):
+def find_proteins_needing_af2rank(csv_file, csv_column, inference_config, regenerate_plots=False):
     """Find proteins from CSV that need AF2Rank scoring or plot regeneration."""
     # Get proteins from CSV file
-    csv_proteins = get_protein_names(csv_file)
+    csv_proteins = get_protein_names(csv_file, csv_column)
     
     inference_base_dir = f"/home/jupyter-chenxi/proteina/inference/{inference_config}"
     
@@ -329,6 +329,7 @@ def find_proteins_needing_af2rank(csv_file, inference_config, regenerate_plots=F
 def main():
     parser = argparse.ArgumentParser(description='Parallel AF2Rank Scoring Pipeline')
     parser.add_argument('--csv_file', required=True, help='Path to CSV file with protein data')
+    parser.add_argument('--csv_column', required=True, help='Column name in CSV file to use for protein selection')
     parser.add_argument('--cif_dir', required=True, help='Directory containing reference CIF files')
     parser.add_argument('--inference_config', required=True, help='Inference configuration name')
     parser.add_argument('--num_gpus', type=int, default=1, help='Number of GPUs to use')
@@ -351,13 +352,13 @@ def main():
     
     # Get protein names
     if args.filter_existing:
-        protein_names = find_proteins_needing_af2rank(args.csv_file, args.inference_config, args.regenerate_plots)
+        protein_names = find_proteins_needing_af2rank(args.csv_file, args.csv_column, args.inference_config, args.regenerate_plots)
         if args.regenerate_plots:
             logger.info(f"Found {len(protein_names)} proteins needing AF2Rank scoring or plot regeneration (from CSV file)")
         else:
             logger.info(f"Found {len(protein_names)} proteins needing AF2Rank scoring (from CSV file)")
     else:
-        protein_names = get_protein_names(args.csv_file)
+        protein_names = get_protein_names(args.csv_file, args.csv_column)
         logger.info(f"Found {len(protein_names)} proteins in CSV file")
     
     if not protein_names:

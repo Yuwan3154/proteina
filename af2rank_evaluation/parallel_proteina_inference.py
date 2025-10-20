@@ -73,12 +73,12 @@ def generate_protein_output_dir(inference_config, protein_name):
     """Generate consistent output directory path for a protein."""
     return f"/home/jupyter-chenxi/proteina/inference/{inference_config}/{protein_name}"
 
-def create_single_protein_csv(csv_file, protein_name, output_dir):
+def create_single_protein_csv(csv_file, csv_column, protein_name, output_dir):
     """Create a single-protein CSV file for individual processing."""
     df = pd.read_csv(csv_file)
     
     # Filter for this specific protein
-    protein_df = df[df['natives_rcsb'] == protein_name]
+    protein_df = df[df[csv_column] == protein_name]
     
     if protein_df.empty:
         raise ValueError(f"Protein {protein_name} not found in CSV file")
@@ -92,132 +92,178 @@ def create_single_protein_csv(csv_file, protein_name, output_dir):
     
     return single_csv_path
 
-def run_cif_to_pt_conversion(csv_file, cif_dir, output_dir):
-    """Run CIF to PT conversion step."""
-    conda_cmd = setup_conda_environment()
-    
-    python_cmd = f"""
-{conda_cmd} && cd /home/jupyter-chenxi/proteina/af2rank_evaluation && python -c "
-import sys
-sys.path.append('/home/jupyter-chenxi/proteina')
-from cif_to_pt_converter import convert_from_csv
+def run_cif_to_pt_conversion(csv_file, csv_column, cif_dir):
+    """
+    Run CIF to PT conversion step.
+    Directly imports and calls the converter to avoid subprocess overhead.
+    """
+    try:
+        # Import here to ensure proteina environment is active
+        sys.path.append('/home/jupyter-chenxi/proteina/af2rank_evaluation')
+        from cif_to_pt_converter import convert_from_csv
+        
+        # Call directly - no subprocess needed!
+        convert_from_csv(
+            csv_file=csv_file,
+            csv_column=csv_column,
+            cif_dir=cif_dir,
+            output_dir='/home/jupyter-chenxi/proteina/data'  # Uses DATA_PATH internally
+        )
+        
+        # Create a mock result object for compatibility
+        class MockResult:
+            returncode = 0
+            stdout = "CIF to PT conversion completed"
+            stderr = ""
+        
+        return MockResult()
+        
+    except Exception as e:
+        logger.error(f"CIF to PT conversion failed: {e}")
+        class MockResult:
+            returncode = 1
+            stdout = ""
+            stderr = str(e)
+        return MockResult()
 
-convert_from_csv(
-    csv_file='{csv_file}',
-    cif_dir='{cif_dir}', 
-    output_dir='{output_dir}/processed'
-)
-print('CIF to PT conversion completed')
-"
-"""
+def run_proteina_inference(protein_name, inference_config):
+    """
+    Run Proteina inference directly.
+    Only uses subprocess for calling proteinfoundation/inference.py.
     
-    result = subprocess.run(python_cmd, shell=True, capture_output=True, text=True, executable='/bin/bash')
-    return result
-
-def run_proteina_inference(csv_file, cif_dir, inference_config, output_dir):
-    """Run Proteina inference step."""
+    Note: No timeout - inference can take hours for long proteins.
+    """
     conda_cmd = setup_conda_environment()
-    
-    af2rank_eval_path = "/home/jupyter-chenxi/proteina/af2rank_evaluation"
+    proteina_dir = "/home/jupyter-chenxi/proteina"
     
     cmd = f"""
-{conda_cmd} && cd {af2rank_eval_path} && python af2rank_evaluation.py \
-    --csv_file "{csv_file}" \
-    --cif_dir "{cif_dir}" \
-    --inference_config "{inference_config}" \
-    --output_dir "{output_dir}" \
-    --step inference \
-    --disable_af2rank
+{conda_cmd} && cd {proteina_dir} && python proteinfoundation/inference.py \
+    --pt {protein_name} \
+    --config_name {inference_config}
 """
     
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, executable='/bin/bash')
-    return result
-
-def run_usalign_evaluation(csv_file, cif_dir, inference_config, output_dir, usalign_path):
-    """Run USalign evaluation step."""
-    conda_cmd = setup_conda_environment()
-    
-    af2rank_eval_path = "/home/jupyter-chenxi/proteina/af2rank_evaluation"
-    
-    cmd = f"""
-{conda_cmd} && cd {af2rank_eval_path} && python af2rank_evaluation.py \
-    --csv_file "{csv_file}" \
-    --cif_dir "{cif_dir}" \
-    --inference_config "{inference_config}" \
-    --output_dir "{output_dir}" \
-    --step evaluate \
-    --usalign_path "{usalign_path}" \
-    --disable_af2rank
-"""
-    
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, executable='/bin/bash')
+    result = subprocess.run(
+        cmd, 
+        shell=True, 
+        capture_output=True, 
+        text=True, 
+        executable='/bin/bash'
+    )
     return result
 
 def process_single_protein(args):
-    """Process a single protein through the entire Proteina pipeline."""
-    protein_name, csv_file, cif_dir, inference_config, usalign_path, gpu_id = args
+    """
+    Process a single protein through the entire Proteina pipeline.
+    Includes proper error handling and GPU memory cleanup.
+    """
+    protein_name, csv_file, csv_column, cif_dir, inference_config, usalign_path, gpu_id = args
     
-    # Set GPU for this process
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
-    
-    logger.info(f"[GPU {gpu_id}] Starting processing for {protein_name}")
-    
-    # Generate output directory for this protein
-    protein_output_dir = generate_protein_output_dir(inference_config, protein_name)
-    
-    logger.info(f"[GPU {gpu_id}] {protein_name} -> {protein_output_dir}")
-    
-    # Create single-protein CSV file
-    logger.info(f"[GPU {gpu_id}] Creating single_protein.csv for {protein_name}")
-    single_csv_path = create_single_protein_csv(csv_file, protein_name, protein_output_dir)
-    
-    # Step 1: CIF to PT conversion
-    logger.info(f"[GPU {gpu_id}] Step 1: CIF to PT conversion for {protein_name}")
-    result = run_cif_to_pt_conversion(single_csv_path, cif_dir, protein_output_dir)
-    
-    if result.returncode != 0:
-        logger.error(f"[GPU {gpu_id}] CIF to PT conversion failed for {protein_name}")
-        logger.error(f"[GPU {gpu_id}] STDOUT: {result.stdout}")
-        logger.error(f"[GPU {gpu_id}] STDERR: {result.stderr}")
-        raise Exception(f"CIF to PT conversion failed: {result.stderr}")
-    
-    logger.info(f"[GPU {gpu_id}] ✅ CIF to PT conversion completed for {protein_name}")
-    
-    # Step 2: Proteina inference
-    logger.info(f"[GPU {gpu_id}] Step 2: Running Proteina inference for {protein_name}")
-    result = run_proteina_inference(single_csv_path, cif_dir, inference_config, protein_output_dir)
-    
-    if result.returncode != 0:
-        logger.error(f"[GPU {gpu_id}] Proteina inference failed for {protein_name}")
-        logger.error(f"[GPU {gpu_id}] STDOUT: {result.stdout}")
-        logger.error(f"[GPU {gpu_id}] STDERR: {result.stderr}")
-        raise Exception(f"Proteina inference failed: {result.stderr}")
-    
-    logger.info(f"[GPU {gpu_id}] ✅ Proteina inference completed for {protein_name}")
-    
-    # Step 3: USalign evaluation
-    if usalign_path:
-        logger.info(f"[GPU {gpu_id}] Step 3: Running USalign evaluation for {protein_name}")
-        result = run_usalign_evaluation(single_csv_path, cif_dir, inference_config, protein_output_dir, usalign_path)
+    try:
+        # Set GPU for this process
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+        
+        logger.info(f"[GPU {gpu_id}] Starting processing for {protein_name}")
+        
+        # Generate output directory for this protein
+        protein_output_dir = generate_protein_output_dir(inference_config, protein_name)
+        
+        logger.info(f"[GPU {gpu_id}] {protein_name} -> {protein_output_dir}")
+        
+        # Create single-protein CSV file
+        logger.info(f"[GPU {gpu_id}] Creating single_protein.csv for {protein_name}")
+        single_csv_path = create_single_protein_csv(csv_file, csv_column, protein_name, protein_output_dir)
+        
+        # Step 1: CIF to PT conversion
+        logger.info(f"[GPU {gpu_id}] Step 1: CIF to PT conversion for {protein_name}")
+        result = run_cif_to_pt_conversion(single_csv_path, csv_column, cif_dir)
         
         if result.returncode != 0:
-            logger.warning(f"[GPU {gpu_id}] USalign evaluation failed for {protein_name}: {result.stderr}")
-        else:
-            logger.info(f"[GPU {gpu_id}] ✅ USalign evaluation completed for {protein_name}")
+            logger.error(f"[GPU {gpu_id}] CIF to PT conversion failed for {protein_name}")
+            logger.error(f"[GPU {gpu_id}] STDERR: {result.stderr}")
+            return {
+                'protein': protein_name, 
+                'gpu': gpu_id, 
+                'status': 'failed', 
+                'error': f"CIF to PT conversion failed: {result.stderr}",
+                'output_dir': protein_output_dir
+            }
+        
+        logger.info(f"[GPU {gpu_id}] ✅ CIF to PT conversion completed for {protein_name}")
+        
+        # Step 2: Proteina inference
+        logger.info(f"[GPU {gpu_id}] Step 2: Running Proteina inference for {protein_name}")
+        result = run_proteina_inference(protein_name, inference_config)
+        
+        if result.returncode != 0:
+            error_msg = result.stderr
+            
+            # Check for specific GPU memory errors
+            if "CUDA out of memory" in error_msg or "OutOfMemoryError" in error_msg:
+                logger.error(f"[GPU {gpu_id}] 🔴 GPU OUT OF MEMORY for {protein_name}")
+                logger.error(f"[GPU {gpu_id}] This protein likely has a very long sequence")
+                error_type = "GPU_OOM"
+            else:
+                logger.error(f"[GPU {gpu_id}] Proteina inference failed for {protein_name}")
+                error_type = "INFERENCE_ERROR"
+            
+            logger.error(f"[GPU {gpu_id}] STDOUT: {result.stdout}")
+            logger.error(f"[GPU {gpu_id}] STDERR: {error_msg}")
+            
+            return {
+                'protein': protein_name, 
+                'gpu': gpu_id, 
+                'status': 'failed',
+                'error_type': error_type,
+                'error': error_msg,
+                'output_dir': protein_output_dir
+            }
+        
+        logger.info(f"[GPU {gpu_id}] ✅ Proteina inference completed for {protein_name}")
+        
+        # Note: USalign evaluation is not implemented - would be handled separately if needed
+        
+        logger.info(f"[GPU {gpu_id}] ✅ Successfully completed {protein_name}")
+        return {
+            'protein': protein_name, 
+            'gpu': gpu_id, 
+            'status': 'success', 
+            'output_dir': protein_output_dir
+        }
+        
+    except Exception as e:
+        logger.error(f"[GPU {gpu_id}] ❌ Unexpected error for {protein_name}: {e}")
+        import traceback
+        logger.error(f"[GPU {gpu_id}] Traceback: {traceback.format_exc()}")
+        
+        return {
+            'protein': protein_name,
+            'gpu': gpu_id,
+            'status': 'failed',
+            'error_type': 'EXCEPTION',
+            'error': str(e),
+            'output_dir': protein_output_dir if 'protein_output_dir' in locals() else 'unknown'
+        }
     
-    logger.info(f"[GPU {gpu_id}] ✅ Successfully completed {protein_name}")
-    return {'protein': protein_name, 'gpu': gpu_id, 'status': 'success', 'output_dir': protein_output_dir}
+    finally:
+        # Cleanup: Clear GPU memory cache
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+        except:
+            pass  # Silently fail if torch not available or other issues
 
-def get_protein_names(csv_file):
+def get_protein_names(csv_file, csv_column):
     """Extract protein names from CSV file."""
     df = pd.read_csv(csv_file)
-    proteins = df['natives_rcsb'].dropna().unique().tolist()
+    proteins = df[csv_column].dropna().unique().tolist()
     return [p for p in proteins if p.strip()]
 
-def find_proteins_needing_inference(csv_file, inference_config):
+def find_proteins_needing_inference(csv_file, csv_column, inference_config):
     """Find proteins from CSV that need inference (no PDB files generated yet)."""
     # Get proteins from CSV file
-    csv_proteins = get_protein_names(csv_file)
+    csv_proteins = get_protein_names(csv_file, csv_column)
     
     inference_base_dir = f"/home/jupyter-chenxi/proteina/inference/{inference_config}"
     
@@ -244,6 +290,7 @@ def find_proteins_needing_inference(csv_file, inference_config):
 def main():
     parser = argparse.ArgumentParser(description='Parallel Proteina Inference Pipeline')
     parser.add_argument('--csv_file', required=True, help='Path to CSV file with protein data')
+    parser.add_argument('--csv_column', required=True, help='Column name in CSV file to use for protein selection')
     parser.add_argument('--cif_dir', required=True, help='Directory containing CIF files')
     parser.add_argument('--inference_config', required=True, help='Inference configuration name')
     parser.add_argument('--num_gpus', type=int, default=1, help='Number of GPUs to use')
@@ -264,10 +311,10 @@ def main():
     
     # Get protein names
     if args.skip_existing:
-        protein_names = find_proteins_needing_inference(args.csv_file, args.inference_config)
+        protein_names = find_proteins_needing_inference(args.csv_file, args.csv_column, args.inference_config)
         logger.info(f"Found {len(protein_names)} proteins needing inference (from CSV file)")
     else:
-        protein_names = get_protein_names(args.csv_file)
+        protein_names = get_protein_names(args.csv_file, args.csv_column)
         logger.info(f"Found {len(protein_names)} proteins to process")
     logger.info(f"Proteins: {protein_names}")
     
@@ -283,20 +330,55 @@ def main():
     
     logger.info(f"Using {args.num_gpus} GPU(s) for parallel processing")
     
-    # Create work items
-    work_items = []
-    for i, protein_name in enumerate(protein_names):
-        gpu_id = i % args.num_gpus
-        work_items.append((protein_name, args.csv_file, args.cif_dir, args.inference_config, args.usalign_path, gpu_id))
-    
-    # Process proteins in parallel
+    # Process proteins in parallel with proper GPU assignment
     start_time = time.time()
     results = []
     
-    executor = ProcessPoolExecutor(max_workers=args.num_gpus)
+    # Create shared counter for worker initialization
+    from multiprocessing import Manager
+    manager = Manager()
+    worker_counter = manager.Value('i', 0)
+    worker_lock = manager.Lock()
+    
+    # Use initializer to assign each worker a fixed GPU
+    def worker_init(counter, lock, num_gpus):
+        """Initialize worker with a specific GPU assignment."""
+        with lock:
+            worker_id = counter.value
+            counter.value += 1
+        
+        gpu_id = worker_id % num_gpus
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+        # Store GPU ID in a process-local variable
+        import builtins
+        builtins._worker_gpu_id = gpu_id
+        logger.info(f"Worker {worker_id} initialized with GPU {gpu_id}")
+    
+    executor = ProcessPoolExecutor(
+        max_workers=args.num_gpus,
+        initializer=worker_init,
+        initargs=(worker_counter, worker_lock, args.num_gpus)
+    )
+    
+    # Modified process function that gets GPU from worker initialization
+    def process_single_protein_wrapper(args_tuple):
+        """Wrapper that uses the GPU assigned during worker init."""
+        protein_name, csv_file, csv_column, cif_dir, inference_config, usalign_path = args_tuple
+        
+        # Get GPU ID from process-local variable set by worker_init
+        import builtins
+        gpu_id = getattr(builtins, '_worker_gpu_id', 0)
+        
+        # Call the actual processing function
+        full_args = (protein_name, csv_file, csv_column, cif_dir, inference_config, usalign_path, gpu_id)
+        return process_single_protein(full_args)
+    
     try:
-        # Submit all jobs
-        future_to_protein = {executor.submit(process_single_protein, item): item[0] for item in work_items}
+        # Submit all jobs (GPU assignment happens via worker init)
+        work_items = [(protein_name, args.csv_file, args.csv_column, args.cif_dir, args.inference_config, args.usalign_path) 
+                      for protein_name in protein_names]
+        future_to_protein = {executor.submit(process_single_protein_wrapper, item): work_items[i][0] 
+                            for i, item in enumerate(work_items)}
         
         # Collect results as they complete
         for future in as_completed(future_to_protein):
@@ -333,15 +415,29 @@ def main():
     successful = len([r for r in results if r['status'] == 'success'])
     failed = len([r for r in results if r['status'] == 'failed'])
     
+    # Count error types
+    error_types = {}
+    for result in results:
+        if result['status'] == 'failed':
+            error_type = result.get('error_type', 'UNKNOWN')
+            error_types[error_type] = error_types.get(error_type, 0) + 1
+    
     logger.info(f"🎯 Pipeline completed in {total_time:.1f}s")
     logger.info(f"✅ Successful: {successful}")
     logger.info(f"❌ Failed: {failed}")
+    
+    if error_types:
+        logger.info(f"Error breakdown:")
+        for error_type, count in error_types.items():
+            logger.info(f"  - {error_type}: {count}")
     
     if failed > 0:
         logger.info("Failed proteins:")
         for result in results:
             if result['status'] == 'failed':
-                logger.info(f"  - {result['protein']}: {result.get('error', 'Unknown error')}")
+                error_type = result.get('error_type', 'UNKNOWN')
+                error_preview = str(result.get('error', 'Unknown error'))[:100]
+                logger.info(f"  - {result['protein']} [{error_type}]: {error_preview}")
     
     # Check if shutdown was requested
     if shutdown_requested:

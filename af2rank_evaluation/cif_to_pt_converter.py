@@ -153,6 +153,12 @@ def convert_cif_to_pt(cif_file: str, chain_id: str, output_file: str) -> bool:
     Returns:
         True if successful, False otherwise
     """
+    # Check if PT file already exists
+    if os.path.exists(output_file):
+        protein_id = f"{Path(cif_file).stem}_{chain_id}"
+        logger.info(f"PT file already exists for {protein_id}, skipping conversion")
+        return True
+    
     # Extract sequence from CIF
     sequence = extract_sequence_from_cif(cif_file, chain_id)
     if sequence is None:
@@ -175,7 +181,7 @@ def convert_cif_to_pt(cif_file: str, chain_id: str, output_file: str) -> bool:
         return False
 
 
-def convert_from_csv(csv_file: str, cif_dir: str, output_dir: str, processed_subdir: str = "processed") -> None:
+def convert_from_csv(csv_file: str, csv_column: str, cif_dir: str, output_dir: str, processed_subdir: str = "processed") -> None:
     """
     Convert multiple CIF files to PT format based on a CSV file.
     Saves PT files to the shared DATA_PATH/processed directory.
@@ -201,12 +207,12 @@ def convert_from_csv(csv_file: str, cif_dir: str, output_dir: str, processed_sub
     failed_conversions = 0
     
     for _, row in df.iterrows():
-        # Parse the natives_rcsb field (e.g., "1a2y_C")
-        natives_rcsb = row['natives_rcsb']
-        if pd.isna(natives_rcsb) or natives_rcsb == '':
+        # Parse the pdb_chain field (e.g., "1a2y_C")
+        pdb_chain = row[csv_column]
+        if pd.isna(pdb_chain) or pdb_chain == '':
             continue
-            
-        pdb_id, chain_id = natives_rcsb.split('_')
+        
+        pdb_id, chain_id = pdb_chain.split('_')
         
         # Find CIF file (check subdirectories)
         cif_file = None
@@ -224,7 +230,7 @@ def convert_from_csv(csv_file: str, cif_dir: str, output_dir: str, processed_sub
             continue
         
         # Output PT file to shared data path
-        output_file = os.path.join(processed_dir, f"{natives_rcsb}.pt")
+        output_file = os.path.join(processed_dir, f"{pdb_chain}.pt")
         
         # Convert
         if convert_cif_to_pt(cif_file, chain_id, output_file):
@@ -241,14 +247,15 @@ def main():
     parser.add_argument("--chain_id", type=str, help="Chain identifier to extract")
     parser.add_argument("--output_file", type=str, help="Output PT file")
     parser.add_argument("--csv_file", type=str, help="CSV file with protein information")
+    parser.add_argument("--csv_column", type=str, help="Column name in CSV file to use for protein selection")
     parser.add_argument("--cif_dir", type=str, help="Directory containing CIF files")
     parser.add_argument("--output_dir", type=str, help="Output directory for PT files")
     
     args = parser.parse_args()
     
-    if args.csv_file and args.cif_dir and args.output_dir:
+    if args.csv_file and args.csv_column and args.cif_dir and args.output_dir:
         # Batch conversion from CSV
-        convert_from_csv(args.csv_file, args.cif_dir, args.output_dir)
+        convert_from_csv(args.csv_file, args.csv_column, args.cif_dir, args.output_dir)
     elif args.cif_file and args.chain_id and args.output_file:
         # Single file conversion
         success = convert_cif_to_pt(args.cif_file, args.chain_id, args.output_file)

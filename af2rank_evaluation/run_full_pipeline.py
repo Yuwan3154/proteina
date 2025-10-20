@@ -27,13 +27,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def run_proteina_inference(csv_file, cif_dir, inference_config, num_gpus, usalign_path=None):
+def run_proteina_inference(csv_file, csv_column, cif_dir, inference_config, num_gpus, usalign_path=None):
     """Run the Proteina inference pipeline."""
     logger.info("🧬 Starting Proteina inference pipeline...")
     
     cmd = [
         'python', 'parallel_proteina_inference.py',
         '--csv_file', csv_file,
+        '--csv_column', csv_column,
         '--cif_dir', cif_dir,
         '--inference_config', inference_config,
         '--num_gpus', str(num_gpus),
@@ -49,13 +50,14 @@ def run_proteina_inference(csv_file, cif_dir, inference_config, num_gpus, usalig
     result = subprocess.run(conda_cmd, shell=True, executable='/bin/bash')
     return result.returncode == 0
 
-def run_af2rank_scoring(csv_file, cif_dir, inference_config, num_gpus, recycles=3, regenerate_plots=False):
+def run_af2rank_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpus, recycles=3, regenerate_plots=False):
     """Run the AF2Rank scoring pipeline."""
     logger.info("⚡ Starting AF2Rank scoring pipeline...")
     
     cmd = [
         'python', 'parallel_af2rank_scoring.py',
         '--csv_file', csv_file,
+        '--csv_column', csv_column,
         '--cif_dir', cif_dir,
         '--inference_config', inference_config,
         '--num_gpus', str(num_gpus),
@@ -75,6 +77,7 @@ def run_af2rank_scoring(csv_file, cif_dir, inference_config, num_gpus, recycles=
 def main():
     parser = argparse.ArgumentParser(description='Complete AF2Rank Evaluation Pipeline')
     parser.add_argument('--csv_file', required=True, help='Path to CSV file with protein data')
+    parser.add_argument('--csv_column', required=True, help='Column name in CSV file to use for protein selection')
     parser.add_argument('--cif_dir', required=True, help='Directory containing CIF files')
     parser.add_argument('--inference_config', required=True, help='Inference configuration name')
     parser.add_argument('--num_gpus', type=int, default=1, help='Number of GPUs to use')
@@ -128,6 +131,7 @@ def main():
         
         inference_success = run_proteina_inference(
             args.csv_file, 
+            args.csv_column,
             args.cif_dir, 
             args.inference_config, 
             args.num_gpus,
@@ -150,6 +154,7 @@ def main():
         
         af2rank_success = run_af2rank_scoring(
             args.csv_file,
+            args.csv_column,
             args.cif_dir,
             args.inference_config,
             args.num_gpus,
