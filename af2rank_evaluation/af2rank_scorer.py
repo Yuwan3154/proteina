@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 import numpy as np
 import pandas as pd
-from Bio.PDB import MMCIFParser, PDBIO, Select
+from Bio.PDB import MMCIFParser, PDBIO, Select, Structure, Model
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from loguru import logger
@@ -168,13 +168,11 @@ def run_do_not_align(query_sequence, target_sequence, **kwargs):
 
 
 def convert_cif_to_pdb_for_colabdesign(cif_file, chain_id=None):
-    """Convert CIF file to PDB format that ColabDesign can handle."""
-    import tempfile
-    import os
-    
-    try:
-        from Bio.PDB import MMCIFParser
-        
+    """
+    Convert CIF file to PDB format that ColabDesign can handle.
+    For multi-character chain IDs, extract the specific chain and rename to 'A'.
+    """
+    try:        
         # Parse CIF file
         parser = MMCIFParser(QUIET=True)
         structure = parser.get_structure('protein', cif_file)
@@ -185,15 +183,38 @@ def convert_cif_to_pdb_for_colabdesign(cif_file, chain_id=None):
         
         # Write to PDB format
         io = PDBIO()
-        io.set_structure(structure)
         
         if chain_id:
-            # Only write specific chain if requested
-            class ChainSelect(Select):
-                def accept_chain(self, chain):
-                    return chain.id == chain_id
-            io.save(temp_pdb.name, ChainSelect())
+            # Extract the specific chain and rename it to 'A' for PDB compatibility
+            found_chain = None
+            for model in structure:
+                for chain in model:
+                    if chain.id == chain_id:
+                        found_chain = chain
+                        break
+                if found_chain:
+                    break
+            
+            if not found_chain:
+                raise Exception(f"Chain '{chain_id}' not found in CIF file")
+            
+            # Create new structure with only this chain, renamed to 'A'
+            new_structure = Structure.Structure('protein')
+            new_model = Model.Model(0)
+            new_structure.add(new_model)
+            
+            # Detach chain from old structure and change ID to 'A'
+            old_chain_id = found_chain.id
+            found_chain.detach_parent()
+            found_chain.id = 'A'
+            new_model.add(found_chain)
+            
+            io.set_structure(new_structure)
+            io.save(temp_pdb.name)
+            
+            logger.debug(f"Converted CIF chain '{old_chain_id}' to PDB chain 'A'")
         else:
+            io.set_structure(structure)
             io.save(temp_pdb.name)
         
         return temp_pdb.name
@@ -249,9 +270,10 @@ def get_sequence_from_pdb(pdb_file, chain=None):
                 detected_chain = "A"  # Default fallback
             
             # Convert CIF to PDB format for ColabDesign compatibility
+            # The chain will be renamed to 'A' in the temporary PDB file
             temp_pdb_file = convert_cif_to_pdb_for_colabdesign(pdb_file, detected_chain)
             working_file = temp_pdb_file
-            working_chain = detected_chain  # Use the actual chain we found
+            working_chain = 'A'  # Chain renamed to 'A' after conversion
         else:
             working_file = pdb_file
             working_chain = chain
@@ -471,7 +493,7 @@ class ModernAF2Rank:
                 # Convert CIF to PDB format for ColabDesign compatibility
                 temp_pdb_file = convert_cif_to_pdb_for_colabdesign(pdb_file, detected_chain)
                 working_file = temp_pdb_file
-                working_chain = detected_chain  # Use the actual chain we found
+                working_chain = 'A'  # Chain renamed to 'A' after conversion
             else:
                 working_file = pdb_file
                 working_chain = chain
@@ -875,6 +897,7 @@ def run_af2rank_analysis(protein_id: str, reference_cif: str, inference_output_d
         "spearman_correlation_rho_ptm": spearman_rho_ptm,  # NEW: pTM vs tm_ref_pred
         "max_tm_ref_template": max_tm_ref_template,
         "max_tm_ref_pred": max_tm_ref_pred,
+        
         "tm_ref_template_at_max_composite": tm_ref_template_at_max_composite,
         "tm_ref_pred_at_max_composite": tm_ref_pred_at_max_composite,
         "tm_ref_pred_at_max_ptm": tm_ref_pred_at_max_ptm,  # NEW: prediction quality at best pTM

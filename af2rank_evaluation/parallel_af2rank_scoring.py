@@ -283,6 +283,48 @@ def process_single_protein_plot_regeneration(args):
         return {'protein': protein_name, 'status': 'failed', 'error': str(e)}
 
 
+# Worker initialization function (must be at module level for pickling)
+def worker_init_af2rank(counter, lock, num_gpus):
+    """Initialize worker with a specific GPU assignment."""
+    with lock:
+        worker_id = counter.value
+        counter.value += 1
+    
+    gpu_id = worker_id % num_gpus
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+    # Store GPU ID in a process-local variable
+    builtins._worker_gpu_id = gpu_id
+    logger.info(f"AF2Rank Worker {worker_id} initialized with GPU {gpu_id}")
+
+# Wrapper function (must be at module level for pickling)
+def process_single_protein_af2rank_wrapper(args_tuple):
+    """Wrapper that uses the GPU assigned during worker init."""
+    protein_name, cif_dir, inference_config, recycles = args_tuple
+    
+    # Get GPU ID from process-local variable set by worker_init
+    gpu_id = getattr(builtins, '_worker_gpu_id', 0)
+    
+    # Call the actual processing function
+    full_args = (protein_name, cif_dir, inference_config, recycles, gpu_id, False)
+    return process_single_protein_af2rank(full_args)
+
+def has_multi_char_chain_id(protein_name):
+    """
+    Check if protein name has multi-character chain ID.
+    PDB format only supports single-character chain IDs.
+    
+    Args:
+        protein_name: Protein name in format "PDBID_CHAIN" (e.g., "6SG9_Ci")
+    
+    Returns:
+        True if chain ID has more than 1 character
+    """
+    parts = protein_name.split('_')
+    if len(parts) >= 2:
+        chain_id = parts[1]
+        return len(chain_id) > 1
+    return False
+
 def get_protein_names(csv_file, csv_column):
     """Extract protein names from CSV file."""
     df = pd.read_csv(csv_file)
@@ -366,6 +408,9 @@ def main():
         logger.warning("No proteins to process")
         sys.exit(0)
     
+    # Note: Multi-character chain IDs are now supported via chain extraction and renaming
+    # No need to filter them out anymore!
+    
     logger.info(f"Proteins to score: {protein_names}")
     
     # Check available GPUs
@@ -409,36 +454,11 @@ def main():
         worker_counter = manager.Value('i', 0)
         worker_lock = manager.Lock()
 
-        # Use initializer to assign each worker a fixed GPU
-        def worker_init(counter, lock, num_gpus):
-            """Initialize worker with a specific GPU assignment."""
-            with lock:
-                worker_id = counter.value
-                counter.value += 1
-
-            gpu_id = worker_id % num_gpus
-            os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
-            # Store GPU ID in a process-local variable
-            builtins._worker_gpu_id = gpu_id
-            logger.info(f"AF2Rank Worker {worker_id} initialized with GPU {gpu_id}")
-
         executor = ProcessPoolExecutor(
             max_workers=args.num_gpus,
-            initializer=worker_init,
+            initializer=worker_init_af2rank,
             initargs=(worker_counter, worker_lock, args.num_gpus)
         )
-
-        # Modified process function that gets GPU from worker initialization
-        def process_single_protein_af2rank_wrapper(args_tuple):
-            """Wrapper that uses the GPU assigned during worker init."""
-            protein_name, cif_dir, inference_config, recycles = args_tuple
-
-            # Get GPU ID from process-local variable set by worker_init
-            gpu_id = getattr(builtins, '_worker_gpu_id', 0)
-
-            # Call the actual processing function
-            full_args = (protein_name, cif_dir, inference_config, recycles, gpu_id, False)
-            return process_single_protein_af2rank(full_args)
 
         try:
             # Submit all jobs (GPU assignment happens via worker init)
