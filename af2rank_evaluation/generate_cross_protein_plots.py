@@ -40,13 +40,15 @@ def find_af2rank_summaries(inference_base_dir: str) -> List[str]:
     return summary_files
 
 
-def load_summary_data(summary_files: List[str], dataset_file: str) -> pd.DataFrame:
+def load_summary_data(summary_files: List[str], dataset_file: str, id_column: str, tms_column: str) -> pd.DataFrame:
     """
     Load and compile summary data from all AF2Rank JSON files.
     
     Args:
         summary_files: List of paths to summary JSON files
         dataset_file: Name of the dataset file to analyze
+        id_column: Column to use as the protein ID
+        tms_column: Column to use as the TM score
     Returns:
         DataFrame with compiled summary data
     """
@@ -54,14 +56,22 @@ def load_summary_data(summary_files: List[str], dataset_file: str) -> pd.DataFra
     
     # Load dataset file
     dataset_df = pd.read_csv(dataset_file)
+    dataset_proteins = set(dataset_df[id_column].tolist())
+    
+    logger.info(f"Dataset contains {len(dataset_proteins)} proteins")
     
     for summary_file in summary_files:
+        # Extract protein ID from path: .../protein_id/af2rank_analysis/af2rank_summary_*.json
+        protein_id = Path(summary_file).parent.parent.name
+        
+        # Skip if not in dataset
+        if protein_id not in dataset_proteins:
+            continue
         try:
             with open(summary_file, 'r') as f:
                 summary = json.load(f)
             
-            # Extract required metrics
-            protein_id = summary.get('protein_id', 'unknown')
+            # Extract required metrics (protein_id already extracted from path)
             spearman_rho_composite = summary.get('spearman_correlation_rho_composite') or summary.get('spearman_correlation_rho')  # Backward compat
             spearman_rho_ptm = summary.get('spearman_correlation_rho_ptm')
             max_tm_ref_template = summary.get('max_tm_ref_template')
@@ -99,19 +109,25 @@ def load_summary_data(summary_files: List[str], dataset_file: str) -> pd.DataFra
             continue
     
     df = pd.DataFrame(data)
-    df = df.merge(dataset_df[['natives_rcsb', 'tms_single', 'in_train']], left_on='protein_id', right_on='natives_rcsb', how='left')
-    df.drop(columns=['natives_rcsb'], inplace=True)
-    logger.info(f"Loaded data for {len(df)} proteins with complete metrics")
+    
+    logger.info(f"Loaded {len(df)} proteins from AF2Rank results (filtered by dataset)")
+    
+    # Merge with dataset
+    df = df.merge(dataset_df[[id_column, tms_column, 'in_train', 'length']], left_on='protein_id', right_on=id_column, how='left')
+    df.drop(columns=[id_column], inplace=True)
+    
+    logger.info(f"Final dataset: {len(df)} proteins with complete metrics")
     return df
 
 
-def create_summary_plots(df: pd.DataFrame, output_dir: str) -> None:
+def create_summary_plots(df: pd.DataFrame, output_dir: str, tms_column: str) -> None:
     """
     Create cross-protein summary plots.
     
     Args:
         df: DataFrame with compiled summary data
         output_dir: Directory to save plots
+        tms_column: Column to use as the TM score
     """
     os.makedirs(output_dir, exist_ok=True)
     
@@ -246,19 +262,38 @@ def create_summary_plots(df: pd.DataFrame, output_dir: str) -> None:
     valid_data_5 = df.dropna(subset=['max_tm_ref_template','top_1_tm_ref_template'])
     
     if len(valid_data_5) > 0:
-        scatter5 = ax5.scatter(
-            valid_data_5['max_tm_ref_template'], 
-            valid_data_5['top_1_tm_ref_template'],
-            alpha=0.7,
-            c=valid_data_5['in_train'].map({True: 'blue', False: 'red'}),
-            s=60
-        )
+        # Separate data by training status for proper legend
+        in_train = valid_data_5[valid_data_5['in_train'] == True]
+        not_in_train = valid_data_5[valid_data_5['in_train'] == False]
+        
+        if len(in_train) > 0:
+            ax5.scatter(
+                in_train['max_tm_ref_template'], 
+                in_train['top_1_tm_ref_template'],
+                alpha=0.3,
+                c='blue',
+                s=in_train['length'] / 1.5,
+                label='In Train'
+            )
+        
+        if len(not_in_train) > 0:
+            ax5.scatter(
+                not_in_train['max_tm_ref_template'], 
+                not_in_train['top_1_tm_ref_template'],
+                alpha=0.3,
+                c='red',
+                s=not_in_train['length'] / 1.5,
+                label='Not In Train'
+            )
+        
+        lgnd = ax5.legend(fontsize=14, scatterpoints=1, loc='upper left')
+        lgnd.legend_handles[0]._sizes = [40] # In newer matplotlib, do lgnd.legend_handles[0]._legmarker.set_markersize(40)
+        lgnd.legend_handles[1]._sizes = [40]
         line5 = ax5.plot([0, 1], [0, 1], 'r--', alpha=0.75, linewidth=3)
         ax5.set_xlabel('Max Template TM Score', fontsize=12)
         ax5.set_ylabel('Top 1 Template TM Score By Composite', fontsize=12)
-        ax5.set_title('Max Template TM Score vs. Top 1 Template TM Score By Composite', fontsize=13)
+        ax5.set_title('Max Template TM Score vs. Top 1 Template TM Score By Composite', fontsize=15)
         ax5.grid(True, alpha=0.3)
-        ax5.legend(['In Train', 'Not In Train'], fontsize=24, loc='upper left')
 
     # Plot 6: Max TM-score vs Top 5 Template TM-score By Composite
     valid_data_6 = df.dropna(subset=['max_tm_ref_template','top_5_tm_ref_template'])
@@ -267,14 +302,14 @@ def create_summary_plots(df: pd.DataFrame, output_dir: str) -> None:
         scatter6 = ax6.scatter(
             valid_data_6['max_tm_ref_template'], 
             valid_data_6['top_5_tm_ref_template'],
-            alpha=0.7,
+            alpha=0.3,
             c=valid_data_6['in_train'].map({True: 'blue', False: 'red'}),
-            s=60
+            s=valid_data_6['length'] / 1.5
         )
         line6 = ax6.plot([0, 1], [0, 1], 'r--', alpha=0.75, linewidth=3)
         ax6.set_xlabel('Max Template TM Score', fontsize=12)
         ax6.set_ylabel('Top 5 Template TM Score By Composite', fontsize=12)
-        ax6.set_title('Max Template TM Score vs. Top 5 Template TM Score By Composite', fontsize=13)
+        ax6.set_title('Max Template TM Score vs. Top 5 Template TM Score By Composite', fontsize=15)
         ax6.grid(True, alpha=0.3)
     
     # Plot 7: Max TM-score vs Top 1 Template TM-score By pTM
@@ -284,14 +319,14 @@ def create_summary_plots(df: pd.DataFrame, output_dir: str) -> None:
         scatter7 = ax7.scatter(
             valid_data_7['max_tm_ref_pred'], 
             valid_data_7['top_1_tm_ref_pred'],
-            alpha=0.7,
+            alpha=0.3,
             c=valid_data_7['in_train'].map({True: 'blue', False: 'red'}),
-            s=60
+            s=valid_data_7['length'] / 1.5
         )
         line7 = ax7.plot([0, 1], [0, 1], 'r--', alpha=0.75, linewidth=3)
         ax7.set_xlabel('Max Prediction TM Score', fontsize=12)
         ax7.set_ylabel('Top 1 Prediction TM Score By pTM', fontsize=12)
-        ax7.set_title('Max Prediction TM Score vs. Top 1 Prediction TM Score By pTM', fontsize=13)
+        ax7.set_title('Max Prediction TM Score vs. Top 1 Prediction TM Score By pTM', fontsize=15)
         ax7.grid(True, alpha=0.3)
     
     # Plot 8: Max TM-score vs Top 5 Template TM-score By pTM
@@ -301,82 +336,82 @@ def create_summary_plots(df: pd.DataFrame, output_dir: str) -> None:
         scatter8 = ax8.scatter(
             valid_data_8['max_tm_ref_pred'], 
             valid_data_8['top_5_tm_ref_pred'],
-            alpha=0.7,
+            alpha=0.3,
             c=valid_data_8['in_train'].map({True: 'blue', False: 'red'}),
-            s=60
+            s=valid_data_8['length'] / 1.5
         )
         line8 = ax8.plot([0, 1], [0, 1], 'r--', alpha=0.75, linewidth=3)
         ax8.set_xlabel('Max Prediction TM Score', fontsize=12)
         ax8.set_ylabel('Top 5 Prediction TM Score By pTM', fontsize=12)
-        ax8.set_title('Max Prediction TM Score vs. Top 5 Prediction TM Score By pTM', fontsize=13)
+        ax8.set_title('Max Prediction TM Score vs. Top 5 Prediction TM Score By pTM', fontsize=15)
         ax8.grid(True, alpha=0.3)
     
-    # Plot 9: Single-sequence TM score vs. Top 1 Template TM-score By Composite
-    valid_data_9 = df.dropna(subset=['tms_single', 'top_1_tm_ref_template'])
+    # Plot 9: Reference TM score vs. Top 1 Template TM-score By Composite
+    valid_data_9 = df.dropna(subset=[tms_column, 'top_1_tm_ref_template'])
     
     if len(valid_data_9) > 0:
         scatter9 = ax9.scatter(
-            valid_data_9['tms_single'], 
+            valid_data_9[tms_column], 
             valid_data_9['top_1_tm_ref_template'],
-            alpha=0.7,
+            alpha=0.3,
             c=valid_data_9['in_train'].map({True: 'blue', False: 'red'}),
-            s=60
+            s=valid_data_9['length'] / 1.5
         )
         line9 = ax9.plot([0, 1], [0, 1], 'r--', alpha=0.75, linewidth=3)
-        ax9.set_xlabel('Single-sequence TM Score', fontsize=12)
+        ax9.set_xlabel('Reference TM Score', fontsize=12)
         ax9.set_ylabel('Top 1 Template TM Score By Composite', fontsize=12)
-        ax9.set_title('Single-sequence TM Score vs. Top 1 Template TM Score By Composite', fontsize=13)
+        ax9.set_title('Reference TM Score vs. Top 1 Template TM Score By Composite', fontsize=15)
         ax9.grid(True, alpha=0.3)
     
-    # Plot 10: Single-sequence TM score vs. Top 5 Template TM-score By Composite
-    valid_data_10 = df.dropna(subset=['tms_single', 'top_5_tm_ref_template'])
+    # Plot 10: Reference TM score vs. Top 5 Template TM-score By Composite
+    valid_data_10 = df.dropna(subset=[tms_column, 'top_5_tm_ref_template'])
     
     if len(valid_data_10) > 0:
         scatter10 = ax10.scatter(
-            valid_data_10['tms_single'], 
+            valid_data_10[tms_column], 
             valid_data_10['top_5_tm_ref_template'],
-            alpha=0.7,
+            alpha=0.3,
             c=valid_data_10['in_train'].map({True: 'blue', False: 'red'}),
-            s=60
+            s=valid_data_10['length'] / 1.5
         )
         line10 = ax10.plot([0, 1], [0, 1], 'r--', alpha=0.75, linewidth=3)
-        ax10.set_xlabel('Single-sequence TM Score', fontsize=12)
+        ax10.set_xlabel('Reference TM Score', fontsize=12)
         ax10.set_ylabel('Top 5 Template TM Score By Composite', fontsize=12)
-        ax10.set_title('Single-sequence TM Score vs. Top 5 Template TM Score By Composite', fontsize=13)
+        ax10.set_title('Reference TM Score vs. Top 5 Template TM Score By Composite', fontsize=15)
         ax10.grid(True, alpha=0.3)
     
-    # Plot 11: Single-sequence TM score vs. Top 1 Template TM-score By pTM
-    valid_data_11 = df.dropna(subset=['tms_single', 'top_1_tm_ref_pred'])
+    # Plot 11: Reference TM score vs. Top 1 Template TM-score By pTM
+    valid_data_11 = df.dropna(subset=[tms_column, 'top_1_tm_ref_pred'])
     
     if len(valid_data_11) > 0:
         scatter11 = ax11.scatter(
-            valid_data_11['tms_single'], 
+            valid_data_11[tms_column], 
             valid_data_11['top_1_tm_ref_pred'],
-            alpha=0.7,
+            alpha=0.3,
             c=valid_data_11['in_train'].map({True: 'blue', False: 'red'}),
-            s=60
+            s=valid_data_11['length'] / 1.5
         )
         line11 = ax11.plot([0, 1], [0, 1], 'r--', alpha=0.75, linewidth=3)
-        ax11.set_xlabel('Single-sequence TM Score', fontsize=12)
+        ax11.set_xlabel('Reference TM Score', fontsize=12)
         ax11.set_ylabel('Top 1 Prediction TM Score By pTM', fontsize=12)
-        ax11.set_title('Single-sequence TM Score vs. Top 1 Prediction TM Score By pTM', fontsize=13)
+        ax11.set_title('Reference TM Score vs. Top 1 Prediction TM Score By pTM', fontsize=15)
         ax11.grid(True, alpha=0.3)
     
-    # Plot 12: Single-sequence TM score vs. Top 5 Template TM-score By pTM
-    valid_data_12 = df.dropna(subset=['tms_single', 'top_5_tm_ref_pred'])
+    # Plot 12: Reference TM score vs. Top 5 Template TM-score By pTM
+    valid_data_12 = df.dropna(subset=[tms_column, 'top_5_tm_ref_pred'])
     
     if len(valid_data_12) > 0:
         scatter12 = ax12.scatter(
-            valid_data_12['tms_single'], 
+            valid_data_12[tms_column], 
             valid_data_12['top_5_tm_ref_pred'],
-            alpha=0.7,
+            alpha=0.3,
             c=valid_data_12['in_train'].map({True: 'blue', False: 'red'}),
-            s=60
+            s=valid_data_12['length'] / 1.5
         )
         line12 = ax12.plot([0, 1], [0, 1], 'r--', alpha=0.75, linewidth=3)
-        ax12.set_xlabel('Single-sequence TM Score', fontsize=12)
+        ax12.set_xlabel('Reference TM Score', fontsize=12)
         ax12.set_ylabel('Top 5 Prediction TM Score By pTM', fontsize=12)
-        ax12.set_title('Single-sequence TM Score vs. Top 5 Prediction TM Score By pTM', fontsize=13)
+        ax12.set_title('Reference TM Score vs. Top 5 Prediction TM Score By pTM', fontsize=15)
         ax12.grid(True, alpha=0.3)
     
     plt.tight_layout()
@@ -464,6 +499,10 @@ def main():
                        help='Output directory for plots and summary files')
     parser.add_argument('--dataset_file', required=True,
                        help='Name of the dataset file to analyze')
+    parser.add_argument('--id_column', default='natives_rcsb',
+                       help='Column name to use as protein ID (default: natives_rcsb)')
+    parser.add_argument('--tms_column', default='tms_single',
+                       help='Column name to use as TM score (default: tms_single)')
     parser.add_argument('--verbose', action='store_true',
                        help='Enable verbose logging')
     
@@ -477,6 +516,8 @@ def main():
     logger.info(f"📂 Inference directory: {args.inference_dir}")
     logger.info(f"📁 Output directory: {args.output_dir}")
     logger.info(f"📄 Dataset file: {args.dataset_file}")
+    logger.info(f"🔑 ID column: {args.id_column}")
+    logger.info(f"🔑 TM score column: {args.tms_column}")
 
     # Validate input directory
     if not os.path.exists(args.inference_dir):
@@ -496,7 +537,7 @@ def main():
         sys.exit(1)
     
     # Load and compile data
-    df = load_summary_data(summary_files, args.dataset_file)
+    df = load_summary_data(summary_files, args.dataset_file, args.id_column, args.tms_column)
     
     if len(df) == 0:
         logger.error("No valid data found in summary files")
@@ -508,7 +549,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     
     # Generate plots
-    create_summary_plots(df, args.output_dir)
+    create_summary_plots(df, args.output_dir, args.tms_column)
     
     # Save summary statistics
     save_summary_statistics(df, args.output_dir)
