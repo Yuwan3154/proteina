@@ -1,4 +1,4 @@
-run_name_: train_run_finetune-all_v1.6_default-fold_4-seq-S25_32-effective-batch_purge-7bny-7kww-7ad5-7b76_cutoff-20190828
+run_name_: train_run_finetune-all_v1.6_default-fold_4-seq-S25_32-effective-batch_purge-7bny-7kww-7ad5-7b76_warmup_cutoff-200513
 pretrain_ckpt_path: ~/proteina/data/weights/proteina_v1.6_DFS_200M_notri_long_chain_generation.ckpt
 
 hardware:
@@ -47,7 +47,7 @@ model:
 
 
 # Dataset params
-dataset: pdb_train_S25_max384_purge-test_cutoff-20190828
+dataset: pdb_train_S25_max384_purge-test_cutoff-200513
 dataset_config_subdir: pdb
 
 force_precision_f32: False  # If false will use bf16-mixed precision
@@ -86,6 +86,12 @@ opt:
   grad_and_weight_analysis: False  # Log some statistics of gradients and weights
   dist_strategy: ddp  # For multi GPU training, do not change
   dist_backend: gloo  # For multi GPU training, applicable when using ddp strategy [nccl, gloo]
+  # Learning rate warmup scheduler
+  use_lr_warmup: True  # Enable learning rate warmup
+  warmup_steps: 1000  # Number of warmup steps (linear warmup from warmup_start_lr_ratio to 1.0)
+  warmup_start_lr_ratio: 0.0  # Starting LR as ratio of target LR (0.0 means start from 0)
+  lr_scheduler_type: "constant"  # Scheduler after warmup: "constant", "linear_decay", or "cosine"
+  total_training_steps: 100000  # Total training steps (required for "linear_decay" and "cosine" schedulers)
 
 log:
   wandb_project: protein_transformer_big_runs  # Leave this so we can compare runs easily
@@ -101,3 +107,4 @@ ema:
   validate_original_weights: False  # Whether to run validation on regular or EMA weights
   every_n_steps: 1  # Frequency of EMA updates
   cpu_offload: False  # Whether to offload EMA weights to cpu
+

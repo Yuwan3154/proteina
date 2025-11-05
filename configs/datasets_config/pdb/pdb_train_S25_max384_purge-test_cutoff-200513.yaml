@@ -36,7 +36,7 @@ datamodule:
     remove_non_standard_residues: True # Include only proteins containing standard amino acid residues
     remove_pdb_unavailable: True # Include only proteins that are available to download
     # NEW FEATURE 1: Release date cutoff (format: YYYY-MM-DD)
-    max_deposition_date: "2019-08-28" # Only include structures deposited on or before this date
+    max_deposition_date: "2020-05-13" # Only include structures deposited on or before this date
     # NOTE: exclude_ids moved to datasplitter for cluster-aware exclusion
     exclude_ids: [] # Can still specify here, but will be passed to datasplitter automatically
 
