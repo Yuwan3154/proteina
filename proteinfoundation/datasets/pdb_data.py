@@ -14,6 +14,7 @@ import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import functools
 
+import numpy as np
 import pandas as pd
 import torch
 from loguru import logger
@@ -63,6 +64,7 @@ class PDBDataSelector:
         remove_cath_unavailable: bool = False,
         exclude_ids: List[str] = None,
         exclude_ids_from_file: str = None,
+        max_deposition_date: str = None,
         num_workers: int = 32,
     ):
         """
@@ -88,6 +90,7 @@ class PDBDataSelector:
             remove_cath_unavailable (bool): Whether to remove structures that don't have CATH labels.
             exclude_ids (List[str]): List of PDB IDs to be excluded from the selection.
             exclude_ids_from_file (str, optional): Path to a txt file containing IDs to be excluded from the selection.
+            max_deposition_date (str, optional): Maximum deposition date in YYYY-MM-DD format. Structures deposited after this date will be excluded.
             num_workers (int): Number of workers for parallel processing. Defaults to 32.
 
         Raises:
@@ -112,6 +115,7 @@ class PDBDataSelector:
         self.max_length = max_length
         self.exclude_ids = exclude_ids
         self.exclude_ids_from_file = exclude_ids_from_file
+        self.max_deposition_date = max_deposition_date
         self.labels = labels
         self.remove_cath_unavailable = remove_cath_unavailable
         self.num_workers = num_workers
@@ -213,21 +217,16 @@ class PDBDataSelector:
             pdb_manager.df = pdb_manager.df[mask]
             rank_zero_info(f"{len(pdb_manager.df)} chains remaining")
 
-        all_exclude_ids = set()
-        # Add IDs from direct list if present
-        if self.exclude_ids:
-            all_exclude_ids.update(self.exclude_ids)
-            # Add IDs from file if present
-        if self.exclude_ids_from_file:
-            with open(self.exclude_ids_from_file, "r") as f:
-                file_ids = {line.strip() for line in f if line.strip()}
-            all_exclude_ids.update(file_ids)
+        if self.max_deposition_date:
+            rank_zero_info(f"Removing chains deposited after {self.max_deposition_date}...")
+            cutoff_date = np.datetime64(self.max_deposition_date)
+            pdb_manager.filter_by_deposition_date(cutoff_date, update=True)
+            rank_zero_info(f"{len(pdb_manager.df)} chains remaining")
 
-        rank_zero_info(f"Removing excluded chains ({len(all_exclude_ids)} gathered)")
-
-        mask = ~pdb_manager.df["id"].isin(all_exclude_ids)
-        pdb_manager.df = pdb_manager.df[mask]
-        rank_zero_info(f"{len(pdb_manager.df)} chains remaining")
+        # NOTE: We do NOT apply exclude_ids here anymore!
+        # Exclusion is handled in PDBDataSplitter.split_data() to support cluster-aware exclusion
+        # where we exclude entire clusters if any member is in exclude_ids
+        
         self.df_data = pdb_manager.df
         return self.df_data
 
@@ -241,6 +240,8 @@ class PDBDataSplitter:
         split_type: Literal["random", "sequence_similarity"] = "random",
         split_sequence_similarity: Optional[int] = None,
         overwrite_sequence_clusters: Optional[bool] = False,
+        exclude_ids: List[str] = None,
+        exclude_ids_from_file: str = None,
     ) -> None:
         """Initialise DataSplitter object for splitting data based on arguments into train, val and test set.
 
@@ -257,6 +258,9 @@ class PDBDataSplitter:
             overwrite_sequence_clusters (Optional[bool], optional): if split_type == "sequence_similarity", if previously
                 generated clusters (if present with the same sequence similarity threshold) should be overwritten
                 or reused. Defaults to False (reuse).
+            exclude_ids (List[str], optional): List of PDB IDs to be excluded. For sequence_similarity split,
+                entire clusters containing these IDs will be excluded. Defaults to None.
+            exclude_ids_from_file (str, optional): Path to a txt file containing IDs to be excluded. Defaults to None.
         """
 
         self.df_data = df_data
@@ -265,6 +269,8 @@ class PDBDataSplitter:
         self.split_type = split_type
         self.split_sequence_similarity = split_sequence_similarity
         self.overwrite_sequence_clusters = overwrite_sequence_clusters
+        self.exclude_ids = exclude_ids
+        self.exclude_ids_from_file = exclude_ids_from_file
         self.splits = ["train", "val", "test"]
         self.dfs_splits = None
         self.clusterid_to_seqid_mappings = None
@@ -279,10 +285,25 @@ class PDBDataSplitter:
         Returns:
             dfs_splits (Dict): dictionary containing the train/val/test splits of the dataframe.
         """
+        # Collect all exclude_ids from both sources
+        all_exclude_ids = set()
+        if self.exclude_ids:
+            all_exclude_ids.update(self.exclude_ids)
+        if self.exclude_ids_from_file:
+            with open(self.exclude_ids_from_file, "r") as f:
+                file_ids = {line.strip() for line in f if line.strip()}
+            all_exclude_ids.update(file_ids)
+        
         if self.split_type == "random":
             rank_zero_info(
                 f"Splitting dataset via random split into {self.train_val_test}..."
             )
+            # For random split, apply simple exclusion
+            if all_exclude_ids:
+                rank_zero_info(f"Excluding {len(all_exclude_ids)} specified IDs...")
+                df_data = df_data[~df_data['id'].isin(all_exclude_ids)]
+                rank_zero_info(f"{len(df_data)} chains remaining after exclusion")
+            
             self.dfs_splits = split_dataframe(df_data, self.splits, self.train_val_test)
             self.clusterid_to_seqid_mappings = None
 
@@ -313,6 +334,36 @@ class PDBDataSplitter:
                     min_seq_id=self.split_sequence_similarity,
                     overwrite=self.overwrite_sequence_clusters,
                 )
+            
+            # construct cluster_dict to map from cluster representative to all sequence ids in cluster
+            clusterid_to_seqid_mapping = read_cluster_tsv(cluster_tsv_filepath)
+            
+            # CLUSTER-AWARE EXCLUSION: Find all clusters containing excluded IDs
+            if all_exclude_ids:
+                rank_zero_info(f"Applying cluster-aware exclusion for {len(all_exclude_ids)} specified IDs...")
+                excluded_clusters = set()
+                excluded_seq_ids = set()
+                
+                for cluster_id, seq_ids in clusterid_to_seqid_mapping.items():
+                    # If ANY member of the cluster is in exclude list, exclude the ENTIRE cluster
+                    if any(seq_id in all_exclude_ids for seq_id in seq_ids):
+                        excluded_clusters.add(cluster_id)
+                        excluded_seq_ids.update(seq_ids)
+                
+                rank_zero_info(f"Found {len(excluded_clusters)} clusters containing excluded IDs")
+                rank_zero_info(f"Total {len(excluded_seq_ids)} sequences will be excluded (entire clusters)")
+                
+                # Remove excluded clusters from the cluster mapping
+                clusterid_to_seqid_mapping = {
+                    cluster_id: seq_ids
+                    for cluster_id, seq_ids in clusterid_to_seqid_mapping.items()
+                    if cluster_id not in excluded_clusters
+                }
+                
+                # Filter df_data to remove all sequences from excluded clusters
+                df_data = df_data[~df_data['id'].isin(excluded_seq_ids)]
+                rank_zero_info(f"{len(df_data)} chains remaining after cluster-aware exclusion")
+            
             # read representative sequences in
             df_cluster_reps = fasta_to_df(cluster_fasta_filepath)
             seq_ids = df_cluster_reps["id"].to_numpy().tolist()
@@ -321,8 +372,6 @@ class PDBDataSplitter:
             splits = split_dataframe(
                 df_sequences_reps, self.splits, self.train_val_test
             )
-            # construct cluster_dict to map from cluster representative to all sequence ids in cluster
-            clusterid_to_seqid_mapping = read_cluster_tsv(cluster_tsv_filepath)
             # use cluster dict to extend splits from cluster representatives to all sequence ids included in these clusters
             self.dfs_splits, self.clusterid_to_seqid_mappings = expand_cluster_splits(
                 cluster_rep_splits=splits,
@@ -618,6 +667,11 @@ class PDBLightningDataModule(BaseLightningDataModule):
             rank_zero_info(f"Loading dataset csv from {df_data_name}")
             self.df_data = pd.read_csv(self.data_dir / df_data_name)
 
+        # Pass exclude_ids from dataselector to datasplitter if not already set
+        if self.dataselector and not self.datasplitter.exclude_ids:
+            self.datasplitter.exclude_ids = self.dataselector.exclude_ids
+            self.datasplitter.exclude_ids_from_file = self.dataselector.exclude_ids_from_file
+        
         # split the dataset into train, val and test and set attributes that are used for dataset creation
         (self.dfs_splits, self.clusterid_to_seqid_mappings) = (
             self.datasplitter.split_data(self.df_data, file_identifier)
@@ -781,7 +835,23 @@ class PDBLightningDataModule(BaseLightningDataModule):
             return fname
 
         except Exception as e:
-            logger.warning(f"Error processing {pdb} {chains if 'chains' in locals() else 'all'}: {e}")
+            error_msg = str(e)
+            chain_id = chains if 'chains' in locals() else 'all'
+            protein_id = f"{pdb}_{chain_id}" if chain_id != 'all' else pdb
+            
+            # Check if this is a non-canonical residue issue
+            if any(keyword in error_msg.lower() for keyword in ['residue', 'resname', 'non-standard', 'unknown']):
+                logger.warning(f"Auto-excluding {protein_id} due to potential non-canonical residues: {e}")
+                # Write to auto-exclude tracking file
+                auto_exclude_file = processed_dir.parent / "auto_excluded_non_canonical.txt"
+                try:
+                    with open(auto_exclude_file, "a") as f:
+                        f.write(f"{protein_id}\t{error_msg}\n")
+                except Exception as write_error:
+                    logger.warning(f"Could not write to auto-exclude file: {write_error}")
+            else:
+                logger.warning(f"Error processing {protein_id}: {e}")
+            
             return None
 
     def _load_and_process_pdb(
@@ -835,7 +905,23 @@ class PDBLightningDataModule(BaseLightningDataModule):
             )
 
         except Exception as e:
-            logger.warning(f"Error processing {pdb} {chains}: {e}")
+            error_msg = str(e)
+            chain_id = chains if 'chains' in locals() else 'all'
+            protein_id = f"{pdb}_{chain_id}" if chain_id != 'all' else pdb
+            
+            # Check if this is a non-canonical residue issue
+            if any(keyword in error_msg.lower() for keyword in ['residue', 'resname', 'non-standard', 'unknown']):
+                logger.warning(f"Auto-excluding {protein_id} due to potential non-canonical residues: {e}")
+                # Write to auto-exclude tracking file
+                auto_exclude_file = self.data_dir / "auto_excluded_non_canonical.txt"
+                try:
+                    with open(auto_exclude_file, "a") as f:
+                        f.write(f"{protein_id}\t{error_msg}\n")
+                except Exception as write_error:
+                    logger.warning(f"Could not write to auto-exclude file: {write_error}")
+            else:
+                logger.warning(f"Error processing {protein_id}: {e}")
+            
             return None
         fname = f"{pdb}.pt" if chains == "all" else f"{pdb}_{chains}.pt"
 
