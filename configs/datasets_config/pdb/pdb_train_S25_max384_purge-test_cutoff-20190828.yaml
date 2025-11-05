@@ -1,6 +1,6 @@
 datamodule:
   _target_: "proteinfoundation.datasets.pdb_data.PDBLightningDataModule"
-  data_dir: ${oc.env:DATA_PATH}/pdb_train_cutoff/ # Directory where the dataset is stored
+  data_dir: ${oc.env:DATA_PATH}/pdb_train/ # Directory where the dataset is stored
   in_memory: False
   format: "cif" # format for file download
   overwrite: False # Whether to overwrite existing dataset files and reprocess the raw data
@@ -21,7 +21,7 @@ datamodule:
 
   dataselector:
     _target_: "proteinfoundation.datasets.pdb_data.PDBDataSelector"
-    data_dir: ${oc.env:DATA_PATH}/pdb_train_cutoff/ # Directory where the dataset is stored
+    data_dir: ${oc.env:DATA_PATH}/pdb_train/ # Directory where the dataset is stored
     fraction: 1 # Fraction of dataset to use
     molecule_type: "protein" # Type of molecule for which to select
     experiment_types: ["diffraction", "EM"] # other options are "NMR" and "other"
@@ -42,7 +42,7 @@ datamodule:
 
   datasplitter:
     _target_: "proteinfoundation.datasets.pdb_data.PDBDataSplitter"
-    data_dir: ${oc.env:DATA_PATH}/pdb_train_cutoff/ # Directory where the dataset is stored
+    data_dir: ${oc.env:DATA_PATH}/pdb_train/ # Directory where the dataset is stored
     train_val_test: [0.98, 0.019, 0.001] # Cross-validation ratios to use for train, val, and test splits
     split_type: "sequence_similarity" # Split sequences by sequence similarity clustering, other option is "random"
     split_sequence_similarity: 0.25 # Clustering at 25% sequence similarity (argument is ignored if split_type!="sequence_similarity")
@@ -50,5 +50,5 @@ datamodule:
     # NEW FEATURE 2: Cluster-aware exclusion
     # For sequence_similarity split: entire clusters containing these IDs will be excluded
     # For random split: only the specified IDs will be excluded
-    exclude_ids: ["7ll9_C", "7ll9_D", "7ll9_G", "7ll9_H", "7bny_A", "7bny_B", "7bny_C", "7bny_D", "7kww_A", "7kww_B", "7ad5_A", "7b76_A"]
+    exclude_ids: ["7bny_A", "7kww_A", "7ad5_A", "7b76_A"]
     exclude_ids_from_file: null # Optional: path to a text file with one ID per line
