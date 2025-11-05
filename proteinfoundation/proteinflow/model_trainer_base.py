@@ -72,6 +72,48 @@ class ModelTrainerBase(L.LightningModule):
             optimizer = torch.optim.Adam(
                 self.parameters(), lr=self.cfg_exp.opt.lr
             )
+        
+        # Check if learning rate warmup is enabled
+        if self.cfg_exp.opt.get("use_lr_warmup", False):
+            warmup_steps = self.cfg_exp.opt.get("warmup_steps", 1000)
+            warmup_start_lr_ratio = self.cfg_exp.opt.get("warmup_start_lr_ratio", 0.0)
+            scheduler_type = self.cfg_exp.opt.get("lr_scheduler_type", "constant")
+            
+            # Create warmup function
+            def lr_lambda(current_step):
+                if current_step < warmup_steps:
+                    # Linear warmup from warmup_start_lr_ratio to 1.0
+                    return warmup_start_lr_ratio + (1.0 - warmup_start_lr_ratio) * (current_step / warmup_steps)
+                else:
+                    # After warmup, apply the specified scheduler
+                    if scheduler_type == "constant":
+                        return 1.0
+                    elif scheduler_type == "linear_decay":
+                        # Linear decay from 1.0 to 0.0 over remaining steps
+                        total_steps = self.cfg_exp.opt.get("total_training_steps", 100000)
+                        remaining_steps = total_steps - warmup_steps
+                        decay_step = current_step - warmup_steps
+                        return max(0.0, 1.0 - (decay_step / remaining_steps))
+                    elif scheduler_type == "cosine":
+                        # Cosine annealing after warmup
+                        total_steps = self.cfg_exp.opt.get("total_training_steps", 100000)
+                        remaining_steps = total_steps - warmup_steps
+                        decay_step = current_step - warmup_steps
+                        return 0.5 * (1.0 + np.cos(np.pi * decay_step / remaining_steps))
+                    else:
+                        return 1.0
+            
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+            
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "step",  # Update learning rate every step
+                    "frequency": 1,
+                }
+            }
+        
         return optimizer
 
     def _nn_out_to_x_clean(self, nn_out, batch):
