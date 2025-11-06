@@ -79,6 +79,27 @@ class ModelTrainerBase(L.LightningModule):
             warmup_start_lr_ratio = self.cfg_exp.opt.get("warmup_start_lr_ratio", 0.0)
             scheduler_type = self.cfg_exp.opt.get("lr_scheduler_type", "constant")
             
+            # Calculate total training steps dynamically from max_epochs and dataloader
+            total_steps = None
+            if scheduler_type in ["linear_decay", "cosine"]:
+                # Try to get dataloader length and max_epochs
+                if hasattr(self, 'trainer') and self.trainer is not None:
+                    if hasattr(self.trainer, 'datamodule') and self.trainer.datamodule is not None:
+                        train_dataloader = self.trainer.datamodule.train_dataloader()
+                        steps_per_epoch = len(train_dataloader)
+                        max_epochs = self.trainer.max_epochs
+                        accumulate_grad_batches = self.cfg_exp.opt.get("accumulate_grad_batches", 1)
+                        # Total steps = (steps_per_epoch / accumulate_grad_batches) * max_epochs
+                        total_steps = int((steps_per_epoch / accumulate_grad_batches) * max_epochs)
+                        logger.info(f"Calculated total_training_steps = {total_steps} "
+                                    f"(steps_per_epoch={steps_per_epoch}, max_epochs={max_epochs}, "
+                                    f"accumulate_grad_batches={accumulate_grad_batches})")
+
+                # Fallback to config value or default
+                if total_steps is None:
+                    total_steps = self.cfg_exp.opt.get("total_training_steps", 100000)
+                    logger.warning(f"Using fallback total_training_steps = {total_steps}")
+            
             # Create warmup function
             def lr_lambda(current_step):
                 if current_step < warmup_steps:
@@ -90,13 +111,11 @@ class ModelTrainerBase(L.LightningModule):
                         return 1.0
                     elif scheduler_type == "linear_decay":
                         # Linear decay from 1.0 to 0.0 over remaining steps
-                        total_steps = self.cfg_exp.opt.get("total_training_steps", 100000)
                         remaining_steps = total_steps - warmup_steps
                         decay_step = current_step - warmup_steps
                         return max(0.0, 1.0 - (decay_step / remaining_steps))
                     elif scheduler_type == "cosine":
                         # Cosine annealing after warmup
-                        total_steps = self.cfg_exp.opt.get("total_training_steps", 100000)
                         remaining_steps = total_steps - warmup_steps
                         decay_step = current_step - warmup_steps
                         return 0.5 * (1.0 + np.cos(np.pi * decay_step / remaining_steps))
@@ -484,7 +503,7 @@ class ModelTrainerBase(L.LightningModule):
 
     @abstractmethod
     def compute_fm_loss(
-        self, x_1, x_1_pred, x_t, t: Float[Tensor, "*"], mask: Bool[Tensor, "* nres"]
+        self, x_1, x_1_pred, x_t, t, mask
     ):
         """
         Computes and logs flow matching loss(es).
@@ -502,7 +521,7 @@ class ModelTrainerBase(L.LightningModule):
 
     @abstractmethod
     def compute_auxiliary_loss(
-        self, x_1, x_1_pred, x_t, t: Float[Tensor, "*"], mask: Bool[Tensor, "* nres"], batch = None
+        self, x_1, x_1_pred, x_t, t, mask, batch = None
     ):
         """
         Computes and logs auxiliary losses.
