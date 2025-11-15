@@ -16,6 +16,7 @@ import argparse
 import subprocess
 import logging
 import time
+import shutil
 
 # Setup logging
 logging.basicConfig(
@@ -26,6 +27,85 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+def detect_conda_executable():
+    """Auto-detect conda executable path."""
+    # Try common conda executables
+    conda_candidates = ['conda', 'mamba', 'micromamba']
+    
+    for cmd in conda_candidates:
+        conda_path = shutil.which(cmd)
+        if conda_path:
+            logger.info(f"🐍 Detected {cmd} at: {conda_path}")
+            return conda_path
+    
+    # Try common installation paths
+    common_paths = [
+        '~/miniforge3/bin/conda',
+        '~/miniconda3/bin/conda',
+        '~/anaconda3/bin/conda',
+        '/opt/conda/bin/conda',
+        '/usr/local/bin/conda'
+    ]
+    
+    for path in common_paths:
+        if os.path.exists(path):
+            logger.info(f"🐍 Found conda at: {path}")
+            return path
+    
+    logger.error("❌ Could not find conda executable")
+    return None
+
+def get_conda_env_path(conda_exe, env_name):
+    """Get the full path to a conda environment."""
+    try:
+        result = subprocess.run([conda_exe, 'info', '--envs'], 
+                              capture_output=True, text=True, check=True)
+        
+        for line in result.stdout.split('\n'):
+            if env_name in line and not line.startswith('#'):
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == env_name:
+                    env_path = parts[-1]
+                    logger.info(f"🔍 Found {env_name} environment at: {env_path}")
+                    return env_path
+        
+        logger.error(f"❌ Environment '{env_name}' not found in conda env list")
+        return None
+    except subprocess.CalledProcessError as e:
+        logger.error(f"❌ Failed to get conda environment info: {e}")
+        return None
+
+def run_with_conda_env(env_name, command_list, cwd=None):
+    """Run a command with conda environment activation using shell script wrappers."""
+    # Get the wrapper script path
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    if env_name == 'proteina':
+        wrapper_script = os.path.join(script_dir, 'run_with_proteina_env.sh')
+    elif env_name == 'colabdesign':
+        wrapper_script = os.path.join(script_dir, 'run_with_colabdesign_env.sh')
+    else:
+        logger.error(f"❌ Unknown environment: {env_name}")
+        return False
+    
+    # Check if wrapper script exists
+    if not os.path.exists(wrapper_script):
+        logger.error(f"❌ Wrapper script not found: {wrapper_script}")
+        return False
+    
+    # Build command with wrapper script
+    cmd = [wrapper_script] + command_list
+    
+    logger.info(f"🚀 Running in {env_name} environment: {' '.join(command_list)}")
+    logger.debug(f"Full command: {' '.join(cmd)}")
+    
+    try:
+        result = subprocess.run(cmd, cwd=cwd, check=False)
+        return result.returncode == 0
+    except Exception as e:
+        logger.error(f"❌ Failed to run command: {e}")
+        return False
 
 def run_proteina_inference(csv_file, csv_column, cif_dir, inference_config, num_gpus, usalign_path=None):
     """Run the Proteina inference pipeline."""
@@ -44,11 +124,8 @@ def run_proteina_inference(csv_file, csv_column, cif_dir, inference_config, num_
     if usalign_path:
         cmd.extend(['--usalign_path', usalign_path])
     
-    # Run in proteina environment
-    conda_cmd = f"source /opt/tljh/user/etc/profile.d/conda.sh && conda activate proteina && {' '.join(cmd)}"
-    
-    result = subprocess.run(conda_cmd, shell=True, executable='/bin/bash')
-    return result.returncode == 0
+    # Run in proteina environment using shell script wrapper
+    return run_with_conda_env('proteina', cmd)
 
 def run_af2rank_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpus, recycles=3, regenerate_plots=False):
     """Run the AF2Rank scoring pipeline."""
@@ -68,11 +145,8 @@ def run_af2rank_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpu
     if regenerate_plots:
         cmd.append('--regenerate_plots')
     
-    # Run in colabdesign environment  
-    conda_cmd = f"source /opt/tljh/user/etc/profile.d/conda.sh && conda activate colabdesign && {' '.join(cmd)}"
-    
-    result = subprocess.run(conda_cmd, shell=True, executable='/bin/bash')
-    return result.returncode == 0
+    # Run in colabdesign environment using shell script wrapper
+    return run_with_conda_env('colabdesign', cmd)
 
 def main():
     parser = argparse.ArgumentParser(description='Complete AF2Rank Evaluation Pipeline')
@@ -120,6 +194,7 @@ def main():
     logger.info(f"⚙️  Inference config: {args.inference_config}")
     logger.info(f"🔥 GPUs: {args.num_gpus}")
     logger.info(f"🔄 AF2Rank recycles: {args.recycles}")
+    logger.info(f"🐍 Using shell script wrappers for conda environments")
     
     success = True
     
@@ -179,7 +254,11 @@ def main():
     
     if success:
         logger.info(f"🎉 Pipeline completed successfully in {total_time:.1f}s")
-        logger.info(f"📁 Results saved to: /home/jupyter-chenxi/proteina/inference/{args.inference_config}/")
+        # Construct results path dynamically
+        current_dir = os.getcwd()
+        results_path = os.path.join(current_dir, '..', 'inference', args.inference_config)
+        results_path = os.path.abspath(results_path)
+        logger.info(f"📁 Results should be available at: {results_path}/")
     else:
         logger.error(f"💥 Pipeline failed after {total_time:.1f}s")
     

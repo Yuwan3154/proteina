@@ -26,7 +26,7 @@ from loguru import logger
 from dotenv import load_dotenv
 
 # Add proteina to path if needed
-sys.path.append('/home/jupyter-chenxi/proteina')
+sys.path.append(os.path.expanduser('~/proteina'))
 
 # Import Proteina's exact amino acid encoding to ensure consistency
 from openfold.np.residue_constants import (
@@ -38,7 +38,7 @@ from openfold.np.residue_constants import (
 )
 
 # Load environment variables
-load_dotenv('/home/jupyter-chenxi/proteina/.env')
+load_dotenv(os.path.expanduser('~/proteina/.env'))
 
 
 def extract_sequence_from_cif(cif_file: str, chain_id: str) -> Optional[List[str]]:
@@ -196,7 +196,7 @@ def convert_from_csv(csv_file: str, csv_column: str, cif_dir: str, output_dir: s
     df = pd.read_csv(csv_file)
     
     # Use shared DATA_PATH from environment, matching inference script expectations
-    data_path = os.environ.get('DATA_PATH', '/home/jupyter-chenxi/proteina/data')
+    data_path = os.environ.get('DATA_PATH', os.path.expanduser('~/proteina/data'))
     # Inference script expects files in DATA_PATH/pdb_train/processed/
     processed_dir = os.path.join(data_path, 'pdb_train', processed_subdir)
     os.makedirs(processed_dir, exist_ok=True)

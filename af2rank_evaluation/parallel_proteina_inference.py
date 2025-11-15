@@ -40,10 +40,31 @@ def signal_handler(signum, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
+# Auto-detect proteina base directory
+def get_proteina_base_dir():
+    """Auto-detect proteina base directory."""
+    # Try common locations
+    possible_dirs = [
+        os.path.expanduser('~/proteina'),
+        os.path.join(os.getcwd(), '..')  # Assume we're in af2rank_evaluation
+    ]
+    
+    for dir_path in possible_dirs:
+        abs_path = os.path.abspath(dir_path)
+        if os.path.exists(abs_path) and os.path.exists(os.path.join(abs_path, 'proteinfoundation')):
+            return abs_path
+    
+    # Fallback to current directory's parent
+    return os.path.abspath(os.path.join(os.getcwd(), '..'))
+
+PROTEINA_BASE_DIR = get_proteina_base_dir()
+
 # Try to import dotenv, but don't fail if it's not available
 try:
     from dotenv import load_dotenv
-    load_dotenv('/home/jupyter-chenxi/proteina/.env')
+    env_path = os.path.join(PROTEINA_BASE_DIR, '.env')
+    if os.path.exists(env_path):
+        load_dotenv(env_path)
 except ImportError:
     load_dotenv = None
 
@@ -57,22 +78,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def setup_conda_environment():
-    """Setup conda environment for proteina."""
-    conda_init_script = None
-    for script_path in ['/opt/tljh/user/etc/profile.d/conda.sh', '/opt/conda/etc/profile.d/conda.sh']:
-        if os.path.exists(script_path):
-            conda_init_script = script_path
-            break
-    
-    if conda_init_script:
-        return f"source {conda_init_script} && conda activate proteina"
-    else:
-        return "conda activate proteina"
 
 def generate_protein_output_dir(inference_config, protein_name):
     """Generate consistent output directory path for a protein."""
-    return f"/home/jupyter-chenxi/proteina/inference/{inference_config}/{protein_name}"
+    return os.path.join(PROTEINA_BASE_DIR, 'inference', inference_config, protein_name)
 
 def create_single_protein_csv(csv_file, csv_column, protein_name, output_dir):
     """Create a single-protein CSV file for individual processing."""
@@ -100,7 +109,7 @@ def run_cif_to_pt_conversion(csv_file, csv_column, cif_dir):
     """
     try:
         # Import here to ensure proteina environment is active
-        sys.path.append('/home/jupyter-chenxi/proteina/af2rank_evaluation')
+        sys.path.append(os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation'))
         from cif_to_pt_converter import convert_from_csv
         
         # Call directly - no subprocess needed!
@@ -108,7 +117,7 @@ def run_cif_to_pt_conversion(csv_file, csv_column, cif_dir):
             csv_file=csv_file,
             csv_column=csv_column,
             cif_dir=cif_dir,
-            output_dir='/home/jupyter-chenxi/proteina/data'  # Uses DATA_PATH internally
+            output_dir=os.path.join(PROTEINA_BASE_DIR, 'data')  # Uses DATA_PATH internally
         )
         
         # Create a mock result object for compatibility
@@ -133,22 +142,19 @@ def run_proteina_inference(protein_name, inference_config):
     Only uses subprocess for calling proteinfoundation/inference.py.
     
     Note: No timeout - inference can take hours for long proteins.
+    Environment activation is handled by the caller (shell script wrapper).
     """
-    conda_cmd = setup_conda_environment()
-    proteina_dir = "/home/jupyter-chenxi/proteina"
-    
-    cmd = f"""
-{conda_cmd} && cd {proteina_dir} && python proteinfoundation/inference.py \
-    --pt {protein_name} \
-    --config_name {inference_config}
-"""
+    cmd = [
+        'python', 'proteinfoundation/inference.py',
+        '--pt', protein_name,
+        '--config_name', inference_config
+    ]
     
     result = subprocess.run(
         cmd, 
-        shell=True, 
+        cwd=PROTEINA_BASE_DIR,
         capture_output=True, 
-        text=True, 
-        executable='/bin/bash'
+        text=True
     )
     return result
 
@@ -308,7 +314,7 @@ def find_proteins_needing_inference(csv_file, csv_column, inference_config):
     # Get proteins from CSV file
     csv_proteins = get_protein_names(csv_file, csv_column)
     
-    inference_base_dir = f"/home/jupyter-chenxi/proteina/inference/{inference_config}"
+    inference_base_dir = os.path.join(PROTEINA_BASE_DIR, 'inference', inference_config)
     
     proteins_needing_inference = []
     

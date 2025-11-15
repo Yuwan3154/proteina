@@ -39,10 +39,31 @@ def signal_handler(signum, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
+# Auto-detect proteina base directory
+def get_proteina_base_dir():
+    """Auto-detect proteina base directory."""
+    # Try common locations
+    possible_dirs = [
+        os.path.expanduser('~/proteina'),
+        os.path.join(os.getcwd(), '..')  # Assume we're in af2rank_evaluation
+    ]
+    
+    for dir_path in possible_dirs:
+        abs_path = os.path.abspath(dir_path)
+        if os.path.exists(abs_path) and os.path.exists(os.path.join(abs_path, 'proteinfoundation')):
+            return abs_path
+    
+    # Fallback to current directory's parent
+    return os.path.abspath(os.path.join(os.getcwd(), '..'))
+
+PROTEINA_BASE_DIR = get_proteina_base_dir()
+
 # Try to import dotenv, but don't fail if it's not available
 try:
     from dotenv import load_dotenv
-    load_dotenv('/home/jupyter-chenxi/proteina/.env')
+    env_path = os.path.join(PROTEINA_BASE_DIR, '.env')
+    if os.path.exists(env_path):
+        load_dotenv(env_path)
 except ImportError:
     load_dotenv = None
 
@@ -56,22 +77,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def setup_conda_environment():
-    """Setup conda environment for colabdesign."""
-    conda_init_script = None
-    for script_path in ['/opt/tljh/user/etc/profile.d/conda.sh', '/opt/conda/etc/profile.d/conda.sh']:
-        if os.path.exists(script_path):
-            conda_init_script = script_path
-            break
-    
-    if conda_init_script:
-        return f"source {conda_init_script} && conda activate colabdesign"
-    else:
-        return "conda activate colabdesign"
 
 def generate_protein_output_dir(inference_config, protein_name):
     """Generate consistent output directory path for a protein."""
-    return f"/home/jupyter-chenxi/proteina/inference/{inference_config}/{protein_name}"
+    return os.path.join(PROTEINA_BASE_DIR, 'inference', inference_config, protein_name)
 
 def find_reference_cif(protein_name, cif_dir):
     """Find the reference CIF file for a protein."""
@@ -157,13 +166,13 @@ def process_single_protein_af2rank(args):
 
 def run_af2rank_scoring(protein_name, reference_cif, inference_output_dir, recycles=3):
     """Run AF2Rank scoring for a single protein."""
-    conda_cmd = setup_conda_environment()
+    # Environment activation is handled by the caller (shell script wrapper)
     
-    python_cmd = f"""
-{conda_cmd} && cd /home/jupyter-chenxi/proteina/af2rank_evaluation && python -c "
+    # Prepare the Python code to execute
+    python_code = f"""
 import sys
 import os
-sys.path.append('/home/jupyter-chenxi/proteina/af2rank_evaluation')
+sys.path.append('{os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation')}')
 
 # Import AF2Rank components
 from af2rank_scorer import run_af2rank_analysis
@@ -199,21 +208,26 @@ if result:
 else:
     print(f'ERROR: AF2Rank analysis failed for {{protein_id}}')
     sys.exit(1)
-"
 """
     
-    result = subprocess.run(python_cmd, shell=True, capture_output=True, text=True, executable='/bin/bash')
+    cmd = ['python', '-c', python_code]
+    result = subprocess.run(
+        cmd, 
+        cwd=os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation'),
+        capture_output=True, 
+        text=True
+    )
     return result
 
 def run_af2rank_plot_only(protein_name, reference_cif, inference_output_dir, recycles=3):
     """Regenerate plots only for existing AF2Rank scores and update summary."""
-    conda_cmd = setup_conda_environment()
+    # Environment activation is handled by the caller (shell script wrapper)
     
-    python_cmd = f"""
-{conda_cmd} && cd /home/jupyter-chenxi/proteina/af2rank_evaluation && python -u -c "
+    # Prepare the Python code to execute
+    python_code = f"""
 import sys
 import os
-sys.path.append('/home/jupyter-chenxi/proteina/af2rank_evaluation')
+sys.path.append('{os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation')}')
 
 # Import AF2Rank components
 from af2rank_scorer import run_af2rank_plot_only
@@ -241,10 +255,15 @@ if result:
 else:
     print(f'ERROR: Failed to regenerate plots for {{protein_id}}', flush=True)
     sys.exit(1)
-"
 """
     
-    result = subprocess.run(python_cmd, shell=True, capture_output=False, text=True, executable='/bin/bash')
+    cmd = ['python', '-u', '-c', python_code]
+    result = subprocess.run(
+        cmd, 
+        cwd=os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation'),
+        capture_output=False, 
+        text=True
+    )
     return result
 
 
@@ -338,7 +357,7 @@ def find_proteins_needing_af2rank(csv_file, csv_column, inference_config, regene
     # Get proteins from CSV file
     csv_proteins = get_protein_names(csv_file, csv_column)
     
-    inference_base_dir = f"/home/jupyter-chenxi/proteina/inference/{inference_config}"
+    inference_base_dir = os.path.join(PROTEINA_BASE_DIR, 'inference', inference_config)
     
     if not os.path.exists(inference_base_dir):
         return []
@@ -430,7 +449,7 @@ def main():
     proteins_needing_plots = []
 
     for protein_name in protein_names:
-        protein_dir = Path(f"/home/jupyter-chenxi/proteina/inference/{args.inference_config}/{protein_name}")
+        protein_dir = Path(os.path.join(PROTEINA_BASE_DIR, 'inference', args.inference_config, protein_name))
         af2rank_csv = protein_dir / "af2rank_analysis" / f"af2rank_scores_{protein_name}.csv"
 
         if af2rank_csv.exists() and args.regenerate_plots:
@@ -578,7 +597,7 @@ def main():
     
     if successful:
         logger.info(f"🎉 Successfully processed {successful} proteins!")
-        logger.info(f"📁 Results saved to: /home/jupyter-chenxi/proteina/inference/{args.inference_config}/")
+        logger.info(f"📁 Results saved to: {os.path.join(PROTEINA_BASE_DIR, 'inference', args.inference_config)}/")
     
     sys.exit(0 if not failed else 1)
 
