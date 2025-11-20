@@ -1,6 +1,6 @@
 run_name_:
-ckpt_path: "~/proteina/data/weights"
-ckpt_name: 
+ckpt_path:
+ckpt_name:
 
 ncpus_: 24
 seed: 5

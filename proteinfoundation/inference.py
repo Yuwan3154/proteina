@@ -375,9 +375,7 @@ if __name__ == "__main__":
     os.makedirs(root_path, exist_ok=True)
 
     # Load model from checkpoint
-    ckpt_path = cfg.ckpt_path
-    if isinstance(ckpt_path, str) and ckpt_path.startswith('~/'):
-        ckpt_path = os.path.expanduser(ckpt_path)
+    ckpt_path = os.path.join(cfg.data_dir, "weights")
     ckpt_file = os.path.join(ckpt_path, cfg.ckpt_name)
     logger.info(f"Using checkpoint {ckpt_file}")
     assert os.path.exists(ckpt_file), f"Not a valid checkpoint {ckpt_file}"
