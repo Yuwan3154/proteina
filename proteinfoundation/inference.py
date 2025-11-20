@@ -375,7 +375,7 @@ if __name__ == "__main__":
     os.makedirs(root_path, exist_ok=True)
 
     # Load model from checkpoint
-    ckpt_path = os.path.join(cfg.data_dir, "weights")
+    ckpt_path = os.path.join(os.getenv("DATA_PATH"), "weights")
     ckpt_file = os.path.join(ckpt_path, cfg.ckpt_name)
     logger.info(f"Using checkpoint {ckpt_file}")
     assert os.path.exists(ckpt_file), f"Not a valid checkpoint {ckpt_file}"
@@ -415,10 +415,8 @@ if __name__ == "__main__":
     model.configure_inference(cfg, nn_ag=nn_ag)
 
     # Create inference dataset
-    # Fix path concatenation to handle trailing slashes
-    data_dir_clean = cfg.data_dir.rstrip('/')
-    pt = torch.load(f"{data_dir_clean}/processed/{args.pt}.pt")
-    cath_codes = pd.read_csv(f"{data_dir_clean}/{cfg.cath_code_file}")["cath_code"].tolist()
+    pt = torch.load(os.path.join(cfg.data_dir, "processed", f"{args.pt}.pt"))
+    cath_codes = pd.read_csv(os.path.join(cfg.data_dir, cfg.cath_code_file))["cath_code"].tolist()
     assert args.pt is not None, "pt must be provided if seq_cond is True"
     
     # Choose the appropriate dataset class based on CIRPIN conditioning
