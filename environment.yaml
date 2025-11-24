@@ -1,4 +1,4 @@
-name: proteina_env
+name: proteina
 channels:
   - nvidia
   - pytorch
