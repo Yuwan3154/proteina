@@ -33,6 +33,7 @@ from Bio.PDB import MMCIFParser, PDBIO, Select, Structure, Model
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from loguru import logger
+import gc
 
 import jax
 import jax.numpy as jnp
@@ -234,7 +235,6 @@ def get_sequence_from_pdb(pdb_file, chain=None):
             # Detect available chains and map if needed
             detected_chain = None
             try:
-                from Bio.PDB import MMCIFParser
                 parser = MMCIFParser(QUIET=True)
                 structure = parser.get_structure('protein', pdb_file)
                 available_chains = []
@@ -314,7 +314,6 @@ def get_sequence_from_pdb(pdb_file, chain=None):
     finally:
         # Clean up temporary PDB file if created
         if temp_pdb_file:
-            import os
             if os.path.exists(temp_pdb_file):
                 os.unlink(temp_pdb_file)
 
@@ -418,9 +417,9 @@ class ModernAF2Rank:
         logger.info("Loading AlphaFold parameters for AF2Rank scoring...")
         
         # Set environment variables for AlphaFold parameters
-        import os
         params_path = os.path.expanduser("~/params")
         os.environ["ALPHAFOLD_DATA_DIR"] = params_path
+        assert os.path.exists(params_path)
         
         # Create model with explicit parameter directory
         model_opts = self.model_opts.copy()
@@ -455,7 +454,6 @@ class ModernAF2Rank:
                 # Detect available chains and map if needed
                 detected_chain = None
                 try:
-                    from Bio.PDB import MMCIFParser
                     parser = MMCIFParser(QUIET=True)
                     structure = parser.get_structure('protein', pdb_file)
                     available_chains = []
@@ -561,7 +559,6 @@ class ModernAF2Rank:
         finally:
             # Clean up temporary PDB file if created
             if temp_pdb_file:
-                import os
                 if os.path.exists(temp_pdb_file):
                     os.unlink(temp_pdb_file)
         
@@ -573,7 +570,8 @@ class ModernAF2Rank:
         
         if verbose:
             logger.debug(f"Starting AF2Rank scoring for {decoy_pdb}")
-        
+        logger.info(f"Using device: {jax.devices}")
+
         # Set random seed for reproducibility
         self.af.set_seed(seed)
         
@@ -651,7 +649,6 @@ class ModernAF2Rank:
             self.af.save_pdb(output_pdb)
         
         # Safe cleanup to prevent memory accumulation
-        import gc
         gc.collect()
         
         if verbose:
