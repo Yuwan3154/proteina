@@ -570,7 +570,6 @@ class ModernAF2Rank:
         
         if verbose:
             logger.debug(f"Starting AF2Rank scoring for {decoy_pdb}")
-        logger.info(f"Using device: {jax.devices}")
 
         # Set random seed for reproducibility
         self.af.set_seed(seed)
@@ -787,6 +786,7 @@ def run_af2rank_analysis(protein_id: str, reference_cif: str, inference_output_d
     """
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
+    logger.info(f"Using device: {jax.devices}")
     
     # Check if summary exists and if we should regenerate
     summary_path = os.path.join(output_dir, f"af2rank_summary_{protein_id}.json")

@@ -168,12 +168,14 @@ def run_af2rank_scoring(protein_name, reference_cif, inference_output_dir, recyc
     python_code = f"""
 import sys
 import os
+import jax
 sys.path.append('{os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation')}')
 
 # Import AF2Rank components
 from af2rank_scorer import run_af2rank_analysis
 
 print('Starting AF2Rank scoring for {protein_name} with ColabDesign environment')
+print(f"Using device: {jax.devices}")
 
 protein_id = '{protein_name}'
 pdb_id, chain_id = protein_id.split('_')
