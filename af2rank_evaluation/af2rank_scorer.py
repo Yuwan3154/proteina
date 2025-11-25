@@ -34,9 +34,27 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from loguru import logger
 import gc
+from contextlib import contextmanager
 
 import jax
 import jax.numpy as jnp
+
+
+@contextmanager
+def suppress_stdout():
+    """Context manager to suppress stdout (for noisy ColabDesign output)."""
+    import sys
+    import os
+    # Save the original stdout
+    original_stdout = sys.stdout
+    # Redirect stdout to /dev/null
+    sys.stdout = open(os.devnull, 'w')
+    try:
+        yield
+    finally:
+        # Restore original stdout
+        sys.stdout.close()
+        sys.stdout = original_stdout
 from colabdesign import mk_af_model, clear_mem
 from colabdesign.af.contrib import predict
 from colabdesign.shared.protein import _np_rmsd
@@ -724,27 +742,29 @@ def score_proteina_structures(protein_id: str, reference_cif: str, inference_out
     
     logger.info(f"Starting AF2Rank scoring for {len(pdb_files)} structures of {protein_id}")
     
-    # Initialize AF2Rank scorer
+    # Initialize AF2Rank scorer (suppress noisy ColabDesign stdout)
     try:
-        scorer = ModernAF2Rank(reference_cif, chain=chain)
+        with suppress_stdout():
+            scorer = ModernAF2Rank(reference_cif, chain=chain)
     except Exception as e:
         logger.error(f"Failed to initialize AF2Rank scorer: {e}")
         return []
     
     scores = []
     
-    # Score each structure
+    # Score each structure (suppress noisy ColabDesign stdout)
     for pdb_path in tqdm(pdb_files, desc=f"AF2Rank scoring {protein_id}"):
         pdb_filename = os.path.basename(pdb_path)
         
         try:
-            # Score the structure
-            structure_scores = scorer.score_structure(
-                pdb_path,
-                decoy_chain="A",  # Force chain A since Proteina generates chain A
-                recycles=recycles,
-                verbose=verbose
-            )
+            # Score the structure (suppress ColabDesign's verbose alignment output)
+            with suppress_stdout():
+                structure_scores = scorer.score_structure(
+                    pdb_path,
+                    decoy_chain="A",  # Force chain A since Proteina generates chain A
+                    recycles=recycles,
+                    verbose=verbose
+                )
             
             # Add metadata
             structure_scores.update({
