@@ -481,6 +481,24 @@ class ProteinTransformerAF3(torch.nn.Module):
             "num_buckets_predict_pair", None
         )
 
+        # Contact map diffusion mode
+        self.contact_map_mode = kwargs.get("contact_map_mode", False)
+        if self.contact_map_mode:
+            # Validation: contact map mode requires triangle multiplicative updates
+            # for proper pairwise distance reasoning
+            if not self.use_tri_mult:
+                raise ValueError(
+                    "contact_map_mode=True requires use_tri_mult=True. "
+                    "Triangle multiplicative updates are essential for contact map "
+                    "diffusion as they enable propagation of pairwise distance "
+                    "constraints through the triangle inequality."
+                )
+            if not self.update_pair_repr:
+                raise ValueError(
+                    "contact_map_mode=True requires update_pair_repr=True. "
+                    "Pair representation updates are needed for contact map prediction."
+                )
+
         # Registers
         self.num_registers = kwargs.get("num_registers", None)
         if self.num_registers is None or self.num_registers <= 0:
@@ -575,6 +593,13 @@ class ProteinTransformerAF3(torch.nn.Module):
                         kwargs["pair_repr_dim"], self.num_buckets_predict_pair
                     ),
                 )
+
+        # Contact map prediction head (for contact map diffusion mode)
+        if self.contact_map_mode:
+            self.contact_map_decoder = torch.nn.Sequential(
+                torch.nn.LayerNorm(kwargs["pair_repr_dim"]),
+                torch.nn.Linear(kwargs["pair_repr_dim"], 1),
+            )
 
         self.coors_3d_decoder = torch.nn.Sequential(
             torch.nn.LayerNorm(kwargs["token_dim"]),
@@ -714,5 +739,16 @@ class ProteinTransformerAF3(torch.nn.Module):
             )  # Does not affect loss but pytorch does not complain for unused params
             final_coors = final_coors * mask[..., None]
             nn_out["pair_pred"] = pair_pred
+
+        # Contact map prediction (for contact map diffusion mode)
+        if self.contact_map_mode:
+            pair_mask = mask[..., :, None] * mask[..., None, :]  # [b, n, n]
+            contact_map_pred = self.contact_map_decoder(pair_rep)  # [b, n, n, 1]
+            contact_map_pred = contact_map_pred.squeeze(-1)  # [b, n, n]
+            # Enforce symmetry
+            contact_map_pred = (contact_map_pred + contact_map_pred.transpose(-1, -2)) / 2.0
+            contact_map_pred = contact_map_pred * pair_mask
+            nn_out["contact_map_pred"] = contact_map_pred
+
         nn_out["coors_pred"] = final_coors
         return nn_out

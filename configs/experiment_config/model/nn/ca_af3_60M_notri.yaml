@@ -68,3 +68,9 @@ num_registers: 10
 use_qkln: True
 
 num_buckets_predict_pair: 64
+
+# Contact map diffusion mode
+# NOTE: contact_map_mode requires use_tri_mult=True and update_pair_repr=True
+# This config has them disabled, so contact_map_mode cannot be used here
+contact_map_mode: False  # Set to True to enable contact map diffusion (requires tri_mult)
+contact_map_embed_dim: 64  # Embedding dimension for noisy contact map feature

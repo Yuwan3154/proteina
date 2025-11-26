@@ -11,7 +11,11 @@ datamodule:
     - _target_: "proteinfoundation.datasets.transforms.GlobalRotationTransform" # Transforms to apply to dataset examples
     - _target_: "proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform"
     - _target_: "proteinfoundation.datasets.transforms.CATHLabelTransform" # activate for fold-conditional training
-      root_dir: ${oc.env:DATA_PATH}/cathdata/ # Root directory for CATH labels  
+      root_dir: ${oc.env:DATA_PATH}/cathdata/ # Root directory for CATH labels
+    # Uncomment below to enable contact map extraction (required for contact_map_mode training)
+    # - _target_: "proteinfoundation.datasets.transforms.ContactMapTransform"
+    #   contact_atom_type: "CB"  # "CA" for alpha-carbon, "CB" for beta-carbon (pseudo-CB for Glycine)
+    #   contact_distance_cutoff: 8.0  # Distance threshold in Angstroms for defining contacts
     - _target_: "proteinfoundation.datasets.transforms.PaddingTransform"
       max_size: 256
   batch_size: 4 # Batch size for dataloader

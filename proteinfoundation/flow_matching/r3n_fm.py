@@ -658,3 +658,401 @@ class R3NFlowMatcher:
         else:
             # Should not get here
             raise IOError(f"Schedule mode not recognized {mode}")
+
+
+class ContactMapFlowMatcher:
+    """
+    Flow matching on symmetric L×L contact maps.
+    
+    The contact map is treated as a continuous L×L matrix where each entry
+    represents the probability/value of contact between residue pairs.
+    We enforce symmetry throughout the diffusion process.
+    """
+
+    def __init__(self, scale_ref: float = 1.0):
+        """
+        Args:
+            scale_ref: Scale of the reference (noise) distribution.
+        """
+        self.scale_ref = scale_ref
+
+    def _apply_pair_mask(
+        self,
+        contact_map: Float[Tensor, "* n n"],
+        mask: Optional[Bool[Tensor, "* n"]] = None,
+    ) -> Float[Tensor, "* n n"]:
+        """
+        Applies pair mask to contact map. Sets masked elements to zero.
+
+        Args:
+            contact_map: Contact map tensor of shape [*, n, n]
+            mask: Sequence mask of shape [*, n]
+
+        Returns:
+            Masked contact map of shape [*, n, n]
+        """
+        if mask is None:
+            return contact_map
+        pair_mask = mask[..., :, None] * mask[..., None, :]  # [*, n, n]
+        return contact_map * pair_mask
+
+    def _enforce_symmetry(
+        self, contact_map: Float[Tensor, "* n n"]
+    ) -> Float[Tensor, "* n n"]:
+        """
+        Enforces symmetry of contact map by averaging with its transpose.
+
+        Args:
+            contact_map: Contact map tensor of shape [*, n, n]
+
+        Returns:
+            Symmetric contact map of shape [*, n, n]
+        """
+        return (contact_map + contact_map.transpose(-1, -2)) / 2.0
+
+    def _extend_t(
+        self, n: int, t: Float[Tensor, "*"]
+    ) -> Float[Tensor, "* n n"]:
+        """
+        Extends t to shape [*, n, n] for element-wise operations on contact map.
+
+        Args:
+            n: Sequence length
+            t: Time tensor of shape [*]
+
+        Returns:
+            Extended time tensor of shape [*, n, n]
+        """
+        return t[..., None, None].expand(t.shape + (n, n))
+
+    def interpolate(
+        self,
+        c_0: Float[Tensor, "* n n"],
+        c_1: Float[Tensor, "* n n"],
+        t: Float[Tensor, "*"],
+        mask: Optional[Bool[Tensor, "* n"]] = None,
+    ) -> Float[Tensor, "* n n"]:
+        """
+        Interpolates between noisy contact map c_0 (reference) and clean c_1 (data).
+
+        Uses linear interpolation: c_t = (1 - t) * c_0 + t * c_1
+
+        Args:
+            c_0: Reference (noise) contact map, shape [*, n, n]
+            c_1: Target (clean) contact map, shape [*, n, n]
+            t: Interpolation time, shape [*]
+            mask: Sequence mask of shape [*, n]
+
+        Returns:
+            Interpolated contact map of shape [*, n, n]
+        """
+        c_0 = self._apply_pair_mask(c_0, mask)
+        c_1 = self._apply_pair_mask(c_1, mask)
+
+        n = c_0.shape[-1]
+        t_ext = self._extend_t(n, t)  # [*, n, n]
+
+        c_t = (1.0 - t_ext) * c_0 + t_ext * c_1
+
+        # Enforce symmetry after interpolation
+        c_t = self._enforce_symmetry(c_t)
+        return self._apply_pair_mask(c_t, mask)
+
+    def ct_dot(
+        self,
+        c_1: Float[Tensor, "* n n"],
+        c_t: Float[Tensor, "* n n"],
+        t: Float[Tensor, "*"],
+        mask: Optional[Bool[Tensor, "* n"]] = None,
+    ) -> Float[Tensor, "* n n"]:
+        """
+        Computes dc_t/dt for the interpolation scheme.
+        This is the target used in flow matching loss.
+
+        dc_t/dt = (c_1 - c_t) / (1 - t)
+
+        Args:
+            c_1: Target contact map, shape [*, n, n]
+            c_t: Current interpolated contact map, shape [*, n, n]
+            t: Current time, shape [*]
+            mask: Sequence mask of shape [*, n]
+
+        Returns:
+            Time derivative of contact map, shape [*, n, n]
+        """
+        c_1 = self._apply_pair_mask(c_1, mask)
+        c_t = self._apply_pair_mask(c_t, mask)
+
+        n = c_1.shape[-1]
+        t_ext = self._extend_t(n, t)  # [*, n, n]
+
+        c_t_dot = (c_1 - c_t) / (1.0 - t_ext + 1e-8)
+        return self._apply_pair_mask(c_t_dot, mask)
+
+    def sample_reference(
+        self,
+        n: int,
+        shape: Tuple = tuple(),
+        dtype: Optional[torch.dtype] = None,
+        device: Optional[torch.device] = None,
+        mask: Optional[Bool[Tensor, "* n"]] = None,
+    ) -> Float[Tensor, "* n n"]:
+        """
+        Samples reference distribution (standard Gaussian) for contact map.
+
+        Args:
+            n: Sequence length
+            shape: Batch shape tuple
+            dtype: Torch dtype
+            device: Torch device
+            mask: Sequence mask of shape [*, n]
+
+        Returns:
+            Symmetric Gaussian noise contact map of shape [*shape, n, n]
+        """
+        # Sample independent Gaussian noise
+        noise = torch.randn(shape + (n, n), device=device, dtype=dtype) * self.scale_ref
+        
+        # Make symmetric by averaging with transpose
+        noise = self._enforce_symmetry(noise)
+        
+        return self._apply_pair_mask(noise, mask)
+
+    def simulation_step(
+        self,
+        c_t: Float[Tensor, "* n n"],
+        v: Float[Tensor, "* n n"],
+        t: Float[Tensor, "*"],
+        dt: float,
+        gt: float,
+        sampling_mode: Literal["vf", "sc"],
+        sc_scale_noise: float,
+        sc_scale_score: float,
+        mask: Optional[Bool[Tensor, "* n"]] = None,
+    ) -> Tuple[Float[Tensor, "* n n"], Float[Tensor, "*"]]:
+        """
+        Single Euler integration step for contact map flow matching.
+
+        Args:
+            c_t: Current contact map, shape [*, n, n]
+            v: Predicted velocity field, shape [*, n, n]
+            t: Current time, shape [*]
+            dt: Time step size
+            gt: g(t) coefficient for SDE sampling
+            sampling_mode: "vf" for ODE, "sc" for SDE with score
+            sc_scale_noise: Noise scale for SDE
+            sc_scale_score: Score scale for SDE
+            mask: Sequence mask of shape [*, n]
+
+        Returns:
+            Updated contact map and updated time
+        """
+        v = self._apply_pair_mask(v, mask)
+        n = c_t.shape[-1]
+        t_ext = self._extend_t(n, t)  # [*, n, n]
+
+        c_t_updated, _ = self.step_euler(
+            c_t=c_t,
+            v=v,
+            t=t_ext,
+            dt=dt,
+            gt=gt,
+            sampling_mode=sampling_mode,
+            sc_scale_noise=sc_scale_noise,
+            sc_scale_score=sc_scale_score,
+        )
+
+        # Enforce symmetry after update
+        c_t_updated = self._enforce_symmetry(c_t_updated)
+        return self._apply_pair_mask(c_t_updated, mask), t + dt
+
+    def step_euler(
+        self,
+        c_t: Float[Tensor, "* n n"],
+        v: Float[Tensor, "* n n"],
+        t: Float[Tensor, "* n n"],
+        dt: float,
+        gt: float,
+        sampling_mode: Literal["vf", "sc"],
+        sc_scale_noise: float,
+        sc_scale_score: float,
+    ) -> Tuple[Float[Tensor, "* n n"], Float[Tensor, "* n n"]]:
+        """
+        Euler integration step for contact map.
+
+        For ODE: dc_t = v(c_t, t) dt
+        For SDE: dc_t = [v(c_t, t) + g(t) * s(c_t, t)] dt + sqrt(2*g(t)) dw_t
+
+        Args:
+            c_t: Current contact map, shape [*, n, n]
+            v: Velocity field, shape [*, n, n]
+            t: Current time (extended), shape [*, n, n]
+            dt: Time step size
+            gt: g(t) coefficient
+            sampling_mode: "vf" or "sc"
+            sc_scale_noise: Noise scale
+            sc_scale_score: Score scale
+
+        Returns:
+            Updated contact map and updated time
+        """
+        t_element = t.flatten()[0]
+
+        if sampling_mode == "vf" or t_element > 1.0:
+            return c_t + v * dt, t + dt
+
+        if sampling_mode == "sc":
+            score = self.vf_to_score(c_t, v, t)
+            eps = torch.randn_like(c_t)
+            # Make noise symmetric
+            eps = (eps + eps.transpose(-1, -2)) / 2.0
+            std_eps = torch.sqrt(torch.tensor(2 * gt * sc_scale_noise * dt, device=c_t.device, dtype=c_t.dtype))
+            delta_c = (v + gt * sc_scale_score * score) * dt + std_eps * eps
+            return c_t + delta_c, t + dt
+
+        return c_t + v * dt, t + dt
+
+    def vf_to_score(
+        self,
+        c_t: Float[Tensor, "* n n"],
+        v: Float[Tensor, "* n n"],
+        t: Float[Tensor, "* n n"],
+    ) -> Float[Tensor, "* n n"]:
+        """
+        Converts velocity field to score for the linear interpolation scheme.
+
+        s(c_t, t) = (t * v(c_t, t) - c_t) / (scale_ref^2 * (1 - t))
+
+        Args:
+            c_t: Current contact map
+            v: Velocity field
+            t: Current time (extended)
+
+        Returns:
+            Score of the noisy distribution
+        """
+        num = t * v - c_t
+        den = (1.0 - t) * self.scale_ref ** 2 + 1e-8
+        return num / den
+
+    def full_simulation(
+        self,
+        predict_clean_contact_map: Callable,
+        dt: float,
+        nsamples: int,
+        n: int,
+        device: torch.device,
+        mask: Bool[Tensor, "* n"],
+        schedule_mode: Literal["uniform", "power", "cos_sch_v_snr", "loglinear", "edm", "log"],
+        schedule_p: float,
+        sampling_mode: str,
+        sc_scale_noise: float,
+        sc_scale_score: float,
+        gt_mode: Literal["us", "tan", "1/t"],
+        gt_p: float,
+        gt_clamp_val: Optional[float],
+        dtype: Optional[torch.dtype] = None,
+    ) -> Float[Tensor, "* n n"]:
+        """
+        Full simulation for contact map generation.
+
+        Args:
+            predict_clean_contact_map: Function that takes batch dict and returns
+                (c_1_pred, v) where c_1_pred is predicted clean contact map and v is velocity
+            dt: Time step size
+            nsamples: Number of samples
+            n: Sequence length
+            device: Torch device
+            mask: Sequence mask
+            schedule_mode: Time schedule mode
+            schedule_p: Schedule parameter
+            sampling_mode: "vf" or "sc"
+            sc_scale_noise: Noise scale for SDE
+            sc_scale_score: Score scale for SDE
+            gt_mode: g(t) mode
+            gt_p: g(t) parameter
+            gt_clamp_val: g(t) clamp value
+            dtype: Torch dtype
+
+        Returns:
+            Generated contact maps of shape [nsamples, n, n]
+        """
+        nsteps = math.ceil(1.0 / dt)
+        
+        # Reuse schedule functions from R3NFlowMatcher
+        ts = self._get_schedule(mode=schedule_mode, nsteps=nsteps, p1=schedule_p)
+        t_eval = ts[:-1]
+        gt = self._get_gt(t=t_eval, mode=gt_mode, param=gt_p, clamp_val=gt_clamp_val)
+
+        with torch.no_grad():
+            c = self.sample_reference(n, shape=(nsamples,), device=device, mask=mask, dtype=dtype)
+
+            for step in tqdm(range(nsteps)):
+                t = ts[step] * torch.ones(nsamples, device=device)
+                dt_step = ts[step + 1] - ts[step]
+                gt_step = gt[step]
+
+                nn_in = {
+                    "contact_map_t": c,
+                    "t": t,
+                    "mask": mask,
+                }
+
+                c_1_pred, v = predict_clean_contact_map(nn_in)
+
+                if ts[step] > 0.99:
+                    step_sampling_mode = "vf"
+                else:
+                    step_sampling_mode = sampling_mode
+
+                c, _ = self.simulation_step(
+                    c_t=c,
+                    v=v,
+                    t=t,
+                    dt=dt_step,
+                    gt=gt_step,
+                    sampling_mode=step_sampling_mode,
+                    sc_scale_noise=sc_scale_noise,
+                    sc_scale_score=sc_scale_score,
+                    mask=mask,
+                )
+
+            return c
+
+    def _get_schedule(self, mode: str, nsteps: int, p1: Optional[float] = None, eps: float = 1e-5):
+        """Get time schedule (reuses logic from R3NFlowMatcher)."""
+        if mode == "uniform":
+            return torch.linspace(0, 1, nsteps + 1)
+        elif mode == "power":
+            t = torch.linspace(0, 1, nsteps + 1)
+            return t ** p1
+        else:
+            # Default to uniform for simplicity
+            return torch.linspace(0, 1, nsteps + 1)
+
+    def _get_gt(
+        self,
+        t: Float[Tensor, "s"],
+        mode: str,
+        param: float,
+        clamp_val: Optional[float] = None,
+        eps: float = 1e-2,
+    ) -> Float[Tensor, "s"]:
+        """Compute g(t) schedule (reuses logic from R3NFlowMatcher)."""
+        t = torch.clamp(t, 0, 1 - 1e-5)
+        
+        if mode == "us":
+            gt = (1.0 - t) / (t + eps)
+        elif mode == "tan":
+            num = torch.sin((1.0 - t) * torch.pi / 2.0)
+            den = torch.cos((1.0 - t) * torch.pi / 2.0)
+            gt = (torch.pi / 2.0) * num / (den + eps)
+        elif mode == "1/t":
+            gt = 1.0 / (t + eps)
+        else:
+            gt = torch.ones_like(t)
+        
+        if clamp_val is not None:
+            gt = torch.clamp(gt, 0, clamp_val)
+        
+        return gt

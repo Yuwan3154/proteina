@@ -364,6 +364,134 @@ class CATHLabelTransform(T.BaseTransform):
         raise ValueError(f"Segment {segment} is not in the correct format")
 
 
+class ContactMapTransform(T.BaseTransform):
+    """Extracts contact map from ground-truth protein coordinates.
+
+    Creates an L×L binary contact map based on pairwise distances between
+    specified atom types (CA or CB) with a configurable distance cutoff.
+    """
+
+    def __init__(
+        self,
+        contact_atom_type: Literal["CA", "CB"] = "CB",
+        contact_distance_cutoff: float = 8.0,
+    ):
+        """Initializes the transform.
+
+        Args:
+            contact_atom_type: Atom type to use for contact calculation.
+                "CA" for alpha-carbon, "CB" for beta-carbon (pseudo-CB for Glycine).
+            contact_distance_cutoff: Distance threshold in Angstroms for defining contacts.
+                Residue pairs with distance <= cutoff are considered in contact.
+        """
+        self.contact_atom_type = contact_atom_type
+        self.contact_distance_cutoff = contact_distance_cutoff
+
+    def _compute_pseudo_cb(self, coords: torch.Tensor) -> torch.Tensor:
+        """Computes pseudo-CB position for residues (used for Glycine).
+
+        The pseudo-CB is placed at a position that would be occupied by CB
+        based on the backbone geometry (N, CA, C atoms).
+
+        Args:
+            coords: Coordinates tensor of shape [L, num_atoms, 3]
+                    Atom order: N(0), CA(1), C(2), O(3), CB(4), ...
+
+        Returns:
+            Pseudo-CB coordinates of shape [L, 3]
+        """
+        # Extract backbone atoms
+        n_coords = coords[:, 0, :]   # [L, 3]
+        ca_coords = coords[:, 1, :]  # [L, 3]
+        c_coords = coords[:, 2, :]   # [L, 3]
+
+        # Compute pseudo-CB using standard geometry
+        # CB is approximately at: CA + 1.52 * normalized(rotation of N-CA by ~120 degrees in N-CA-C plane)
+        # Simplified approach: CB = CA + normalized(CA-N + CA-C) * 1.52
+        ca_n = ca_coords - n_coords  # [L, 3]
+        ca_c = ca_coords - c_coords  # [L, 3]
+        
+        # Normalize vectors
+        ca_n_norm = ca_n / (torch.linalg.norm(ca_n, dim=-1, keepdim=True) + 1e-8)
+        ca_c_norm = ca_c / (torch.linalg.norm(ca_c, dim=-1, keepdim=True) + 1e-8)
+        
+        # CB direction is roughly the sum of these normalized vectors
+        cb_direction = ca_n_norm + ca_c_norm
+        cb_direction = cb_direction / (torch.linalg.norm(cb_direction, dim=-1, keepdim=True) + 1e-8)
+        
+        # CB is approximately 1.52 Angstroms from CA
+        pseudo_cb = ca_coords + cb_direction * 1.52
+        
+        return pseudo_cb
+
+    def __call__(self, graph: Data) -> Data:
+        """Extracts contact map and adds it to the graph.
+
+        Args:
+            graph: PyG Data object containing protein structure with coords [L, num_atoms, 3]
+
+        Returns:
+            Graph with added contact_map tensor of shape [L, L] with values 0.0 or 1.0
+        """
+        coords = graph.coords  # [L, num_atoms, 3]
+        L = coords.shape[0]
+
+        if self.contact_atom_type == "CA":
+            # CA is at index 1
+            atom_coords = coords[:, 1, :]  # [L, 3]
+        elif self.contact_atom_type == "CB":
+            # CB is at index 4, but Glycine doesn't have CB
+            cb_coords = coords[:, 4, :]  # [L, 3]
+            
+            # Check for missing CB (coordinates might be zero or a fill value)
+            # Compute pseudo-CB for all residues and use it where CB is missing
+            pseudo_cb = self._compute_pseudo_cb(coords)  # [L, 3]
+            
+            # Detect missing CB: if CB coords are very close to zero or a fill value
+            # Use residue_type if available to detect Glycine (index 5 in OpenFold)
+            if hasattr(graph, 'residue_type'):
+                is_glycine = (graph.residue_type == 5)  # Glycine index
+                atom_coords = torch.where(
+                    is_glycine.unsqueeze(-1).expand(-1, 3),
+                    pseudo_cb,
+                    cb_coords
+                )
+            else:
+                # Fallback: use pseudo-CB where CB coords seem invalid (near zero)
+                cb_norm = torch.linalg.norm(cb_coords, dim=-1)
+                is_missing = cb_norm < 0.1
+                atom_coords = torch.where(
+                    is_missing.unsqueeze(-1).expand(-1, 3),
+                    pseudo_cb,
+                    cb_coords
+                )
+        else:
+            raise ValueError(f"Unknown contact_atom_type: {self.contact_atom_type}")
+
+        # Compute pairwise distances
+        # atom_coords: [L, 3]
+        diff = atom_coords.unsqueeze(0) - atom_coords.unsqueeze(1)  # [L, L, 3]
+        distances = torch.linalg.norm(diff, dim=-1)  # [L, L]
+
+        # Create binary contact map (1 if distance <= cutoff, 0 otherwise)
+        contact_map = (distances <= self.contact_distance_cutoff).float()  # [L, L]
+
+        # Ensure symmetry (should already be symmetric, but enforce it)
+        contact_map = (contact_map + contact_map.T) / 2.0
+        contact_map = (contact_map > 0.5).float()
+
+        graph.contact_map = contact_map
+
+        return graph
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"contact_atom_type={self.contact_atom_type}, "
+            f"contact_distance_cutoff={self.contact_distance_cutoff})"
+        )
+
+
 class TEDLabelTransform(T.BaseTransform):
     """Adds CATH labels if available to the AFDB protein.
 
