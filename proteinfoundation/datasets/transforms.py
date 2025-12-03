@@ -476,10 +476,6 @@ class ContactMapTransform(T.BaseTransform):
         # Create binary contact map (1 if distance <= cutoff, 0 otherwise)
         contact_map = (distances <= self.contact_distance_cutoff).float()  # [L, L]
 
-        # Ensure symmetry (should already be symmetric, but enforce it)
-        contact_map = (contact_map + contact_map.T) / 2.0
-        contact_map = (contact_map > 0.5).float()
-
         graph.contact_map = contact_map
 
         return graph

@@ -599,7 +599,7 @@ class ProteinTransformerAF3(torch.nn.Module):
             self.contact_map_decoder = torch.nn.Sequential(
                 torch.nn.LayerNorm(kwargs["pair_repr_dim"]),
                 torch.nn.Linear(kwargs["pair_repr_dim"], 1),
-            )
+                )
 
         self.coors_3d_decoder = torch.nn.Sequential(
             torch.nn.LayerNorm(kwargs["token_dim"]),

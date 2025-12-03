@@ -815,6 +815,9 @@ class ContactMapFlowMatcher:
         
         # Make symmetric by averaging with transpose
         noise = self._enforce_symmetry(noise)
+
+        # Multiply by sqrt(2) to have variance scale_ref^2.
+        noise = noise * (2 ** 0.5)
         
         return self._apply_pair_mask(noise, mask)
 
@@ -897,6 +900,9 @@ class ContactMapFlowMatcher:
             Updated contact map and updated time
         """
         t_element = t.flatten()[0]
+        assert torch.all(
+            t_element == t
+        ), "Sampling only implemented for same time for all samples"
 
         if sampling_mode == "vf" or t_element > 1.0:
             return c_t + v * dt, t + dt
@@ -904,8 +910,9 @@ class ContactMapFlowMatcher:
         if sampling_mode == "sc":
             score = self.vf_to_score(c_t, v, t)
             eps = torch.randn_like(c_t)
-            # Make noise symmetric
+            # Make noise symmetric; sqrt(2) corrects the variance of the noise to be std_eps^2.
             eps = (eps + eps.transpose(-1, -2)) / 2.0
+            eps = eps * (2 ** 0.5)
             std_eps = torch.sqrt(torch.tensor(2 * gt * sc_scale_noise * dt, device=c_t.device, dtype=c_t.dtype))
             delta_c = (v + gt * sc_scale_score * score) * dt + std_eps * eps
             return c_t + delta_c, t + dt
@@ -980,9 +987,9 @@ class ContactMapFlowMatcher:
         nsteps = math.ceil(1.0 / dt)
         
         # Reuse schedule functions from R3NFlowMatcher
-        ts = self._get_schedule(mode=schedule_mode, nsteps=nsteps, p1=schedule_p)
+        ts = self.get_schedule(mode=schedule_mode, nsteps=nsteps, p1=schedule_p)
         t_eval = ts[:-1]
-        gt = self._get_gt(t=t_eval, mode=gt_mode, param=gt_p, clamp_val=gt_clamp_val)
+        gt = self.get_gt(t=t_eval, mode=gt_mode, param=gt_p, clamp_val=gt_clamp_val)
 
         with torch.no_grad():
             c = self.sample_reference(n, shape=(nsamples,), device=device, mask=mask, dtype=dtype)
@@ -1000,10 +1007,12 @@ class ContactMapFlowMatcher:
 
                 c_1_pred, v = predict_clean_contact_map(nn_in)
 
+                # Accomodate last few steps
                 if ts[step] > 0.99:
-                    step_sampling_mode = "vf"
-                else:
-                    step_sampling_mode = sampling_mode
+                    sampling_mode = "vf"
+                if schedule_mode in ["cos_sch_v_snr", "edm"]:
+                    if ts[step] > 0.985:
+                        sampling_mode = "vf"
 
                 c, _ = self.simulation_step(
                     c_t=c,
@@ -1019,18 +1028,63 @@ class ContactMapFlowMatcher:
 
             return c
 
-    def _get_schedule(self, mode: str, nsteps: int, p1: Optional[float] = None, eps: float = 1e-5):
-        """Get time schedule (reuses logic from R3NFlowMatcher)."""
-        if mode == "uniform":
-            return torch.linspace(0, 1, nsteps + 1)
-        elif mode == "power":
-            t = torch.linspace(0, 1, nsteps + 1)
-            return t ** p1
-        else:
-            # Default to uniform for simplicity
-            return torch.linspace(0, 1, nsteps + 1)
+    def get_schedule(self, mode: str, nsteps: int, *, p1: float = None, eps=1e-5):
+        # Useful for schedules defined in terms of SNR
+        def snr_to_us_t(snr):
+            snr = torch.clamp(snr, 1e-10, 1e10)
+            return torch.sqrt(snr) / (1 + torch.sqrt(snr))
 
-    def _get_gt(
+        # In case we want to use EDM schedule
+        def snr_edm(n, rho):
+            step = torch.arange(n)
+            s_min, s_max = 0.002, 80.0
+            r = rho
+            ir = 1.0 / rho
+            sigma = (s_max**ir + (step / (n - 1)) * (s_min**ir - s_max**ir)) ** r
+            snr = 1.0 / sigma**2
+            return snr
+
+        if mode == "uniform":
+            t = torch.linspace(0, 1, nsteps + 1)
+            return t
+        elif mode == "power":
+            assert p1 is not None, "p1 cannot be none for the power schedule"
+            t = torch.linspace(0, 1, nsteps + 1)
+            t = t**p1
+            return t
+        elif mode == "cos_sch_v_snr":
+            assert p1 is not None, "p1 cannot be none for the cos_sch_v_snr schedule"
+            t = torch.linspace(0, 1, nsteps + 1)
+            num_snr = torch.cos(torch.pi * (1 - t) / 2) + eps
+            den_snr = torch.sin(torch.pi * (1 - t) / 2) + eps
+            snr = num_snr**p1 / den_snr**p1
+            t = snr_to_us_t(snr)
+            t = t - torch.min(t)
+            t = t / torch.max(t)
+            return t
+        elif mode == "loglinear":
+            t = snr_to_us_t(torch.logspace(-6, 6, nsteps + 1))
+            t = t - torch.min(t)
+            t = t / torch.max(t)
+            return t
+        elif mode == "edm":
+            assert p1 is not None, "p1 cannot be none for the edm schedule"
+            t = snr_to_us_t(snr_edm(nsteps + 1, p1))
+            t = t - torch.min(t)
+            t = t / torch.max(t)
+            return t
+        elif mode == "log":
+            assert p1 is not None, "p1 cannot be none for the log schedule"
+            assert p1 > 0, f"p1 must be >0 for the log schedule, got {p1}"
+            t = 1.0 - torch.logspace(-p1, 0, nsteps + 1).flip(0)
+            t = t - torch.min(t)
+            t = t / torch.max(t)
+            return t
+        else:
+            # Should not get here
+            raise IOError(f"Schedule mode not recognized {mode}")
+
+    def get_gt(
         self,
         t: Float[Tensor, "s"],
         mode: str,
@@ -1039,6 +1093,27 @@ class ContactMapFlowMatcher:
         eps: float = 1e-2,
     ) -> Float[Tensor, "s"]:
         """Compute g(t) schedule (reuses logic from R3NFlowMatcher)."""
+        
+        # Function to get variants for some gt mode
+        def transform_gt(gt, f_pow=1.0):
+            # 1.0 means no transformation
+            if f_pow == 1.0:
+                return gt
+
+            # First we somewhat normalize between 0 and 1
+            log_gt = torch.log(gt)
+            mean_log_gt = torch.mean(log_gt)
+            log_gt_centered = log_gt - mean_log_gt
+            normalized = torch.nn.functional.sigmoid(log_gt_centered)
+            # Transformation here
+            normalized = normalized**f_pow
+            # Undo normalization with the transformed variable
+            log_gt_centered_rec = torch.logit(normalized, eps=1e-6)
+            log_gt_rec = log_gt_centered_rec + mean_log_gt
+            gt_rec = torch.exp(log_gt_rec)
+            return gt_rec
+
+        # Numerical reasons for some schedule
         t = torch.clamp(t, 0, 1 - 1e-5)
         
         if mode == "us":
@@ -1050,9 +1125,8 @@ class ContactMapFlowMatcher:
         elif mode == "1/t":
             gt = 1.0 / (t + eps)
         else:
-            gt = torch.ones_like(t)
+            raise NotImplementedError(f"gt not implemented {mode}")
         
-        if clamp_val is not None:
-            gt = torch.clamp(gt, 0, clamp_val)
-        
-        return gt
+        gt = transform_gt(gt, f_pow=param)
+        gt = torch.clamp(gt, 0, clamp_val)  # If None no clamping
+        return gt  # [s]
