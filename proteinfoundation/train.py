@@ -215,6 +215,10 @@ if __name__ == "__main__":
                 cfg_data.datamodule.dataselector.exclude_ids += exclude_ids
             else:
                 cfg_data.datamodule.dataselector.exclude_ids = exclude_ids
+        # overfit_pdb_chains is set in the dataset config (e.g., pdb_train.yaml)
+        # and passed to datamodule via hydra instantiation
+        if cfg_data.datamodule.get("overfit_pdb_chains") is not None:
+            log_info(f"Overfit mode enabled: filtering to {cfg_data.datamodule.overfit_pdb_chains}")
         log_info(f"Data config {cfg_data}")
 
     # create datamodule containing default train and val dataloader

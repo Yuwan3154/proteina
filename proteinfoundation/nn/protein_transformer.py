@@ -510,8 +510,11 @@ class ProteinTransformerAF3(torch.nn.Module):
                 torch.randn(self.num_registers, self.token_dim) / 20.0
             )
 
-        # To encode corrupted 3d positions
-        self.linear_3d_embed = torch.nn.Linear(3, kwargs["token_dim"], bias=False)
+        # Coordinate encoder/decoder (disabled in contact map mode)
+        self.predict_coords = not self.contact_map_mode
+        if self.predict_coords:
+            # To encode corrupted 3d positions
+            self.linear_3d_embed = torch.nn.Linear(3, kwargs["token_dim"], bias=False)
 
         # To form initial representation
         self.init_repr_factory = FeatureFactory(
@@ -599,12 +602,15 @@ class ProteinTransformerAF3(torch.nn.Module):
             self.contact_map_decoder = torch.nn.Sequential(
                 torch.nn.LayerNorm(kwargs["pair_repr_dim"]),
                 torch.nn.Linear(kwargs["pair_repr_dim"], 1),
-                )
+            )
 
-        self.coors_3d_decoder = torch.nn.Sequential(
-            torch.nn.LayerNorm(kwargs["token_dim"]),
-            torch.nn.Linear(kwargs["token_dim"], 3, bias=False),
-        )
+        if self.predict_coords:
+            self.coors_3d_decoder = torch.nn.Sequential(
+                torch.nn.LayerNorm(kwargs["token_dim"]),
+                torch.nn.Linear(kwargs["token_dim"], 3, bias=False),
+            )
+        else:
+            self.coors_3d_decoder = None
 
     def _extend_w_registers(self, seqs, pair, mask, cond_seq):
         """
@@ -697,13 +703,15 @@ class ProteinTransformerAF3(torch.nn.Module):
         c = self.transition_c_2(self.transition_c_1(c, mask), mask)  # [b, n, dim_cond]
 
         # Prepare input - coordinates and initial sequence representation from features
-        coors_3d = batch_nn["x_t"] * mask[..., None]  # [b, n, 3]
-        coors_embed = (
-            self.linear_3d_embed(coors_3d) * mask[..., None]
-        )  # [b, n, token_dim]
-        seq_f_repr = self.init_repr_factory(batch_nn)  # [b, n, token_dim]
-        seqs = coors_embed + seq_f_repr  # [b, n, token_dim]
-        seqs = seqs * mask[..., None]  # [b, n, token_dim]
+        if self.predict_coords:
+            coors_3d = batch_nn["x_t"] * mask[..., None]  # [b, n, 3]
+            coors_embed = (
+                self.linear_3d_embed(coors_3d) * mask[..., None]
+            )  # [b, n, token_dim]
+            seq_f_repr = self.init_repr_factory(batch_nn)  # [b, n, token_dim]
+            seqs = (coors_embed + seq_f_repr) * mask[..., None]  # [b, n, token_dim]
+        else:
+            seqs = self.init_repr_factory(batch_nn) * mask[..., None]
 
         # Pair representation
         pair_rep = None
@@ -729,15 +737,20 @@ class ProteinTransformerAF3(torch.nn.Module):
         # Undo registers
         seqs, pair_rep, mask = self._undo_registers(seqs, pair_rep, mask)
 
-        # Get final coordinates
-        final_coors = self.coors_3d_decoder(seqs) * mask[..., None]  # [b, n, 3]
         nn_out = {}
+        if self.predict_coords:
+            final_coors = self.coors_3d_decoder(seqs) * mask[..., None]  # [b, n, 3]
+            nn_out["coors_pred"] = final_coors
+        else:
+            final_coors = None
+
         if self.update_pair_repr and self.num_buckets_predict_pair is not None:
             pair_pred = self.pair_head_prediction(pair_rep)
-            final_coors = (
-                final_coors + torch.mean(pair_pred) * 0.0
-            )  # Does not affect loss but pytorch does not complain for unused params
-            final_coors = final_coors * mask[..., None]
+            if final_coors is not None:
+                final_coors = (
+                    final_coors + torch.mean(pair_pred) * 0.0
+                )  # Keeps graph consistent
+                final_coors = final_coors * mask[..., None]
             nn_out["pair_pred"] = pair_pred
 
         # Contact map prediction (for contact map diffusion mode)
@@ -750,5 +763,4 @@ class ProteinTransformerAF3(torch.nn.Module):
             contact_map_pred = contact_map_pred * pair_mask
             nn_out["contact_map_pred"] = contact_map_pred
 
-        nn_out["coors_pred"] = final_coors
         return nn_out

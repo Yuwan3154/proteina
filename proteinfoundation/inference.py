@@ -474,10 +474,16 @@ if __name__ == "__main__":
     
     samples_per_length = {}
     for pred in predictions:
-        coors_atom37, cath_codes_batch, cirpin_ids_batch = pred  # [b, n, 37, 3], prediction_step returns atom37
+        # Unpack dictionary returned by predict_step
+        coors_atom37 = pred["coords_atom37"]  # [b, n, 37, 3]
+        cath_codes_batch = pred["cath_code"]
+        cirpin_ids_batch = pred["cirpin_ids"]
+        contact_map = pred.get("contact_map")  # [b, n, n] or None
+        distogram = pred.get("distogram")  # [b, n, n, num_buckets] or None
 
-        # Save each generation as a pdb file
-        for i in range(coors_atom37.shape[0]):
+        batch_size = len(cath_codes_batch)
+        # Save each generation
+        for i in range(batch_size):
             # Create directory where everything related to this sample will be stored
             current_cath_code = cath_codes_batch[i][0] # Get the actual CATH code string
             current_cirpin_id = cirpin_ids_batch[i][0] if cirpin_ids_batch[i] is not None else "unknown"
@@ -496,19 +502,30 @@ if __name__ == "__main__":
             if cfg.get("cirpin_cond", False) and current_cirpin_id != "unknown":
                 filename_parts.append(f"cirpin_{current_cirpin_id}")
             filename_parts.append(str(sample_idx))
-            fname = "_".join(filename_parts) + ".pdb"
-            pdb_path = os.path.join(
-                root_path, fname
-            )  # ./inference/conf_{}/n_{}_id_{}
-
-            # Save generated structure as pdb
-            write_prot_to_pdb(
-                coors_atom37[i].numpy(),
-                pdb_path,
-                aatype=aatype,
-                overwrite=True,
-                no_indexing=True,
-            )
+            
+            if coors_atom37 is not None:
+                pdb_fname = "_".join(filename_parts) + ".pdb"
+                pdb_path = os.path.join(root_path, pdb_fname)
+                write_prot_to_pdb(
+                    coors_atom37[i].numpy(),
+                    pdb_path,
+                    aatype=aatype,
+                    overwrite=True,
+                    no_indexing=True,
+                )
+            
+            # Save contact map as .pt if present
+            if contact_map is not None:
+                contact_fname = "_".join(filename_parts) + "_contact.pt"
+                contact_path = os.path.join(root_path, contact_fname)
+                torch.save(contact_map[i].cpu(), contact_path)
+            
+            # Save distogram as .pt if present
+            if distogram is not None:
+                distogram_fname = "_".join(filename_parts) + "_distogram.pt"
+                distogram_path = os.path.join(root_path, distogram_fname)
+                torch.save(distogram[i].cpu(), distogram_path)
+            
             samples_per_length[sample_key] += 1
     
     if cfg.compute_fid or cfg.compute_designability:
@@ -525,7 +542,14 @@ if __name__ == "__main__":
             results = []
             samples_per_length = {}
             for pred in predictions:
-                coors_atom37, cath_codes = pred  # [b, n, 37, 3], prediction_step returns atom37
+                # Unpack dictionary returned by predict_step
+                coors_atom37 = pred["coords_atom37"]  # [b, n, 37, 3]
+                cath_codes = pred["cath_code"]
+                contact_map = pred.get("contact_map")
+                distogram = pred.get("distogram")
+                if coors_atom37 is None:
+                    continue
+
                 n = coors_atom37.shape[-3]
                 if n not in samples_per_length:
                     samples_per_length[n] = 0
@@ -552,6 +576,18 @@ if __name__ == "__main__":
                         overwrite=True,
                         no_indexing=True,
                     )
+                    
+                    # Save contact map as .pt if present
+                    if contact_map is not None:
+                        contact_fname = dir_name + "_contact.pt"
+                        contact_path = os.path.join(sample_root_path, contact_fname)
+                        torch.save(contact_map[i].cpu(), contact_path)
+                    
+                    # Save distogram as .pt if present
+                    if distogram is not None:
+                        distogram_fname = dir_name + "_distogram.pt"
+                        distogram_path = os.path.join(sample_root_path, distogram_fname)
+                        torch.save(distogram[i].cpu(), distogram_path)
 
                     res_row = list(flat_dict.values()) + [i, pdb_path, n]
 
@@ -577,9 +613,16 @@ if __name__ == "__main__":
             # Store samples
             list_of_pdbs = []
             for pred in predictions:
-                coors_atom37 = pred  # [b, n, 37, 3], prediction_step returns atom37
+                # Unpack dictionary returned by predict_step
+                coors_atom37 = pred["coords_atom37"]  # [b, n, 37, 3]
+                contact_map = pred.get("contact_map")
+                distogram = pred.get("distogram")
+                if coors_atom37 is None:
+                    continue
+
                 for i in range(coors_atom37.shape[0]):
-                    pdb_path = os.path.join(samples_dir_fid, f"{len(list_of_pdbs)}_fid.pdb")
+                    sample_idx = len(list_of_pdbs)
+                    pdb_path = os.path.join(samples_dir_fid, f"{sample_idx}_fid.pdb")
                     write_prot_to_pdb(
                         coors_atom37[i].numpy(),
                         pdb_path,
@@ -587,6 +630,21 @@ if __name__ == "__main__":
                         no_indexing=True,
                     )
                     list_of_pdbs.append(pdb_path)
+                    
+                    # Save contact map as .pt if present
+                    if contact_map is not None:
+                        contact_path = os.path.join(samples_dir_fid, f"{sample_idx}_fid_contact.pt")
+                        torch.save(contact_map[i].cpu(), contact_path)
+                    
+                    # Save distogram as .pt if present
+                    if distogram is not None:
+                        distogram_path = os.path.join(samples_dir_fid, f"{sample_idx}_fid_distogram.pt")
+                        torch.save(distogram[i].cpu(), distogram_path)
+                    
+                    # Save contact map as .pt if present
+                    if contact_map is not None:
+                        contact_path = os.path.join(samples_dir_fid, f"{sample_idx}_fid_contact.pt")
+                        torch.save(contact_map[i].cpu(), contact_path)
 
             # Initialize row with results
             res_row = list(flat_dict.values())

@@ -26,5 +26,6 @@ inference/*
 data/
 proteinfoundation.egg-info/
 store/
+proteinfoundation/tests
 
 af2rank_evaluation/params

@@ -9,22 +9,32 @@
 # its affiliates is strictly prohibited.
 
 
+import io
+import math
 import os
 import random
 import re
+import tempfile
 
 from abc import abstractmethod
 from functools import partial
 from typing import List, Literal
 
 import lightning as L
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import wandb
 from jaxtyping import Bool, Float
 from loguru import logger
+from PIL import Image
 from torch import Dict, Tensor
 
-from proteinfoundation.utils.ff_utils.pdb_utils import mask_cath_code_by_level, mask_seq
+from proteinfoundation.utils.ff_utils.pdb_utils import (
+    mask_cath_code_by_level,
+    mask_seq,
+    write_prot_to_pdb,
+)
 
 
 class ModelTrainerBase(L.LightningModule):
@@ -149,6 +159,9 @@ class ModelTrainerBase(L.LightningModule):
         Returns:
             Clean sample prediction, tensor of shape [b, n, 3].
         """
+        if "coors_pred" not in nn_out:
+            return None
+
         nn_pred = nn_out["coors_pred"]
         t = batch["t"]  # [*]
         t_ext = t[..., None, None]  # [*, 1, 1]
@@ -162,6 +175,25 @@ class ModelTrainerBase(L.LightningModule):
                 f"Wrong parameterization chosen: {self.cfg_exp.model.target_pred}"
             )
         return x_1_pred
+
+    def _nn_out_to_c_clean(self, nn_out: Dict, batch: Dict):
+        """
+        Converts nn output to clean contact map prediction.
+
+        For contact maps, we always predict the clean contact map directly (x_1 parameterization).
+        This mirrors _nn_out_to_x_clean for coordinates.
+
+        Args:
+            nn_out: Dictionary containing network outputs, expected to have:
+                - "contact_map_pred": Tensor of shape [b, n, n], clean contact map prediction
+            batch: Dictionary, batch of data (unused, for API consistency)
+
+        Returns:
+            Clean contact map prediction, tensor of shape [b, n, n], or None if not present.
+        """
+        if "contact_map_pred" not in nn_out:
+            return None
+        return nn_out["contact_map_pred"]
 
     def predict_clean(
         self,
@@ -207,39 +239,100 @@ class ModelTrainerBase(L.LightningModule):
 
         WARNING: The ag checkpoint needs to rely on the same parameterization of the main model. This can be changed after training
         so no big deal but just in case leaving a note.
+
+        Returns:
+            Dictionary with keys:
+                - "coords": Predicted clean coordinates, shape [*, n, 3]
+                - "v": Velocity field for coordinates (only in coord diffusion mode), shape [*, n, 3]
+                - "contact_map": Predicted clean contact map (if available), shape [*, n, n]
+                - "contact_map_v": Velocity field for contact map (only in contact map mode), shape [*, n, n]
+                - "distogram": Distogram logits (if available), shape [*, n, n, num_buckets]
         """
         if self.motif_conditioning and ("fixed_structure_mask" not in batch or "x_motif" not in batch):
             batch.update(self.motif_factory(batch, zeroes = True))  # for generation we have to pass conditioning info in. But for validation do the same as training
 
         nn_out = self.nn(batch)
         x_pred = self._nn_out_to_x_clean(nn_out, batch)
+        c_pred = self._nn_out_to_c_clean(nn_out, batch)
+        
+        contact_map_mode = getattr(self, "contact_map_mode", False)
 
+        # Apply CFG/autoguidance if needed
         if guidance_weight != 1.0:
             assert autoguidance_ratio >= 0.0 and autoguidance_ratio <= 1.0
-            if autoguidance_ratio > 0.0:  # Use auto-guidance
+            
+            # Get autoguidance predictions
+            nn_out_ag = None
+            if autoguidance_ratio > 0.0:
                 nn_out_ag = self.nn_ag(batch)
-                x_pred_ag = self._nn_out_to_x_clean(nn_out_ag, batch)
+                x_pred_ag = self._nn_out_to_x_clean(nn_out_ag, batch) if x_pred is not None else None
+                c_pred_ag = self._nn_out_to_c_clean(nn_out_ag, batch) if c_pred is not None else None
             else:
-                x_pred_ag = torch.zeros_like(x_pred)
+                x_pred_ag = torch.zeros_like(x_pred) if x_pred is not None else None
+                c_pred_ag = torch.zeros_like(c_pred) if c_pred is not None else None
 
-            if autoguidance_ratio < 1.0:  # Use CFG
+            # Get unconditional predictions (CFG)
+            nn_out_uncond = None
+            if autoguidance_ratio < 1.0:
                 assert (
                     "cath_code" in batch
                 ), "Only support CFG when cath_code is provided"
                 uncond_batch = batch.copy()
                 uncond_batch.pop("cath_code")
                 nn_out_uncond = self.nn(uncond_batch)
-                x_pred_uncond = self._nn_out_to_x_clean(nn_out_uncond, uncond_batch)
+                x_pred_uncond = self._nn_out_to_x_clean(nn_out_uncond, uncond_batch) if x_pred is not None else None
+                c_pred_uncond = self._nn_out_to_c_clean(nn_out_uncond, uncond_batch) if c_pred is not None else None
             else:
-                x_pred_uncond = torch.zeros_like(x_pred)
+                x_pred_uncond = torch.zeros_like(x_pred) if x_pred is not None else None
+                c_pred_uncond = torch.zeros_like(c_pred) if c_pred is not None else None
 
-            x_pred = guidance_weight * x_pred + (1 - guidance_weight) * (
-                autoguidance_ratio * x_pred_ag
-                + (1 - autoguidance_ratio) * x_pred_uncond
-            )
+            # Apply guidance to coordinates
+            if x_pred is not None:
+                x_pred = guidance_weight * x_pred + (1 - guidance_weight) * (
+                    autoguidance_ratio * x_pred_ag
+                    + (1 - autoguidance_ratio) * x_pred_uncond
+                )
+            
+            # Apply guidance to contact map
+            if c_pred is not None:
+                c_pred = guidance_weight * c_pred + (1 - guidance_weight) * (
+                    autoguidance_ratio * c_pred_ag
+                    + (1 - autoguidance_ratio) * c_pred_uncond
+                )
 
-        v = self.fm.xt_dot(x_pred, batch["x_t"], batch["t"], batch["mask"])
-        return x_pred, v
+        result = {}
+
+        # Coordinates: always include if available
+        if x_pred is not None:
+            result["coords"] = x_pred
+            # Only compute velocity in coordinate diffusion mode (not contact map mode)
+            if not contact_map_mode and "x_t" in batch:
+                result["v"] = self.fm.xt_dot(
+                    x_pred,
+                    batch["x_t"],
+                    batch["t"],
+                    batch["mask"],
+                    modality="coordinates",
+                )
+
+        # Contact map: always include if available
+        if c_pred is not None:
+            result["contact_map"] = c_pred
+            # Only compute velocity in contact map diffusion mode
+            if contact_map_mode and "contact_map_t" in batch:
+                result["contact_map_v"] = self.fm.xt_dot(
+                    c_pred,
+                    batch["contact_map_t"],
+                    batch["t"],
+                    batch["mask"],
+                    modality="contact_map",
+                )
+        
+        # Include distogram if available
+        if "pair_pred" in nn_out:
+            result["distogram"] = nn_out["pair_pred"]
+
+        return result
 
     def on_save_checkpoint(self, checkpoint):
         """Adds additional variables to checkpoint."""
@@ -319,17 +412,44 @@ class ModelTrainerBase(L.LightningModule):
         # Center and mask input
         x_1 = self.fm._mask_and_zero_com(x_1, mask)
 
-        # Sample time, reference and align reference to target
+        # Sample time
         t = self.sample_t(batch_shape)
-        x_0 = self.fm.sample_reference(
-            n=n, shape=batch_shape, device=self.device, dtype=dtype, mask=mask
-        )
+        contact_map_mode = getattr(self, "contact_map_mode", False)
+        predict_coords = getattr(self.nn, "predict_coords", True)
+
+        if contact_map_mode:
+            # Contact map diffusion mode:
+            # - Diffuse ONLY contact map
+            # - Coordinates: direct prediction with FAPE loss (no noising)
+            c_1 = self.extract_clean_contact_map(batch, mask)
+            c_0 = self.fm.sample_reference(
+                n=n,
+                shape=batch_shape,
+                device=self.device,
+                dtype=dtype,
+                mask=mask,
+                modality="contact_map",
+            )
+            c_t = self.fm.interpolate(
+                c_0, c_1, t, mask=mask, modality="contact_map"
+            )
+            batch["contact_map_t"] = c_t
+            # x_t is a placeholder only (not used for diffusion in this mode)
+            x_t = torch.zeros_like(x_1)
+        else:
+            x_0 = self.fm.sample_reference(
+                n=n,
+                shape=batch_shape,
+                device=self.device,
+                dtype=dtype,
+                mask=mask,
+                modality="coordinates",
+            )
+            x_t = self.fm.interpolate(x_0, x_1, t, modality="coordinates")
         
         if self.motif_conditioning:
             batch.update(self.motif_factory(batch))
             x_1 = batch["x_1"] # we need this since we change x_1 based n the motif center
-        # Interpolation
-        x_t = self.fm.interpolate(x_0, x_1, t)
         # Add a few things to batch, needed for nn
         batch["t"] = t
         batch["mask"] = mask
@@ -410,18 +530,53 @@ class ModelTrainerBase(L.LightningModule):
 
         # Prediction for self-conditioning
         if random.random() > 0.5 and self.cfg_exp.training.self_cond:
-            x_pred_sc, _ = self.predict_clean(batch)
-            batch["x_sc"] = self.detach_gradients(x_pred_sc)
+            x_pred_sc, nn_out_sc = self.predict_clean(batch)
+            if x_pred_sc is not None:
+                batch["x_sc"] = self.detach_gradients(x_pred_sc)
+            else:
+                batch["x_sc"] = torch.zeros_like(x_1)
+            if contact_map_mode and "contact_map_pred" in nn_out_sc:
+                batch["contact_map_sc"] = self.detach_gradients(
+                    nn_out_sc["contact_map_pred"]
+                )
         else:
             batch["x_sc"] = torch.zeros_like(x_1)
+            if contact_map_mode:
+                batch["contact_map_sc"] = torch.zeros(
+                    batch_shape + (n, n),
+                    device=self.device,
+                    dtype=x_1.dtype,
+                )
 
         x_1_pred, nn_out = self.predict_clean(batch)
 
-        # Compute losses
-        fm_loss = self.compute_fm_loss(
-            x_1, x_1_pred, x_t, t, mask, log_prefix=log_prefix
-        )  # [*]
-        train_loss = torch.mean(fm_loss)
+        if contact_map_mode:
+            c_1_pred = nn_out.get("contact_map_pred")
+            if c_1_pred is None:
+                raise ValueError(
+                    "contact_map_mode=True requires contact_map_pred in model output."
+                )
+            contact_map_loss = self.compute_contact_map_loss(
+                c_1, c_1_pred, batch["contact_map_t"], t, mask, log_prefix=log_prefix
+            )
+            train_loss = torch.mean(contact_map_loss)
+
+            if predict_coords and x_1_pred is not None:
+                coord_loss = self.compute_fape_loss(
+                    x_1, x_1_pred, mask, log_prefix=log_prefix
+                )
+                coord_weight = getattr(
+                    self, "contact_map_coord_loss_weight", 0.0
+                )
+                train_loss = train_loss + (
+                    coord_weight * torch.mean(coord_loss)
+                )
+        else:
+            # Compute losses
+            fm_loss = self.compute_fm_loss(
+                x_1, x_1_pred, x_t, t, mask, log_prefix=log_prefix
+            )  # [*]
+            train_loss = torch.mean(fm_loss)
         
         if self.cfg_exp.loss.use_aux_loss:
             auxiliary_loss = self.compute_auxiliary_loss(
@@ -498,8 +653,82 @@ class ModelTrainerBase(L.LightningModule):
                 sync_dist=True,
             )
             # Constant line but ok, easy to compare # params
+            
+            # Log structure visualization (if enabled)
+            log_every_n = self.cfg_exp.training.get("log_structure_every_n_steps", 0)
+            if log_every_n > 0 and self.global_step % log_every_n == 0:
+                self._log_structure_visualization(
+                    x_1_pred=x_1_pred,
+                    contact_map_pred=nn_out.get("contact_map_pred"),
+                    mask=mask,
+                    log_prefix=log_prefix,
+                )
 
         return train_loss
+    
+    def _log_structure_visualization(
+        self,
+        x_1_pred: torch.Tensor,
+        contact_map_pred: torch.Tensor,
+        mask: torch.Tensor,
+        log_prefix: str,
+    ):
+        """
+        Logs predicted structure (as temporary PDB) and contact map visualizations.
+
+        Args:
+            x_1_pred: Predicted coordinates, shape [b, n, 3]
+            contact_map_pred: Predicted contact map, shape [b, n, n] or None
+            mask: Boolean mask, shape [b, n]
+            log_prefix: Prefix for log names ("train" or "validation_loss")
+        """
+        if self.logger is None or not hasattr(self.logger, "experiment"):
+            return
+
+        if x_1_pred is not None:
+            # Save first sample as temporary PDB for logging
+            atom37 = self.samples_to_atom37(x_1_pred[:1]).detach().cpu().numpy()
+            with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False) as tmp_pdb:
+                temp_pdb_path = tmp_pdb.name
+            try:
+                write_prot_to_pdb(atom37[0], temp_pdb_path, overwrite=True, no_indexing=True)
+                self.logger.experiment.log(
+                    {
+                        f"{log_prefix}/structure": wandb.Molecule(temp_pdb_path),
+                        "global_step": self.global_step,
+                    }
+                )
+            finally:
+                if os.path.exists(temp_pdb_path):
+                    os.remove(temp_pdb_path)
+
+        if contact_map_pred is None:
+            return
+
+        mask_np = mask[0].detach().cpu().numpy()
+        contact_map_np = contact_map_pred[0].detach().cpu().numpy()
+        pair_mask_np = mask_np[:, None] * mask_np[None, :]
+        contact_map_np = contact_map_np * pair_mask_np
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+        im = ax.imshow(contact_map_np, cmap="viridis", aspect="auto", vmin=0, vmax=1)
+        ax.set_xlabel("Residue j")
+        ax.set_ylabel("Residue i")
+        ax.set_title(f"Contact Map - Step {self.global_step}")
+        plt.colorbar(im, ax=ax, label="Contact probability")
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+        buf.seek(0)
+        img_contact = Image.open(buf)
+        plt.close(fig)
+
+        self.logger.experiment.log(
+            {
+                f"{log_prefix}/contact_map": wandb.Image(img_contact),
+                "global_step": self.global_step,
+            }
+        )
 
     @abstractmethod
     def compute_fm_loss(
@@ -518,6 +747,69 @@ class ModelTrainerBase(L.LightningModule):
         Returns:
             Flow matching loss per sample in the batch.
         """
+
+    def compute_fape_loss(
+        self,
+        x_1,
+        x_1_pred,
+        mask,
+        log_prefix: str = None,
+    ):
+        """
+        Computes FAPE loss using identity frames (no orientation info).
+        
+        This is useful for contact map diffusion mode where we predict coordinates
+        directly without orientation information from the backbone.
+        
+        Args:
+            x_1: Ground truth coordinates, shape [b, n, 3].
+            x_1_pred: Predicted coordinates, shape [b, n, 3].
+            mask: Boolean mask, shape [b, n].
+            log_prefix: Optional prefix for logging.
+            
+        Returns:
+            FAPE loss per sample, shape [b].
+        """
+        from openfold.utils.loss import compute_fape
+        from openfold.utils.rigid_utils import Rigid, Rotation
+        
+        frames_mask = mask.float()
+        
+        # Create identity rotation matrices for all residues
+        rot = torch.eye(3, device=x_1.device, dtype=x_1.dtype)
+        rot = rot.view(1, 1, 3, 3).expand(x_1.shape[0], x_1.shape[1], 3, 3)
+        
+        # Create rigid frames with identity rotations and CA translations
+        pred_rotation = Rotation(rot_mats=rot, quats=None)
+        target_rotation = Rotation(rot_mats=rot, quats=None)
+        pred_frames = Rigid(rot=pred_rotation, trans=x_1_pred)
+        target_frames = Rigid(rot=target_rotation, trans=x_1)
+        
+        fape = compute_fape(
+            pred_frames=pred_frames,
+            target_frames=target_frames,
+            frames_mask=frames_mask,
+            pred_positions=x_1_pred,
+            target_positions=x_1,
+            positions_mask=frames_mask,
+            length_scale=10.0,
+            l1_clamp_distance=10.0,
+        )
+        
+        if log_prefix:
+            self.log(
+                f"{log_prefix}/fape_loss",
+                torch.mean(fape),
+                on_step=True,
+                on_epoch=True,
+                prog_bar=False,
+                logger=True,
+                batch_size=mask.shape[0],
+                sync_dist=True,
+                add_dataloader_idx=False,
+            )
+        
+        return fape
 
     @abstractmethod
     def compute_auxiliary_loss(
@@ -592,7 +884,11 @@ class ModelTrainerBase(L.LightningModule):
                 to generate (nsamples, nres, dt)
 
         Returns:
-            Samples generated in atom 37 format.
+            Dictionary with keys:
+                - "coords_atom37": Generated coordinates in atom37 format, shape [b, n, 37, 3]
+                - "contact_map": Generated contact map (if available), shape [b, n, n]
+                - "cath_code": CATH codes for each sample
+                - "cirpin_ids": CIRPIN IDs for each sample
         """
         sampling_args = self.inf_cfg.sampling_caflow
 
@@ -612,8 +908,7 @@ class ModelTrainerBase(L.LightningModule):
             fixed_sequence_mask, x_motif, fixed_structure_mask = None, None, None
             fixed_sequence_mask = None
 
-
-        x = self.generate(
+        result = self.generate(
             nsamples=batch["nsamples"],
             n=batch["nres"],
             dt=batch["dt"].to(dtype=torch.float32),
@@ -637,7 +932,17 @@ class ModelTrainerBase(L.LightningModule):
             fixed_structure_mask = fixed_structure_mask,
         )
         cirpin_ids = batch.get("cirpin_ids", [None] * len(cath_code))
-        return self.samples_to_atom37(x), cath_code, cirpin_ids  # [b, n, 37, 3]
+        coords_atom37 = None
+        if result.get("coords") is not None:
+            coords_atom37 = self.samples_to_atom37(result["coords"])
+
+        return {
+            "coords_atom37": coords_atom37,
+            "contact_map": result.get("contact_map"),
+            "distogram": result.get("distogram"),
+            "cath_code": cath_code,
+            "cirpin_ids": cirpin_ids,
+        }
 
     def generate(
         self,
@@ -665,6 +970,12 @@ class ModelTrainerBase(L.LightningModule):
     ) -> Dict[str, Tensor]:
         """
         Generates samples by integrating ODE with learned vector field.
+
+        Returns:
+            Dictionary with keys:
+                - "coords": Generated coordinates, shape [nsamples, n, 3]
+                - "contact_map": Generated contact map (if contact_map_mode), shape [nsamples, n, n]
+                - "distogram": Distogram logits (if available), shape [nsamples, n, n, num_buckets]
         """
         predict_clean_n_v_w_guidance = partial(
             self.predict_clean_n_v_w_guidance,
@@ -673,6 +984,11 @@ class ModelTrainerBase(L.LightningModule):
         )
         if mask is None:
             mask = torch.ones(nsamples, n).long().bool().to(self.device)
+
+        contact_map_mode = getattr(self, "contact_map_mode", False)
+        modality = "contact_map" if contact_map_mode else "coordinates"
+        predict_coords = getattr(self.nn, "predict_coords", True)
+
         return self.fm.full_simulation(
             predict_clean_n_v_w_guidance,
             dt=dt,
@@ -692,10 +1008,13 @@ class ModelTrainerBase(L.LightningModule):
             gt_mode=gt_mode,
             gt_p=gt_p,
             gt_clamp_val=gt_clamp_val,
-            x_motif = x_motif,
-            fixed_sequence_mask = fixed_sequence_mask,
-            fixed_structure_mask = fixed_structure_mask,
+            x_motif=x_motif,
+            fixed_sequence_mask=fixed_sequence_mask,
+            fixed_structure_mask=fixed_structure_mask,
+            modality=modality,
+            predict_coords=predict_coords,
         )
+
 
 
 def _extract_cath_code(batch):

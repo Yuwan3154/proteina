@@ -495,6 +495,8 @@ class PDBLightningDataModule(BaseLightningDataModule):
         num_workers: int = 32,
         pin_memory: bool = False,
         prefetch_factor: int = 2,
+        # Overfit testing: filter dataset to specific PDB chains
+        overfit_pdb_chains: Optional[List[str]] = None,
         **kwargs,
     ):
         """Initializes the PDBLightningDataModule.
@@ -562,6 +564,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
         self.store_het = store_het
         self.store_bfactor = store_bfactor
         self.use_multiprocessing = use_multiprocessing
+        self.overfit_pdb_chains = overfit_pdb_chains
         self.df_data = None
         self.dfs_splits = None
         self.clusterid_to_seqid_mappings = None
@@ -997,6 +1000,32 @@ class PDBLightningDataModule(BaseLightningDataModule):
             PDBCompDataset: initialised dataset for one split
         """
         df_split = self.dfs_splits[split]
+        
+        # Filter to specific PDB chains if overfit_pdb_chains is set
+        if self.overfit_pdb_chains is not None:
+            overfit_set = set(self.overfit_pdb_chains)
+            if 'chain' in df_split.columns:
+                # Filter using pdb_chain format (e.g., "1abc_A")
+                df_split = df_split[
+                    df_split.apply(
+                        lambda row: f"{row['pdb']}_{row['chain']}" in overfit_set,
+                        axis=1
+                    )
+                ]
+            else:
+                # Filter using pdb only
+                df_split = df_split[df_split["pdb"].isin(overfit_set)]
+            
+            if len(df_split) == 0:
+                raise ValueError(
+                    f"No samples found matching overfit_pdb_chains: {self.overfit_pdb_chains}. "
+                    "Check that the PDB chain IDs are formatted correctly (e.g., '1abc_A')."
+                )
+            rank_zero_info(
+                f"Overfit mode: filtered {split} split to {len(df_split)} samples "
+                f"matching {self.overfit_pdb_chains}"
+            )
+        
         self.clusterid_to_seqid_mappings = self.clusterid_to_seqid_mappings
         pdb_codes = df_split["pdb"].tolist()
         # Check if 'chain' column exists in the DataFrame

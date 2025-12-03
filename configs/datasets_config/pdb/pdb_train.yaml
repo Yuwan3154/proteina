@@ -22,6 +22,8 @@ datamodule:
   num_workers: 8 # Number of workers for dataloader
   pin_memory: True # Pin memory for dataloader
   prefetch_factor: 2 # Prefetch factor for dataloader
+  # Overfit testing: filter dataset to specific PDB chains (e.g., ["1abc_A", "2xyz_B"])
+  overfit_pdb_chains: null
 
   dataselector:
     _target_: "proteinfoundation.datasets.pdb_data.PDBDataSelector"

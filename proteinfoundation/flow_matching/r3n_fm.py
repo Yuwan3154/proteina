@@ -20,7 +20,7 @@ from tqdm import tqdm
 from proteinfoundation.utils.align_utils.align_utils import mean_w_mask
 
 
-class R3NFlowMatcher:
+class _CoordinateFlowMatcher:
     """
     Flow matching on (R^3)^n, where n is for the number of elements
     per sample (e.g. number of residues).
@@ -520,7 +520,9 @@ class R3NFlowMatcher:
                 if residue_type is not None:
                     nn_in["residue_type"] = residue_type
 
-                x_1_pred, v = predict_clean_n_v(nn_in)
+                result = predict_clean_n_v(nn_in)
+                x_1_pred = result["coords"]
+                v = result["v"]
 
                 # Accomodate last few steps
                 if ts[step] > 0.99:
@@ -660,7 +662,7 @@ class R3NFlowMatcher:
             raise IOError(f"Schedule mode not recognized {mode}")
 
 
-class ContactMapFlowMatcher:
+class _ContactMapFlowMatcher:
     """
     Flow matching on symmetric L×L contact maps.
     
@@ -758,7 +760,7 @@ class ContactMapFlowMatcher:
         c_t = self._enforce_symmetry(c_t)
         return self._apply_pair_mask(c_t, mask)
 
-    def ct_dot(
+    def xt_dot(
         self,
         c_1: Float[Tensor, "* n n"],
         c_t: Float[Tensor, "* n n"],
@@ -944,12 +946,16 @@ class ContactMapFlowMatcher:
 
     def full_simulation(
         self,
-        predict_clean_contact_map: Callable,
+        predict_fn: Callable,
         dt: float,
         nsamples: int,
         n: int,
+        self_cond: bool,
+        cath_code: Optional[List[List[str]]],
+        residue_type: Optional[List[List[int]]],
         device: torch.device,
         mask: Bool[Tensor, "* n"],
+        dtype: Optional[torch.dtype],
         schedule_mode: Literal["uniform", "power", "cos_sch_v_snr", "loglinear", "edm", "log"],
         schedule_p: float,
         sampling_mode: str,
@@ -958,19 +964,26 @@ class ContactMapFlowMatcher:
         gt_mode: Literal["us", "tan", "1/t"],
         gt_p: float,
         gt_clamp_val: Optional[float],
-        dtype: Optional[torch.dtype] = None,
-    ) -> Float[Tensor, "* n n"]:
+        x_motif = None,
+        fixed_sequence_mask = None,
+        fixed_structure_mask = None,
+        predict_coords: bool = False,
+    ) -> Dict[str, Optional[Tensor]]:
         """
-        Full simulation for contact map generation.
+        Full simulation for contact map generation with optional coordinate tracking.
 
         Args:
-            predict_clean_contact_map: Function that takes batch dict and returns
-                (c_1_pred, v) where c_1_pred is predicted clean contact map and v is velocity
+            predict_fn: Function that takes batch dict and returns dict with keys:
+                "contact_map", "contact_map_v", "coords", "distogram"
             dt: Time step size
             nsamples: Number of samples
             n: Sequence length
+            self_cond: Whether to use self-conditioning
+            cath_code: CATH codes for conditioning
+            residue_type: Residue types for conditioning
             device: Torch device
             mask: Sequence mask
+            dtype: Torch dtype
             schedule_mode: Time schedule mode
             schedule_p: Schedule parameter
             sampling_mode: "vf" or "sc"
@@ -979,44 +992,89 @@ class ContactMapFlowMatcher:
             gt_mode: g(t) mode
             gt_p: g(t) parameter
             gt_clamp_val: g(t) clamp value
-            dtype: Torch dtype
+            x_motif: Motif for conditioning
+            fixed_sequence_mask: Fixed sequence mask
+            fixed_structure_mask: Fixed structure mask
+            predict_coords: Whether to track coordinate predictions (pass-through, no diffusion)
 
         Returns:
-            Generated contact maps of shape [nsamples, n, n]
+            Dictionary with keys:
+                - "coords": Final coordinates (or None if predict_coords=False)
+                - "contact_map": Final contact map
+                - "distogram": Final distogram prediction (or None)
         """
         nsteps = math.ceil(1.0 / dt)
-        
-        # Reuse schedule functions from R3NFlowMatcher
         ts = self.get_schedule(mode=schedule_mode, nsteps=nsteps, p1=schedule_p)
         t_eval = ts[:-1]
         gt = self.get_gt(t=t_eval, mode=gt_mode, param=gt_p, clamp_val=gt_clamp_val)
 
         with torch.no_grad():
+            # Initialize contact map from reference
             c = self.sample_reference(n, shape=(nsamples,), device=device, mask=mask, dtype=dtype)
+            
+            # Coordinates: zeros placeholder (no diffusion in contact map mode)
+            x = torch.zeros(nsamples, n, 3, device=device, dtype=dtype if dtype else torch.float32)
+            
+            x_1_pred = None
+            c_1_pred = None
+            distogram = None
 
-            for step in tqdm(range(nsteps)):
+            for step in tqdm(range(nsteps), desc="Contact Map Diffusion"):
                 t = ts[step] * torch.ones(nsamples, device=device)
                 dt_step = ts[step + 1] - ts[step]
                 gt_step = gt[step]
 
                 nn_in = {
+                    "x_t": x,
                     "contact_map_t": c,
                     "t": t,
                     "mask": mask,
                 }
 
-                c_1_pred, v = predict_clean_contact_map(nn_in)
+                if cath_code is not None:
+                    nn_in["cath_code"] = cath_code
+                if residue_type is not None:
+                    nn_in["residue_type"] = residue_type
+                if fixed_sequence_mask is not None:
+                    nn_in["fixed_sequence_mask"] = fixed_sequence_mask
+                if fixed_structure_mask is not None:
+                    nn_in["fixed_structure_mask"] = fixed_structure_mask
+                if x_motif is not None:
+                    nn_in["x_motif"] = x_motif
 
-                # Accomodate last few steps
+                # Self-conditioning
+                if step > 0 and self_cond:
+                    if predict_coords and x_1_pred is not None:
+                        nn_in["x_sc"] = x_1_pred
+                    if c_1_pred is not None:
+                        nn_in["contact_map_sc"] = c_1_pred
+
+                result = predict_fn(nn_in)
+                
+                # Extract predictions
+                x_1_pred = result.get("coords")
+                c_1_pred = result.get("contact_map")
+                c_v = result.get("contact_map_v")
+                distogram = result.get("distogram")  # Capture for final output
+
+                if c_1_pred is None:
+                    raise ValueError("Contact map prediction missing during contact map diffusion.")
+
+                # Compute velocity if not provided
+                if c_v is None:
+                    c_v = self.xt_dot(c_1_pred, c, t, mask)
+
+                # Accommodate last few steps
+                step_sampling_mode = sampling_mode
                 if ts[step] > 0.99:
-                    sampling_mode = "vf"
-                if schedule_mode in ["cos_sch_v_snr", "edm"]:
-                    if ts[step] > 0.985:
-                        sampling_mode = "vf"
+                    step_sampling_mode = "vf"
+                if schedule_mode in ["cos_sch_v_snr", "edm"] and ts[step] > 0.985:
+                    step_sampling_mode = "vf"
 
+                # Update contact map via flow matching
                 c, _ = self.simulation_step(
                     c_t=c,
-                    v=v,
+                    v=c_v,
                     t=t,
                     dt=dt_step,
                     gt=gt_step,
@@ -1026,7 +1084,15 @@ class ContactMapFlowMatcher:
                     mask=mask,
                 )
 
-            return c
+                # Coordinates: just track latest prediction (no simulation step)
+                if predict_coords and x_1_pred is not None:
+                    x = x_1_pred
+
+            return {
+                "coords": x if predict_coords and x_1_pred is not None else None,
+                "contact_map": c,
+                "distogram": distogram,
+            }
 
     def get_schedule(self, mode: str, nsteps: int, *, p1: float = None, eps=1e-5):
         # Useful for schedules defined in terms of SNR
@@ -1130,3 +1196,148 @@ class ContactMapFlowMatcher:
         gt = transform_gt(gt, f_pow=param)
         gt = torch.clamp(gt, 0, clamp_val)  # If None no clamping
         return gt  # [s]
+
+
+class FlowMatcher:
+    """
+    Wrapper flow matcher supporting both coordinate and contact map modalities.
+    """
+
+    def __init__(
+        self,
+        modality: Literal["coordinates", "contact_map"] = "coordinates",
+        *,
+        zero_com: bool = False,
+        scale_ref: float = 1.0,
+    ):
+        assert modality in ("coordinates", "contact_map")
+        self.modality = modality
+        self.coord_fm = _CoordinateFlowMatcher(zero_com=zero_com, scale_ref=scale_ref)
+        self.contact_fm = _ContactMapFlowMatcher(scale_ref=scale_ref)
+
+    def set_modality(self, modality: Literal["coordinates", "contact_map"]):
+        assert modality in ("coordinates", "contact_map")
+        self.modality = modality
+
+    def _get_fm(self, modality: Optional[str] = None):
+        mode = modality or self.modality
+        if mode == "coordinates":
+            return self.coord_fm, mode
+        if mode == "contact_map":
+            return self.contact_fm, mode
+        raise ValueError(f"Unsupported modality: {mode}")
+
+    def sample_reference(self, *args, modality: Optional[str] = None, **kwargs):
+        fm, _ = self._get_fm(modality)
+        return fm.sample_reference(*args, **kwargs)
+
+    def _mask_and_zero_com(self, *args, **kwargs):
+        """
+        Convenience wrapper to coordinate flow matcher's centering utility.
+        """
+        return self.coord_fm._mask_and_zero_com(*args, **kwargs)
+
+    def interpolate(self, *args, modality: Optional[str] = None, **kwargs):
+        fm, _ = self._get_fm(modality)
+        return fm.interpolate(*args, **kwargs)
+
+    def xt_dot(self, *args, modality: Optional[str] = None, **kwargs):
+        fm, mode = self._get_fm(modality)
+        if mode == "coordinates":
+            return fm.xt_dot(*args, **kwargs)
+        return fm.xt_dot(*args, **kwargs)
+
+    def simulation_step(self, *args, modality: Optional[str] = None, **kwargs):
+        fm, _ = self._get_fm(modality)
+        return fm.simulation_step(*args, **kwargs)
+
+    def step_euler(self, *args, modality: Optional[str] = None, **kwargs):
+        fm, _ = self._get_fm(modality)
+        return fm.step_euler(*args, **kwargs)
+
+    def vf_to_score(self, *args, modality: Optional[str] = None, **kwargs):
+        fm, _ = self._get_fm(modality)
+        return fm.vf_to_score(*args, **kwargs)
+
+    def get_gt(self, *args, modality: Optional[str] = None, **kwargs):
+        fm, _ = self._get_fm(modality)
+        return fm.get_gt(*args, **kwargs)
+
+    def get_schedule(self, *args, modality: Optional[str] = None, **kwargs):
+        fm, _ = self._get_fm(modality)
+        return fm.get_schedule(*args, **kwargs)
+
+    def full_simulation(
+        self,
+        predict_fn: Callable,
+        dt: float,
+        nsamples: int,
+        n: int,
+        self_cond: bool,
+        cath_code: Optional[List[List[str]]],
+        residue_type: Optional[List[List[int]]],
+        device: torch.device,
+        mask: Bool[Tensor, "* n"],
+        dtype: Optional[torch.dtype] = None,
+        schedule_mode: str = "uniform",
+        schedule_p: float = 1.0,
+        sampling_mode: str = "vf",
+        sc_scale_noise: float = 1.0,
+        sc_scale_score: float = 1.0,
+        gt_mode: str = "us",
+        gt_p: float = 1.0,
+        gt_clamp_val: Optional[float] = None,
+        x_motif = None,
+        fixed_sequence_mask = None,
+        fixed_structure_mask = None,
+        modality: Optional[str] = None,
+        predict_coords: bool = True,
+    ) -> Dict[str, Optional[Tensor]]:
+        """
+        Full simulation supporting both coordinate and contact map modalities.
+        
+        Delegates to the appropriate internal flow matcher based on modality.
+        
+        For coordinate mode: runs standard coordinate flow matching.
+        For contact map mode: runs contact map flow matching with optional coordinate pass-through.
+        
+        Args:
+            predict_fn: Prediction function that returns dict with "coords", "v", 
+                       "contact_map", "contact_map_v", "distogram" keys.
+            predict_coords: Whether to track coordinate predictions (only for contact map mode).
+            modality: Override modality ("coordinates" or "contact_map").
+            
+        Returns:
+            Dictionary with keys:
+                - "coords": Final coordinates (or None)
+                - "contact_map": Final contact map (or None)
+                - "distogram": Final distogram prediction (or None)
+        """
+        _, mode = self._get_fm(modality)
+        
+        if mode == "coordinates":
+            # Delegate to coordinate flow matcher
+            x = self.coord_fm.full_simulation(
+                predict_fn, dt=dt, nsamples=nsamples, n=n, self_cond=self_cond,
+                cath_code=cath_code, residue_type=residue_type, device=device,
+                mask=mask, dtype=dtype, schedule_mode=schedule_mode,
+                schedule_p=schedule_p, sampling_mode=sampling_mode,
+                sc_scale_noise=sc_scale_noise, sc_scale_score=sc_scale_score,
+                gt_mode=gt_mode, gt_p=gt_p, gt_clamp_val=gt_clamp_val,
+                x_motif=x_motif, fixed_sequence_mask=fixed_sequence_mask,
+                fixed_structure_mask=fixed_structure_mask,
+            )
+            return {"coords": x, "contact_map": None, "distogram": None}
+        
+        # Delegate to contact map flow matcher
+        return self.contact_fm.full_simulation(
+            predict_fn, dt=dt, nsamples=nsamples, n=n, self_cond=self_cond,
+            cath_code=cath_code, residue_type=residue_type, device=device,
+            mask=mask, dtype=dtype, schedule_mode=schedule_mode,
+            schedule_p=schedule_p, sampling_mode=sampling_mode,
+            sc_scale_noise=sc_scale_noise, sc_scale_score=sc_scale_score,
+            gt_mode=gt_mode, gt_p=gt_p, gt_clamp_val=gt_clamp_val,
+            x_motif=x_motif, fixed_sequence_mask=fixed_sequence_mask,
+            fixed_structure_mask=fixed_structure_mask,
+            predict_coords=predict_coords,
+        )
