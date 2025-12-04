@@ -319,11 +319,15 @@ if __name__ == "__main__":
             process_group_backend=cfg_exp.opt.get("dist_backend", "nccl"),
             find_unused_parameters=(
                 cfg_exp.training.get("finetune_seq_cond_lora_only", False)
+                or (cfg_exp.training.get("contact_map_mode", False) 
+                    and not cfg_exp.model.nn.get("predict_coords", True))
                 # or 
                 # cfg_exp.training.get("cirpin_cond", False)  # Enable for CIRPIN conditioning
             ),
             gradient_as_bucket_view=True,  # Memory optimization
-            static_graph=False  # Disable static graph optimization
+            # Use static_graph when contact_map_mode and not predict_coords to handle checkpointing
+            static_graph=(cfg_exp.training.get("contact_map_mode", False) 
+                         and not cfg_exp.model.nn.get("predict_coords", True))
         ) if cfg_exp.opt.dist_strategy == "ddp" else cfg_exp.opt.dist_strategy,
         enable_progress_bar=show_prog_bar,
         plugins=plugins,

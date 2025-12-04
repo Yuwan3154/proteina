@@ -75,9 +75,6 @@ class Proteina(ModelTrainerBase):
             scale_ref=1.0,
         )
 
-        if self.contact_map_mode and "contact_map_t" not in cfg_exp.model.nn.feats_pair_repr:
-            cfg_exp.model.nn.feats_pair_repr.append("contact_map_t")
-
         if self.motif_conditioning:
             self.motif_conditioning_sequence_rep = cfg_exp.training.get("motif_conditioning_sequence_rep", False)
             if self.motif_conditioning_sequence_rep:
@@ -155,7 +152,7 @@ class Proteina(ModelTrainerBase):
         pair_mask = mask[..., :, None] * mask[..., None, :]  # [b, n, n]
         contact_map = contact_map * pair_mask
         
-        return contact_map.float()
+        return contact_map
 
     def apply_random_rotation(self, x, mask, naug=1):
         """
@@ -269,8 +266,8 @@ class Proteina(ModelTrainerBase):
         pair_mask = mask[..., :, None] * mask[..., None, :]  # [*, n, n]
         npairs = torch.sum(pair_mask, dim=(-1, -2))  # [*]
 
-        err = (c_1 - c_1_pred) * pair_mask  # [*, n, n]
-        loss = torch.sum(err ** 2, dim=(-1, -2)) / (npairs + 1e-8)  # [*]
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(c_1_pred, c_1, reduction="none") * pair_mask  # [*, n, n]
+        loss = torch.sum(loss, dim=(-1, -2)) / (npairs + 1e-8)  # [*]
 
         # Apply time-dependent weighting (same as coordinate loss)
         total_loss_w = 1.0 / ((1.0 - t) ** 2 + 1e-5)
@@ -307,7 +304,7 @@ class Proteina(ModelTrainerBase):
 
         Args:
             x_1: True clean sample, shape [*, n, 3].
-            x_1_pred: Predicted clean sample, shape [*, n, 3].
+            x_1_pred: Predicted clean sample, shape [*, n, 3]. Can be None in contact map mode.
             x_t: Sample at interpolation time t (used as input to predict clean sample), shape [*, n, 3].
             t: Interpolation time, shape [*].
             mask: Boolean residue mask, shape [*, n].
@@ -321,18 +318,23 @@ class Proteina(ModelTrainerBase):
         nres = mask.sum(-1)  # [*]
 
         gt_ca_coors = x_1 * mask[..., None]  # [*, n, 3]
-        pred_ca_coors = x_1_pred * mask[..., None]  # [*, n, 3]
         pair_mask = mask[..., None, :] * mask[..., None]  # [*, n, n]
 
-        # Pairwise distances
+        # Pairwise distances from ground truth (always needed for distogram)
         gt_pair_dists = torch.linalg.norm(
             gt_ca_coors[:, :, None, :] - gt_ca_coors[:, None, :, :], dim=-1
         )  # [*, n, n]
-        pred_pair_dists = torch.linalg.norm(
-            pred_ca_coors[:, :, None, :] - pred_ca_coors[:, None, :, :], dim=-1
-        )  # [*, n, n]
         gt_pair_dists = gt_pair_dists * pair_mask  # [*, n, n]
-        pred_pair_dists = pred_pair_dists * pair_mask  # [*, n, n]
+
+        # Compute predicted pairwise distances only if x_1_pred is available
+        if x_1_pred is not None:
+            pred_ca_coors = x_1_pred * mask[..., None]  # [*, n, 3]
+            pred_pair_dists = torch.linalg.norm(
+                pred_ca_coors[:, :, None, :] - pred_ca_coors[:, None, :, :], dim=-1
+            )  # [*, n, n]
+            pred_pair_dists = pred_pair_dists * pair_mask  # [*, n, n]
+        else:
+            pred_pair_dists = None
 
         # Add mask to only account for pairs that are closer than thr in ground truth
         max_dist = self.cfg_exp.loss.thres_aux_2d_loss
@@ -341,12 +343,16 @@ class Proteina(ModelTrainerBase):
         pair_mask_thr = gt_pair_dists < max_dist  # [*, n, n]
         total_pair_mask = pair_mask * pair_mask_thr  # [*, n, n]
 
-        # Compute loss
-        den = torch.sum(total_pair_mask, dim=(-1, -2)) - nres
-        dist_mat_loss = torch.sum(
-            (gt_pair_dists - pred_pair_dists) ** 2 * total_pair_mask, dim=(-1, -2)
-        )  # [*]
-        dist_mat_loss = dist_mat_loss / den  # [*]
+        # Compute coordinate-based auxiliary loss (only if coordinates are predicted)
+        if pred_pair_dists is not None:
+            den = torch.sum(total_pair_mask, dim=(-1, -2)) - nres
+            dist_mat_loss = torch.sum(
+                (gt_pair_dists - pred_pair_dists) ** 2 * total_pair_mask, dim=(-1, -2)
+            )  # [*]
+            dist_mat_loss = dist_mat_loss / den  # [*]
+        else:
+            # No coordinate prediction, skip distance matrix loss
+            dist_mat_loss = torch.zeros(bs, device=x_1.device, dtype=x_1.dtype)
 
         # Distogram loss
         num_dist_buckets = self.cfg_exp.loss.get("num_dist_buckets", 64)
@@ -392,7 +398,8 @@ class Proteina(ModelTrainerBase):
         auxiliary_loss_no_w = distogram_loss * (t > self.cfg_exp.loss.aux_loss_t_lim)
         motif_aux_loss_weight = self.cfg_exp.loss.get("motif_aux_loss_weight", 0)
         scaffold_aux_loss_weight = self.cfg_exp.loss.get("scaffold_aux_loss_weight", 0)
-        if scaffold_aux_loss_weight > 0:
+        # Scaffold and motif losses require coordinate predictions
+        if scaffold_aux_loss_weight > 0 and x_1_pred is not None:
             scaffold_loss = scaffold_aux_loss_weight * self.compute_fm_loss(
                         x_1=x_1,
                         x_1_pred=x_1_pred,
@@ -414,7 +421,7 @@ class Proteina(ModelTrainerBase):
                 add_dataloader_idx=False,
                 rank_zero_only=True,
             )
-        elif motif_aux_loss_weight:
+        elif motif_aux_loss_weight and x_1_pred is not None:
             mask_to_use = batch["fixed_sequence_mask"] * batch["mask"]
             check_weight = 1.0
             if not batch["fixed_sequence_mask"].any():

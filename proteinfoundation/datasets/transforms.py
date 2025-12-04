@@ -132,8 +132,14 @@ class PaddingTransform(T.BaseTransform):
         for key, value in graph:
             if isinstance(value, torch.Tensor):
                 if value.dim() >= 1:
-                    pad_dim = 0
-                    graph[key] = self.pad_tensor(value, self.max_size, pad_dim, self.fill_value)
+                    # For 2D tensors like contact_map [n, n], pad both dimensions
+                    if key == "contact_map" and value.dim() == 2:
+                        # Pad dimension 0 first, then dimension 1
+                        value = self.pad_tensor(value, self.max_size, dim=0, fill_value=self.fill_value)
+                        value = self.pad_tensor(value, self.max_size, dim=1, fill_value=self.fill_value)
+                    else:
+                        value = self.pad_tensor(value, self.max_size, dim=0, fill_value=self.fill_value)
+                    graph[key] = value
         return graph
 
     def pad_tensor(self, tensor, max_size, dim, fill_value=0):
@@ -474,7 +480,7 @@ class ContactMapTransform(T.BaseTransform):
         distances = torch.linalg.norm(diff, dim=-1)  # [L, L]
 
         # Create binary contact map (1 if distance <= cutoff, 0 otherwise)
-        contact_map = (distances <= self.contact_distance_cutoff).float()  # [L, L]
+        contact_map = (distances <= self.contact_distance_cutoff).to(dtype=coords.dtype)  # [L, L]
 
         graph.contact_map = contact_map
 

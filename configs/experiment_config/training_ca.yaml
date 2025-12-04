@@ -21,9 +21,8 @@ loss:
   aux_loss_t_lim: 0.3  # Time limit to apply auxiliary loss
   thres_aux_2d_loss: 0.6  # This is nm not Å
   aux_loss_weight: 1.0
-  distogram_min_bin: 0.325  # 3.25 Å in nm
-  distogram_max_bin: 5.075  # 50.75 Å in nm
-  num_dist_buckets: 39  # 38 bins between min/max + 1 overflow bin
+  num_dist_buckets: 64  # Number of buckets to discretize the pairwise distance
+  max_dist_boundary: 1.0  # Given by nanometer
 
 
 defaults:

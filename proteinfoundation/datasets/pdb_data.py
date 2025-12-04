@@ -670,6 +670,31 @@ class PDBLightningDataModule(BaseLightningDataModule):
             rank_zero_info(f"Loading dataset csv from {df_data_name}")
             self.df_data = pd.read_csv(self.data_dir / df_data_name)
 
+        # Apply overfit_pdb_chains filter BEFORE splitting to avoid issues with samples
+        # ending up in different splits. This ensures all splits contain the same samples.
+        if self.overfit_pdb_chains is not None:
+            overfit_set = set(self.overfit_pdb_chains)
+            original_len = len(self.df_data)
+            if 'chain' in self.df_data.columns:
+                self.df_data = self.df_data[
+                    self.df_data.apply(
+                        lambda row: f"{row['pdb']}_{row['chain']}" in overfit_set,
+                        axis=1
+                    )
+                ]
+            else:
+                self.df_data = self.df_data[self.df_data["pdb"].isin(overfit_set)]
+            
+            if len(self.df_data) == 0:
+                raise ValueError(
+                    f"No samples found matching overfit_pdb_chains: {self.overfit_pdb_chains}. "
+                    f"Check that the PDB chain IDs exist in the dataset (searched {original_len} entries)."
+                )
+            rank_zero_info(
+                f"Overfit mode: filtered dataset from {original_len} to {len(self.df_data)} samples "
+                f"matching {self.overfit_pdb_chains}"
+            )
+
         # Pass exclude_ids from dataselector to datasplitter if not already set
         if self.dataselector and not self.datasplitter.exclude_ids:
             self.datasplitter.exclude_ids = self.dataselector.exclude_ids
@@ -679,6 +704,15 @@ class PDBLightningDataModule(BaseLightningDataModule):
         (self.dfs_splits, self.clusterid_to_seqid_mappings) = (
             self.datasplitter.split_data(self.df_data, file_identifier)
         )
+        
+        # In overfit mode with very few samples, val/test splits may be empty.
+        # Copy train data to val/test to avoid issues with empty dataloaders.
+        if self.overfit_pdb_chains is not None:
+            if len(self.dfs_splits.get("val", [])) == 0:
+                rank_zero_info("Overfit mode: val split empty, using train data for validation")
+                self.dfs_splits["val"] = self.dfs_splits["train"].copy()
+            if len(self.dfs_splits.get("test", [])) == 0:
+                self.dfs_splits["test"] = self.dfs_splits["train"].copy()
 
         # create appropriate datasets based on the selected stage
         if stage == "fit" or stage is None:
@@ -1000,31 +1034,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
             PDBCompDataset: initialised dataset for one split
         """
         df_split = self.dfs_splits[split]
-        
-        # Filter to specific PDB chains if overfit_pdb_chains is set
-        if self.overfit_pdb_chains is not None:
-            overfit_set = set(self.overfit_pdb_chains)
-            if 'chain' in df_split.columns:
-                # Filter using pdb_chain format (e.g., "1abc_A")
-                df_split = df_split[
-                    df_split.apply(
-                        lambda row: f"{row['pdb']}_{row['chain']}" in overfit_set,
-                        axis=1
-                    )
-                ]
-            else:
-                # Filter using pdb only
-                df_split = df_split[df_split["pdb"].isin(overfit_set)]
-            
-            if len(df_split) == 0:
-                raise ValueError(
-                    f"No samples found matching overfit_pdb_chains: {self.overfit_pdb_chains}. "
-                    "Check that the PDB chain IDs are formatted correctly (e.g., '1abc_A')."
-                )
-            rank_zero_info(
-                f"Overfit mode: filtered {split} split to {len(df_split)} samples "
-                f"matching {self.overfit_pdb_chains}"
-            )
+        # Note: overfit_pdb_chains filtering is now applied in setup() BEFORE splitting
         
         self.clusterid_to_seqid_mappings = self.clusterid_to_seqid_mappings
         pdb_codes = df_split["pdb"].tolist()

@@ -63,6 +63,7 @@ training:
   fold_label_sample_ratio: [0.5, 0.1, 0.15, 0.25]   # Training proportion for [None, C, CA, CAT]. If specified, will override mask_{C,A,T}_prob  
   mask_seq_proportion: 0.1
   finetune_seq_cond_lora_only: False
+  predict_coords: True
 
 cirpin:
   cirpin_emb_path: "~/progres/progres/databases/v_0_2_1/pdb_max384.pt"  # Path to CIRPIN embeddings .pt file

@@ -68,9 +68,4 @@ num_registers: 10
 use_qkln: True
 
 num_buckets_predict_pair: 64
-
-# Contact map diffusion mode
-# When enabled, the model predicts contact maps in addition to coordinates
-# Requires use_tri_mult=True and update_pair_repr=True
-contact_map_mode: False  # Set to True to enable contact map diffusion
-contact_map_embed_dim: 64  # Embedding dimension for noisy contact map feature
+predict_coords: True

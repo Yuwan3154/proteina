@@ -158,6 +158,11 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
 
         dataloader_class = DensePaddingDataLoader if self.batch_padding else DataLoader
 
+        # In overfit mode with few samples, don't drop the last incomplete batch
+        drop_last = True
+        if hasattr(self, 'overfit_pdb_chains') and self.overfit_pdb_chains is not None:
+            drop_last = False
+
         return dataloader_class(
             dataset,
             batch_size=self.batch_size,
@@ -165,7 +170,7 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             shuffle=shuffle,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            drop_last=True,
+            drop_last=drop_last,
             prefetch_factor=self.prefetch_factor,
         )
 

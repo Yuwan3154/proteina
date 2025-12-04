@@ -1,9 +1,9 @@
-name: ca_af3_contact_map
+name: contact_af3_200M_yes_tri
 
-# Architecture parameters
-token_dim: 512
-nlayers: 10
-nheads: 8
+# Architecture parameters (matching ca_af3_200M_yes_tri)
+token_dim: 768  # dimension of the tokens in the sequence
+nlayers: 15  # number of transformer layers
+nheads: 12  # number of attn heads
 residual_mha: True
 residual_transition: True
 parallel_mha_transition: False
@@ -12,7 +12,6 @@ use_attn_pair_bias: True
 strict_feats: False
 
 # Sequence features (no coordinate self-conditioning in contact map mode)
-# Available features documented in ca_af3_60M_tri.yaml
 feats_init_seq: ["res_seq_pdb_idx", "chain_break_per_res"]
 feats_cond_seq: ["time_emb", "fold_emb"]
 
@@ -24,12 +23,11 @@ fold_emb_dim: 256
 cath_code_dir: ${oc.env:DATA_PATH}/pdb_raw/
 multilabel_mode: "sample"
 
-# Pair features (contact map inputs replace xt/x_sc pair distances)
-# Available features documented in ca_af3_60M_tri.yaml
-feats_pair_repr: ["rel_seq_sep", "contact_map_t", "contact_map_sc"]
+# Pair features (contact_map_t is embedded directly in protein_transformer.py)
+feats_pair_repr: ["rel_seq_sep", "contact_map_sc"]
 feats_pair_cond: ["time_emb"]
 
-# Pair feature params (reuse defaults where applicable)
+# Pair feature params (kept for compatibility, though not used in contact map mode)
 xt_pair_dist_dim: 64
 xt_pair_dist_min: 0.1
 xt_pair_dist_max: 3
@@ -40,18 +38,18 @@ x_motif_pair_dist_dim: 128
 x_motif_pair_dist_min: 0.1
 x_motif_pair_dist_max: 3
 seq_sep_dim: 127
-pair_repr_dim: 256
+pair_repr_dim: 512  # matching 200M size
 
 update_pair_repr: True
-update_pair_repr_every_n: 2
+update_pair_repr_every_n: 3  # matching 200M: 15 layers -> 5 pair updates
 use_tri_mult: True
 
 num_registers: 10
 use_qkln: True
 
-num_buckets_predict_pair: 64
+num_buckets_predict_pair: 39  # 38 bins between 3.25Å-50.75Å + 1 overflow (AlphaFold format)
 
 # Contact map diffusion mode
 contact_map_mode: True
 contact_map_embed_dim: 64
-predict_coords: False  # Disable coordinate embedding/decoder for contact map mode
+predict_coords: False  # Whether to predict coordinates (for FAPE loss, logging)

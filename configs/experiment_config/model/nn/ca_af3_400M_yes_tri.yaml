@@ -66,3 +66,4 @@ num_registers: 10
 use_qkln: True
 
 num_buckets_predict_pair: 64
+predict_coords: True

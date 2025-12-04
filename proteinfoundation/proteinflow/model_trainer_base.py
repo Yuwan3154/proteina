@@ -193,7 +193,19 @@ class ModelTrainerBase(L.LightningModule):
         """
         if "contact_map_pred" not in nn_out:
             return None
-        return nn_out["contact_map_pred"]
+        nn_pred = nn_out["contact_map_pred"]
+        t = batch["t"]  # [*]
+        t_ext = t[..., None, None]  # [*, 1, 1]
+        contact_map_t = batch["contact_map_t"]  # [*, n, n]
+        if self.cfg_exp.model.target_pred == "c_1":
+            contact_map_pred = nn_pred
+        elif self.cfg_exp.model.target_pred == "v":
+            contact_map_pred = contact_map_t + (1.0 - t_ext) * nn_pred
+        else:
+            raise IOError(
+                f"Wrong parameterization chosen: {self.cfg_exp.model.target_pred} for contact map prediction"
+            )
+        return contact_map_pred
 
     def predict_clean(
         self,
@@ -363,6 +375,19 @@ class ModelTrainerBase(L.LightningModule):
 
         Returns:
             Tuple (x_1, mask, batch_shape, n, dtype)
+        """
+    
+    @abstractmethod
+    def extract_clean_contact_map(self, batch, mask):
+        """
+        Extracts clean contact map from the batch.
+
+        Args:
+            batch: batch from dataloader.
+            mask: mask of the batch.
+
+        Returns:
+            Clean contact map of shape [b, n, n].
         """
 
     def sample_t(self, shape):
@@ -535,10 +560,16 @@ class ModelTrainerBase(L.LightningModule):
                 batch["x_sc"] = self.detach_gradients(x_pred_sc)
             else:
                 batch["x_sc"] = torch.zeros_like(x_1)
-            if contact_map_mode and "contact_map_pred" in nn_out_sc:
-                batch["contact_map_sc"] = self.detach_gradients(
-                    nn_out_sc["contact_map_pred"]
-                )
+            if contact_map_mode:
+                c_pred_sc = self._nn_out_to_c_clean(nn_out_sc, batch)
+                if c_pred_sc is not None:
+                    batch["contact_map_sc"] = self.detach_gradients(c_pred_sc)
+                else:
+                    batch["contact_map_sc"] = torch.zeros(
+                        batch_shape + (n, n),
+                        device=self.device,
+                        dtype=c_1.dtype,
+                    )
         else:
             batch["x_sc"] = torch.zeros_like(x_1)
             if contact_map_mode:
@@ -551,7 +582,7 @@ class ModelTrainerBase(L.LightningModule):
         x_1_pred, nn_out = self.predict_clean(batch)
 
         if contact_map_mode:
-            c_1_pred = nn_out.get("contact_map_pred")
+            c_1_pred = self._nn_out_to_c_clean(nn_out, batch)
             if c_1_pred is None:
                 raise ValueError(
                     "contact_map_mode=True requires contact_map_pred in model output."

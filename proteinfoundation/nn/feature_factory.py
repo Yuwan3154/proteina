@@ -692,73 +692,6 @@ class XscPairwiseDistancesPairFeat(Feature):
             return torch.zeros(b, n, n, self.dim, device=x.device)
 
 
-class ContactMapPairFeat(Feature):
-    """Embeds noisy contact map (at time t) as a pair feature.
-
-    Takes the noisy contact map from batch["contact_map_t"] and projects it
-    to the desired embedding dimension. Optionally bins values for one-hot representation.
-    """
-
-    def __init__(
-        self,
-        contact_map_embed_dim: int = 64,
-        use_binning: bool = False,
-        num_bins: int = 32,
-        **kwargs
-    ):
-        """Initialize the contact map pair feature.
-
-        Args:
-            contact_map_embed_dim: Output dimension for the contact map embedding.
-            use_binning: If True, bin the contact map values and use one-hot encoding.
-                        If False, use a learned linear projection.
-            num_bins: Number of bins for binning (only used if use_binning=True).
-        """
-        if use_binning:
-            super().__init__(dim=num_bins)
-        else:
-            super().__init__(dim=contact_map_embed_dim)
-        
-        self.use_binning = use_binning
-        self.num_bins = num_bins
-        self.contact_map_embed_dim = contact_map_embed_dim
-        
-        if not use_binning:
-            # Learnable linear projection from scalar contact map value to embedding
-            self.linear_embed = torch.nn.Linear(1, contact_map_embed_dim, bias=False)
-
-    def forward(self, batch):
-        """Extract and embed the noisy contact map.
-
-        Args:
-            batch: Dictionary containing "contact_map_t" of shape [b, n, n]
-                   and "x_t" for shape/device inference.
-
-        Returns:
-            Embedded contact map of shape [b, n, n, dim]
-        """
-        if "contact_map_t" in batch:
-            contact_map_t = batch["contact_map_t"]  # [b, n, n]
-        else:
-            # Fallback: if no contact map, return zeros
-            self.assert_defaults_allowed(batch, "Contact map pair")
-            x_t = batch["x_t"]  # [b, n, 3]
-            b, n = x_t.shape[0], x_t.shape[1]
-            return torch.zeros(b, n, n, self.dim, device=x_t.device, dtype=x_t.dtype)
-
-        if self.use_binning:
-            # Bin the contact map values
-            # The noisy contact map can have values outside [0, 1] due to Gaussian noise
-            # Create bins from -2 to 3 (covering typical noise range)
-            bin_limits = torch.linspace(-2.0, 3.0, self.num_bins - 1, device=contact_map_t.device)
-            return bin_and_one_hot(contact_map_t, bin_limits)  # [b, n, n, num_bins]
-        else:
-            # Linear projection
-            # contact_map_t: [b, n, n] -> [b, n, n, 1] -> [b, n, n, dim]
-            contact_map_expanded = contact_map_t.unsqueeze(-1)  # [b, n, n, 1]
-            return self.linear_embed(contact_map_expanded)  # [b, n, n, contact_map_embed_dim]
-
-
 class ContactMapScPairFeat(Feature):
     """Embeds self-conditioned contact map prediction as a pair feature.
 
@@ -903,8 +836,6 @@ class FeatureFactory(torch.nn.Module):
                 return ResidueTypeEmbeddingPairFeat(**kwargs)
             elif f == "cirpin_emb":
                 return CirpinEmbeddingPairFeat(**kwargs)
-            elif f == "contact_map_t":
-                return ContactMapPairFeat(**kwargs)
             elif f == "contact_map_sc":
                 return ContactMapScPairFeat(**kwargs)
             else:
