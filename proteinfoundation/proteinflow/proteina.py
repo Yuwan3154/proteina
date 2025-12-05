@@ -266,7 +266,7 @@ class Proteina(ModelTrainerBase):
         pair_mask = mask[..., :, None] * mask[..., None, :]  # [*, n, n]
         npairs = torch.sum(pair_mask, dim=(-1, -2))  # [*]
 
-        loss = torch.nn.functional.binary_cross_entropy_with_logits_loss(c_1_pred, c_1, reduction="none") * pair_mask  # [*, n, n]
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(c_1_pred, c_1, reduction="none") * pair_mask  # [*, n, n]
         loss = torch.sum(loss, dim=(-1, -2)) / (npairs + 1e-8)  # [*]
 
         # Apply time-dependent weighting (same as coordinate loss)
