@@ -62,8 +62,8 @@ class Proteina(ModelTrainerBase):
         self.save_hyperparameters()
 
         # Define flow matcher
-        # # Contact map diffusion mode
-        self.contact_map_mode = cfg_exp.training.get("contact_map_mode", False)
+        # Contact map diffusion mode - read from nn config (architecture determines training mode)
+        self.contact_map_mode = cfg_exp.model.nn.get("contact_map_mode", False)
         self.contact_map_coord_loss_weight = cfg_exp.training.get("contact_map_coord_loss_weight", 0.1)
 
         # Flow matcher (supports coordinates/contact maps via modality switching)

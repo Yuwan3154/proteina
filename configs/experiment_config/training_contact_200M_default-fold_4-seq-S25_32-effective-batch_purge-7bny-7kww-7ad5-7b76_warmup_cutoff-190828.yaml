@@ -1,5 +1,4 @@
-run_name_: train_contact_map_overfit_200M_test
-# pretrain_ckpt_path: ~/proteina/data/weights/proteina_v1.4_D21M_400M_tri.ckpt  # Disabled: incompatible with contact map mode
+run_name_: train_run_contact_200M_default-fold_4-seq-S25_32-effective-batch_purge-7bny-7kww-7ad5-7b76_warmup_cutoff-190828
 
 hardware:
   ncpus_per_task_train_: 8  # Number of CPUs per task during training
@@ -41,16 +40,10 @@ model:
     residue_type_emb_init_pair: True
     residue_type_emb_cond_pair: True
     seq_emb_dim: 4
-    # cirpin_emb_init_seq: False
-    # cirpin_emb_cond_seq: False
-    # cirpin_emb_init_pair: False
-    # cirpin_emb_cond_pair: False
-    # cirpin_emb_dim: 128
-    # cirpin_emb_path: "~/progres/progres/databases/v_0_2_1/pdb_max384.pt"
 
 
 # Dataset params
-dataset: pdb_train_contact_101m_A_test
+dataset: pdb_train_contact_S25_max384_purge-test_cutoff-190828
 dataset_config_subdir: pdb
 
 force_precision_f32: False  # If false will use bf16-mixed precision
@@ -79,9 +72,9 @@ lora:
 
 opt:
   lr: 0.0001
-  max_epochs: 10000
-  accumulate_grad_batches: 1  # effective batch size = 1*2*16 = 32
-  val_check_interval: 50  # Number of training steps after which we check validation loss
+  max_epochs: 100
+  accumulate_grad_batches: 128  # effective batch size = 1*1*128 = 128
+  val_check_interval: 100  # Number of training steps after which we check validation loss
   skip_nan_grad: False  # Skip updates with nan gradient
   grad_and_weight_analysis: False  # Log some statistics of gradients and weights
   dist_strategy: ddp  # For multi GPU training, do not change
@@ -95,12 +88,11 @@ opt:
 log:
   wandb_project: protein_transformer_big_runs  # Leave this so we can compare runs easily
   log_wandb: True  # whether to log to wandb
-  wandb_resume: "allow"  # "allow" (resume if exists), "never" (always fresh), "must" (require existing)
-  log_every_n_steps: 1  # How often to log metrics to wandb
-  log_structure_every_n_steps: 1  # How often to log structure/contact map visualizations (0 = disabled)
+  log_every_n_steps: 100  # How often to log metrics to wandb
+  log_structure_every_n_steps: 100  # How often to log structure/contact map visualizations (0 = disabled)
   checkpoint: True  # whether to store checkpoints
-  checkpoint_every_n_steps: 2500  # How often we store a checkpoint, should be greater than val_check_interval above
-  last_ckpt_every_n_steps: 2500  # How often do we update our last ckpt, needed for requeuing without losing progress
+  checkpoint_every_n_steps: 1000  # How often we store a checkpoint, should be greater than val_check_interval above
+  last_ckpt_every_n_steps: 1000  # How often do we update our last ckpt, needed for requeuing without losing progress
 
 seed: 42
 

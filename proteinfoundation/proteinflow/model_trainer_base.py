@@ -741,7 +741,7 @@ class ModelTrainerBase(L.LightningModule):
 
         mask_np = mask[0].detach().cpu().numpy()
         # Apply sigmoid to convert logits to probabilities for visualization
-        contact_map_prob = torch.sigmoid(contact_map_pred[0]).detach().cpu().numpy()
+        contact_map_prob = torch.sigmoid(contact_map_pred[0].float()).detach().cpu().numpy()
         pair_mask_np = mask_np[:, None] * mask_np[None, :]
         contact_map_np = contact_map_prob * pair_mask_np
 

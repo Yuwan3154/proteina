@@ -6,7 +6,7 @@ datamodule:
   overwrite: False # Whether to overwrite existing dataset files and reprocess the raw data
   # arguments for BaseLightningDataModule class
   batch_padding: True # whether we want a sparse PyG batch or a padded dense batch
-  sampling_mode: "random" # sample randomly during training
+  sampling_mode: "cluster-random" # sample randomly inside each sequence similarity cluster during training
   transforms: 
     - _target_: "proteinfoundation.datasets.transforms.GlobalRotationTransform" # Transforms to apply to dataset examples
     - _target_: "proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform"
@@ -21,7 +21,6 @@ datamodule:
   num_workers: 8 # Number of workers for dataloader
   pin_memory: True # Pin memory for dataloader
   prefetch_factor: 2 # Prefetch factor for dataloader
-  overfit_pdb_chains: ["101m_A"]  # Using existing protein from dataset for testing
 
   dataselector:
     _target_: "proteinfoundation.datasets.pdb_data.PDBDataSelector"
@@ -40,9 +39,9 @@ datamodule:
     remove_non_standard_residues: True # Include only proteins containing standard amino acid residues
     remove_pdb_unavailable: True # Include only proteins that are available to download
     # NEW FEATURE 1: Release date cutoff (format: YYYY-MM-DD)
-    max_deposition_date: 2019-08-28 # Only include structures deposited on or before this date
+    max_deposition_date: "2019-08-28" # Only include structures deposited on or before this date
     # NOTE: exclude_ids moved to datasplitter for cluster-aware exclusion
-    exclude_ids: [] # No exclusions needed for overfit testing
+    exclude_ids: ["7bny_A", "7kww_A", "7ad5_A", "7b76_A"] # Can still specify here, but will be passed to datasplitter automatically
 
   datasplitter:
     _target_: "proteinfoundation.datasets.pdb_data.PDBDataSplitter"
@@ -54,5 +53,5 @@ datamodule:
     # NEW FEATURE 2: Cluster-aware exclusion
     # For sequence_similarity split: entire clusters containing these IDs will be excluded
     # For random split: only the specified IDs will be excluded
-    exclude_ids: []
+    exclude_ids: ["7bny_A", "7kww_A", "7ad5_A", "7b76_A"]
     exclude_ids_from_file: null # Optional: path to a text file with one ID per line

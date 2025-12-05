@@ -133,7 +133,7 @@ class PaddingTransform(T.BaseTransform):
             if isinstance(value, torch.Tensor):
                 if value.dim() >= 1:
                     # For 2D tensors like contact_map [n, n], pad both dimensions
-                    if key == "contact_map" and value.dim() == 2:
+                    if "contact_map" in key and value.dim() == 2:
                         # Pad dimension 0 first, then dimension 1
                         value = self.pad_tensor(value, self.max_size, dim=0, fill_value=self.fill_value)
                         value = self.pad_tensor(value, self.max_size, dim=1, fill_value=self.fill_value)
