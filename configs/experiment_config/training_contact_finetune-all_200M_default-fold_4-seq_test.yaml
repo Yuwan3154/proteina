@@ -1,4 +1,4 @@
-run_name_: train_contact_map_overfit_test
+run_name_: train_contact_map_overfit_200M_test
 # pretrain_ckpt_path: ~/proteina/data/weights/proteina_v1.4_D21M_400M_tri.ckpt  # Disabled: incompatible with contact map mode
 
 hardware:
@@ -31,7 +31,7 @@ loss:
 
 defaults:
   - model: contactflow  # caflow or contactflow
-  - override model/nn: contact_af3_60M_tri
+  - override model/nn: contact_af3_200M_tri
   - _self_
 
 model:
@@ -102,6 +102,7 @@ opt:
 log:
   wandb_project: protein_transformer_big_runs  # Leave this so we can compare runs easily
   log_wandb: True  # whether to log to wandb
+  wandb_resume: "allow"  # "allow" (resume if exists), "never" (always fresh), "must" (require existing)
   checkpoint: True  # whether to store checkpoints
   checkpoint_every_n_steps: 2500  # How often we store a checkpoint, should be greater than val_check_interval above
   last_ckpt_every_n_steps: 2500  # How often do we update our last ckpt, needed for requeuing without losing progress

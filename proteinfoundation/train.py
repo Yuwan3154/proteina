@@ -231,7 +231,15 @@ if __name__ == "__main__":
     # Set logger
     wandb_logger = None
     if cfg_exp.log.log_wandb and not args.nolog:
-        wandb_logger = WandbLogger(entity="kryst3154-massachusetts-institute-of-technology", project=cfg_exp.log.wandb_project, id=run_name)
+        # resume options: "allow" (resume if exists, create if not), "never" (always create new), 
+        # "must" (must resume existing), None (same as "allow" when id is set)
+        wandb_resume = cfg_exp.log.get("wandb_resume", "allow")
+        wandb_logger = WandbLogger(
+            entity="kryst3154-massachusetts-institute-of-technology", 
+            project=cfg_exp.log.wandb_project, 
+            id=run_name,
+            resume=wandb_resume,
+        )
         callbacks.append(LogEpochTimeCallback())
         callbacks.append(LogSetpTimeCallback())
 
@@ -253,8 +261,8 @@ if __name__ == "__main__":
             "save_weights_only": False,
             "filename": "chk_{epoch:08d}_{step:012d}",
             "every_n_train_steps": cfg_exp.log.checkpoint_every_n_steps,
-            "monitor": "train/trans_loss",
-            "save_top_k": 10000,
+            "monitor": "train/loss",  # Works for both coordinate and contact map modes
+            "save_top_k": 5,
             "mode": "min",
         }
         checkpoint_callback = EmaModelCheckpoint(**args_ckpt)
