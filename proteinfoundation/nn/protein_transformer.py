@@ -775,6 +775,6 @@ class ProteinTransformerAF3(torch.nn.Module):
             # Enforce symmetry
             contact_map_pred = (contact_map_pred + contact_map_pred.transpose(-1, -2)) / 2.0
             contact_map_pred = contact_map_pred * pair_mask
-            nn_out["contact_map_pred"] = torch.sigmoid(contact_map_pred)
+            nn_out["contact_map_pred"] = contact_map_pred
 
         return nn_out

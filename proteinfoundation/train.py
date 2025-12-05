@@ -319,7 +319,7 @@ if __name__ == "__main__":
         num_nodes=cfg_exp.hardware.nnodes_,
         callbacks=callbacks,
         logger=wandb_logger,
-        log_every_n_steps=cfg_exp.opt.log_every_n_steps,
+        log_every_n_steps=cfg_exp.log.get("log_every_n_steps", 100),
         default_root_dir=root_run,
         check_val_every_n_epoch=None,  # Leave like this
         val_check_interval=cfg_exp.opt.val_check_interval,

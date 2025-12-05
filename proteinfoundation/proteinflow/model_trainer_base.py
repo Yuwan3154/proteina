@@ -328,12 +328,14 @@ class ModelTrainerBase(L.LightningModule):
                 )
 
         # Contact map: always include if available
+        # Apply sigmoid to convert logits to probabilities for flow matching
         if c_pred is not None:
-            result["contact_map"] = c_pred
+            c_pred_prob = torch.sigmoid(c_pred)
+            result["contact_map"] = c_pred_prob
             # Only compute velocity in contact map diffusion mode
             if contact_map_mode and "contact_map_t" in batch:
                 result["contact_map_v"] = self.fm.xt_dot(
-                    c_pred,
+                    c_pred_prob,  # Use probabilities for flow matching
                     batch["contact_map_t"],
                     batch["t"],
                     batch["mask"],
@@ -563,7 +565,8 @@ class ModelTrainerBase(L.LightningModule):
             if contact_map_mode:
                 c_pred_sc = self._nn_out_to_c_clean(nn_out_sc, batch)
                 if c_pred_sc is not None:
-                    batch["contact_map_sc"] = self.detach_gradients(c_pred_sc)
+                    # Apply sigmoid to convert logits to probabilities for self-conditioning
+                    batch["contact_map_sc"] = self.detach_gradients(torch.sigmoid(c_pred_sc))
                 else:
                     batch["contact_map_sc"] = torch.zeros(
                         batch_shape + (n, n),
@@ -686,7 +689,7 @@ class ModelTrainerBase(L.LightningModule):
             # Constant line but ok, easy to compare # params
             
             # Log structure visualization (if enabled)
-            log_every_n = self.cfg_exp.training.get("log_structure_every_n_steps", 0)
+            log_every_n = self.cfg_exp.log.get("log_structure_every_n_steps", 0)
             if log_every_n > 0 and self.global_step % log_every_n == 0:
                 self._log_structure_visualization(
                     x_1_pred=x_1_pred,
@@ -737,9 +740,10 @@ class ModelTrainerBase(L.LightningModule):
             return
 
         mask_np = mask[0].detach().cpu().numpy()
-        contact_map_np = contact_map_pred[0].detach().cpu().numpy()
+        # Apply sigmoid to convert logits to probabilities for visualization
+        contact_map_prob = torch.sigmoid(contact_map_pred[0]).detach().cpu().numpy()
         pair_mask_np = mask_np[:, None] * mask_np[None, :]
-        contact_map_np = contact_map_np * pair_mask_np
+        contact_map_np = contact_map_prob * pair_mask_np
 
         fig, ax = plt.subplots(figsize=(6, 6))
         im = ax.imshow(contact_map_np, cmap="viridis", aspect="auto", vmin=0, vmax=1)

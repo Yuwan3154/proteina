@@ -80,7 +80,6 @@ lora:
 opt:
   lr: 0.0001
   max_epochs: 100
-  log_every_n_steps: 100  # For wandb
   accumulate_grad_batches: 16  # effective batch size = 1*2*16 = 32
   val_check_interval: 500  # Number of training steps after which we check validation loss
   skip_nan_grad: False  # Skip updates with nan gradient
@@ -96,6 +95,8 @@ opt:
 log:
   wandb_project: protein_transformer_big_runs  # Leave this so we can compare runs easily
   log_wandb: True  # whether to log to wandb
+  log_every_n_steps: 100  # How often to log metrics to wandb
+  log_structure_every_n_steps: 100  # How often to log structure/contact map visualizations (0 = disabled)
   checkpoint: True  # whether to store checkpoints
   checkpoint_every_n_steps: 2500  # How often we store a checkpoint, should be greater than val_check_interval above
   last_ckpt_every_n_steps: 3500  # How often do we update our last ckpt, needed for requeuing without losing progress
