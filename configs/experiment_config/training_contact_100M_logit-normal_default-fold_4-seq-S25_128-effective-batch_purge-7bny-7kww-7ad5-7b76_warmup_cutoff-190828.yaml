@@ -72,7 +72,7 @@ lora:
 
 opt:
   lr: 0.0001
-  max_epochs: 100
+  max_epochs: 500
   accumulate_grad_batches: 128  # effective batch size = 1*1*128 = 128
   val_check_interval: 1000  # Number of training steps after which we check validation loss
   skip_nan_grad: False  # Skip updates with nan gradient

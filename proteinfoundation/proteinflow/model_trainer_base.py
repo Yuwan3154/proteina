@@ -689,14 +689,17 @@ class ModelTrainerBase(L.LightningModule):
             # Constant line but ok, easy to compare # params
             
             # Log structure visualization (if enabled)
+            # Only log once per unique global_step to avoid duplicate logs during gradient accumulation
             log_every_n = self.cfg_exp.log.get("log_structure_every_n_steps", 0)
             if log_every_n > 0 and self.global_step % log_every_n == 0:
-                self._log_structure_visualization(
-                    x_1_pred=x_1_pred,
-                    contact_map_pred=nn_out.get("contact_map_pred"),
-                    mask=mask,
-                    log_prefix=log_prefix,
-                )
+                if not hasattr(self, "_last_structure_log_step") or self._last_structure_log_step != self.global_step:
+                    self._last_structure_log_step = self.global_step
+                    self._log_structure_visualization(
+                        x_1_pred=x_1_pred,
+                        contact_map_pred=nn_out.get("contact_map_pred"),
+                        mask=mask,
+                        log_prefix=log_prefix,
+                    )
 
         return train_loss
     
