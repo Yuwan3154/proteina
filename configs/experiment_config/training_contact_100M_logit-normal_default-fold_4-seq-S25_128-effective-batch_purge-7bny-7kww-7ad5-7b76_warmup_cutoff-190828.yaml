@@ -1,4 +1,4 @@
-run_name_: train_run_contact_200M_default-fold_4-seq-S25_32-effective-batch_purge-7bny-7kww-7ad5-7b76_warmup_cutoff-190828
+run_name_: train_run_contact_100M_logit-normal_default-fold_4-seq-S25_128-effective-batch_purge-7bny-7kww-7ad5-7b76_warmup_cutoff-190828
 
 hardware:
   ncpus_per_task_train_: 8  # Number of CPUs per task during training
@@ -13,8 +13,8 @@ hardware:
 # - name: beta. This is beta(p1, p2).
 loss:
   t_distribution:
-    name: mix_up02_beta
-    p1: 1.9
+    name: logit-normal
+    p1: 0.0
     p2: 1.0
   loss_t_clamp: 0.9  # Used for loss stability in frameflow, 1. for no clamping
   use_aux_loss: True  # Whether to use auxiliary loss
@@ -30,7 +30,7 @@ loss:
 
 defaults:
   - model: contactflow  # caflow or contactflow
-  - override model/nn: contact_af3_200M_tri
+  - override model/nn: contact_af3_100M_tri
   - _self_
 
 model:
@@ -74,7 +74,7 @@ opt:
   lr: 0.0001
   max_epochs: 100
   accumulate_grad_batches: 128  # effective batch size = 1*1*128 = 128
-  val_check_interval: 100  # Number of training steps after which we check validation loss
+  val_check_interval: 1000  # Number of training steps after which we check validation loss
   skip_nan_grad: False  # Skip updates with nan gradient
   grad_and_weight_analysis: False  # Log some statistics of gradients and weights
   dist_strategy: ddp  # For multi GPU training, do not change
@@ -91,8 +91,8 @@ log:
   log_every_n_steps: 100  # How often to log metrics to wandb
   log_structure_every_n_steps: 100  # How often to log structure/contact map visualizations (0 = disabled)
   checkpoint: True  # whether to store checkpoints
-  checkpoint_every_n_steps: 1000  # How often we store a checkpoint, should be greater than val_check_interval above
-  last_ckpt_every_n_steps: 1000  # How often do we update our last ckpt, needed for requeuing without losing progress
+  checkpoint_every_n_steps: 5000  # How often we store a checkpoint, should be greater than val_check_interval above
+  last_ckpt_every_n_steps: 5000  # How often do we update our last ckpt, needed for requeuing without losing progress
 
 seed: 42
 

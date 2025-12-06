@@ -18,7 +18,7 @@ import tempfile
 
 from abc import abstractmethod
 from functools import partial
-from typing import List, Literal
+from typing import Dict, List, Literal
 
 import lightning as L
 import matplotlib.pyplot as plt
@@ -28,7 +28,7 @@ import wandb
 from jaxtyping import Bool, Float
 from loguru import logger
 from PIL import Image
-from torch import Dict, Tensor
+from torch import Tensor
 
 from proteinfoundation.utils.ff_utils.pdb_utils import (
     mask_cath_code_by_level,

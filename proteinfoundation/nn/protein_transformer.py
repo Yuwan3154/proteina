@@ -9,7 +9,7 @@
 # its affiliates is strictly prohibited.
 
 
-from typing import Dict
+from typing import Dict, Literal, Optional
 
 import einops
 import torch
@@ -23,6 +23,14 @@ from openfold.model.triangular_multiplicative_update import (
     TriangleMultiplicationOutgoing,
 )
 from openfold.utils.rigid_utils import Rigid
+
+# Try to import cuequivariance for faster triangle multiplicative updates
+try:
+    import cuequivariance_torch as cuet
+    CUEQUIVARIANCE_AVAILABLE = True
+except ImportError:
+    CUEQUIVARIANCE_AVAILABLE = False
+
 from proteinfoundation.nn.feature_factory import FeatureFactory
 from proteinfoundation.nn.pair_bias_attn.pair_bias_attn import PairBiasAttention
 from proteinfoundation.nn.alphafold3_pytorch_utils.modules import (
@@ -331,10 +339,12 @@ class PairReprUpdate(torch.nn.Module):
         pair_dim,
         expansion_factor_transition=2,
         use_tri_mult=False,
-        tri_mult_c=196,
+        tri_mult_c=None,
     ):
         super().__init__()
 
+        if tri_mult_c is None:
+            tri_mult_c = pair_dim
         self.use_tri_mult = use_tri_mult
         self.layer_norm_in = torch.nn.LayerNorm(token_dim)
         self.linear_x = torch.nn.Linear(token_dim, int(2 * pair_dim), bias=False)
@@ -347,6 +357,12 @@ class PairReprUpdate(torch.nn.Module):
             self.tri_mult_in = TriangleMultiplicationIncoming(
                 c_z=pair_dim, c_hidden=tri_mult_c
             )
+            # Check if cuequivariance can be used (requires c_z == c_hidden and both multiples of 32)
+            self._cuequivariance_compatible = (
+                CUEQUIVARIANCE_AVAILABLE
+                and pair_dim == tri_mult_c
+                and pair_dim % 32 == 0
+            )
         self.transition_out = PairTransition(
             c_z=pair_dim, n=expansion_factor_transition
         )
@@ -357,6 +373,92 @@ class PairReprUpdate(torch.nn.Module):
         pair_mask has shape [b, n, n]
         """
         return pair_rep * pair_mask[..., None]
+
+    def _run_triangle_mult_cuet(
+        self,
+        x: torch.Tensor,
+        tri_mult_module: torch.nn.Module,
+        direction: Literal["outgoing", "incoming"],
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Run triangle multiplicative update using cuequivariance_torch.
+        
+        This function extracts weights from an OpenFold TriangleMultiplication module
+        and runs the optimized cuequivariance implementation.
+        
+        Args:
+            x: Input tensor of shape [B, N, N, D]
+            tri_mult_module: OpenFold TriangleMultiplicationOutgoing or TriangleMultiplicationIncoming
+            direction: "outgoing" or "incoming"
+            mask: Optional mask tensor of shape [B, N, N]
+        
+        Returns:
+            Output tensor of shape [B, N, N, D]
+        """
+        # Extract weights from OpenFold module
+        # Input normalization
+        norm_in_weight = tri_mult_module.layer_norm_in.weight
+        norm_in_bias = tri_mult_module.layer_norm_in.bias
+        
+        # Input projections: stack a and b projections
+        # p_in combines linear_a_p and linear_b_p: [2*c_hidden, c_z]
+        p_in_weight = torch.cat([
+            tri_mult_module.linear_a_p.weight,
+            tri_mult_module.linear_b_p.weight
+        ], dim=0)
+        p_in_bias = torch.cat([
+            tri_mult_module.linear_a_p.bias,
+            tri_mult_module.linear_b_p.bias
+        ], dim=0)
+        
+        # Input gating: stack a and b gates: [2*c_hidden, c_z]
+        g_in_weight = torch.cat([
+            tri_mult_module.linear_a_g.weight,
+            tri_mult_module.linear_b_g.weight
+        ], dim=0)
+        g_in_bias = torch.cat([
+            tri_mult_module.linear_a_g.bias,
+            tri_mult_module.linear_b_g.bias
+        ], dim=0)
+        
+        # Output normalization
+        norm_out_weight = tri_mult_module.layer_norm_out.weight
+        norm_out_bias = tri_mult_module.layer_norm_out.bias
+        
+        # Output projection: linear_z maps from c_hidden to c_z
+        p_out_weight = tri_mult_module.linear_z.weight
+        p_out_bias = tri_mult_module.linear_z.bias
+        
+        # Output gating: linear_g maps c_z to c_z
+        g_out_weight = tri_mult_module.linear_g.weight
+        g_out_bias = tri_mult_module.linear_g.bias
+        
+        return cuet.triangle_multiplicative_update(
+            x=x,
+            direction=direction,
+            mask=mask,
+            norm_in_weight=norm_in_weight,
+            norm_in_bias=norm_in_bias,
+            p_in_weight=p_in_weight,
+            p_in_bias=p_in_bias,
+            g_in_weight=g_in_weight,
+            g_in_bias=g_in_bias,
+            norm_out_weight=norm_out_weight,
+            norm_out_bias=norm_out_bias,
+            p_out_weight=p_out_weight,
+            p_out_bias=p_out_bias,
+            g_out_weight=g_out_weight,
+            g_out_bias=g_out_bias,
+        )
+
+    def _tri_mult_out_cuet(self, pair_rep, pair_mask):
+        """Wrapper for cuequivariance triangle mult outgoing (for checkpointing)."""
+        return self._run_triangle_mult_cuet(pair_rep, self.tri_mult_out, "outgoing", pair_mask)
+    
+    def _tri_mult_in_cuet(self, pair_rep, pair_mask):
+        """Wrapper for cuequivariance triangle mult incoming (for checkpointing)."""
+        return self._run_triangle_mult_cuet(pair_rep, self.tri_mult_in, "incoming", pair_mask)
 
     def forward(self, x, pair_rep, mask):
         """
@@ -378,16 +480,28 @@ class PairReprUpdate(torch.nn.Module):
         )  # [b, n, n, pair_dim]
         pair_rep = self._apply_mask(pair_rep, pair_mask)  # [b, n, n, pair_dim]
         if self.use_tri_mult:
-            pair_rep = pair_rep + checkpoint(
-                self.tri_mult_out, *(pair_rep, pair_mask * 1.0)
-            )
-            pair_rep = self._apply_mask(pair_rep, pair_mask)  # [b, n, n, pair_dim]
-            pair_rep = pair_rep + checkpoint(
-                self.tri_mult_in, *(pair_rep, pair_mask * 1.0)
-            )
-            pair_rep = self._apply_mask(pair_rep, pair_mask)  # [b, n, n, pair_dim]
+            if CUEQUIVARIANCE_AVAILABLE and self._cuequivariance_compatible:
+                # Use fast cuequivariance implementation (requires c_z == c_hidden and both % 32 == 0)
+                pair_rep = pair_rep + checkpoint(
+                    self._tri_mult_out_cuet, *(pair_rep, pair_mask), use_reentrant=False
+                )
+                pair_rep = self._apply_mask(pair_rep, pair_mask)
+                pair_rep = pair_rep + checkpoint(
+                    self._tri_mult_in_cuet, *(pair_rep, pair_mask), use_reentrant=False
+                )
+                pair_rep = self._apply_mask(pair_rep, pair_mask)
+            else:
+                # Fall back to OpenFold implementation
+                pair_rep = pair_rep + checkpoint(
+                    self.tri_mult_out, *(pair_rep, pair_mask * 1.0), use_reentrant=False
+                )
+                pair_rep = self._apply_mask(pair_rep, pair_mask)  # [b, n, n, pair_dim]
+                pair_rep = pair_rep + checkpoint(
+                    self.tri_mult_in, *(pair_rep, pair_mask * 1.0), use_reentrant=False
+                )
+                pair_rep = self._apply_mask(pair_rep, pair_mask)  # [b, n, n, pair_dim]
         pair_rep = pair_rep + checkpoint(
-            self.transition_out, *(pair_rep, pair_mask * 1.0)
+            self.transition_out, *(pair_rep, pair_mask * 1.0), use_reentrant=False
         )
         pair_rep = self._apply_mask(pair_rep, pair_mask)  # [b, n, n, pair_dim]
         return pair_rep

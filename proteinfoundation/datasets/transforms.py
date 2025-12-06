@@ -53,7 +53,7 @@ class CopyCoordinatesTransform(T.BaseTransform):
     other transformations (like noising or rotations) are applied.
     """
 
-    def __call__(self, graph: Data) -> Data:
+    def forward(self, graph: Data) -> Data:
         """Copies coordinates to coords_unmodified.
 
         Args:
@@ -82,7 +82,7 @@ class ChainBreakPerResidueTransform(T.BaseTransform):
         """
         self.chain_break_cutoff = chain_break_cutoff
 
-    def __call__(self, graph: Data) -> Data:
+    def forward(self, graph: Data) -> Data:
         """Identifies chain breaks and adds mask to graph.
 
         Args:
@@ -120,7 +120,7 @@ class PaddingTransform(T.BaseTransform):
         self.max_size = max_size
         self.fill_value = fill_value
 
-    def __call__(self, graph: Data) -> Data:
+    def forward(self, graph: Data) -> Data:
         """Applies padding to all applicable tensors in graph.
 
         Args:
@@ -185,7 +185,7 @@ class GlobalRotationTransform(T.BaseTransform):
         """
         self.rotation_strategy = rotation_strategy
 
-    def __call__(self, graph: Data) -> Data:
+    def forward(self, graph: Data) -> Data:
         """Applies random rotation to coordinates.
 
         Args:
@@ -240,7 +240,7 @@ class CATHLabelTransform(T.BaseTransform):
         rank_zero_info("Processing CATH ID to CATH code map...")
         self.cathid_to_cathcode_mapping, self.cathid_to_segment_mapping = self._parse_cath_code()
 
-    def __call__(self, graph: Data) -> Data:
+    def forward(self, graph: Data) -> Data:
         """Map each PDB chain to its CATH ID and CATH code.
 
         Args:
@@ -430,7 +430,7 @@ class ContactMapTransform(T.BaseTransform):
         
         return pseudo_cb
 
-    def __call__(self, graph: Data) -> Data:
+    def forward(self, graph: Data) -> Data:
         """Extracts contact map and adds it to the graph.
 
         Args:
@@ -606,7 +606,7 @@ class TEDLabelTransform(T.BaseTransform):
                 self.sample_to_cath.update(chunk_data)
             chunk_counter += 1
 
-    def __call__(self, graph: Data) -> Data:
+    def forward(self, graph: Data) -> Data:
         """Call transform on sample.
 
         Args:
