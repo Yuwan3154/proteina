@@ -17,7 +17,7 @@ datamodule:
       contact_distance_cutoff: 10.0  # Distance threshold in Angstroms for defining contacts
     - _target_: "proteinfoundation.datasets.transforms.PaddingTransform"
       max_size: 384
-  batch_size: 1 # Batch size for dataloader
+  batch_size: 2 # Batch size for dataloader
   num_workers: 8 # Number of workers for dataloader
   pin_memory: True # Pin memory for dataloader
   prefetch_factor: 2 # Prefetch factor for dataloader
@@ -41,7 +41,7 @@ datamodule:
     # NEW FEATURE 1: Release date cutoff (format: YYYY-MM-DD)
     max_deposition_date: "2019-08-28" # Only include structures deposited on or before this date
     # NOTE: exclude_ids moved to datasplitter for cluster-aware exclusion
-    exclude_ids: ["7bny_A", "7kww_A", "7ad5_A", "7b76_A"] # Can still specify here, but will be passed to datasplitter automatically
+    exclude_ids: [] # Can still specify here, but will be passed to datasplitter automatically
 
   datasplitter:
     _target_: "proteinfoundation.datasets.pdb_data.PDBDataSplitter"
