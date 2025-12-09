@@ -223,6 +223,14 @@ class PDBDataSelector:
             pdb_manager.filter_by_deposition_date(cutoff_date, update=True)
             rank_zero_info(f"{len(pdb_manager.df)} chains remaining")
 
+        # Remove obsolete PDB entries
+        rank_zero_info("Removing obsolete PDB entries...")
+        from graphein_utils.graphein_utils import get_obsolete_mapping
+        obs_map = get_obsolete_mapping()
+        obsolete_pdbs = set(obs_map.keys())
+        pdb_manager.df = pdb_manager.df[~pdb_manager.df['pdb'].isin(obsolete_pdbs)]
+        rank_zero_info(f"{len(pdb_manager.df)} chains remaining after removing obsolete entries")
+
         # NOTE: We do NOT apply exclude_ids here anymore!
         # Exclusion is handled in PDBDataSplitter.split_data() to support cluster-aware exclusion
         # where we exclude entire clusters if any member is in exclude_ids

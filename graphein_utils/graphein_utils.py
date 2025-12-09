@@ -378,12 +378,33 @@ def read_pdb_to_dataframe(
             or path.endswith(".mmcif")
             or path.endswith(".mmcif.gz")
         ):
-            atomic_df = PandasMmcif().read_mmcif(path)
-            atomic_df = atomic_df.get_model(model_index)
-            atomic_df = atomic_df.convert_to_pandas_pdb()
-            atomic_df = pd.concat(
-                [atomic_df.df["ATOM"], atomic_df.df["HETATM"]]
-            )
+            pmcif = PandasMmcif().read_mmcif(path)
+            pmcif = pmcif.get_model(model_index)
+            
+            # Store label_asym_id (standardized chain IDs) before conversion
+            label_asym_ids = []
+            dfs_to_concat = []
+            
+            for record_type in ["ATOM", "HETATM"]:
+                if record_type in pmcif.df and len(pmcif.df[record_type]) > 0:
+                    df = pmcif.df[record_type]
+                    if "label_asym_id" in df.columns:
+                        label_asym_ids.append(df["label_asym_id"].values)
+            
+            # Convert to PDB format (this uses auth_asym_id by default)
+            atomic_df = pmcif.convert_to_pandas_pdb()
+            
+            for record_type in ["ATOM", "HETATM"]:
+                if record_type in atomic_df.df and len(atomic_df.df[record_type]) > 0:
+                    dfs_to_concat.append(atomic_df.df[record_type])
+            
+            atomic_df = pd.concat(dfs_to_concat)
+            
+            # Replace auth_asym_id with label_asym_id (standardized chain IDs)
+            if len(label_asym_ids) > 0:
+                label_asym_id_combined = np.concatenate(label_asym_ids)
+                atomic_df = atomic_df.reset_index(drop=True)
+                atomic_df["chain_id"] = label_asym_id_combined
         else:
             raise ValueError(
                 f"File {path} must be either .pdb(.gz), .mmtf(.gz), .(mm)cif(.gz) or .ent, not {path.split('.')[-1]}"
