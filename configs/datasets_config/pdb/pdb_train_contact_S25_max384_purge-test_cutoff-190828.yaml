@@ -53,5 +53,5 @@ datamodule:
     # NEW FEATURE 2: Cluster-aware exclusion
     # For sequence_similarity split: entire clusters containing these IDs will be excluded
     # For random split: only the specified IDs will be excluded
-    exclude_ids: ["7bny_A", "7kww_A", "7ad5_A", "7b76_A"]
+    exclude_ids: ["7ll9_C", "7ll9_D", "7ll9_G", "7ll9_H", "7bny_A", "7bny_B", "7bny_C", "7bny_D", "7kww_A", "7ad5_A", "7b76_A"]
     exclude_ids_from_file: null # Optional: path to a text file with one ID per line
