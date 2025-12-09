@@ -453,6 +453,7 @@ class PDBDataset(Dataset):
         """
         if self.in_memory:
             graph = self.data[idx]
+            fname = f"{graph.id}.pt"
         else:
             if self.file_names is not None:
                 fname = f"{self.file_names[idx]}.pt"
@@ -462,6 +463,17 @@ class PDBDataset(Dataset):
                 fname = f"{self.pdb_codes[idx]}.pt"
 
             graph = torch.load(self.data_dir / "processed" / fname, weights_only=False)
+
+        # Check if graph has coords attribute before accessing (defensive check for corrupted data)
+        if not hasattr(graph, 'coords') or graph.coords is None:
+            logger.warning(f"Sample {idx} (file: {fname}) has no coords attribute, skipping and trying next sample.")
+            # Return next valid sample (with wraparound to avoid infinite loop)
+            return self.__getitem__((idx + 1) % len(self))
+        
+        # Check if graph has coord_mask attribute
+        if not hasattr(graph, 'coord_mask') or graph.coord_mask is None:
+            logger.warning(f"Sample {idx} (file: {fname}) has no coord_mask attribute, skipping and trying next sample.")
+            return self.__getitem__((idx + 1) % len(self))
 
         # reorder coords to be in OpenFold and not PDB convention
         graph.coords = graph.coords[:, PDB_TO_OPENFOLD_INDEX_TENSOR, :]
