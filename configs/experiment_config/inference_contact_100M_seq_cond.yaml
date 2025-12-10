@@ -1,0 +1,36 @@
+defaults:
+  - inference_base
+  - _self_
+
+run_name_: inference_contact_100M_seq_cond
+ckpt_name: train_run_contact_100M_logit-normal_default-fold_4-seq-S25_128-effective-batch_purge-7bny-7kww-7ad5-7b76_warmup_cutoff-190828_last-v2.ckpt
+
+self_cond: True
+fold_cond: False
+cath_code_level: "T"
+seq_cond: True
+data_dir: ${oc.env:DATA_PATH}/pdb_train/
+cath_code_file: cath_codes_train_df_pdb_f1_minl50_maxl384_mtprotein_etdiffractionEM_minoNone_maxoNone_minr0.0_maxr5.0_hl_rl_rnsrTrue_rpuTrue_l_rcuFalse_ex11.csv
+
+# Sampling
+dt: 0.005
+nsamples_per_len: 25000
+max_nsamples: 150
+
+predict_structure_from_distogram: True
+
+# LoRA
+lora:
+  use: False
+  lora_alpha: 32.0
+  lora_dropout: 0.0
+  r: 0
+  train_bias: "none"
+
+sampling_caflow:
+  sampling_mode: sc
+  sc_scale_noise: 0.45
+
+compute_designability: False
+compute_fid: False
+

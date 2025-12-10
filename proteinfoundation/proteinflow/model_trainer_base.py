@@ -35,6 +35,8 @@ from proteinfoundation.utils.ff_utils.pdb_utils import (
     mask_seq,
     write_prot_to_pdb,
 )
+from proteinfoundation.utils.openfold_inference import OpenFoldTemplateInference
+import openfold.np.residue_constants as rc
 
 
 class ModelTrainerBase(L.LightningModule):
@@ -60,6 +62,10 @@ class ModelTrainerBase(L.LightningModule):
         # For autoguidance, overridden in `self.configure_inference`
         self.nn_ag = None
         self.motif_conditioning = cfg_exp.training.get("motif_conditioning", False)
+
+        # Lazy OpenFold template inference helper
+        self._template_inference = None
+        self._logged_val_traj_epoch = -1
 
     def configure_optimizers(self):
         if self.cfg_exp.training.finetune_seq_cond_lora_only:
@@ -231,6 +237,26 @@ class ModelTrainerBase(L.LightningModule):
         """
         nn_out = self.nn(batch)  # [*, n, 3]
         return self._nn_out_to_x_clean(nn_out, batch), nn_out  # [*, n, 3]
+
+    def _get_template_inference_module(self, num_bins: int):
+        if self._template_inference is None or self._template_inference.num_bins != num_bins:
+            self._template_inference = OpenFoldTemplateInference(num_bins=num_bins).to(self.device)
+        return self._template_inference
+
+    def _predict_structure_from_distogram(
+        self,
+        pair_logits: torch.Tensor,
+        residue_type: torch.Tensor,
+        mask: torch.Tensor,
+    ):
+        module = self._get_template_inference_module(pair_logits.shape[-1])
+        module = module.to(self.device)
+        module.eval()
+        with torch.no_grad():
+            out = module(pair_logits, residue_type, mask)
+        atom37 = out["atom37"]
+        ca = atom37[..., rc.atom_order["CA"], :]
+        return ca, atom37
 
     def predict_clean_n_v_w_guidance(
         self,
@@ -429,7 +455,7 @@ class ModelTrainerBase(L.LightningModule):
         Returns:
             Training loss averaged over batches.
         """
-        val_step = batch_idx == -1  # validation step is indicated with batch_idx -1
+        val_step = batch_idx == -1 or getattr(self, "_in_validation_loop", False)
         log_prefix = "validation_loss" if val_step else "train"
         
         # Extract inputs from batch (our dataloader)
@@ -647,6 +673,9 @@ class ModelTrainerBase(L.LightningModule):
             # For scaling laws
             b, n = mask.shape
             nflops_step = None
+            if hasattr(self.nn, "get_flops"):
+                nflops_step = self.nn.get_flops(mask)
+
             if nflops_step is not None:
                 self.nflops = (
                     self.nflops + nflops_step * self.trainer.world_size
@@ -687,19 +716,34 @@ class ModelTrainerBase(L.LightningModule):
                 sync_dist=True,
             )
             # Constant line but ok, easy to compare # params
-            
-            # Log structure visualization (if enabled)
-            # Only log once per unique global_step to avoid duplicate logs during gradient accumulation
-            log_every_n = self.cfg_exp.log.get("log_structure_every_n_steps", 0)
-            if log_every_n > 0 and self.global_step % log_every_n == 0:
-                if not hasattr(self, "_last_structure_log_step") or self._last_structure_log_step != self.global_step:
-                    self._last_structure_log_step = self.global_step
-                    self._log_structure_visualization(
-                        x_1_pred=x_1_pred,
-                        contact_map_pred=nn_out.get("contact_map_pred"),
-                        mask=mask,
-                        log_prefix=log_prefix,
-                    )
+        
+        # Log structure visualization (train + validation)
+        log_every_n = self.cfg_exp.log.get("log_structure_every_n_steps", 0)
+        if log_every_n > 0:
+            log_id = f"{log_prefix}_{self.global_step if not val_step else batch_idx}"
+            if not hasattr(self, "_last_structure_log_step"):
+                self._last_structure_log_step = {}
+            already_logged = self._last_structure_log_step.get(log_prefix) == log_id
+            should_log = False
+            if val_step:
+                should_log = batch_idx % log_every_n == 0
+            else:
+                should_log = self.global_step % log_every_n == 0
+            if should_log and not already_logged:
+                self._last_structure_log_step[log_prefix] = log_id
+                self._log_structure_visualization(
+                    x_1_pred=x_1_pred,
+                    contact_map_pred=nn_out.get("contact_map_pred"),
+                    mask=mask,
+                    log_prefix=log_prefix,
+                    pair_pred=nn_out.get("pair_pred"),
+                    residue_type=batch.get("residue_type"),
+                    use_template_inference=(
+                        getattr(self.nn, "predict_coords", True) is False
+                        and getattr(self, "contact_map_mode", False)
+                        and self.cfg_exp.model.nn.get("predict_structure_from_distogram", False)
+                    ),
+                )
 
         return train_loss
     
@@ -709,6 +753,9 @@ class ModelTrainerBase(L.LightningModule):
         contact_map_pred: torch.Tensor,
         mask: torch.Tensor,
         log_prefix: str,
+        pair_pred: torch.Tensor = None,
+        residue_type: torch.Tensor = None,
+        use_template_inference: bool = False,
     ):
         """
         Logs predicted structure (as temporary PDB) and contact map visualizations.
@@ -721,6 +768,23 @@ class ModelTrainerBase(L.LightningModule):
         """
         if self.logger is None or not hasattr(self.logger, "experiment"):
             return
+
+        if hasattr(self.trainer, "is_global_zero") and not self.trainer.is_global_zero:
+            return
+
+        mask = mask.bool()
+
+        # If coords not predicted, try template inference from distogram
+        if (
+            x_1_pred is None
+            and use_template_inference
+            and pair_pred is not None
+            and residue_type is not None
+        ):
+            ca_coords, _ = self._predict_structure_from_distogram(
+                pair_pred, residue_type, mask
+            )
+            x_1_pred = ca_coords
 
         if x_1_pred is not None:
             # Save first sample as temporary PDB for logging
@@ -894,8 +958,20 @@ class ModelTrainerBase(L.LightningModule):
         This is done with the function `training_step` with batch_idx -1.
         """
         with torch.no_grad():
-            loss = self.training_step(batch, batch_idx=-1)
+            self._in_validation_loop = True
+            loss = self.training_step(batch, batch_idx=batch_idx)
+            self._in_validation_loop = False
             self.validation_output_data.append(loss.item())
+
+        val_sampling_cfg = self.cfg_exp.get("validation_sampling", None)
+        if (
+            val_sampling_cfg
+            and batch_idx == 0
+            and self.global_step > 0
+            and self._logged_val_traj_epoch != self.current_epoch
+        ):
+            self._run_validation_trajectory(batch, val_sampling_cfg)
+            self._logged_val_traj_epoch = self.current_epoch
 
     def on_validation_epoch_end(self):
         """
@@ -906,6 +982,83 @@ class ModelTrainerBase(L.LightningModule):
 
     def on_validation_epoch_end_data(self):
         self.validation_output_data = []
+
+    def _run_validation_trajectory(self, batch, val_sampling_cfg):
+        if self.logger is None or not hasattr(self.logger, "experiment"):
+            return
+        if hasattr(self.trainer, "is_global_zero") and not self.trainer.is_global_zero:
+            return
+
+        dt = float(val_sampling_cfg.get("dt", 0.005))
+        sampling_mode = val_sampling_cfg.get("sampling_mode", "sc")
+        sc_scale_noise = float(val_sampling_cfg.get("sc_scale_noise", 0.45))
+        sc_scale_score = float(val_sampling_cfg.get("sc_scale_score", 1.0))
+
+        nsamples = 1
+        mask = batch["mask"][:nsamples].to(self.device)
+        n = mask.shape[-1]
+        residue_type = batch.get("residue_type")
+        if residue_type is not None:
+            residue_type = residue_type[:nsamples].to(self.device)
+        cath_code = batch.get("cath_code") if self.cfg_exp.training.get("fold_cond", False) else None
+        if cath_code is not None and isinstance(cath_code, torch.Tensor):
+            cath_code = cath_code[:nsamples]
+
+        x_motif = batch.get("motif_structure", None)
+        if x_motif is not None:
+            x_motif = x_motif[:nsamples].to(self.device)
+        fixed_sequence_mask = batch.get("motif_seq_mask", None)
+        if fixed_sequence_mask is not None:
+            fixed_sequence_mask = fixed_sequence_mask[:nsamples].to(self.device)
+
+        result = self.generate(
+            nsamples=nsamples,
+            n=n,
+            dt=dt,
+            self_cond=self.cfg_exp.training.self_cond,
+            cath_code=cath_code,
+            residue_type=residue_type,
+            guidance_weight=1.0,
+            autoguidance_ratio=0.0,
+            dtype=torch.float32,
+            schedule_mode="uniform",
+            schedule_p=1.0,
+            sampling_mode=sampling_mode,
+            sc_scale_noise=sc_scale_noise,
+            sc_scale_score=sc_scale_score,
+            gt_mode="us",
+            gt_p=1.0,
+            gt_clamp_val=None,
+            mask=mask,
+            x_motif=x_motif,
+            fixed_sequence_mask=fixed_sequence_mask,
+            fixed_structure_mask=None,
+        )
+
+        coords = result.get("coords")
+        contact_map = result.get("contact_map")
+        distogram = result.get("distogram")
+
+        predict_from_dist = (
+            val_sampling_cfg.get("predict_structure_from_distogram", False)
+            or self.cfg_exp.model.nn.get("predict_structure_from_distogram", False)
+        )
+        if coords is None and predict_from_dist and distogram is not None and residue_type is not None:
+            coords, _ = self._predict_structure_from_distogram(
+                distogram,
+                residue_type,
+                mask,
+            )
+
+        self._log_structure_visualization(
+            x_1_pred=coords,
+            contact_map_pred=contact_map,
+            mask=mask,
+            log_prefix="validation_sampling",
+            pair_pred=distogram,
+            residue_type=residue_type,
+            use_template_inference=predict_from_dist,
+        )
 
     def configure_inference(self, inf_cfg, nn_ag):
         """Sets inference config with all sampling parameters required by the method (dt, etc)
@@ -973,11 +1126,27 @@ class ModelTrainerBase(L.LightningModule):
         coords_atom37 = None
         if result.get("coords") is not None:
             coords_atom37 = self.samples_to_atom37(result["coords"])
+        distogram = result.get("distogram")
+
+        predict_from_dist = self.inf_cfg.get("predict_structure_from_distogram", False)
+        if (
+            coords_atom37 is None
+            and predict_from_dist
+            and distogram is not None
+            and residue_type is not None
+            and mask is not None
+        ):
+            ca_coords, atom37 = self._predict_structure_from_distogram(
+                distogram,
+                residue_type.to(self.device),
+                mask.to(self.device),
+            )
+            coords_atom37 = atom37
 
         return {
             "coords_atom37": coords_atom37,
             "contact_map": result.get("contact_map"),
-            "distogram": result.get("distogram"),
+            "distogram": distogram,
             "cath_code": cath_code,
             "cirpin_ids": cirpin_ids,
         }

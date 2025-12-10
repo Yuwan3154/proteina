@@ -94,6 +94,11 @@ log:
   checkpoint_every_n_steps: 5000  # How often we store a checkpoint, should be greater than val_check_interval above
   last_ckpt_every_n_steps: 5000  # How often do we update our last ckpt, needed for requeuing without losing progress
 
+validation_sampling:
+  dt: 0.005
+  sampling_mode: sc
+  sc_scale_noise: 0.45
+
 seed: 42
 
 ema:
