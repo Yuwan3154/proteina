@@ -990,6 +990,8 @@ class ModelTrainerBase(L.LightningModule):
             return
 
         dt = float(val_sampling_cfg.get("dt", 0.005))
+        if os.getenv("PROTEINA_DEBUG_FAST_REPRO", "0") == "1":
+            dt = max(dt, 0.05)
         sampling_mode = val_sampling_cfg.get("sampling_mode", "sc")
         sc_scale_noise = float(val_sampling_cfg.get("sc_scale_noise", 0.45))
         sc_scale_score = float(val_sampling_cfg.get("sc_scale_score", 1.0))

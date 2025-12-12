@@ -12,6 +12,9 @@
 from typing import Dict, Literal, Optional
 
 import einops
+import json
+import os
+import time
 import torch
 from torch.utils.checkpoint import checkpoint
 
@@ -801,7 +804,7 @@ class ProteinTransformerAF3(torch.nn.Module):
         r = self.num_registers
         return seqs[:, r:, :], pair[:, r:, r:, :], mask[:, r:]
 
-    @torch.compile()
+    # @torch.compile()
     def forward(self, batch_nn: Dict[str, torch.Tensor]):
         """
         Runs the network.
@@ -818,6 +821,30 @@ class ProteinTransformerAF3(torch.nn.Module):
         Returns:
             Predicted clean coordinates, shape [b, n, 3].
         """
+        # region agent log
+        if os.getenv("PROTEINA_DEBUG_VALSIM", "0") == "1":
+            dbg = {
+                "sessionId": "debug-session",
+                "runId": "cluster-pre-fix",
+                "hypothesisId": "H1",
+                "location": "proteinfoundation/nn/protein_transformer.py:ProteinTransformerAF3.forward",
+                "message": "forward batch shapes",
+                "data": {
+                    "mask_shape": list(batch_nn["mask"].shape) if "mask" in batch_nn else None,
+                    "contact_map_t_shape": list(batch_nn["contact_map_t"].shape) if isinstance(batch_nn.get("contact_map_t"), torch.Tensor) else None,
+                    "x_t_shape": list(batch_nn["x_t"].shape) if isinstance(batch_nn.get("x_t"), torch.Tensor) else None,
+                    "t_shape": list(batch_nn["t"].shape) if isinstance(batch_nn.get("t"), torch.Tensor) else None,
+                    "residue_type_shape": list(batch_nn["residue_type"].shape) if isinstance(batch_nn.get("residue_type"), torch.Tensor) else None,
+                    "cath_code_len": (len(batch_nn["cath_code"]) if "cath_code" in batch_nn and hasattr(batch_nn["cath_code"], "__len__") else None),
+                },
+                "timestamp": int(time.time() * 1000),
+            }
+            dbg_dir = os.path.dirname("/home/ubuntu/.cursor/debug.log")
+            if os.path.isdir(dbg_dir):
+                open("/home/ubuntu/.cursor/debug.log", "a").write(json.dumps(dbg) + "\n")
+            print(json.dumps(dbg), flush=True)
+        # endregion
+
         mask = batch_nn["mask"]
         pair_mask = mask[..., None] * mask[..., None, :]  # [b, n, n]
 
