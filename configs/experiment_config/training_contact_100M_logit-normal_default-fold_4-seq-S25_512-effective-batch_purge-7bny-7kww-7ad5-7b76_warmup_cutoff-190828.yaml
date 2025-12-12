@@ -1,4 +1,4 @@
-run_name_: train_run_contact_100M_logit-normal_default-fold_4-seq-S25_128-effective-batch_purge-7bny-7kww-7ad5-7b76_warmup_cutoff-190828
+run_name_: train_run_contact_100M_logit-normal_default-fold_4-seq-S25_512-effective-batch_purge-7bny-7kww-7ad5-7b76_warmup_cutoff-190828
 
 hardware:
   ncpus_per_task_train_: 32  # Number of CPUs per task during training

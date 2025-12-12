@@ -915,8 +915,8 @@ class _ContactMapFlowMatcher:
             # Make noise symmetric; sqrt(2) corrects the variance of the noise to be std_eps^2.
             eps = (eps + eps.transpose(-1, -2)) / 2.0
             eps = eps * (2 ** 0.5)
-            std_eps = torch.sqrt(torch.tensor(2 * gt * sc_scale_noise * dt, device=c_t.device, dtype=c_t.dtype))
-            delta_c = (v + gt * sc_scale_score * score) * dt + std_eps * eps
+            std_eps = torch.sqrt(2 * gt * sc_scale_noise * dt)
+            delta_c = (v + gt * score) * dt + std_eps * eps
             return c_t + delta_c, t + dt
 
         return c_t + v * dt, t + dt
