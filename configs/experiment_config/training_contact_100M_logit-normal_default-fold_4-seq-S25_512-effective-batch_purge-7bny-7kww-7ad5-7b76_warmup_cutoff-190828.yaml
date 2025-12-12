@@ -1,8 +1,9 @@
 run_name_: train_run_contact_100M_logit-normal_default-fold_4-seq-S25_512-effective-batch_purge-7bny-7kww-7ad5-7b76_warmup_cutoff-190828
+pretrain_ckpt_path: /orcd/pool/006/chenxiou/proteina/store/train_run_contact_100M_logit-normal_default-fold_4-seq-S25_128-effective-batch_purge-7bny-7kww-7ad5-7b76_warmup_cutoff-190828/checkpoints/last-v2.ckpt
 
 hardware:
-  ncpus_per_task_train_: 32  # Number of CPUs per task during training
-  ncpus_per_task_prepro_: 32  # Number of CPUs used for data preprocessing run
+  ncpus_per_task_train_: 48  # Number of CPUs per task during training
+  ncpus_per_task_prepro_: 48  # Number of CPUs used for data preprocessing run
   accelerator: gpu
   ngpus_per_node_: 4  # Number of GPUs per node
   nnodes_: 1  # Number of nodes
@@ -89,10 +90,10 @@ log:
   wandb_project: protein_transformer_big_runs  # Leave this so we can compare runs easily
   log_wandb: True  # whether to log to wandb
   log_every_n_steps: 10  # How often to log metrics to wandb
-  log_structure_every_n_steps: 1000  # How often to log structure/contact map visualizations (0 = disabled)
+  log_structure_every_n_steps: 100  # How often to log structure/contact map visualizations (0 = disabled)
   checkpoint: True  # whether to store checkpoints
-  checkpoint_every_n_steps: 2000  # How often we store a checkpoint, should be greater than val_check_interval above
-  last_ckpt_every_n_steps: 2000  # How often do we update our last ckpt, needed for requeuing without losing progress
+  checkpoint_every_n_steps: 1000  # How often we store a checkpoint, should be greater than val_check_interval above
+  last_ckpt_every_n_steps: 1000  # How often do we update our last ckpt, needed for requeuing without losing progress
 
 validation_sampling:
   dt: 0.005
