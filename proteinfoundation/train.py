@@ -254,6 +254,8 @@ if __name__ == "__main__":
             "filename": "ignore",
             "every_n_train_steps": cfg_exp.log.last_ckpt_every_n_steps,
             "save_last": True,
+            "enable_version_counter": False,
+            "save_top_k": 0,
         }
         args_ckpt = {
             "dirpath": checkpoint_path_store,
@@ -261,7 +263,7 @@ if __name__ == "__main__":
             "save_weights_only": False,
             "filename": "chk_{epoch:08d}_{step:012d}",
             "every_n_train_steps": cfg_exp.log.checkpoint_every_n_steps,
-            "monitor": "train/loss",  # Works for both coordinate and contact map modes
+            "monitor": "val/loss",  # Works for both coordinate and contact map modes
             "save_top_k": 5,
             "mode": "min",
         }
