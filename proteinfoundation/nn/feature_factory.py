@@ -13,8 +13,6 @@ import gzip
 import math
 import os
 import random
-import json
-import time
 from typing import Dict, List, Literal
 
 import torch
@@ -883,32 +881,6 @@ class FeatureFactory(torch.nn.Module):
             )  # [b, n, dim_f] or [b, n, n, dim_f] if seq or pair mode
 
         # Concatenate features and mask
-        # region agent log
-        if os.getenv("PROTEINA_DEBUG_FEATCAT", "0") == "1":
-            debug_payload = {
-                "sessionId": "debug-session",
-                "runId": "cluster-pre-fix",
-                "hypothesisId": "H3",
-                "location": "proteinfoundation/nn/feature_factory.py:FeatureFactory.forward",
-                "message": "pre_cat feature shapes",
-                "data": {
-                    "mode": getattr(self, "mode", None),
-                    "n_feats": len(feature_tensors),
-                    "feat_shapes": [
-                        (list(t.shape) if hasattr(t, "shape") else str(type(t)))
-                        for t in feature_tensors
-                    ],
-                    "mask_shape": list(batch["mask"].shape) if "mask" in batch else None,
-                    "residue_type_shape": list(batch["residue_type"].shape) if isinstance(batch.get("residue_type"), torch.Tensor) else None,
-                    "cath_code_len": (len(batch["cath_code"]) if "cath_code" in batch and hasattr(batch["cath_code"], "__len__") else None),
-                },
-                "timestamp": int(time.time() * 1000),
-            }
-            dbg_dir = os.path.dirname("/home/ubuntu/.cursor/debug.log")
-            if os.path.isdir(dbg_dir):
-                open("/home/ubuntu/.cursor/debug.log", "a").write(json.dumps(debug_payload) + "\n")
-            logger.info(json.dumps(debug_payload))
-        # endregion
         features = torch.cat(
             feature_tensors, dim=-1
         )  # [b, n, dim_f] or [b, n, n, dim_f]
