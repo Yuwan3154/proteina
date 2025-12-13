@@ -1005,6 +1005,8 @@ class ModelTrainerBase(L.LightningModule):
         cath_code = batch.get("cath_code") if self.cfg_exp.training.get("fold_cond", False) else None
         if cath_code is not None and isinstance(cath_code, torch.Tensor):
             cath_code = cath_code[:nsamples]
+        if cath_code is not None and isinstance(cath_code, (list, tuple)):
+            cath_code = cath_code[:nsamples]
 
         x_motif = batch.get("motif_structure", None)
         if x_motif is not None:
