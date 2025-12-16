@@ -384,7 +384,7 @@ class Proteina(ModelTrainerBase):
             )  # [*, n, n], each value in [0, num_dist_buckets)
 
             # Distogram loss
-            distogram_loss = torch.nn.functional.cross_entropy_with_logits(
+            distogram_loss = torch.nn.functional.cross_entropy(
                 pair_logits, gt_pair_dist_bucket, reduction="none"
             )  # [bs, n, n]
             distogram_loss = torch.sum(distogram_loss * pair_mask, dim=(-1, -2))  # [bs]
