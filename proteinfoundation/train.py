@@ -11,40 +11,6 @@
 import os
 import sys
 
-# region agent log
-import json as _agent_json
-import time as _agent_time
-import importlib.util as _agent_importlib_util
-try:
-    _spec_of = _agent_importlib_util.find_spec("openfold")
-    _spec_cfg = _agent_importlib_util.find_spec("openfold.config")
-    with open("/home/ubuntu/.cursor/debug.ndjson", "a") as _f:
-        _f.write(
-            _agent_json.dumps(
-                {
-                    "sessionId": "debug-session",
-                    "runId": "pre-fix",
-                    "hypothesisId": "H1",
-                    "location": "proteinfoundation/train.py:top",
-                    "message": "openfold resolution at train.py import time (before Proteina import)",
-                    "data": {
-                        "cwd": os.getcwd(),
-                        "argv0": sys.argv[0] if sys.argv else None,
-                        "sys_path_0": sys.path[0] if sys.path else None,
-                        "sys_path_head": sys.path[:8],
-                        "openfold_spec_origin": getattr(_spec_of, "origin", None),
-                        "openfold_spec_submodule_search_locations": list(getattr(_spec_of, "submodule_search_locations", []) or []),
-                        "openfold_config_spec_origin": getattr(_spec_cfg, "origin", None),
-                    },
-                    "timestamp": int(_agent_time.time() * 1000),
-                }
-            )
-            + "\n"
-        )
-except Exception:
-    pass
-# endregion agent log
-
 # # Set CUDA environment variables
 # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 # os.environ["TORCH_USE_CUDA_DSA"] = "1"
@@ -55,6 +21,7 @@ root = os.path.abspath(".")
 sys.path.append(root)  # Adds project's root directory
 
 import argparse
+import hashlib
 import json
 import pickle
 from pathlib import Path
@@ -86,6 +53,17 @@ from proteinfoundation.utils.training_analysis_utils import (
     LogSetpTimeCallback,
     SkipNanGradCallback,
 )
+# Try to import cuequivariance for faster triangle multiplicative updates
+try:
+    import cuequivariance_torch as cuet
+    CUEQUIVARIANCE_AVAILABLE = True
+    from cueuivariance_ops_torch import init_triton_cache
+except ImportError:
+    CUEQUIVARIANCE_AVAILABLE = False
+
+if CUEQUIVARIANCE_AVAILABLE:
+    init_triton_cache()
+
 @rank_zero_only
 def wandb_login():
     wandb.login()
@@ -109,7 +87,7 @@ def store_configs(path_configs):
 def log_configs(path_configs, wandb_logger):
     if wandb_logger is None:
         return
-    artifact = wandb.Artifact(f"config_files_{run_name}", type="config")
+    artifact = wandb.Artifact(wandb_safe_name(f"config_files_{run_name}"), type="config")
     for _, path in path_configs:
         artifact.add_file(path)
     wandb_logger.experiment.log_artifact(artifact)
@@ -118,6 +96,24 @@ def log_configs(path_configs, wandb_logger):
 @rank_zero_only
 def create_dir(checkpoint_path_store, parents=True, exist_ok=True):
     Path(checkpoint_path_store).mkdir(parents=parents, exist_ok=exist_ok)
+
+
+def wandb_safe_name(name: str, max_len: int = 128) -> str:
+    """
+    W&B API enforces a 128-char limit for certain name fields (run/artifact names).
+    Keep names readable but guarantee length via truncation + short hash suffix.
+    """
+    if name is None:
+        return "none"
+    name = str(name)
+    if len(name) <= max_len:
+        return name
+    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:10]
+    # Reserve space for "-" + digest
+    keep = max_len - (1 + len(digest))
+    if keep < 1:
+        return digest[:max_len]
+    return f"{name[:keep]}-{digest}"
 
 
 if __name__ == "__main__":
@@ -271,7 +267,8 @@ if __name__ == "__main__":
         wandb_logger = WandbLogger(
             entity="kryst3154-massachusetts-institute-of-technology", 
             project=cfg_exp.log.wandb_project, 
-            id=run_name,
+            id=wandb_safe_name(run_name),
+            name=wandb_safe_name(run_name),
             resume=wandb_resume,
         )
         callbacks.append(LogEpochTimeCallback())
@@ -361,13 +358,7 @@ if __name__ == "__main__":
         val_check_interval=cfg_exp.opt.val_check_interval,
         strategy=DDPStrategy(
             process_group_backend=cfg_exp.opt.get("dist_backend", "nccl"),
-            find_unused_parameters=(
-                cfg_exp.training.get("finetune_seq_cond_lora_only", False)
-                or (cfg_exp.model.nn.get("contact_map_mode", False) 
-                    and not cfg_exp.model.nn.get("predict_coords", True))
-                # or 
-                # cfg_exp.training.get("cirpin_cond", False)  # Enable for CIRPIN conditioning
-            ),
+            find_unused_parameters=True,
             gradient_as_bucket_view=True,  # Memory optimization
             static_graph=False
         ) if cfg_exp.opt.dist_strategy == "ddp" else cfg_exp.opt.dist_strategy,

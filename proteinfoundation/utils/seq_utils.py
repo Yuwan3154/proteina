@@ -8,7 +8,7 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-from openfold.np.residue_constants import restype_3to1
+from proteinfoundation.openfold_stub.np.residue_constants import restype_3to1
 
 
 def seq_batch_3to1(sequences3):

@@ -17,32 +17,32 @@ from functools import partial
 import torch
 import torch.nn as nn
 
-from openfold.utils.feats import (
+from proteinfoundation.openfold_stub.utils.feats import (    
     pseudo_beta_fn,
     build_extra_msa_feat,
     build_template_angle_feat,
     build_template_pair_feat,
     atom14_to_atom37,
 )
-from openfold.model.embedders import (
+from proteinfoundation.openfold_stub.model.embedders import (    
     InputEmbedder,
     RecyclingEmbedder,
     TemplateAngleEmbedder,
     TemplatePairEmbedder,
     ExtraMSAEmbedder,
 )
-from openfold.model.evoformer import EvoformerStack, ExtraMSAStack
-from openfold.model.heads import AuxiliaryHeads
-import openfold.np.residue_constants as residue_constants
-from openfold.model.structure_module import StructureModule
-from openfold.model.template import (
+from proteinfoundation.openfold_stub.model.evoformer import EvoformerStack, ExtraMSAStack
+from proteinfoundation.openfold_stub.model.heads import AuxiliaryHeads
+import proteinfoundation.openfold_stub.np.residue_constants as residue_constants
+from proteinfoundation.openfold_stub.model.structure_module import StructureModule
+from proteinfoundation.openfold_stub.model.template import (    
     TemplatePairStack,
     TemplatePointwiseAttention,
 )
-from openfold.utils.loss import (
+from proteinfoundation.openfold_stub.utils.loss import (    
     compute_plddt,
 )
-from openfold.utils.tensor_utils import (
+from proteinfoundation.openfold_stub.utils.tensor_utils import (    
     dict_multimap,
     tensor_tree_map,
 )

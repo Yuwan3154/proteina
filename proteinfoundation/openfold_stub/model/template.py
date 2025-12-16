@@ -19,22 +19,22 @@ from typing import Optional, List
 import torch
 import torch.nn as nn
 
-from openfold.model.primitives import Linear, LayerNorm, Attention
-from openfold.model.dropout import (
+from proteinfoundation.openfold_stub.model.primitives import Linear, LayerNorm, Attention
+from proteinfoundation.openfold_stub.model.dropout import (    
     DropoutRowwise,
     DropoutColumnwise,
 )
-from openfold.model.pair_transition import PairTransition
-from openfold.model.triangular_attention import (
+from proteinfoundation.openfold_stub.model.pair_transition import PairTransition
+from proteinfoundation.openfold_stub.model.triangular_attention import (    
     TriangleAttentionStartingNode,
     TriangleAttentionEndingNode,
 )
-from openfold.model.triangular_multiplicative_update import (
+from proteinfoundation.openfold_stub.model.triangular_multiplicative_update import (    
     TriangleMultiplicationOutgoing,
     TriangleMultiplicationIncoming,
 )
-from openfold.utils.checkpointing import checkpoint_blocks
-from openfold.utils.tensor_utils import (
+from proteinfoundation.openfold_stub.utils.checkpointing import checkpoint_blocks
+from proteinfoundation.openfold_stub.utils.tensor_utils import (    
     chunk_layer,
     permute_final_dims,
     flatten_final_dims,

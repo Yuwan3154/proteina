@@ -15,7 +15,7 @@
 
 """Utils for minimization."""
 import io
-from openfold.np import residue_constants
+from proteinfoundation.openfold_stub.np import residue_constants
 from Bio import PDB
 import numpy as np
 # simtk.openmm is not supported anymore. Remove simtk.

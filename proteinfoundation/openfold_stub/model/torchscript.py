@@ -17,32 +17,32 @@ from typing import Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 
-from openfold.model.dropout import (
+from proteinfoundation.openfold_stub.model.dropout import (    
     DropoutRowwise,
     DropoutColumnwise,
 )
-from openfold.model.evoformer import (
+from proteinfoundation.openfold_stub.model.evoformer import (    
     EvoformerBlock,
     EvoformerStack,
 )
-from openfold.model.outer_product_mean import OuterProductMean
-from openfold.model.msa import (
+from proteinfoundation.openfold_stub.model.outer_product_mean import OuterProductMean
+from proteinfoundation.openfold_stub.model.msa import (    
     MSARowAttentionWithPairBias, 
     MSAColumnAttention,
     MSAColumnGlobalAttention,
 )
-from openfold.model.pair_transition import PairTransition
-from openfold.model.primitives import Attention, GlobalAttention
-from openfold.model.structure_module import (
+from proteinfoundation.openfold_stub.model.pair_transition import PairTransition
+from proteinfoundation.openfold_stub.model.primitives import Attention, GlobalAttention
+from proteinfoundation.openfold_stub.model.structure_module import (    
     InvariantPointAttention,
     BackboneUpdate,
 )
-from openfold.model.template import TemplatePairStackBlock
-from openfold.model.triangular_attention import (
+from proteinfoundation.openfold_stub.model.template import TemplatePairStackBlock
+from proteinfoundation.openfold_stub.model.triangular_attention import (    
     TriangleAttentionStartingNode,
     TriangleAttentionEndingNode,
 )
-from openfold.model.triangular_multiplicative_update import (
+from proteinfoundation.openfold_stub.model.triangular_multiplicative_update import (    
     TriangleMultiplicationOutgoing,
     TriangleMultiplicationIncoming,
 )

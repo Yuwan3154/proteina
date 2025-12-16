@@ -10,7 +10,7 @@
 
 import torch
 from typing import Dict
-from openfold.np.residue_constants import atom_types
+from proteinfoundation.openfold_stub.np.residue_constants import atom_types
 
 
 ATOM_NUMBERING: Dict[str, int] = {

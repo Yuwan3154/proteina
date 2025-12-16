@@ -22,20 +22,20 @@ import torch
 import torch.nn as nn
 from typing import Optional, Tuple, Sequence
 
-from openfold.model.primitives import Linear, LayerNorm, ipa_point_weights_init_
-from openfold.np.residue_constants import (
+from proteinfoundation.openfold_stub.model.primitives import Linear, LayerNorm, ipa_point_weights_init_
+from proteinfoundation.openfold_stub.np.residue_constants import (    
     restype_rigid_group_default_frame,
     restype_atom14_to_rigid_group,
     restype_atom14_mask,
     restype_atom14_rigid_group_positions,
 )
-from openfold.utils.feats import (
+from proteinfoundation.openfold_stub.utils.feats import (    
     frames_and_literature_positions_to_atom14_pos,
     torsion_angles_to_frames,
 )
-from openfold.utils.precision_utils import is_fp16_enabled
-from openfold.utils.rigid_utils import Rotation, Rigid
-from openfold.utils.tensor_utils import (
+from proteinfoundation.openfold_stub.utils.precision_utils import is_fp16_enabled
+from proteinfoundation.openfold_stub.utils.rigid_utils import Rotation, Rigid
+from proteinfoundation.openfold_stub.utils.tensor_utils import (    
     dict_multimap,
     permute_final_dims,
     flatten_final_dims,

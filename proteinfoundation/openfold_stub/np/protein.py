@@ -20,7 +20,7 @@ from typing import Any, Sequence, Mapping, Optional
 import re
 import string
 
-from openfold.np import residue_constants
+from proteinfoundation.openfold_stub.np import residue_constants
 from Bio.PDB import PDBParser
 import numpy as np
 

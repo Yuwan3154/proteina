@@ -4,8 +4,7 @@ import random
 import numpy as np
 from pytorch_lightning.utilities.seed import seed_everything
 
-from openfold.utils.suppress_output import SuppressLogging
-
+from proteinfoundation.openfold_stub.utils.suppress_output import SuppressLogging
 
 def seed_globally(seed=None):
     if("PL_GLOBAL_SEED" not in os.environ):

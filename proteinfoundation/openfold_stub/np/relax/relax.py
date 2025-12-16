@@ -15,9 +15,8 @@
 
 """Amber relaxation."""
 from typing import Any, Dict, Sequence, Tuple
-from openfold.np import protein
-from openfold.np.relax import amber_minimize, utils
-import numpy as np
+from proteinfoundation.openfold_stub.np import protein
+from proteinfoundation.openfold_stub.np.relax import amber_minimize, utilsimport numpy as np
 
 
 class AmberRelaxation(object):

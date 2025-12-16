@@ -34,8 +34,8 @@ from typing import Any, List, Literal, Mapping, Optional
 import numpy as np
 from Bio.PDB import PDBParser
 
-from openfold.np import residue_constants
-from openfold.np.protein import Protein
+from proteinfoundation.openfold_stub.np import residue_constants
+from proteinfoundation.openfold_stub.np.protein import Protein
 
 FeatureDict = Mapping[str, np.ndarray]
 ModelOutput = Mapping[str, Any]  # Is a nested dict.

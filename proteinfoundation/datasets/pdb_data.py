@@ -23,7 +23,7 @@ from torch.utils.data import Dataset
 from torch_geometric.data import Data
 from tqdm import tqdm
 
-from openfold.np.residue_constants import resname_to_idx
+from proteinfoundation.openfold_stub.np.residue_constants import resname_to_idx
 from proteinfoundation.datasets.base_data import BaseLightningDataModule
 from proteinfoundation.utils.cluster_utils import (
     cluster_sequences,

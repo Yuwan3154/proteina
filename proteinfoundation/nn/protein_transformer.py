@@ -15,14 +15,14 @@ import einops
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from openfold.model.msa import MSARowAttentionWithPairBias
-from openfold.model.pair_transition import PairTransition
-from openfold.model.structure_module import InvariantPointAttention
-from openfold.model.triangular_multiplicative_update import (
+from proteinfoundation.openfold_stub.model.msa import MSARowAttentionWithPairBias
+from proteinfoundation.openfold_stub.model.pair_transition import PairTransition
+from proteinfoundation.openfold_stub.model.structure_module import InvariantPointAttention
+from proteinfoundation.openfold_stub.model.triangular_multiplicative_update import (
     TriangleMultiplicationIncoming,
     TriangleMultiplicationOutgoing,
 )
-from openfold.utils.rigid_utils import Rigid
+from proteinfoundation.openfold_stub.utils.rigid_utils import Rigid
 
 # Try to import cuequivariance for faster triangle multiplicative updates
 try:
@@ -805,8 +805,22 @@ class ProteinTransformerAF3(torch.nn.Module):
         r = self.num_registers
         return seqs[:, r:, :], pair[:, r:, r:, :], mask[:, r:]
 
-    @torch.compile()
     def forward(self, batch_nn: Dict[str, torch.Tensor]):
+        # TorchDynamo treats `requires_grad` / grad-mode as a compile guard. In Lightning we
+        # call the model under both grad-enabled (training) and `torch.no_grad()` (validation,
+        # validation sampling, self-conditioning helpers). If we always run the compiled graph,
+        # Dynamo will keep recompiling on these mode switches until hitting `recompile_limit`
+        # and then fall back to eager.
+        #
+        # To keep training fast/stable and avoid validation recompiles, only use `torch.compile`
+        # in grad-enabled contexts and run eager under `no_grad()`.
+        if torch.is_grad_enabled():
+            if getattr(self, "_forward_compiled", None) is None:
+                self._forward_compiled = torch.compile(self._forward_impl)
+            return self._forward_compiled(batch_nn)
+        return self._forward_impl(batch_nn)
+
+    def _forward_impl(self, batch_nn: Dict[str, torch.Tensor]):
         """
         Runs the network.
 

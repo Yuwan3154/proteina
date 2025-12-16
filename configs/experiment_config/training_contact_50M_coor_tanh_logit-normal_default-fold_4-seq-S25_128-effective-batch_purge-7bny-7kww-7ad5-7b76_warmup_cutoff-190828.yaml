@@ -1,10 +1,10 @@
-run_name_: train_run_contact_60M_coor_tanh_logit-normal_default-fold_4-seq-S25_512-effective-batch_purge-7bny-7kww-7ad5-7b76_warmup_cutoff-190828
+run_name_: contact_50M_coor_tanh_logit-normal_default-fold_4-seq-S25_128-effective-batch_purge-7bny-7kww-7ad5-7b76_warmup_cutoff-190828
 
 hardware:
-  ncpus_per_task_train_: 48  # Number of CPUs per task during training
-  ncpus_per_task_prepro_: 48  # Number of CPUs used for data preprocessing run
+  ncpus_per_task_train_: 16  # Number of CPUs per task during training
+  ncpus_per_task_prepro_: 16  # Number of CPUs used for data preprocessing run
   accelerator: gpu
-  ngpus_per_node_: 4  # Number of GPUs per node
+  ngpus_per_node_: 1  # Number of GPUs per node
   nnodes_: 1  # Number of nodes
 
 # Below, for t_distribution, options are
@@ -30,7 +30,7 @@ loss:
 
 defaults:
   - model: contactflow  # caflow or contactflow
-  - override model/nn: contact_af3_60M_tri_coor_tanh
+  - override model/nn: contact_af3_50M_tri_coor_tanh
   - _self_
 
 model:
@@ -43,7 +43,7 @@ model:
 
 
 # Dataset params
-dataset: pdb_train_contact_S25_max384_purge-test_cutoff-190828
+dataset: pdb_train_contact_S25_max320_purge-test_cutoff-190828
 dataset_config_subdir: pdb
 
 force_precision_f32: False  # If false will use bf16-mixed precision
@@ -71,8 +71,8 @@ lora:
 
 opt:
   lr: 0.0001
-  max_epochs: 200
-  accumulate_grad_batches: 64  # effective batch size = 4*2*64 = 512
+  max_epochs: 1000
+  accumulate_grad_batches: 32  # effective batch size = 1*4*32 = 128
   val_check_interval: 1000  # Number of training batches after which we check validation loss
   skip_nan_grad: False  # Skip updates with nan gradient
   grad_and_weight_analysis: False  # Log some statistics of gradients and weights
@@ -105,4 +105,3 @@ ema:
   validate_original_weights: False  # Whether to run validation on regular or EMA weights
   every_n_steps: 1  # Frequency of EMA updates
   cpu_offload: False  # Whether to offload EMA weights to cpu
-

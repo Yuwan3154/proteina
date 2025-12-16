@@ -20,13 +20,11 @@ import time
 from typing import Collection, Optional, Sequence
 
 from absl import logging
-from openfold.np import (
-    protein,
+from proteinfoundation.openfold_stub.np import (    protein,
     residue_constants,
 )
-import openfold.utils.loss as loss
-from openfold.np.relax import cleanup, utils
-import ml_collections
+import proteinfoundation.openfold_stub.utils.loss as loss
+from proteinfoundation.openfold_stub.np.relax import cleanup, utilsimport ml_collections
 import numpy as np
 import openmm
 from openmm import unit

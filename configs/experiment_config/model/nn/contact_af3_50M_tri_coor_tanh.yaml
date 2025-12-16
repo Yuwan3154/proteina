@@ -1,7 +1,7 @@
-name: contact_af3_60M_tri
+name: contact_af3_50M_tri
 
 # Architecture parameters
-token_dim: 512
+token_dim: 384
 nlayers: 10
 nheads: 8
 residual_mha: True
@@ -12,7 +12,7 @@ use_attn_pair_bias: True
 strict_feats: False
 
 # Sequence features (no coordinate self-conditioning in contact map mode)
-# Available features documented in ca_af3_60M_tri.yaml
+# Available features documented in ca_af3_50M_tri.yaml
 feats_init_seq: ["res_seq_pdb_idx", "chain_break_per_res"]
 feats_cond_seq: ["time_emb", "fold_emb"]
 
@@ -25,7 +25,7 @@ cath_code_dir: ${oc.env:DATA_PATH}/pdb_raw/
 multilabel_mode: "sample"
 
 # Pair features (contact_map_t is embedded directly in protein_transformer.py)
-# Available features documented in ca_af3_60M_tri.yaml
+# Available features documented in ca_af3_50M_tri.yaml
 feats_pair_repr: ["rel_seq_sep", "contact_map_sc"]
 feats_pair_cond: ["time_emb"]
 

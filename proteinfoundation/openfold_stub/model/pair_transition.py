@@ -17,9 +17,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from openfold.model.primitives import Linear, LayerNorm
-from openfold.utils.tensor_utils import chunk_layer
-
+from proteinfoundation.openfold_stub.model.primitives import Linear, LayerNorm
+from proteinfoundation.openfold_stub.utils.tensor_utils import chunk_layer
 
 class PairTransition(nn.Module):
     """

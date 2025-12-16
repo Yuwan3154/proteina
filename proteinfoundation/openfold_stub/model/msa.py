@@ -18,15 +18,15 @@ import torch
 import torch.nn as nn
 from typing import Optional, List, Tuple
 
-from openfold.model.primitives import (
+from proteinfoundation.openfold_stub.model.primitives import (    
     Linear, 
     LayerNorm,
     Attention, 
     GlobalAttention, 
     _attention_chunked_trainable,
 )
-from openfold.utils.checkpointing import get_checkpoint_fn
-from openfold.utils.tensor_utils import (
+from proteinfoundation.openfold_stub.utils.checkpointing import get_checkpoint_fn
+from proteinfoundation.openfold_stub.utils.tensor_utils import (    
     chunk_layer,
     permute_final_dims,
     flatten_final_dims,

@@ -36,7 +36,7 @@ from proteinfoundation.utils.ff_utils.pdb_utils import (
     write_prot_to_pdb,
 )
 from proteinfoundation.utils.openfold_inference import OpenFoldTemplateInference, OpenFoldDistogramOnlyInference
-import openfold.np.residue_constants as rc
+import proteinfoundation.openfold_stub.np.residue_constants as rc
 
 
 class ModelTrainerBase(L.LightningModule):
@@ -648,7 +648,8 @@ class ModelTrainerBase(L.LightningModule):
                 # In contact-map mode, target_pred is 'c_1' and predict_clean()'s
                 # coordinate path is not applicable. We only need the raw nn outputs
                 # to extract contact_map_pred for self-conditioning.
-                nn_out_sc = self.nn(batch)
+                with torch.no_grad():
+                    nn_out_sc = self.nn(batch)
                 c_pred_sc = self._nn_out_to_c_clean(nn_out_sc, batch)
                 if c_pred_sc is not None:
                     # `c_pred_sc` is already activated in model/data space.
@@ -810,13 +811,13 @@ class ModelTrainerBase(L.LightningModule):
                 self._last_structure_log_step[log_prefix] = log_id
                 self._log_structure_visualization(
                     x_1_pred=x_1_pred,
-                    contact_map_pred=self._contact_map_to_viz(nn_out.get("contact_map_pred"))
+                    contact_map_pred=self._contact_map_to_viz(nn_out.get("contact_map_pred"))[0]
                     if nn_out.get("contact_map_pred") is not None
                     else None,
                     mask=mask,
                     log_prefix=log_prefix,
-                    pair_pred=(nn_out.get("pair_logits") if "pair_logits" in nn_out else nn_out.get("pair_pred")),
-                    residue_type=batch.get("residue_type"),
+                    pair_pred=(nn_out.get("pair_logits") if "pair_logits" in nn_out else nn_out.get("pair_pred"))[0],
+                    residue_type=batch.get("residue_type")[0],
                     use_template_inference=(
                         getattr(self.nn, "predict_coords", True) is False
                         and getattr(self, "contact_map_mode", False)
@@ -867,11 +868,12 @@ class ModelTrainerBase(L.LightningModule):
 
         if x_1_pred is not None:
             # Save first sample as temporary PDB for logging
-            atom37 = self.samples_to_atom37(x_1_pred[:1]).detach().cpu().numpy()
+            atom37 = self.samples_to_atom37(x_1_pred[0]).float().detach().cpu().numpy()
+            aatype = residue_type.long().detach().cpu().numpy()
             with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False) as tmp_pdb:
                 temp_pdb_path = tmp_pdb.name
             try:
-                write_prot_to_pdb(atom37[0], temp_pdb_path, overwrite=True, no_indexing=True)
+                write_prot_to_pdb(atom37, temp_pdb_path, aatype=aatype, overwrite=True, no_indexing=True)
                 self.logger.experiment.log(
                     {
                         f"{log_prefix}/structure": wandb.Molecule(temp_pdb_path),
@@ -951,8 +953,8 @@ class ModelTrainerBase(L.LightningModule):
         Returns:
             FAPE loss per sample, shape [b].
         """
-        from openfold.utils.loss import compute_fape
-        from openfold.utils.rigid_utils import Rigid, Rotation
+        from proteinfoundation.openfold_stub.utils.loss import compute_fape
+        from proteinfoundation.openfold_stub.utils.rigid_utils import Rigid, Rotation
         
         frames_mask = mask.float()
         
@@ -963,8 +965,9 @@ class ModelTrainerBase(L.LightningModule):
         # Create rigid frames with identity rotations and CA translations
         pred_rotation = Rotation(rot_mats=rot, quats=None)
         target_rotation = Rotation(rot_mats=rot, quats=None)
-        pred_frames = Rigid(rot=pred_rotation, trans=x_1_pred)
-        target_frames = Rigid(rot=target_rotation, trans=x_1)
+        # Proteina/OpenFold stub uses Rigid(rots=..., trans=...) (not keyword 'rot')
+        pred_frames = Rigid(rots=pred_rotation, trans=x_1_pred)
+        target_frames = Rigid(rots=target_rotation, trans=x_1)
         
         fape = compute_fape(
             pred_frames=pred_frames,
@@ -1078,7 +1081,7 @@ class ModelTrainerBase(L.LightningModule):
         n = mask.shape[-1]
         residue_type = batch.get("residue_type")
         if residue_type is not None:
-            residue_type = residue_type[:nsamples].to(self.device)
+            residue_type = residue_type[:nsamples].to(self.device).long()
         cath_code = batch.get("cath_code") if self.cfg_exp.training.get("fold_cond", False) else None
         if cath_code is not None and isinstance(cath_code, torch.Tensor):
             cath_code = cath_code[:nsamples]

@@ -20,10 +20,8 @@ from typing import Tuple
 
 import torch
 
-from openfold.np import residue_constants as rc
-# from openfold.utils import geometry, tensor_utils
-from openfold.utils import tensor_utils
-# from openfold.utils.geometry.rigid_matrix_vector import Rigid3Array
+from proteinfoundation.openfold_stub.np import residue_constants as rc # from proteinfoundation.openfold_stub.utils import geometry, tensor_utils
+from proteinfoundation.openfold_stub.utils import tensor_utils # from proteinfoundation.openfold_stub.utils.geometry.rigid_matrix_vector import Rigid3Array
 # import numpy as np
 
 
