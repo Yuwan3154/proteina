@@ -272,36 +272,7 @@ class Proteina(ModelTrainerBase):
         pair_mask = mask[..., :, None] * mask[..., None, :]  # [*, n, n]
         npairs = torch.sum(pair_mask, dim=(-1, -2))  # [*]
 
-        # non_contact_value == 0:
-        #   - c_1 is in {0, 1}
-        #   - c_1_pred is expected to be logits (BCEWithLogits)
-        #
-        # non_contact_value == -1:
-        #   - c_1 is in {-1, 1}
-        #   - c_1_pred is expected to be raw logits (pre-activation)
-        #   - map logits -> tanh(logits) in [-1, 1], then to probability via (x+1)/2
-        #   - convert that probability to logit space and use BCEWithLogits for autocast stability
-        if self.non_contact_value == 0:
-            loss = (
-                torch.nn.functional.binary_cross_entropy_with_logits(
-                    c_1_pred, c_1, reduction="none"
-                )
-                * pair_mask
-            )  # [*, n, n]
-        else:
-            y_true = (c_1 + 1.0) * 0.5
-            # p = tanh(logits) mapped to (0, 1)
-            y_pred = (torch.tanh(c_1_pred) + 1.0) * 0.5
-            # Convert probability -> logit so we can use BCEWithLogits under autocast
-            eps = 1e-4
-            y_pred = y_pred.clamp(eps, 1.0 - eps)
-            y_pred_logits = torch.log(y_pred) - torch.log1p(-y_pred)
-            loss = (
-                torch.nn.functional.binary_cross_entropy_with_logits(
-                    y_pred_logits, y_true, reduction="none"
-                )
-                * pair_mask
-            )  # [*, n, n]
+        loss = torch.nn.functional.mse_loss(c_1_pred, c_1, reduction="none") * pair_mask
         loss = torch.sum(loss, dim=(-1, -2)) / (npairs + 1e-8)  # [*]
 
         # Apply time-dependent weighting (same as coordinate loss)
@@ -362,14 +333,15 @@ class Proteina(ModelTrainerBase):
         gt_pair_dists = gt_pair_dists * pair_mask  # [*, n, n]
 
         # Compute predicted pairwise distances only if x_1_pred is available
-        if x_1_pred is not None:
-            pred_ca_coors = x_1_pred * mask[..., None]  # [*, n, 3]
-            pred_pair_dists = torch.linalg.norm(
-                pred_ca_coors[:, :, None, :] - pred_ca_coors[:, None, :, :], dim=-1
-            )  # [*, n, n]
-            pred_pair_dists = pred_pair_dists * pair_mask  # [*, n, n]
+        if self.contact_map_mode and "coords_pred" in nn_out:
+            pred_ca_coors = nn_out.get("coords_pred", None) * mask[..., None]  # [*, n, 3]
         else:
-            pred_pair_dists = None
+            pred_ca_coors = x_1_pred * mask[..., None]  # [*, n, 3]
+
+        pred_pair_dists = torch.linalg.norm(
+            pred_ca_coors[:, :, None, :] - pred_ca_coors[:, None, :, :], dim=-1
+        )  # [*, n, n]
+        pred_pair_dists = pred_pair_dists * pair_mask  # [*, n, n]
 
         # Add mask to only account for pairs that are closer than thr in ground truth
         max_dist = self.cfg_exp.loss.thres_aux_2d_loss
@@ -391,12 +363,10 @@ class Proteina(ModelTrainerBase):
 
         # Distogram loss
         num_dist_buckets = self.cfg_exp.loss.get("num_dist_buckets", 64)
-        pair_pred = nn_out.get("pair_logits", None)
-        if pair_pred is None:
-            pair_pred = nn_out.get("pair_pred", None)
-        if num_dist_buckets and pair_pred is not None:
+        pair_logits = nn_out.get("pair_logits", None)
+        if num_dist_buckets and pair_logits is not None:
             assert (
-                num_dist_buckets == pair_pred.shape[-1]
+                num_dist_buckets == pair_logits.shape[-1]
             ), "The number of distance buckets should be equal with the output dim of pair pred head"
             assert num_dist_buckets > 1, "Need more than one bucket for distogram loss"
 
@@ -407,23 +377,20 @@ class Proteina(ModelTrainerBase):
                 self.cfg_exp.loss.get("max_dist_boundary", 1.0),
             )
             boundaries = torch.linspace(
-                min_dist, max_dist, num_dist_buckets - 1, device=pair_pred.device
+                min_dist, max_dist, num_dist_buckets - 1, device=pair_logits.device
             )
             gt_pair_dist_bucket = torch.bucketize(
                 gt_pair_dists, boundaries
             )  # [*, n, n], each value in [0, num_dist_buckets)
 
             # Distogram loss
-            pair_pred = pair_pred.view(bs * n * n, num_dist_buckets)
-            gt_pair_dist_bucket = gt_pair_dist_bucket.view(bs * n * n)
-            distogram_loss = torch.nn.functional.cross_entropy(
-                pair_pred, gt_pair_dist_bucket, reduction="none"
-            )  # [bs * n * n]
-            distogram_loss = distogram_loss.view(bs, n, n)
-            distogram_loss = torch.sum(distogram_loss * pair_mask, dim=(-1, -2))  # [*]
+            distogram_loss = torch.nn.functional.cross_entropy_with_logits(
+                pair_logits, gt_pair_dist_bucket, reduction="none"
+            )  # [bs, n, n]
+            distogram_loss = torch.sum(distogram_loss * pair_mask, dim=(-1, -2))  # [bs]
             distogram_loss = distogram_loss / (
                 pair_mask.sum(dim=(-1, -2)) + 1e-10
-            )  # [*]
+            )  # [bs]
         else:
             distogram_loss = dist_mat_loss * 0
 
