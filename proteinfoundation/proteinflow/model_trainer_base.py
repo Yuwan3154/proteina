@@ -696,7 +696,7 @@ class ModelTrainerBase(L.LightningModule):
             train_loss = torch.mean(contact_map_loss)
 
             if predict_coords:
-                x_1_pred = batch["coors_pred"]
+                x_1_pred = nn_out["coords_pred"]
                 coord_loss = self.compute_fape_loss(
                     x_1, x_1_pred, mask, log_prefix=log_prefix
                 )

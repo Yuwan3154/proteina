@@ -873,7 +873,7 @@ class ProteinTransformerAF3(torch.nn.Module):
         nn_out = {}
         if self.predict_coords:
             final_coors = self.coors_3d_decoder(seqs) * mask[..., None]  # [b, n, 3]
-            nn_out["coors_pred"] = final_coors
+            nn_out["coords_pred"] = final_coors
         else:
             final_coors = None
 
