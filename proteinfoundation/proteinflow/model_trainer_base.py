@@ -257,8 +257,7 @@ class ModelTrainerBase(L.LightningModule):
                 - For CAflow it returns a tensor of shape [*, n, 3].
             Other things predicted by nn (pair_pred for distogram loss)
         """
-        nn_out = self.nn(batch)  # [*, n, 3]
-        return self._nn_out_to_x_clean(nn_out, batch), nn_out  # [*, n, 3]
+        return self.nn(batch)
 
     def _get_template_inference_module(self, num_bins: int):
         if self._template_inference is None or self._template_inference.num_bins != num_bins:
@@ -645,12 +644,11 @@ class ModelTrainerBase(L.LightningModule):
 
         # Prediction for self-conditioning
         if random.random() > 0.5 and self.cfg_exp.training.self_cond:
-            x_pred_sc, nn_out_sc = self.predict_clean(batch)
-            if x_pred_sc is not None:
-                batch["x_sc"] = self.detach_gradients(x_pred_sc)
-            else:
-                batch["x_sc"] = torch.zeros_like(x_1)
             if contact_map_mode:
+                # In contact-map mode, target_pred is 'c_1' and predict_clean()'s
+                # coordinate path is not applicable. We only need the raw nn outputs
+                # to extract contact_map_pred for self-conditioning.
+                nn_out_sc = self.nn(batch)
                 c_pred_sc = self._nn_out_to_c_clean(nn_out_sc, batch)
                 if c_pred_sc is not None:
                     # `c_pred_sc` is already activated in model/data space.
@@ -661,17 +659,24 @@ class ModelTrainerBase(L.LightningModule):
                         device=self.device,
                         dtype=c_1.dtype,
                     )
+            else:
+                x_pred_sc, nn_out_sc = self.predict_clean(batch)
+                if x_pred_sc is not None:
+                    batch["x_sc"] = self.detach_gradients(x_pred_sc)
+                else:
+                    batch["x_sc"] = torch.zeros_like(x_1)
         else:
-            batch["x_sc"] = torch.zeros_like(x_1)
             if contact_map_mode:
                 batch["contact_map_sc"] = torch.zeros(
                     batch_shape + (n, n),
                     device=self.device,
                     dtype=x_1.dtype,
                 )
+            else:
+                batch["x_sc"] = torch.zeros_like(x_1)
 
-        x_1_pred, nn_out = self.predict_clean(batch)
-
+        # Main prediction
+        nn_out = self.nn(batch) if contact_map_mode else self.predict_clean(batch)[1]
         if contact_map_mode:
             non_contact_value = getattr(self.nn, "non_contact_value", 0)
             if non_contact_value not in (0, -1):
@@ -679,7 +684,8 @@ class ModelTrainerBase(L.LightningModule):
             if non_contact_value == 0:
                 c_1_pred = self._nn_out_to_c_logits(nn_out, batch)
             else:
-                c_1_pred = self._nn_out_to_c_clean(nn_out, batch)
+                # For non_contact_value == -1 we want logits for a stable BCEWithLogits loss.
+                c_1_pred = self._nn_out_to_c_logits(nn_out, batch)
             if c_1_pred is None:
                 raise ValueError(
                     "contact_map_mode=True requires contact_map_logits/contact_map_pred in model output."
@@ -689,7 +695,8 @@ class ModelTrainerBase(L.LightningModule):
             )
             train_loss = torch.mean(contact_map_loss)
 
-            if predict_coords and x_1_pred is not None:
+            if predict_coords:
+                x_1_pred = batch["coors_pred"]
                 coord_loss = self.compute_fape_loss(
                     x_1, x_1_pred, mask, log_prefix=log_prefix
                 )
@@ -700,6 +707,8 @@ class ModelTrainerBase(L.LightningModule):
                     coord_weight * torch.mean(coord_loss)
                 )
         else:
+            nn_out = self.predict_clean(batch)
+            x_1_pred = self._nn_out_to_x_clean(nn_out, batch)
             # Compute losses
             fm_loss = self.compute_fm_loss(
                 x_1, x_1_pred, x_t, t, mask, log_prefix=log_prefix

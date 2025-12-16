@@ -5,9 +5,4 @@ setup(
       version='1.0.0',
       description='proteina',
       packages=find_packages(),
-      package_dir={
-          'proteinfoundation': './proteinfoundation',
-          'openfold': './openfold',
-          'graphein_utils': './graphein_utils'
-      }
 )

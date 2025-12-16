@@ -1,7 +1,42 @@
+import json
+import os
+import sys
+import time
+import importlib.util
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
+
+# region agent log
+try:
+    _spec_of = importlib.util.find_spec("openfold")
+    _spec_cfg = importlib.util.find_spec("openfold.config")
+    with open("/home/ubuntu/.cursor/debug.ndjson", "a") as _f:
+        _f.write(
+            json.dumps(
+                {
+                    "sessionId": "debug-session",
+                    "runId": "pre-fix",
+                    "hypothesisId": "H1",
+                    "location": "proteinfoundation/utils/openfold_inference.py:imports",
+                    "message": "openfold resolution before importing openfold.*",
+                    "data": {
+                        "cwd": os.getcwd(),
+                        "sys_path_0": sys.path[0] if sys.path else None,
+                        "sys_path_head": sys.path[:5],
+                        "openfold_spec_origin": getattr(_spec_of, "origin", None),
+                        "openfold_spec_submodule_search_locations": list(getattr(_spec_of, "submodule_search_locations", []) or []),
+                        "openfold_config_spec_origin": getattr(_spec_cfg, "origin", None),
+                    },
+                    "timestamp": int(time.time() * 1000),
+                }
+            )
+            + "\n"
+        )
+except Exception:
+    pass
+# endregion agent log
 
 from openfold.model.template import TemplatePairStack, TemplatePointwiseAttention
 from openfold.model.embedders import TemplatePairEmbedder
@@ -11,7 +46,11 @@ from openfold.config import model_config
 from openfold.model.model import AlphaFold
 from openfold.utils.import_weights import import_jax_weights_
 from openfold.data.feature_pipeline import FeaturePipeline
-from openfold.data.data_pipeline import make_dummy_msa_feats, make_sequence_features_with_distogram_template, make_sequence_features
+from openfold.data.data_pipeline import (
+    make_dummy_msa_feats,
+    make_sequence_features_with_distogram_template,
+    make_sequence_features,
+)
 from openfold.utils.tensor_utils import tensor_tree_map
 
 

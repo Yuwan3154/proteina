@@ -278,8 +278,9 @@ class Proteina(ModelTrainerBase):
         #
         # non_contact_value == -1:
         #   - c_1 is in {-1, 1}
-        #   - c_1_pred is expected to be the activated prediction in [-1, 1]
-        #   - map both to [0, 1] via y = (x + 1)/2 and use BCE on probabilities
+        #   - c_1_pred is expected to be raw logits (pre-activation)
+        #   - map logits -> tanh(logits) in [-1, 1], then to probability via (x+1)/2
+        #   - convert that probability to logit space and use BCEWithLogits for autocast stability
         if self.non_contact_value == 0:
             loss = (
                 torch.nn.functional.binary_cross_entropy_with_logits(
@@ -289,10 +290,15 @@ class Proteina(ModelTrainerBase):
             )  # [*, n, n]
         else:
             y_true = (c_1 + 1.0) * 0.5
-            y_pred = (c_1_pred.clamp(-1.0, 1.0) + 1.0) * 0.5
+            # p = tanh(logits) mapped to (0, 1)
+            y_pred = (torch.tanh(c_1_pred) + 1.0) * 0.5
+            # Convert probability -> logit so we can use BCEWithLogits under autocast
+            eps = 1e-4
+            y_pred = y_pred.clamp(eps, 1.0 - eps)
+            y_pred_logits = torch.log(y_pred) - torch.log1p(-y_pred)
             loss = (
-                torch.nn.functional.binary_cross_entropy(
-                    y_pred, y_true, reduction="none"
+                torch.nn.functional.binary_cross_entropy_with_logits(
+                    y_pred_logits, y_true, reduction="none"
                 )
                 * pair_mask
             )  # [*, n, n]

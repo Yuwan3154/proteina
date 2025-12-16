@@ -11,6 +11,40 @@
 import os
 import sys
 
+# region agent log
+import json as _agent_json
+import time as _agent_time
+import importlib.util as _agent_importlib_util
+try:
+    _spec_of = _agent_importlib_util.find_spec("openfold")
+    _spec_cfg = _agent_importlib_util.find_spec("openfold.config")
+    with open("/home/ubuntu/.cursor/debug.ndjson", "a") as _f:
+        _f.write(
+            _agent_json.dumps(
+                {
+                    "sessionId": "debug-session",
+                    "runId": "pre-fix",
+                    "hypothesisId": "H1",
+                    "location": "proteinfoundation/train.py:top",
+                    "message": "openfold resolution at train.py import time (before Proteina import)",
+                    "data": {
+                        "cwd": os.getcwd(),
+                        "argv0": sys.argv[0] if sys.argv else None,
+                        "sys_path_0": sys.path[0] if sys.path else None,
+                        "sys_path_head": sys.path[:8],
+                        "openfold_spec_origin": getattr(_spec_of, "origin", None),
+                        "openfold_spec_submodule_search_locations": list(getattr(_spec_of, "submodule_search_locations", []) or []),
+                        "openfold_config_spec_origin": getattr(_spec_cfg, "origin", None),
+                    },
+                    "timestamp": int(_agent_time.time() * 1000),
+                }
+            )
+            + "\n"
+        )
+except Exception:
+    pass
+# endregion agent log
+
 # # Set CUDA environment variables
 # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 # os.environ["TORCH_USE_CUDA_DSA"] = "1"

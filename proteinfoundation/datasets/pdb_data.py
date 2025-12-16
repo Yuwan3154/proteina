@@ -36,7 +36,7 @@ from proteinfoundation.utils.cluster_utils import (
 )
 from proteinfoundation.utils.constants import PDB_TO_OPENFOLD_INDEX_TENSOR
 
-from graphein_utils.graphein_utils import (
+from proteinfoundation.graphein_utils.graphein_utils import (
     protein_to_pyg, 
     PDBManager,     
     download_pdb_multiprocessing,
@@ -225,7 +225,7 @@ class PDBDataSelector:
 
         # Remove obsolete PDB entries
         rank_zero_info("Removing obsolete PDB entries...")
-        from graphein_utils.graphein_utils import get_obsolete_mapping
+        from proteinfoundation.graphein_utils.graphein_utils import get_obsolete_mapping
         obs_map = get_obsolete_mapping()
         obsolete_pdbs = set(obs_map.keys())
         pdb_manager.df = pdb_manager.df[~pdb_manager.df['pdb'].isin(obsolete_pdbs)]

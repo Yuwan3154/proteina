@@ -28,7 +28,7 @@ from proteinfoundation.metrics.gearnet_utils import NoTrainBBGearNet, NoTrainCAG
 from proteinfoundation.metrics.inception_score import ProteinInceptionScore
 from proteinfoundation.utils.constants import PDB_TO_OPENFOLD_INDEX_TENSOR
 
-from graphein_utils.graphein_utils import protein_to_pyg
+from proteinfoundation.graphein_utils.graphein_utils import protein_to_pyg
 
 
 class GenerationMetricFactory(ModuleList):
