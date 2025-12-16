@@ -91,6 +91,9 @@ class Proteina(ModelTrainerBase):
 
         # Neural network
         self.nn = ProteinTransformerAF3(**cfg_exp.model.nn)
+        self.non_contact_value = cfg_exp.model.nn.get("non_contact_value", 0)
+        if self.non_contact_value not in (0, -1):
+            raise ValueError(f"non_contact_value must be 0 or -1, got {self.non_contact_value}")
 
         self.nparams = sum(p.numel() for p in self.nn.parameters() if p.requires_grad)
 
@@ -146,7 +149,10 @@ class Proteina(ModelTrainerBase):
                 "is included in the data transforms when using contact_map_mode."
             )
         
-        contact_map = batch["contact_map"]  # [b, n, n]
+        contact_map = batch["contact_map"].float()  # [b, n, n]
+        if self.non_contact_value == -1:
+            # Map {0, 1} -> {-1, 1}
+            contact_map = contact_map * 2.0 - 1.0
         
         # Apply pair mask
         pair_mask = mask[..., :, None] * mask[..., None, :]  # [b, n, n]
@@ -266,7 +272,30 @@ class Proteina(ModelTrainerBase):
         pair_mask = mask[..., :, None] * mask[..., None, :]  # [*, n, n]
         npairs = torch.sum(pair_mask, dim=(-1, -2))  # [*]
 
-        loss = torch.nn.functional.binary_cross_entropy_with_logits(c_1_pred, c_1, reduction="none") * pair_mask  # [*, n, n]
+        # non_contact_value == 0:
+        #   - c_1 is in {0, 1}
+        #   - c_1_pred is expected to be logits (BCEWithLogits)
+        #
+        # non_contact_value == -1:
+        #   - c_1 is in {-1, 1}
+        #   - c_1_pred is expected to be the activated prediction in [-1, 1]
+        #   - map both to [0, 1] via y = (x + 1)/2 and use BCE on probabilities
+        if self.non_contact_value == 0:
+            loss = (
+                torch.nn.functional.binary_cross_entropy_with_logits(
+                    c_1_pred, c_1, reduction="none"
+                )
+                * pair_mask
+            )  # [*, n, n]
+        else:
+            y_true = (c_1 + 1.0) * 0.5
+            y_pred = (c_1_pred.clamp(-1.0, 1.0) + 1.0) * 0.5
+            loss = (
+                torch.nn.functional.binary_cross_entropy(
+                    y_pred, y_true, reduction="none"
+                )
+                * pair_mask
+            )  # [*, n, n]
         loss = torch.sum(loss, dim=(-1, -2)) / (npairs + 1e-8)  # [*]
 
         # Apply time-dependent weighting (same as coordinate loss)
@@ -356,7 +385,9 @@ class Proteina(ModelTrainerBase):
 
         # Distogram loss
         num_dist_buckets = self.cfg_exp.loss.get("num_dist_buckets", 64)
-        pair_pred = nn_out.get("pair_pred", None)
+        pair_pred = nn_out.get("pair_logits", None)
+        if pair_pred is None:
+            pair_pred = nn_out.get("pair_pred", None)
         if num_dist_buckets and pair_pred is not None:
             assert (
                 num_dist_buckets == pair_pred.shape[-1]

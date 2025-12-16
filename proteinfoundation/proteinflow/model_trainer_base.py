@@ -35,7 +35,7 @@ from proteinfoundation.utils.ff_utils.pdb_utils import (
     mask_seq,
     write_prot_to_pdb,
 )
-from proteinfoundation.utils.openfold_inference import OpenFoldTemplateInference
+from proteinfoundation.utils.openfold_inference import OpenFoldTemplateInference, OpenFoldDistogramOnlyInference
 import openfold.np.residue_constants as rc
 
 
@@ -199,19 +199,41 @@ class ModelTrainerBase(L.LightningModule):
         """
         if "contact_map_pred" not in nn_out:
             return None
-        nn_pred = nn_out["contact_map_pred"]
-        t = batch["t"]  # [*]
-        t_ext = t[..., None, None]  # [*, 1, 1]
-        contact_map_t = batch["contact_map_t"]  # [*, n, n]
-        if self.cfg_exp.model.target_pred == "c_1":
-            contact_map_pred = nn_pred
-        elif self.cfg_exp.model.target_pred == "v":
-            contact_map_pred = contact_map_t + (1.0 - t_ext) * nn_pred
-        else:
-            raise IOError(
-                f"Wrong parameterization chosen: {self.cfg_exp.model.target_pred} for contact map prediction"
+        if self.cfg_exp.model.target_pred != "c_1":
+            raise ValueError(
+                "Contact-map mode currently expects target_pred == 'c_1' "
+                f"(got {self.cfg_exp.model.target_pred})."
             )
-        return contact_map_pred
+        return nn_out["contact_map_pred"]
+
+    def _nn_out_to_c_logits(self, nn_out: Dict, batch: Dict):
+        """
+        Returns clean contact-map logits, when available.
+
+        This is used for losses that operate in logit space (e.g. BCEWithLogits when
+        non_contact_value == 0).
+        """
+        if "contact_map_logits" not in nn_out:
+            return None
+        if self.cfg_exp.model.target_pred != "c_1":
+            raise ValueError(
+                "Contact-map mode currently expects target_pred == 'c_1' "
+                f"(got {self.cfg_exp.model.target_pred})."
+            )
+        return nn_out["contact_map_logits"]
+
+    def _contact_map_to_viz(self, c: torch.Tensor) -> torch.Tensor:
+        """
+        Converts a contact map in model space to [0, 1] for visualization.
+        - If non_contact_value == 0: already in [0, 1]
+        - If non_contact_value == -1: map from [-1, 1] to [0, 1] via (x + 1)/2
+        """
+        non_contact_value = getattr(self.nn, "non_contact_value", 0)
+        if non_contact_value not in (0, -1):
+            raise ValueError(f"non_contact_value must be 0 or -1, got {non_contact_value}")
+        if non_contact_value == 0:
+            return c
+        return (c.clamp(-1.0, 1.0) + 1.0) * 0.5
 
     def predict_clean(
         self,
@@ -243,12 +265,44 @@ class ModelTrainerBase(L.LightningModule):
             self._template_inference = OpenFoldTemplateInference(num_bins=num_bins).to(self.device)
         return self._template_inference
 
+    def _get_distogram_only_inference_module(self):
+        if getattr(self, "_distogram_only_inference", None) is None:
+            model_name = self.cfg_exp.model.nn.get("openfold_model_name", "model_1_ptm")
+            jax_params_path = self.cfg_exp.model.nn.get(
+                "openfold_jax_params_path", "/home/ubuntu/params/params_model_1_ptm.npz"
+            )
+            self._distogram_only_inference = OpenFoldDistogramOnlyInference(
+                model_name=model_name,
+                jax_params_path=jax_params_path,
+                device=self.device,
+            )
+        return self._distogram_only_inference
+
     def _predict_structure_from_distogram(
         self,
         pair_logits: torch.Tensor,
         residue_type: torch.Tensor,
         mask: torch.Tensor,
     ):
+        # Distogram-only template inference uses probabilities [B,L,L,39].
+        # We allow either logits or probs; if logits, convert to probs.
+        use_full_openfold = self.cfg_exp.model.nn.get("openfold_distogram_only", True)
+        if use_full_openfold:
+            distogram_probs = pair_logits
+            if distogram_probs.dtype != torch.float32:
+                distogram_probs = distogram_probs.float()
+            # Heuristic: if not in [0,1], treat as logits
+            if distogram_probs.numel() > 0 and (distogram_probs.min() < 0.0 or distogram_probs.max() > 1.0):
+                distogram_probs = torch.softmax(distogram_probs, dim=-1)
+            module = self._get_distogram_only_inference_module()
+            module = module.to(self.device)
+            module.eval()
+            with torch.no_grad():
+                out = module(distogram_probs, residue_type, mask)
+            atom37 = out["atom37"]
+            ca = atom37[..., rc.atom_order["CA"], :]
+            return ca, atom37
+
         module = self._get_template_inference_module(pair_logits.shape[-1])
         module = module.to(self.device)
         module.eval()
@@ -292,6 +346,7 @@ class ModelTrainerBase(L.LightningModule):
         nn_out = self.nn(batch)
         x_pred = self._nn_out_to_x_clean(nn_out, batch)
         c_pred = self._nn_out_to_c_clean(nn_out, batch)
+        c_logits = self._nn_out_to_c_logits(nn_out, batch)
         
         contact_map_mode = getattr(self, "contact_map_mode", False)
 
@@ -354,22 +409,29 @@ class ModelTrainerBase(L.LightningModule):
                 )
 
         # Contact map: always include if available
-        # Apply sigmoid to convert logits to probabilities for flow matching
         if c_pred is not None:
-            c_pred_prob = torch.sigmoid(c_pred)
-            result["contact_map"] = c_pred_prob
+            # `c_pred` is already in model/data space (activated in the NN):
+            # - non_contact_value == 0  -> in [0, 1] (sigmoid)
+            # - non_contact_value == -1 -> in [-1, 1] (tanh)
+            result["contact_map"] = c_pred
             # Only compute velocity in contact map diffusion mode
             if contact_map_mode and "contact_map_t" in batch:
                 result["contact_map_v"] = self.fm.xt_dot(
-                    c_pred_prob,  # Use probabilities for flow matching
+                    c_pred,
                     batch["contact_map_t"],
                     batch["t"],
                     batch["mask"],
                     modality="contact_map",
                 )
         
+        if c_logits is not None:
+            result["contact_map_logits"] = c_logits
+
         # Include distogram if available
-        if "pair_pred" in nn_out:
+        if "pair_logits" in nn_out:
+            # Store probabilities for OpenFold distogram-only template inference.
+            result["distogram"] = torch.softmax(nn_out["pair_logits"], dim=-1)
+        elif "pair_pred" in nn_out:
             result["distogram"] = nn_out["pair_pred"]
 
         return result
@@ -591,8 +653,8 @@ class ModelTrainerBase(L.LightningModule):
             if contact_map_mode:
                 c_pred_sc = self._nn_out_to_c_clean(nn_out_sc, batch)
                 if c_pred_sc is not None:
-                    # Apply sigmoid to convert logits to probabilities for self-conditioning
-                    batch["contact_map_sc"] = self.detach_gradients(torch.sigmoid(c_pred_sc))
+                    # `c_pred_sc` is already activated in model/data space.
+                    batch["contact_map_sc"] = self.detach_gradients(c_pred_sc)
                 else:
                     batch["contact_map_sc"] = torch.zeros(
                         batch_shape + (n, n),
@@ -611,10 +673,16 @@ class ModelTrainerBase(L.LightningModule):
         x_1_pred, nn_out = self.predict_clean(batch)
 
         if contact_map_mode:
-            c_1_pred = self._nn_out_to_c_clean(nn_out, batch)
+            non_contact_value = getattr(self.nn, "non_contact_value", 0)
+            if non_contact_value not in (0, -1):
+                raise ValueError(f"non_contact_value must be 0 or -1, got {non_contact_value}")
+            if non_contact_value == 0:
+                c_1_pred = self._nn_out_to_c_logits(nn_out, batch)
+            else:
+                c_1_pred = self._nn_out_to_c_clean(nn_out, batch)
             if c_1_pred is None:
                 raise ValueError(
-                    "contact_map_mode=True requires contact_map_pred in model output."
+                    "contact_map_mode=True requires contact_map_logits/contact_map_pred in model output."
                 )
             contact_map_loss = self.compute_contact_map_loss(
                 c_1, c_1_pred, batch["contact_map_t"], t, mask, log_prefix=log_prefix
@@ -733,10 +801,12 @@ class ModelTrainerBase(L.LightningModule):
                 self._last_structure_log_step[log_prefix] = log_id
                 self._log_structure_visualization(
                     x_1_pred=x_1_pred,
-                    contact_map_pred=nn_out.get("contact_map_pred"),
+                    contact_map_pred=self._contact_map_to_viz(nn_out.get("contact_map_pred"))
+                    if nn_out.get("contact_map_pred") is not None
+                    else None,
                     mask=mask,
                     log_prefix=log_prefix,
-                    pair_pred=nn_out.get("pair_pred"),
+                    pair_pred=(nn_out.get("pair_logits") if "pair_logits" in nn_out else nn_out.get("pair_pred")),
                     residue_type=batch.get("residue_type"),
                     use_template_inference=(
                         getattr(self.nn, "predict_coords", True) is False
@@ -807,8 +877,8 @@ class ModelTrainerBase(L.LightningModule):
             return
 
         mask_np = mask[0].detach().cpu().numpy()
-        # Apply sigmoid to convert logits to probabilities for visualization
-        contact_map_prob = torch.sigmoid(contact_map_pred[0].float()).detach().cpu().numpy()
+        # `contact_map_pred` is expected to already be in [0, 1] for visualization.
+        contact_map_prob = contact_map_pred[0].float().clamp(0.0, 1.0).detach().cpu().numpy()
         pair_mask_np = mask_np[:, None] * mask_np[None, :]
         contact_map_np = contact_map_prob * pair_mask_np
 
@@ -1045,6 +1115,14 @@ class ModelTrainerBase(L.LightningModule):
             val_sampling_cfg.get("predict_structure_from_distogram", False)
             or self.cfg_exp.model.nn.get("predict_structure_from_distogram", False)
         )
+        # In contact-map mode, if the NN doesn't predict coords, default to enabling
+        # template inference for validation sampling (so we can log a structure).
+        if (
+            not predict_from_dist
+            and getattr(self, "contact_map_mode", False)
+            and getattr(self.nn, "predict_coords", True) is False
+        ):
+            predict_from_dist = True
         if coords is None and predict_from_dist and distogram is not None and residue_type is not None:
             coords, _ = self._predict_structure_from_distogram(
                 distogram,
@@ -1054,7 +1132,7 @@ class ModelTrainerBase(L.LightningModule):
 
         self._log_structure_visualization(
             x_1_pred=coords,
-            contact_map_pred=contact_map,
+            contact_map_pred=self._contact_map_to_viz(contact_map) if contact_map is not None else None,
             mask=mask,
             log_prefix="validation_sampling",
             pair_pred=distogram,

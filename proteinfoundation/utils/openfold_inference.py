@@ -7,6 +7,12 @@ from openfold.model.template import TemplatePairStack, TemplatePointwiseAttentio
 from openfold.model.embedders import TemplatePairEmbedder
 from openfold.model.structure_module import StructureModule
 import openfold.np.residue_constants as rc
+from openfold.config import model_config
+from openfold.model.model import AlphaFold
+from openfold.utils.import_weights import import_jax_weights_
+from openfold.data.feature_pipeline import FeaturePipeline
+from openfold.data.data_pipeline import make_dummy_msa_feats, make_sequence_features_with_distogram_template, make_sequence_features
+from openfold.utils.tensor_utils import tensor_tree_map
 
 
 class OpenFoldTemplateInference(nn.Module):
@@ -224,4 +230,144 @@ class OpenFoldTemplateInference(nn.Module):
             "pair": z,
             "single": s,
         }
+
+
+class OpenFoldDistogramOnlyInference(nn.Module):
+    """
+    Full OpenFold AlphaFold model inference using a distogram-only template.
+
+    This is intended for Proteina contact-map diffusion logging/inference:
+    given a predicted distogram probability tensor [B, L, L, 39] and the
+    target sequence, produce atom37 coordinates.
+    """
+
+    def __init__(
+        self,
+        *,
+        model_name: str = "model_1_ptm",
+        jax_params_path: str = "/home/ubuntu/params/params_model_1_ptm.npz",
+        device: Optional[torch.device] = None,
+        template_sequence_all_x: bool = False,
+        max_recycling_iters: Optional[int] = None,
+    ):
+        super().__init__()
+
+        self.model_name = model_name
+        self.jax_params_path = jax_params_path
+        self.cfg = model_config(model_name)
+        self.cfg.data.common.use_templates = True
+        if max_recycling_iters is not None:
+            self.cfg.data.common.max_recycling_iters = int(max_recycling_iters)
+
+        self.model = AlphaFold(self.cfg)
+        self.model.eval()
+        import_jax_weights_(self.model, jax_params_path, version=model_name.replace("model_", ""))
+
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device.type != "cuda":
+            raise ValueError(
+                "OpenFoldDistogramOnlyInference requires CUDA (OpenFold attention CUDA kernels are enabled). "
+                f"Got device={device}."
+            )
+        self.device = device
+        self.model = self.model.to(self.device)
+        self.feature_pipeline = FeaturePipeline(self.cfg.data)
+        self.template_sequence_all_x = template_sequence_all_x
+
+    @staticmethod
+    def _restype_idx_to_str(restype_idx: torch.Tensor) -> str:
+        seq = []
+        for x in restype_idx.detach().cpu().tolist():
+            if x < 0:
+                x = rc.restype_num
+            if x > rc.restype_num:
+                x = rc.restype_num
+            seq.append(rc.restypes_with_x[x])
+        return "".join(seq)
+
+    def forward(
+        self,
+        distogram_probs: torch.Tensor,
+        residue_type: torch.Tensor,
+        mask: torch.Tensor,
+    ):
+        """
+        Args:
+            distogram_probs: [B, L, L, 39] float probabilities
+            residue_type: [B, L] ints in [0..20] (20=unknown)
+            mask: [B, L] bool/float
+        Returns:
+            dict with atom37 coordinates [B, L, 37, 3]
+        """
+        b, n = residue_type.shape[:2]
+        if b != 1:
+            raise ValueError(f"Expected batch size 1 for distogram-only inference, got {b}")
+
+        # Truncate to true length for speed
+        if mask.dtype != torch.float32:
+            mask_f = mask.float()
+        else:
+            mask_f = mask
+        l = int(mask_f[0].sum().item())
+        if l <= 0:
+            raise ValueError("Mask has no valid residues")
+
+        residue_type = residue_type[:, :l]
+        distogram_probs = distogram_probs[:, :l, :l, :]
+        mask_f = torch.ones((1, l), dtype=torch.float32, device=distogram_probs.device)
+
+        seq = self._restype_idx_to_str(residue_type[0])
+        dist_np = distogram_probs[0].detach().cpu().numpy()
+        mask_np = mask_f[0].detach().cpu().numpy()
+        print("distogram_probs.shape", distogram_probs.shape)
+        print("dist_np.shape", dist_np.shape)
+        print("mask_np.shape", mask_np.shape)
+        print("seq", seq)
+        
+        raw = make_sequence_features_with_distogram_template(
+            sequence=seq,
+            distogram_probs=dist_np,
+            mask=mask_np,
+            pdb_id="distogram_template",
+            template_sequence_all_x=self.template_sequence_all_x,
+        )
+        feats = self.feature_pipeline.process_features(raw, mode="predict", is_multimer=False)
+
+        batch = tensor_tree_map(lambda x: x.to(self.device), feats)
+        with torch.no_grad():
+            out = self.model(batch)
+
+        atom_pos = out["final_atom_positions"]
+        # OpenFold may return:
+        # - atom37: [B, L, 37, 3]
+        # - atom37 without batch: [L, 37, 3]
+        # - CA-only: [B, L, 3]
+        # - CA-only without batch: [L, 3]
+        # Normalize to atom37: [B, L, 37, 3].
+        if atom_pos.dim() == 4:
+            if atom_pos.shape[-2] != rc.atom_type_num or atom_pos.shape[-1] != 3:
+                raise ValueError(f"Unexpected final_atom_positions shape: {tuple(atom_pos.shape)}")
+            atom37 = atom_pos
+        elif atom_pos.dim() == 3:
+            if atom_pos.shape[-2] == rc.atom_type_num and atom_pos.shape[-1] == 3:
+                # [L, 37, 3] -> [1, L, 37, 3]
+                atom37 = atom_pos[None, ...]
+            elif atom_pos.shape[-1] == 3 and atom_pos.shape[-2] != rc.atom_type_num:
+                # [B, L, 3] -> [B, L, 37, 3] with only CA filled
+                bsz, l, _ = atom_pos.shape
+                atom37 = atom_pos.new_zeros((bsz, l, rc.atom_type_num, 3))
+                atom37[:, :, rc.atom_order["CA"], :] = atom_pos
+            else:
+                raise ValueError(f"Unexpected final_atom_positions shape: {tuple(atom_pos.shape)}")
+        elif atom_pos.dim() == 2:
+            # [L, 3] -> [1, L, 37, 3] with only CA filled
+            if atom_pos.shape[-1] != 3:
+                raise ValueError(f"Unexpected final_atom_positions shape: {tuple(atom_pos.shape)}")
+            l, _ = atom_pos.shape
+            atom37 = atom_pos.new_zeros((1, l, rc.atom_type_num, 3))
+            atom37[0, :, rc.atom_order["CA"], :] = atom_pos
+        else:
+            raise ValueError(f"Unexpected final_atom_positions ndim: {atom_pos.dim()} shape={tuple(atom_pos.shape)}")
+        return {"atom37": atom37}
 

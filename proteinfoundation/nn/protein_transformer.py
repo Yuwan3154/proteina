@@ -631,6 +631,10 @@ class ProteinTransformerAF3(torch.nn.Module):
 
         # Coordinate encoder/decoder (configurable, default: disabled in contact map mode)
         self.predict_coords = kwargs.get("predict_coords", not self.contact_map_mode)
+        non_contact_value = kwargs.get("non_contact_value", 0)
+        if non_contact_value not in (0, -1):
+            raise ValueError(f"non_contact_value must be 0 or -1, got {non_contact_value}")
+        self.non_contact_value = non_contact_value
         if self.contact_map_mode:
             # To encode corrupted contact map
             self.linear_contact_embed = torch.nn.Linear(1, kwargs["pair_repr_dim"], bias=False)
@@ -874,21 +878,25 @@ class ProteinTransformerAF3(torch.nn.Module):
             final_coors = None
 
         if self.update_pair_repr and self.num_buckets_predict_pair is not None:
-            pair_pred = self.pair_head_prediction(pair_rep)
+            pair_logits = self.pair_head_prediction(pair_rep)
             if final_coors is not None:
                 final_coors = (
-                    final_coors + torch.mean(pair_pred) * 0.0
+                    final_coors + torch.mean(pair_logits) * 0.0
                 )  # Keeps graph consistent
                 final_coors = final_coors * mask[..., None]
-            nn_out["pair_pred"] = pair_pred
+            nn_out["pair_logits"] = pair_logits
 
         # Contact map prediction (for contact map diffusion mode)
         if self.contact_map_mode:
-            contact_map_pred = self.contact_map_decoder(pair_rep)  # [b, n, n, 1]
-            contact_map_pred = contact_map_pred.squeeze(-1)  # [b, n, n]
+            contact_map_logits = self.contact_map_decoder(pair_rep)  # [b, n, n, 1]
+            contact_map_logits = contact_map_logits.squeeze(-1)  # [b, n, n]
             # Enforce symmetry
-            contact_map_pred = (contact_map_pred + contact_map_pred.transpose(-1, -2)) / 2.0
-            contact_map_pred = contact_map_pred * pair_mask
-            nn_out["contact_map_pred"] = contact_map_pred
-
+            contact_map_logits = (contact_map_logits + contact_map_logits.transpose(-1, -2)) / 2.0
+            contact_map_logits = contact_map_logits * pair_mask
+            nn_out["contact_map_logits"] = contact_map_logits
+            if self.non_contact_value == -1:
+                nn_out["contact_map_pred"] = torch.tanh(contact_map_logits)
+            else:
+                nn_out["contact_map_pred"] = torch.sigmoid(contact_map_logits)
+            
         return nn_out
