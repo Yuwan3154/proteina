@@ -55,4 +55,4 @@ num_buckets_predict_pair: 39  # 38 bins between 3.25Å-50.75Å + 1 overflow (Alp
 contact_map_mode: True
 contact_map_embed_dim: 64
 predict_coords: True  # Whether to predict coordinates (for FAPE loss, logging)
-non_contact_value: 1  # 0 -> contacts in {0,1} (sigmoid); -1 -> contacts in {-1,1} (tanh)
+non_contact_value: -1  # 0 -> contacts in {0,1} (sigmoid); -1 -> contacts in {-1,1} (tanh)
