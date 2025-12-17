@@ -333,15 +333,21 @@ class Proteina(ModelTrainerBase):
         gt_pair_dists = gt_pair_dists * pair_mask  # [*, n, n]
 
         # Compute predicted pairwise distances only if x_1_pred is available
-        if self.contact_map_mode and "coords_pred" in nn_out:
-            pred_ca_coors = nn_out.get("coords_pred", None) * mask[..., None]  # [*, n, 3]
+        if self.contact_map_mode:
+            if "coords_pred" in nn_out:
+                pred_ca_coors = nn_out.get("coords_pred", None) * mask[..., None]  # [*, n, 3]
+                pred_pair_dists = torch.linalg.norm(
+                    pred_ca_coors[:, :, None, :] - pred_ca_coors[:, None, :, :], dim=-1
+                )  # [*, n, n]
+                pred_pair_dists = pred_pair_dists * pair_mask  # [*, n, n]
+            else:
+                pred_pair_dists = None
         else:
             pred_ca_coors = x_1_pred * mask[..., None]  # [*, n, 3]
-
-        pred_pair_dists = torch.linalg.norm(
-            pred_ca_coors[:, :, None, :] - pred_ca_coors[:, None, :, :], dim=-1
-        )  # [*, n, n]
-        pred_pair_dists = pred_pair_dists * pair_mask  # [*, n, n]
+            pred_pair_dists = torch.linalg.norm(
+                pred_ca_coors[:, :, None, :] - pred_ca_coors[:, None, :, :], dim=-1
+            )  # [*, n, n]
+            pred_pair_dists = pred_pair_dists * pair_mask  # [*, n, n]
 
         # Add mask to only account for pairs that are closer than thr in ground truth
         max_dist = self.cfg_exp.loss.thres_aux_2d_loss
@@ -384,9 +390,15 @@ class Proteina(ModelTrainerBase):
             )  # [*, n, n], each value in [0, num_dist_buckets)
 
             # Distogram loss
+            print(f"First pair logits shape: {pair_logits[0].shape}, range: {pair_logits[0].min()}, {pair_logits[0].max()}")
+            print(f"First GT pair dist bucket shape: {gt_pair_dist_bucket[0].shape}, range: {gt_pair_dist_bucket[0].min()}, {gt_pair_dist_bucket[0].max()}")
+            print(f"First Mask shape: {pair_mask[0].shape}, range: {pair_mask[0].min()}, {pair_mask[0].max()}")
+            pair_logits = pair_logits.view(bs * n * n, num_dist_buckets)
+            gt_pair_dist_bucket = gt_pair_dist_bucket.view(bs * n * n)
             distogram_loss = torch.nn.functional.cross_entropy(
                 pair_logits, gt_pair_dist_bucket, reduction="none"
-            )  # [bs, n, n]
+            )  # [bs * n * n]
+            distogram_loss = distogram_loss.view(bs, n, n)
             distogram_loss = torch.sum(distogram_loss * pair_mask, dim=(-1, -2))  # [bs]
             distogram_loss = distogram_loss / (
                 pair_mask.sum(dim=(-1, -2)) + 1e-10

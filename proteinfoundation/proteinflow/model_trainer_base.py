@@ -37,7 +37,8 @@ from proteinfoundation.utils.ff_utils.pdb_utils import (
 )
 # from proteinfoundation.utils.openfold_inference import OpenFoldTemplateInference, OpenFoldDistogramOnlyInference
 import proteinfoundation.openfold_stub.np.residue_constants as rc
-
+from proteinfoundation.openfold_stub.utils.loss import compute_fape
+from proteinfoundation.openfold_stub.utils.rigid_utils import Rigid, Rotation
 
 class ModelTrainerBase(L.LightningModule):
     def __init__(self, cfg_exp, store_dir=None):
@@ -199,12 +200,19 @@ class ModelTrainerBase(L.LightningModule):
         """
         if "contact_map_pred" not in nn_out:
             return None
-        if self.cfg_exp.model.target_pred != "c_1":
-            raise ValueError(
-                "Contact-map mode currently expects target_pred == 'c_1' "
-                f"(got {self.cfg_exp.model.target_pred})."
+        nn_pred = nn_out["contact_map_pred"]
+        t = batch["t"]  # [*]
+        t_ext = t[..., None, None]  # [*, 1, 1]
+        contact_map_t = batch["contact_map_t"]  # [*, n, n]
+        if self.cfg_exp.model.target_pred == "c_1":
+            contact_map_pred = nn_pred
+        elif self.cfg_exp.model.target_pred == "v":
+            contact_map_pred = contact_map_t + (1.0 - t_ext) * nn_pred
+        else:
+            raise IOError(
+                f"Wrong parameterization chosen: {self.cfg_exp.model.target_pred} for contact map prediction"
             )
-        return nn_out["contact_map_pred"]
+        return contact_map_pred
 
     def _nn_out_to_c_logits(self, nn_out: Dict, batch: Dict):
         """
@@ -228,12 +236,11 @@ class ModelTrainerBase(L.LightningModule):
         - If non_contact_value == 0: already in [0, 1]
         - If non_contact_value == -1: map from [-1, 1] to [0, 1] via (x + 1)/2
         """
-        non_contact_value = getattr(self.nn, "non_contact_value", 0)
-        if non_contact_value not in (0, -1):
-            raise ValueError(f"non_contact_value must be 0 or -1, got {non_contact_value}")
+        non_contact_value = getattr(self.nn, "non_contact_value")
         if non_contact_value == 0:
             return c
-        return (c.clamp(-1.0, 1.0) + 1.0) * 0.5
+        else:
+            return (c + 1.0) * 0.5
 
     def predict_clean(
         self,
@@ -289,12 +296,8 @@ class ModelTrainerBase(L.LightningModule):
         # We allow either logits or probs; if logits, convert to probs.
         use_full_openfold = self.cfg_exp.model.nn.get("openfold_distogram_only", True)
         if use_full_openfold:
-            distogram_probs = pair_logits
-            if distogram_probs.dtype != torch.float32:
-                distogram_probs = distogram_probs.float()
-            # Heuristic: if not in [0,1], treat as logits
-            if distogram_probs.numel() > 0 and (distogram_probs.min() < 0.0 or distogram_probs.max() > 1.0):
-                distogram_probs = torch.softmax(distogram_probs, dim=-1)
+            distogram_probs = torch.softmax(pair_logits, dim=-1)
+
             module = self._get_distogram_only_inference_module()
             module = module.to(self.device)
             module.eval()
@@ -432,8 +435,6 @@ class ModelTrainerBase(L.LightningModule):
         if "pair_logits" in nn_out:
             # Store probabilities for OpenFold distogram-only template inference.
             result["distogram"] = torch.softmax(nn_out["pair_logits"], dim=-1)
-        elif "pair_pred" in nn_out:
-            result["distogram"] = nn_out["pair_pred"]
 
         return result
 
@@ -663,7 +664,9 @@ class ModelTrainerBase(L.LightningModule):
                         dtype=c_1.dtype,
                     )
             else:
-                x_pred_sc, nn_out_sc = self.predict_clean(batch)
+                with torch.no_grad(): 
+                    nn_out_sc = self.predict_clean(batch)
+                    x_pred_sc = self._nn_out_to_x_clean(nn_out_sc, batch)
                 if x_pred_sc is not None:
                     batch["x_sc"] = self.detach_gradients(x_pred_sc)
                 else:
@@ -679,16 +682,12 @@ class ModelTrainerBase(L.LightningModule):
                 batch["x_sc"] = torch.zeros_like(x_1)
 
         # Main prediction
-        nn_out = self.nn(batch) if contact_map_mode else self.predict_clean(batch)[1]
+        nn_out = self.predict_clean(batch)
         if contact_map_mode:
-            non_contact_value = getattr(self.nn, "non_contact_value", 0)
+            non_contact_value = getattr(self.nn, "non_contact_value")
             if non_contact_value not in (0, -1):
                 raise ValueError(f"non_contact_value must be 0 or -1, got {non_contact_value}")
-            if non_contact_value == 0:
-                c_1_pred = self._nn_out_to_c_logits(nn_out, batch)
-            else:
-                # For non_contact_value == -1 we want logits for a stable BCEWithLogits loss.
-                c_1_pred = self._nn_out_to_c_logits(nn_out, batch)
+            c_1_pred = self._nn_out_to_c_clean(nn_out, batch)
             if c_1_pred is None:
                 raise ValueError(
                     "contact_map_mode=True requires contact_map_logits/contact_map_pred in model output."
@@ -710,7 +709,6 @@ class ModelTrainerBase(L.LightningModule):
                     coord_weight * torch.mean(coord_loss)
                 )
         else:
-            nn_out = self.predict_clean(batch)
             x_1_pred = self._nn_out_to_x_clean(nn_out, batch)
             # Compute losses
             fm_loss = self.compute_fm_loss(
@@ -818,7 +816,7 @@ class ModelTrainerBase(L.LightningModule):
                     else None,
                     mask=mask,
                     log_prefix=log_prefix,
-                    pair_pred=(nn_out.get("pair_logits") if "pair_logits" in nn_out else nn_out.get("pair_pred"))[0],
+                    pair_logits=nn_out.get("pair_logits")[0],
                     residue_type=batch.get("residue_type")[0],
                     use_template_inference=(
                         getattr(self.nn, "predict_coords", True) is False
@@ -835,7 +833,7 @@ class ModelTrainerBase(L.LightningModule):
         contact_map_pred: torch.Tensor,
         mask: torch.Tensor,
         log_prefix: str,
-        pair_pred: torch.Tensor = None,
+        pair_logits: torch.Tensor = None,
         residue_type: torch.Tensor = None,
         use_template_inference: bool = False,
     ):
@@ -860,11 +858,11 @@ class ModelTrainerBase(L.LightningModule):
         if (
             x_1_pred is None
             and use_template_inference
-            and pair_pred is not None
+            and pair_logits is not None
             and residue_type is not None
         ):
             ca_coords, _ = self._predict_structure_from_distogram(
-                pair_pred, residue_type, mask
+                pair_logits, residue_type, mask
             )
             x_1_pred = ca_coords
 
@@ -955,9 +953,6 @@ class ModelTrainerBase(L.LightningModule):
         Returns:
             FAPE loss per sample, shape [b].
         """
-        from proteinfoundation.openfold_stub.utils.loss import compute_fape
-        from proteinfoundation.openfold_stub.utils.rigid_utils import Rigid, Rotation
-        
         frames_mask = mask.float()
         
         # Create identity rotation matrices for all residues
@@ -1083,7 +1078,7 @@ class ModelTrainerBase(L.LightningModule):
         n = mask.shape[-1]
         residue_type = batch.get("residue_type")
         if residue_type is not None:
-            residue_type = residue_type[:nsamples].to(self.device).long()
+            residue_type = residue_type[:nsamples].to(self.device)
         cath_code = batch.get("cath_code") if self.cfg_exp.training.get("fold_cond", False) else None
         if cath_code is not None and isinstance(cath_code, torch.Tensor):
             cath_code = cath_code[:nsamples]
@@ -1149,7 +1144,7 @@ class ModelTrainerBase(L.LightningModule):
             contact_map_pred=self._contact_map_to_viz(contact_map) if contact_map is not None else None,
             mask=mask,
             log_prefix="validation_sampling",
-            pair_pred=distogram,
+            pair_logits=distogram,
             residue_type=residue_type,
             use_template_inference=predict_from_dist,
         )
