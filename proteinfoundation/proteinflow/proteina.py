@@ -114,7 +114,7 @@ class Proteina(ModelTrainerBase):
         Returns:
             Tuple (x_1, mask, batch_shape, n, dtype)
         """
-        x_1 = batch["coords"][:,:,1,:]  # [b, n, 3]
+        x_1 = batch["coords"][:, :, 1, :]  # [b, n, 3]
         mask = batch["mask_dict"]["coords"][..., 0, 0]  # [b, n] boolean
         if self.cfg_exp.model.augmentation.global_rotation:
             # CAREFUL: If naug_rot is > 1 this increases "batch size"
@@ -390,9 +390,6 @@ class Proteina(ModelTrainerBase):
             )  # [*, n, n], each value in [0, num_dist_buckets)
 
             # Distogram loss
-            print(f"First pair logits shape: {pair_logits[0].shape}, range: {pair_logits[0].min()}, {pair_logits[0].max()}")
-            print(f"First GT pair dist bucket shape: {gt_pair_dist_bucket[0].shape}, range: {gt_pair_dist_bucket[0].min()}, {gt_pair_dist_bucket[0].max()}")
-            print(f"First Mask shape: {pair_mask[0].shape}, range: {pair_mask[0].min()}, {pair_mask[0].max()}")
             pair_logits = pair_logits.view(bs * n * n, num_dist_buckets)
             gt_pair_dist_bucket = gt_pair_dist_bucket.view(bs * n * n)
             distogram_loss = torch.nn.functional.cross_entropy(

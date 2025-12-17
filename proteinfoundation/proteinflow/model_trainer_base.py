@@ -846,7 +846,11 @@ class ModelTrainerBase(L.LightningModule):
             mask: Boolean mask, shape [b, n]
             log_prefix: Prefix for log names ("train" or "validation_loss")
         """
-        if self.logger is None or not hasattr(self.logger, "experiment"):
+        if (
+            self.logger is None
+            or not hasattr(self.logger, "experiment")
+            or not hasattr(self.logger.experiment, "log")
+        ):
             return
 
         if hasattr(self.trainer, "is_global_zero") and not self.trainer.is_global_zero:

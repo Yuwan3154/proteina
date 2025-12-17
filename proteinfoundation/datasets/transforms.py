@@ -26,6 +26,7 @@ from scipy.spatial.transform import Rotation as Scipy_Rotation
 from torch_geometric import transforms as T
 from torch_geometric.data import Data
 
+from proteinfoundation.utils.dense_padding_data_loader import FLOAT_PADDING_VALUE
 
 
 def sample_uniform_rotation(shape=(), dtype=None, device=None) -> torch.Tensor:
@@ -133,12 +134,13 @@ class PaddingTransform(T.BaseTransform):
             if isinstance(value, torch.Tensor):
                 if value.dim() >= 1:
                     # For 2D tensors like contact_map [n, n], pad both dimensions
+                    fill_value = FLOAT_PADDING_VALUE if torch.is_floating_point(value) else self.fill_value
                     if "contact_map" in key and value.dim() == 2:
                         # Pad dimension 0 first, then dimension 1
-                        value = self.pad_tensor(value, self.max_size, dim=0, fill_value=self.fill_value)
-                        value = self.pad_tensor(value, self.max_size, dim=1, fill_value=self.fill_value)
+                        value = self.pad_tensor(value, self.max_size, dim=0, fill_value=fill_value)
+                        value = self.pad_tensor(value, self.max_size, dim=1, fill_value=fill_value)
                     else:
-                        value = self.pad_tensor(value, self.max_size, dim=0, fill_value=self.fill_value)
+                        value = self.pad_tensor(value, self.max_size, dim=0, fill_value=fill_value)
                     graph[key] = value
         return graph
 
