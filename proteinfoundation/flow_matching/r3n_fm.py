@@ -698,20 +698,6 @@ class _ContactMapFlowMatcher:
         pair_mask = mask[..., :, None] * mask[..., None, :]  # [*, n, n]
         return contact_map * pair_mask
 
-    def _enforce_symmetry(
-        self, contact_map: Float[Tensor, "* n n"]
-    ) -> Float[Tensor, "* n n"]:
-        """
-        Enforces symmetry of contact map by averaging with its transpose.
-
-        Args:
-            contact_map: Contact map tensor of shape [*, n, n]
-
-        Returns:
-            Symmetric contact map of shape [*, n, n]
-        """
-        return (contact_map + contact_map.transpose(-1, -2)) / 2.0
-
     def _extend_t(
         self, n: int, t: Float[Tensor, "*"]
     ) -> Float[Tensor, "* n n"]:
@@ -756,8 +742,6 @@ class _ContactMapFlowMatcher:
 
         c_t = (1.0 - t_ext) * c_0 + t_ext * c_1
 
-        # Enforce symmetry after interpolation
-        c_t = self._enforce_symmetry(c_t)
         return self._apply_pair_mask(c_t, mask)
 
     def xt_dot(
@@ -816,7 +800,7 @@ class _ContactMapFlowMatcher:
         noise = torch.randn(shape + (n, n), device=device, dtype=dtype) * self.scale_ref
         
         # Make symmetric by averaging with transpose
-        noise = self._enforce_symmetry(noise)
+        noise = (noise + noise.transpose(-1, -2)) / 2.0
 
         # Multiply by sqrt(2) to have variance scale_ref^2.
         noise = noise * (2 ** 0.5)
@@ -867,8 +851,6 @@ class _ContactMapFlowMatcher:
             sc_scale_score=sc_scale_score,
         )
 
-        # Enforce symmetry after update
-        c_t_updated = self._enforce_symmetry(c_t_updated)
         return self._apply_pair_mask(c_t_updated, mask), t + dt
 
     def step_euler(
@@ -1011,11 +993,8 @@ class _ContactMapFlowMatcher:
         with torch.no_grad():
             # Initialize contact map from reference
             c = self.sample_reference(n, shape=(nsamples,), device=device, mask=mask, dtype=dtype)
-            
-            # Coordinates: zeros placeholder (no diffusion in contact map mode)
-            x = torch.zeros(nsamples, n, 3, device=device, dtype=dtype if dtype else torch.float32)
-            
-            x_1_pred = None
+
+            coords_pred = None
             c_1_pred = None
             distogram = None
 
@@ -1025,7 +1004,6 @@ class _ContactMapFlowMatcher:
                 gt_step = gt[step]
 
                 nn_in = {
-                    "x_t": x,
                     "contact_map_t": c,
                     "t": t,
                     "mask": mask,
@@ -1044,16 +1022,14 @@ class _ContactMapFlowMatcher:
 
                 # Self-conditioning
                 if step > 0 and self_cond:
-                    if predict_coords and x_1_pred is not None:
-                        nn_in["x_sc"] = x_1_pred
                     if c_1_pred is not None:
                         nn_in["contact_map_sc"] = c_1_pred
 
                 result = predict_fn(nn_in)
                 
                 # Extract predictions
-                x_1_pred = result.get("coords")
-                c_1_pred = result.get("contact_map")
+                x = result.get("coords_pred")
+                c_1_pred = result.get("contact_map_pred")
                 c_v = result.get("contact_map_v")
                 distogram = result.get("distogram")  # Capture for final output
 
@@ -1084,12 +1060,8 @@ class _ContactMapFlowMatcher:
                     mask=mask,
                 )
 
-                # Coordinates: just track latest prediction (no simulation step)
-                if predict_coords and x_1_pred is not None:
-                    x = x_1_pred
-
             return {
-                "coords": x if predict_coords and x_1_pred is not None else None,
+                "coords": x if predict_coords and x is not None else None,
                 "contact_map": c,
                 "distogram": distogram,
             }

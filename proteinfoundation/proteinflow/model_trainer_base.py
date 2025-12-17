@@ -239,8 +239,10 @@ class ModelTrainerBase(L.LightningModule):
         non_contact_value = getattr(self.nn, "non_contact_value")
         if non_contact_value == 0:
             return c
-        else:
+        elif non_contact_value == -1:
             return (c + 1.0) * 0.5
+        else:
+            raise ValueError(f"non_contact_value must be 0 or -1, got {non_contact_value}")
 
     def predict_clean(
         self,
@@ -811,8 +813,8 @@ class ModelTrainerBase(L.LightningModule):
                 self._last_structure_log_step[log_prefix] = log_id
                 self._log_structure_visualization(
                     x_1_pred=x_1_pred,
-                    contact_map_pred=self._contact_map_to_viz(nn_out.get("contact_map_pred"))[0]
-                    if nn_out.get("contact_map_pred") is not None
+                    contact_map_pred=self._contact_map_to_viz(self._nn_out_to_c_clean(nn_out, batch))[0]
+                    if "contact_map_pred" in nn_out is not None
                     else None,
                     mask=mask,
                     log_prefix=log_prefix,
