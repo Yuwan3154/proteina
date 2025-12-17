@@ -35,7 +35,7 @@ from proteinfoundation.utils.ff_utils.pdb_utils import (
     mask_seq,
     write_prot_to_pdb,
 )
-from proteinfoundation.utils.openfold_inference import OpenFoldTemplateInference, OpenFoldDistogramOnlyInference
+# from proteinfoundation.utils.openfold_inference import OpenFoldTemplateInference, OpenFoldDistogramOnlyInference
 import proteinfoundation.openfold_stub.np.residue_constants as rc
 
 
@@ -260,22 +260,24 @@ class ModelTrainerBase(L.LightningModule):
         return self.nn(batch)
 
     def _get_template_inference_module(self, num_bins: int):
-        if self._template_inference is None or self._template_inference.num_bins != num_bins:
-            self._template_inference = OpenFoldTemplateInference(num_bins=num_bins).to(self.device)
-        return self._template_inference
+        raise NotImplementedError("This method is not implemented")
+        # if self._template_inference is None or self._template_inference.num_bins != num_bins:
+        #     self._template_inference = OpenFoldTemplateInference(num_bins=num_bins).to(self.device)
+        # return self._template_inference
 
     def _get_distogram_only_inference_module(self):
-        if getattr(self, "_distogram_only_inference", None) is None:
-            model_name = self.cfg_exp.model.nn.get("openfold_model_name", "model_1_ptm")
-            jax_params_path = self.cfg_exp.model.nn.get(
-                "openfold_jax_params_path", "/home/ubuntu/params/params_model_1_ptm.npz"
-            )
-            self._distogram_only_inference = OpenFoldDistogramOnlyInference(
-                model_name=model_name,
-                jax_params_path=jax_params_path,
-                device=self.device,
-            )
-        return self._distogram_only_inference
+        raise NotImplementedError("This method is not implemented")
+        # if getattr(self, "_distogram_only_inference", None) is None:
+        #     model_name = self.cfg_exp.model.nn.get("openfold_model_name", "model_1_ptm")
+        #     jax_params_path = self.cfg_exp.model.nn.get(
+        #         "openfold_jax_params_path", "/home/ubuntu/params/params_model_1_ptm.npz"
+        #     )
+        #     self._distogram_only_inference = OpenFoldDistogramOnlyInference(
+        #         model_name=model_name,
+        #         jax_params_path=jax_params_path,
+        #         device=self.device,
+        #     )
+        # return self._distogram_only_inference
 
     def _predict_structure_from_distogram(
         self,
