@@ -883,6 +883,10 @@ class ProteinTransformerAF3(torch.nn.Module):
 
         # Undo registers
         seqs, pair_rep, mask = self._undo_registers(seqs, pair_rep, mask)
+        
+        # Symmetrize pair representation
+        pair_rep = (pair_rep + pair_rep.transpose(-2, -3)) / 2.0
+        print(f"First pair rep {pair_rep[0, :10, :10, 0]}")
 
         nn_out = {}
         if self.predict_coords:
@@ -904,13 +908,11 @@ class ProteinTransformerAF3(torch.nn.Module):
         if self.contact_map_mode:
             contact_map_logits = self.contact_map_decoder(pair_rep)  # [b, n, n, 1]
             contact_map_logits = contact_map_logits.squeeze(-1)  # [b, n, n]
-            # Enforce symmetry
-            contact_map_logits = (contact_map_logits + contact_map_logits.transpose(-1, -2)) / 2.0
             contact_map_logits = contact_map_logits * pair_mask
             nn_out["contact_map_logits"] = contact_map_logits
             if self.non_contact_value == -1:
                 nn_out["contact_map_pred"] = torch.tanh(contact_map_logits)
             else:
                 nn_out["contact_map_pred"] = torch.sigmoid(contact_map_logits)
-            
+            print(f"First contact map pred {nn_out['contact_map_pred'][0, :10, :10]}")
         return nn_out

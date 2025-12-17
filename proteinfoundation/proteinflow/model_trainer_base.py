@@ -813,10 +813,10 @@ class ModelTrainerBase(L.LightningModule):
                 self._last_structure_log_step[log_prefix] = log_id
                 self._log_structure_visualization(
                     x_1_pred=x_1_pred,
-                    contact_map_pred=self._contact_map_to_viz(self._nn_out_to_c_clean(nn_out, batch))[0]
+                    contact_map_pred=self._contact_map_to_viz(self._nn_out_to_c_clean(nn_out, batch)[0])
                     if "contact_map_pred" in nn_out is not None
                     else None,
-                    mask=mask,
+                    mask=mask[0],
                     log_prefix=log_prefix,
                     pair_logits=nn_out.get("pair_logits")[0],
                     residue_type=batch.get("residue_type")[0],
@@ -874,7 +874,7 @@ class ModelTrainerBase(L.LightningModule):
 
         if x_1_pred is not None:
             # Save first sample as temporary PDB for logging
-            atom37 = self.samples_to_atom37(x_1_pred[0]).float().detach().cpu().numpy()
+            atom37 = self.samples_to_atom37(x_1_pred).float().detach().cpu().numpy()
             aatype = residue_type.long().detach().cpu().numpy()
             with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False) as tmp_pdb:
                 temp_pdb_path = tmp_pdb.name
@@ -893,10 +893,10 @@ class ModelTrainerBase(L.LightningModule):
         if contact_map_pred is None:
             return
 
-        mask_np = mask[0].detach().cpu().numpy()
+        mask_np = mask.detach().cpu().numpy()
         # `contact_map_pred` is expected to already be in [0, 1] for visualization.
-        contact_map_prob = contact_map_pred[0].float().clamp(0.0, 1.0).detach().cpu().numpy()
-        pair_mask_np = mask_np[:, None] * mask_np[None, :]
+        contact_map_prob = contact_map_pred.float().clamp(0.0, 1.0).detach().cpu().numpy()
+        pair_mask_np = mask_np[..., :, None] * mask_np[..., None, :]
         contact_map_np = contact_map_prob * pair_mask_np
 
         fig, ax = plt.subplots(figsize=(6, 6))
@@ -1147,11 +1147,11 @@ class ModelTrainerBase(L.LightningModule):
 
         self._log_structure_visualization(
             x_1_pred=coords,
-            contact_map_pred=self._contact_map_to_viz(contact_map) if contact_map is not None else None,
-            mask=mask,
+            contact_map_pred=self._contact_map_to_viz(contact_map).squeeze(0) if contact_map is not None else None,
+            mask=mask.squeeze(0),
             log_prefix="validation_sampling",
-            pair_logits=distogram,
-            residue_type=residue_type,
+            pair_logits=distogram.squeeze(0),
+            residue_type=residue_type.squeeze(0),
             use_template_inference=predict_from_dist,
         )
 
