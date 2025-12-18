@@ -14,7 +14,7 @@ hardware:
 loss:
   t_distribution:
     name: logit-normal
-    p1: 0.0
+    p1: -0.5
     p2: 1.0
   loss_t_clamp: 0.9  # Used for loss stability in frameflow, 1. for no clamping
   use_aux_loss: True  # Whether to use auxiliary loss
