@@ -349,7 +349,6 @@ class ModelTrainerBase(L.LightningModule):
         if self.motif_conditioning and ("fixed_structure_mask" not in batch or "x_motif" not in batch):
             batch.update(self.motif_factory(batch, zeroes = True))  # for generation we have to pass conditioning info in. But for validation do the same as training
 
-        print(f"Batch keys {batch.keys()}")
         nn_out = self.nn(batch)
         x_pred = self._nn_out_to_x_clean(nn_out, batch)
         c_pred = self._nn_out_to_c_clean(nn_out, batch)

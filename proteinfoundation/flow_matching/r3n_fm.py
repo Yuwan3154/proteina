@@ -993,6 +993,9 @@ class _ContactMapFlowMatcher:
         with torch.no_grad():
             # Initialize contact map from reference
             c = self.sample_reference(n, shape=(nsamples,), device=device, mask=mask, dtype=dtype)
+            
+            # Coordinates: zeros placeholder (no diffusion in contact map mode)
+            x = torch.zeros(nsamples, n, 3, device=device, dtype=dtype if dtype else torch.float32)
 
             coords_pred = None
             c_1_pred = None
@@ -1004,6 +1007,7 @@ class _ContactMapFlowMatcher:
                 gt_step = gt[step]
 
                 nn_in = {
+                    "x_t": x,
                     "contact_map_t": c,
                     "t": t,
                     "mask": mask,
@@ -1025,7 +1029,6 @@ class _ContactMapFlowMatcher:
                     if c_1_pred is not None:
                         nn_in["contact_map_sc"] = c_1_pred
 
-                print(f"nn_in keys {nn_in.keys()}")
                 result = predict_fn(nn_in)
                 
                 # Extract predictions
