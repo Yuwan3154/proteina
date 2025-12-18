@@ -339,12 +339,10 @@ class PairReprUpdate(torch.nn.Module):
         pair_dim,
         expansion_factor_transition=2,
         use_tri_mult=False,
-        tri_mult_c=None,
+        tri_mult_c=196,
     ):
         super().__init__()
 
-        if tri_mult_c is None:
-            tri_mult_c = pair_dim
         self.use_tri_mult = use_tri_mult
         self.layer_norm_in = torch.nn.LayerNorm(token_dim)
         self.linear_x = torch.nn.Linear(token_dim, int(2 * pair_dim), bias=False)
@@ -707,6 +705,7 @@ class ProteinTransformerAF3(torch.nn.Module):
                             token_dim=kwargs["token_dim"],
                             pair_dim=kwargs["pair_repr_dim"],
                             use_tri_mult=self.use_tri_mult,
+                            tri_mult_c=kwargs["tri_mult_c"],
                         )
                         if i % self.update_pair_repr_every_n == 0
                         else None

@@ -1,4 +1,5 @@
-run_name_: train_run_default-fold_4-seq-S25_32-effective-batch_purge-7bny-7kww-7ad5-7b76_warmup_cutoff-190828
+run_name_: train_run_finetune-all_v1.4_default-fold_4-seq-S25_32-effective-batch_purge-7bny-7kww-7ad5-7b76_warmup_cutoff-190828
+pretrain_ckpt_path: /home/jupyter-chenxi/proteina/data/weights/proteina_v1.4_D21M_400M_tri.ckpt
 
 hardware:
   ncpus_per_task_train_: 8  # Number of CPUs per task during training
@@ -49,7 +50,6 @@ training:
   self_cond: True
   seq_cond: True
   fold_cond: True
-  cirpin_cond: False
   mask_T_prob: 0.5
   mask_A_prob: 0.5
   mask_C_prob: 0.5
@@ -84,8 +84,8 @@ opt:
 log:
   wandb_project: protein_transformer_big_runs  # Leave this so we can compare runs easily
   log_wandb: True  # whether to log to wandb
-  log_every_n_steps: 5  # How often to log metrics to wandb
-  log_structure_every_n_steps: 5  # How often to log structure/contact map visualizations (0 = disabled)
+  log_every_n_steps: 1  # How often to log metrics to wandb
+  log_structure_every_n_steps: 1  # How often to log structure/contact map visualizations (0 = disabled)
   checkpoint: True  # whether to store checkpoints
   checkpoint_every_n_steps: 1000  # How often we store a checkpoint, should be greater than val_check_interval above
   last_ckpt_every_n_steps: 1000  # How often do we update our last ckpt, needed for requeuing without losing progress

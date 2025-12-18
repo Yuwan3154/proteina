@@ -43,6 +43,7 @@ pair_repr_dim: 256
 update_pair_repr: True
 update_pair_repr_every_n: 2  # 12 layers -> 6 pair updates
 use_tri_mult: True
+tri_mult_c: 256
 
 num_registers: 10
 use_qkln: True
