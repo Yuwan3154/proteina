@@ -69,3 +69,4 @@ use_qkln: True
 
 num_buckets_predict_pair: 64
 predict_coords: True
+contact_map_mode: False

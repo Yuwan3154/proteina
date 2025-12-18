@@ -730,7 +730,7 @@ class ProteinTransformerAF3(torch.nn.Module):
                 torch.nn.Linear(kwargs["pair_repr_dim"], 1, bias=False),
             )
 
-        if self.predict_coords:
+        if self.predict_coords or not self.contact_map_mode:
             self.coors_3d_decoder = torch.nn.Sequential(
                 torch.nn.LayerNorm(kwargs["token_dim"]),
                 torch.nn.Linear(kwargs["token_dim"], 3, bias=False),
@@ -888,7 +888,7 @@ class ProteinTransformerAF3(torch.nn.Module):
         pair_rep = (pair_rep + pair_rep.transpose(-2, -3)) / 2.0
 
         nn_out = {}
-        if self.predict_coords:
+        if self.predict_coords or not self.contact_map_mode:
             final_coors = self.coors_3d_decoder(seqs) * mask[..., None]  # [b, n, 3]
             nn_out["coords_pred"] = final_coors
         else:

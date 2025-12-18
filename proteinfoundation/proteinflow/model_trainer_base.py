@@ -166,10 +166,10 @@ class ModelTrainerBase(L.LightningModule):
         Returns:
             Clean sample prediction, tensor of shape [b, n, 3].
         """
-        if "coors_pred" not in nn_out:
+        if "coords_pred" not in nn_out:
             return None
 
-        nn_pred = nn_out["coors_pred"]
+        nn_pred = nn_out["coords_pred"]
         t = batch["t"]  # [*]
         t_ext = t[..., None, None]  # [*, 1, 1]
         x_t = batch["x_t"]  # [*, n, 3]
@@ -1150,7 +1150,7 @@ class ModelTrainerBase(L.LightningModule):
             contact_map_pred=self._contact_map_to_viz(contact_map).squeeze(0) if contact_map is not None else None,
             mask=mask.squeeze(0),
             log_prefix="validation_sampling",
-            pair_logits=distogram.squeeze(0),
+            pair_logits=distogram.squeeze(0) if distogram is not None else None,
             residue_type=residue_type.squeeze(0),
             use_template_inference=predict_from_dist,
         )

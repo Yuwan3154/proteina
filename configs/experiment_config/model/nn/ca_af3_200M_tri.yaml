@@ -2,9 +2,9 @@ name: ca_af3  # name of architecture
 
 
 # Architecture parameters
-token_dim: 1024  # dimension of the tokens in the sequence
-nlayers: 18  # number of transformer layers
-nheads: 16  # number of attn heads
+token_dim: 768  # dimension of the tokens in the sequence
+nlayers: 15  # number of transformer layers
+nheads: 12  # number of attn heads
 residual_mha: True  # whether to use a residual connection in the mha
 residual_transition: True  # whether to use a residual connection in the transition
 parallel_mha_transition: False  # whether to compute mha and transition as parallel and add them up (AF3 style) or sequentially (normal transofrmers)
@@ -37,7 +37,6 @@ multilabel_mode: "sample"
 #   "x_sc_pair_dists"
 #   "rel_seq_sep"
 #   "time_emb"
-#   "fold_emb"
 feats_pair_repr: ["rel_seq_sep", "x_sc_pair_dists", "xt_pair_dists"]  # Features to include in the pair representation
 feats_pair_cond: ["time_emb"]  # Features to include in the pair representation conditioning
 
@@ -59,7 +58,7 @@ pair_repr_dim: 512
 
 # Newer stuff for exploration
 update_pair_repr: True  # whether to update pair representation, automatically overridden to False if `use_attn_pair_bias: False`
-update_pair_repr_every_n: 5  # Update the pair representation every n layers -> with 18 layers we get 4 pair updates
+update_pair_repr_every_n: 3  # Update the pair representation every n layers -> For 15 layers we get 5 pair updates
 use_tri_mult: True  # whether to use triangular multiplication layers in pair update, ignored if not updating pair representation
 
 num_registers: 10
@@ -67,3 +66,4 @@ use_qkln: True
 
 num_buckets_predict_pair: 64
 predict_coords: True
+contact_map_mode: False
