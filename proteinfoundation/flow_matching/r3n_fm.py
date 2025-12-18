@@ -1032,17 +1032,13 @@ class _ContactMapFlowMatcher:
                 result = predict_fn(nn_in)
                 
                 # Extract predictions
-                x = result.get("coords_pred")
-                c_1_pred = result.get("contact_map_pred")
+                x = result.get("coords")
+                c_1_pred = result.get("contact_map")
                 c_v = result.get("contact_map_v")
                 distogram = result.get("distogram")  # Capture for final output
 
                 if c_1_pred is None:
                     raise ValueError("Contact map prediction missing during contact map diffusion.")
-
-                # Compute velocity if not provided
-                if c_v is None:
-                    c_v = self.xt_dot(c_1_pred, c, t, mask)
 
                 # Accommodate last few steps
                 step_sampling_mode = sampling_mode
