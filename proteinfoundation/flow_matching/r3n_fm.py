@@ -1025,6 +1025,7 @@ class _ContactMapFlowMatcher:
                     if c_1_pred is not None:
                         nn_in["contact_map_sc"] = c_1_pred
 
+                print(f"nn_in keys {nn_in.keys()}")
                 result = predict_fn(nn_in)
                 
                 # Extract predictions
