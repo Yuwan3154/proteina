@@ -173,7 +173,7 @@ class ModelTrainerBase(L.LightningModule):
         t = batch["t"]  # [*]
         t_ext = t[..., None, None]  # [*, 1, 1]
         x_t = batch["x_t"]  # [*, n, 3]
-        if self.cfg_exp.model.target_pred == "x_1":
+        if self.cfg_exp.model.target_pred == "x_1" or self.contact_map_mode:
             x_1_pred = nn_pred
         elif self.cfg_exp.model.target_pred == "v":
             x_1_pred = x_t + (1.0 - t_ext) * nn_pred
