@@ -140,6 +140,16 @@ if __name__ == "__main__":
         action="store_true",
         help="Shows progress bar as training progresses.",
     )
+    parser.add_argument(
+        "--resume_option",
+        type=str,
+        default="allow",
+        choices=["allow", "never", "must", None],
+        help=(
+            "Resume option: allow (resume if exists, create if not), never (always create new), "
+            "must (must resume existing), None (same as allow when id is set). Default is allow."
+        ),
+    )
     args = parser.parse_args()
 
     logger.add(
@@ -261,9 +271,7 @@ if __name__ == "__main__":
     # Set logger
     wandb_logger = None
     if cfg_exp.log.log_wandb and not args.nolog:
-        # resume options: "allow" (resume if exists, create if not), "never" (always create new), 
-        # "must" (must resume existing), None (same as "allow" when id is set)
-        wandb_resume = cfg_exp.log.get("wandb_resume", "allow")
+        wandb_resume = args.resume_option
         wandb_logger = WandbLogger(
             entity="kryst3154-massachusetts-institute-of-technology", 
             project=cfg_exp.log.wandb_project, 
@@ -338,7 +346,7 @@ if __name__ == "__main__":
     # If this is the first run for fine-tuning, load pre-trained checkpoint and don't load optimizer states
     pretrain_ckpt_path = cfg_exp.get("pretrain_ckpt_path", None)
     if last_ckpt_path is None and pretrain_ckpt_path is not None:
-        log_info(f"Loading from pre-trained checkpoint path {pretrain_ckpt_path}")
+        log_info(f"Loading from pre-trained checkpoint path {os.path.expanduser(pretrain_ckpt_path)}")
         ckpt = torch.load(os.path.expanduser(pretrain_ckpt_path), map_location="cpu", weights_only=False)
         model.load_state_dict(ckpt["state_dict"], strict=False)
 
