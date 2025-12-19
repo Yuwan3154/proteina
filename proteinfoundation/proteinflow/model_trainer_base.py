@@ -613,8 +613,12 @@ class ModelTrainerBase(L.LightningModule):
                 seq[i] = mask_seq(seq[i], self.cfg_exp.training.mask_seq_proportion)
             batch["residue_type"] = seq
         else:
-            # Remove residue_type from batch when seq_cond is False
-            if "residue_type" in batch:
+            # Keep residue_type if IPA coordinates are needed for contact_map_mode
+            need_residue_type = (
+                getattr(self, "contact_map_mode", False)
+                and getattr(self.nn, "predict_coords", None) == "ipa"
+            )
+            if "residue_type" in batch and not need_residue_type:
                 batch.pop("residue_type")
                 print("residue_type removed from batch")
 
@@ -884,7 +888,7 @@ class ModelTrainerBase(L.LightningModule):
 
         if x_1_pred is not None:
             # Save first sample as temporary PDB for logging
-            atom37 = self.samples_to_atom37(x_1_pred).float().detach().cpu().numpy()
+            atom37 = self.samples_to_atom37(x_1_pred, residue_type=residue_type).float().detach().cpu().numpy()
             aatype = residue_type.long().detach().cpu().numpy()
             with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False) as tmp_pdb:
                 temp_pdb_path = tmp_pdb.name
@@ -955,40 +959,60 @@ class ModelTrainerBase(L.LightningModule):
         log_prefix: str = None,
     ):
         """
-        Computes FAPE loss using identity frames (no orientation info).
-        
-        This is useful for contact map diffusion mode where we predict coordinates
-        directly without orientation information from the backbone.
+        Computes FAPE loss. Supports CA-only, backbone (N,CA,C), and all-atom inputs.
         
         Args:
-            x_1: Ground truth coordinates, shape [b, n, 3].
-            x_1_pred: Predicted coordinates, shape [b, n, 3].
+            x_1: Ground truth coordinates, shape [b, n, 3] or [b, n, natom, 3].
+            x_1_pred: Predicted coordinates, same shape as x_1.
             mask: Boolean mask, shape [b, n].
             log_prefix: Optional prefix for logging.
             
         Returns:
             FAPE loss per sample, shape [b].
         """
+        if x_1_pred is None:
+            raise ValueError("x_1_pred is required for FAPE loss.")
+
         frames_mask = mask.float()
-        
-        # Create identity rotation matrices for all residues
-        rot = torch.eye(3, device=x_1.device, dtype=x_1.dtype)
-        rot = rot.view(1, 1, 3, 3).expand(x_1.shape[0], x_1.shape[1], 3, 3)
-        
-        # Create rigid frames with identity rotations and CA translations
-        pred_rotation = Rotation(rot_mats=rot, quats=None)
-        target_rotation = Rotation(rot_mats=rot, quats=None)
-        # Proteina/OpenFold stub uses Rigid(rots=..., trans=...) (not keyword 'rot')
-        pred_frames = Rigid(rots=pred_rotation, trans=x_1_pred)
-        target_frames = Rigid(rots=target_rotation, trans=x_1)
-        
+
+        if x_1_pred.dim() == 4:
+            # Backbone or all-atom: build frames from N, CA, C and flatten atoms for positions
+            n_pred = x_1_pred[..., 0, :]
+            ca_pred = x_1_pred[..., 1, :]
+            c_pred = x_1_pred[..., 2, :]
+            n_true = x_1[..., 0, :]
+            ca_true = x_1[..., 1, :]
+            c_true = x_1[..., 2, :]
+
+            pred_frames = Rigid.make_transform_from_reference(n_pred, ca_pred, c_pred)
+            target_frames = Rigid.make_transform_from_reference(n_true, ca_true, c_true)
+
+            pred_positions = x_1_pred.reshape(x_1_pred.shape[0], -1, 3)
+            target_positions = x_1.reshape(x_1.shape[0], -1, 3)
+            positions_mask = mask[..., None].expand(-1, -1, x_1_pred.shape[-2]).reshape(x_1_pred.shape[0], -1)
+        elif x_1_pred.dim() == 3:
+            # CA-only fallback: identity frames
+            rot = torch.eye(3, device=x_1.device, dtype=x_1.dtype)
+            rot = rot.view(1, 1, 3, 3).expand(x_1.shape[0], x_1.shape[1], 3, 3)
+
+            pred_rotation = Rotation(rot_mats=rot, quats=None)
+            target_rotation = Rotation(rot_mats=rot, quats=None)
+            pred_frames = Rigid(rots=pred_rotation, trans=x_1_pred)
+            target_frames = Rigid(rots=target_rotation, trans=x_1)
+
+            pred_positions = x_1_pred
+            target_positions = x_1
+            positions_mask = frames_mask
+        else:
+            raise ValueError(f"Unsupported x_1_pred shape for FAPE: {x_1_pred.shape}")
+
         fape = compute_fape(
             pred_frames=pred_frames,
             target_frames=target_frames,
             frames_mask=frames_mask,
-            pred_positions=x_1_pred,
-            target_positions=x_1,
-            positions_mask=frames_mask,
+            pred_positions=pred_positions,
+            target_positions=target_positions,
+            positions_mask=positions_mask,
             length_scale=10.0,
             l1_clamp_distance=10.0,
         )

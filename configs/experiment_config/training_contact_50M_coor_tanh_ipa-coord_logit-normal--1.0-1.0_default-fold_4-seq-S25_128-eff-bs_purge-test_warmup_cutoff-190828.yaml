@@ -1,4 +1,4 @@
-run_name_: contact_50M_coor_tanh_logit-normal_default-fold_4-seq-S25_128-effective-batch_purge-7bny-7kww-7ad5-7b76_warmup_cutoff-190828
+run_name_: contact_50M_coor_tanh_ipa-coord_logit-normal--1.0-1.0_default-fold_4-seq-S25_128-eff-bs_purge-test_warmup_cutoff-190828
 
 hardware:
   ncpus_per_task_train_: 16  # Number of CPUs per task during training
@@ -14,7 +14,7 @@ hardware:
 loss:
   t_distribution:
     name: logit-normal
-    p1: 0.0
+    p1: -1.0
     p2: 1.0
   loss_t_clamp: 0.9  # Used for loss stability in frameflow, 1. for no clamping
   use_aux_loss: True  # Whether to use auxiliary loss
@@ -30,7 +30,7 @@ loss:
 
 defaults:
   - model: contactflow  # caflow or contactflow
-  - override model/nn: contact_af3_50M_tri_coor_tanh
+  - override model/nn: contact_af3_50M_tri_coor_tanh_ipa-coord
   - _self_
 
 model:

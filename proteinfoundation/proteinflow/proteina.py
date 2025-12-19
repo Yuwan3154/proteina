@@ -24,7 +24,7 @@ from proteinfoundation.flow_matching.r3n_fm import FlowMatcher
 from proteinfoundation.nn.protein_transformer import ProteinTransformerAF3
 from proteinfoundation.proteinflow.model_trainer_base import ModelTrainerBase
 from proteinfoundation.utils.align_utils.align_utils import kabsch_align
-from proteinfoundation.utils.coors_utils import ang_to_nm, trans_nm_to_atom37
+from proteinfoundation.utils.coors_utils import ang_to_nm, nm_to_ang, trans_nm_to_atom37
 from proteinfoundation.utils.ff_utils.pdb_utils import mask_cath_code_by_level, mask_seq
 from proteinfoundation.nn.motif_factory import SingleMotifFactory
 
@@ -114,8 +114,15 @@ class Proteina(ModelTrainerBase):
         Returns:
             Tuple (x_1, mask, batch_shape, n, dtype)
         """
-        x_1 = batch["coords"][:, :, 1, :]  # [b, n, 3]
+        coords = batch["coords"]  # [b, n, atoms, 3]
         mask = batch["mask_dict"]["coords"][..., 0, 0]  # [b, n] boolean
+        predict_coords_mode = getattr(self.nn, "predict_coords", None)
+        if self.contact_map_mode and predict_coords_mode == "ipa":
+            x_1 = coords  # [b, n, 37?, 3]
+        elif self.contact_map_mode and predict_coords_mode == "linear":
+            x_1 = coords[:, :, [0, 1, 2], :]  # backbone N, CA, C
+        else:
+            x_1 = coords[:, :, 1, :]  # CA only
         if self.cfg_exp.model.augmentation.global_rotation:
             # CAREFUL: If naug_rot is > 1 this increases "batch size"
             x_1, mask = self.apply_random_rotation(
@@ -516,14 +523,52 @@ class Proteina(ModelTrainerBase):
         """Detaches gradients from sample x"""
         return x.detach()
 
-    def samples_to_atom37(self, samples):
+    def samples_to_atom37(self, samples, residue_type=None):
         """
         Transforms samples to atom37 representation.
 
         Args:
-            samples: Tensor of shape [b, n, 3]
+            samples: Tensor of shape [b, n, 3] (CA only), [b, n, 3, 3] (backbone), [b, n, 14, 3], or [b, n, 37, 3]
 
         Returns:
             Samples in atom37 representation, shape [b, n, 37, 3].
         """
-        return trans_nm_to_atom37(samples)  # [b, n, 37, 3]
+        if samples.dim() == 3:
+            return trans_nm_to_atom37(samples)
+        if samples.dim() != 4:
+            raise ValueError(f"Unsupported samples shape for atom37 conversion: {samples.shape}")
+
+        b, n, natoms, _ = samples.shape
+        samples_ang = nm_to_ang(samples)
+        if natoms == 37:
+            return samples_ang
+        atom37 = samples_ang.new_zeros((b, n, 37, 3))
+        if natoms == 3:
+            # Backbone N(0), CA(1), C(2) to atom37 indices 0,1,2
+            atom37[..., 0, :] = samples_ang[..., 0, :]
+            atom37[..., 1, :] = samples_ang[..., 1, :]
+            atom37[..., 2, :] = samples_ang[..., 2, :]
+            return atom37
+        if natoms == 14:
+            if residue_type is None:
+                raise ValueError("residue_type is required to map atom14 to atom37")
+            from proteinfoundation.openfold_stub.np import residue_constants as rc
+
+            restype_atom14_to_atom37 = torch.tensor(
+                rc.RESTYPE_ATOM14_TO_ATOM37,
+                dtype=torch.long,
+                device=samples_ang.device,
+            )
+            restype_atom14_mask = torch.tensor(
+                rc.RESTYPE_ATOM14_MASK,
+                dtype=samples_ang.dtype,
+                device=samples_ang.device,
+            )
+            aatype = torch.clamp(residue_type, max=restype_atom14_to_atom37.shape[0] - 1)
+            residx = restype_atom14_to_atom37[aatype]
+            atom14_mask = restype_atom14_mask[aatype]
+            scatter_idx = residx[..., None].expand(-1, -1, -1, 3)
+            atom37.scatter_(2, scatter_idx, samples_ang * atom14_mask[..., None])
+            return atom37
+
+        raise ValueError(f"Unsupported natoms for atom37 conversion: {natoms}")

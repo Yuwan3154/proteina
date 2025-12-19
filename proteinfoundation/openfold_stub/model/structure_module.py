@@ -41,7 +41,7 @@ from proteinfoundation.openfold_stub.utils.tensor_utils import (
     flatten_final_dims,
 )
 
-# attn_core_inplace_cuda = importlib.import_module("attn_core_inplace_cuda")
+attn_core_inplace_cuda = importlib.import_module("attn_core_inplace_cuda")
 
 
 class AngleResnetBlock(nn.Module):

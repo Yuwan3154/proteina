@@ -17,12 +17,16 @@ from torch.utils.checkpoint import checkpoint
 
 from proteinfoundation.openfold_stub.model.msa import MSARowAttentionWithPairBias
 from proteinfoundation.openfold_stub.model.pair_transition import PairTransition
-from proteinfoundation.openfold_stub.model.structure_module import InvariantPointAttention
+from proteinfoundation.openfold_stub.model.structure_module import (
+    InvariantPointAttention,
+    StructureModule,
+)
 from proteinfoundation.openfold_stub.model.triangular_multiplicative_update import (
     TriangleMultiplicationIncoming,
     TriangleMultiplicationOutgoing,
 )
 from proteinfoundation.openfold_stub.utils.rigid_utils import Rigid
+import proteinfoundation.openfold_stub.np.residue_constants as rc
 
 # Try to import cuequivariance for faster triangle multiplicative updates
 try:
@@ -628,7 +632,27 @@ class ProteinTransformerAF3(torch.nn.Module):
             )
 
         # Coordinate encoder/decoder (configurable, default: disabled in contact map mode)
-        self.predict_coords = kwargs.get("predict_coords", not self.contact_map_mode)
+        predict_coords_cfg = kwargs.get("predict_coords", not self.contact_map_mode)
+        if self.contact_map_mode:
+            if isinstance(predict_coords_cfg, bool):
+                predict_coords_cfg = "linear" if predict_coords_cfg else None
+            elif isinstance(predict_coords_cfg, str):
+                predict_coords_cfg = predict_coords_cfg.lower()
+                if predict_coords_cfg == "none":
+                    predict_coords_cfg = None
+                elif predict_coords_cfg not in ("ipa", "linear"):
+                    raise ValueError(
+                        f"Invalid predict_coords mode for contact_map_mode: {predict_coords_cfg}"
+                    )
+            elif predict_coords_cfg is None:
+                predict_coords_cfg = None
+            else:
+                raise ValueError(
+                    f"predict_coords must be bool or one of ['ipa','linear','none'], got {type(predict_coords_cfg)}"
+                )
+        else:
+            predict_coords_cfg = bool(predict_coords_cfg)
+        self.predict_coords = predict_coords_cfg
         non_contact_value = kwargs.get("non_contact_value", 0)
         if non_contact_value not in (0, -1):
             raise ValueError(f"non_contact_value must be 0 or -1, got {non_contact_value}")
@@ -728,14 +752,46 @@ class ProteinTransformerAF3(torch.nn.Module):
                 torch.nn.LayerNorm(kwargs["pair_repr_dim"]),
                 torch.nn.Linear(kwargs["pair_repr_dim"], 1, bias=False),
             )
-
-        if self.predict_coords:
+        
+        self.coors_3d_decoder = None
+        if not self.contact_map_mode:
             self.coors_3d_decoder = torch.nn.Sequential(
                 torch.nn.LayerNorm(kwargs["token_dim"]),
                 torch.nn.Linear(kwargs["token_dim"], 3, bias=False),
             )
-        else:
-            self.coors_3d_decoder = None
+        elif self.predict_coords == "ipa":
+            sm_cfg = kwargs.get("structure_module_cfg", {})
+            self.structure_module_cfg = {
+                "c_s": kwargs["token_dim"],
+                "c_z": kwargs["pair_repr_dim"],
+                "c_ipa": sm_cfg.get("c_ipa", 16),
+                "c_resnet": sm_cfg.get("c_resnet", 128),
+                "no_heads_ipa": sm_cfg.get("no_heads_ipa", 12),
+                "no_qk_points": sm_cfg.get("no_qk_points", 4),
+                "no_v_points": sm_cfg.get("no_v_points", 8),
+                "dropout_rate": sm_cfg.get("dropout_rate", 0.1),
+                "no_blocks": sm_cfg.get("no_blocks", 8),
+                "no_transition_layers": sm_cfg.get("no_transition_layers", 1),
+                "no_resnet_blocks": sm_cfg.get("no_resnet_blocks", 2),
+                "no_angles": sm_cfg.get("no_angles", 7),
+                "trans_scale_factor": sm_cfg.get("trans_scale_factor", 10),
+                "epsilon": sm_cfg.get("epsilon", 1e-12),
+                "inf": sm_cfg.get("inf", 1e5),
+            }
+            self.coors_3d_decoder = StructureModule(**self.structure_module_cfg)
+            self.register_buffer(
+                "restype_atom14_to_atom37",
+                torch.tensor(rc.RESTYPE_ATOM14_TO_ATOM37, dtype=torch.long),
+            )
+            self.register_buffer(
+                "restype_atom14_mask",
+                torch.tensor(rc.RESTYPE_ATOM14_MASK, dtype=torch.float32),
+            )
+        elif self.predict_coords == "linear":
+            self.coors_3d_decoder = torch.nn.Sequential(
+                torch.nn.LayerNorm(kwargs["token_dim"]),
+                torch.nn.Linear(kwargs["token_dim"], 9, bias=False),
+            )
 
     def _extend_w_registers(self, seqs, pair, mask, cond_seq):
         """
@@ -887,19 +943,45 @@ class ProteinTransformerAF3(torch.nn.Module):
         pair_rep = (pair_rep + pair_rep.transpose(-2, -3)) / 2.0
 
         nn_out = {}
-        if self.predict_coords:
-            final_coors = self.coors_3d_decoder(seqs) * mask[..., None]  # [b, n, 3]
-            nn_out["coords_pred"] = final_coors
-        else:
-            final_coors = None
+        coords_pred = None
+        if not self.contact_map_mode and self.coors_3d_decoder is not None:
+            coords_pred = self.coors_3d_decoder(seqs) * mask[..., None]  # [b, n, 3]
+            nn_out["coords_pred"] = coords_pred
+        elif self.contact_map_mode and self.predict_coords == "ipa":
+            aatype = batch_nn.get("residue_type", None)
+            if aatype is None:
+                raise ValueError(
+                    "residue_type is required in batch for IPA coordinate prediction."
+                )
+            struct_out = self.coors_3d_decoder(
+                {"single": seqs, "pair": pair_rep},
+                aatype=aatype,
+                mask=mask,
+                inplace_safe=False,
+                _offload_inference=False,
+            )
+            atom14 = struct_out["positions"][-1] if struct_out["positions"].dim() == 5 else struct_out["positions"]
+            atom14 = atom14 * mask[..., None, None]
+            aatype_safe = torch.clamp(aatype, min=0, max=self.restype_atom14_to_atom37.shape[0] - 1)
+            residx_atom14_to_atom37 = self.restype_atom14_to_atom37[aatype_safe]
+            atom14_mask = self.restype_atom14_mask[aatype_safe] * mask[..., None]
+            bsz, n_res, _, _ = atom14.shape
+            atom37 = atom14.new_zeros((bsz, n_res, 37, 3))
+            scatter_idx = residx_atom14_to_atom37[..., None].expand(-1, -1, -1, 3)
+            atom37.scatter_(2, scatter_idx, atom14 * atom14_mask[..., None])
+            coords_pred = atom37
+            nn_out["coords_pred"] = coords_pred
+        elif self.contact_map_mode and self.predict_coords == "linear":
+            raw = self.coors_3d_decoder(seqs)  # [b, n, 9]
+            coords_pred = raw.view(raw.shape[0], raw.shape[1], 3, 3)
+            coords_pred = coords_pred * mask[..., None, None]
+            nn_out["coords_pred"] = coords_pred
 
         if self.update_pair_repr and self.num_buckets_predict_pair is not None:
             pair_logits = self.pair_head_prediction(pair_rep)
-            if final_coors is not None:
-                final_coors = (
-                    final_coors + torch.mean(pair_logits) * 0.0
-                )  # Keeps graph consistent
-                final_coors = final_coors * mask[..., None]
+            if coords_pred is not None:
+                coords_pred = coords_pred + torch.mean(pair_logits) * 0.0
+                coords_pred = coords_pred * (mask[..., None] if coords_pred.dim() == 3 else mask[..., None, None])
             nn_out["pair_logits"] = pair_logits
 
         # Contact map prediction (for contact map diffusion mode)
