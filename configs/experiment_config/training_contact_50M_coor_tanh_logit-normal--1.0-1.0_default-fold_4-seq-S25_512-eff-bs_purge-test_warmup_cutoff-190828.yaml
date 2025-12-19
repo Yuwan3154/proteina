@@ -1,4 +1,4 @@
-run_name_: train_run_contact_50M_coor_tanh_logit-normal_default-fold_4-seq-S25_512-effective-batch_purge-7bny-7kww-7ad5-7b76_warmup_cutoff-190828
+run_name_: contact_50M_coor_tanh_logit-normal--1.0-1.0_default-fold_4-seq-S25_512-eff-bs_purge-test_warmup_cutoff-190828
 
 hardware:
   ncpus_per_task_train_: 16  # Number of CPUs per task during training
