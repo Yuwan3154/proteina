@@ -511,15 +511,29 @@ def protein_df_to_tensor(
     df = df.loc[df["atom_name"].isin(atoms_to_keep)]
     residue_indices = pd.factorize(
         pd.Series(get_residue_id(df, unique=False))
-    )[0]
-    atom_indices = df["atom_name"].map(lambda x: atoms_to_keep.index(x)).values
+    )[0].astype(np.int64, copy=False)
+    atom_indices = (
+        df["atom_name"]
+        .map(lambda x: atoms_to_keep.index(x))
+        .to_numpy(dtype=np.int64, copy=False)
+    )
 
     positions: AtomTensor = (
         torch.zeros((num_residues, len(atoms_to_keep), 3)) + fill_value
     )
-    positions[residue_indices, atom_indices] = torch.tensor(
-        df[["x_coord", "y_coord", "z_coord"]].values
-    ).float()
+    coords_np = (
+        df[["x_coord", "y_coord", "z_coord"]]
+        .apply(pd.to_numeric, errors="coerce")
+        .to_numpy(dtype=np.float32, copy=False)
+    )
+    # Replace NaN/Inf (from coercion failures) with fill_value to avoid object dtype issues
+    coords_np = np.nan_to_num(
+        coords_np, nan=fill_value, posinf=fill_value, neginf=fill_value
+    )
+    if coords_np.size > 0:
+        positions[residue_indices, atom_indices] = torch.as_tensor(
+            coords_np, dtype=torch.float32
+        )
 
     return positions
 
@@ -883,6 +897,10 @@ def protein_to_pyg(
         df = df.loc[
             df.residue_name.isin(STANDARD_AMINO_ACID_MAPPING_1_TO_3.values())
         ]
+    if df.empty:
+        raise ValueError(
+            "No standard protein atoms found after filtering; likely ligand-only chain."
+        )
     df = pd.concat([df] + hets)
     df = sort_dataframe(df)
 

@@ -355,12 +355,10 @@ class Proteina(ModelTrainerBase):
             max_dist = 1e10
         pair_mask_thr = gt_pair_dists < max_dist  # [*, n, n]
         total_pair_mask = pair_mask * pair_mask_thr  # [*, n, n]
-        total_pair_mask_sum = torch.sum(total_pair_mask, dim=(-1, -2))  # [*]
-        valid_pairs = total_pair_mask_sum - nres  # subtract diagonal
 
         # Compute coordinate-based auxiliary loss (only if coordinates are predicted)
         if pred_pair_dists is not None:
-            den = total_pair_mask_sum - nres
+            den = torch.sum(total_pair_mask, dim=(-1, -2)) - nres
             dist_mat_loss = torch.sum(
                 (gt_pair_dists - pred_pair_dists) ** 2 * total_pair_mask, dim=(-1, -2)
             )  # [*]
@@ -402,16 +400,8 @@ class Proteina(ModelTrainerBase):
             distogram_loss = distogram_loss / (
                 pair_mask.sum(dim=(-1, -2)) + 1e-10
             )  # [bs]
-            distogram_loss = torch.nan_to_num(distogram_loss, nan=0.0, posinf=0.0, neginf=0.0)
         else:
             distogram_loss = dist_mat_loss * 0
-
-        # Zero-out aux loss for degenerate tiny chains (e.g., nres <= 2 or no valid pairs)
-        tiny_mask = (nres <= 2) | (valid_pairs <= 0)
-        if tiny_mask.any():
-            dist_mat_loss = torch.where(tiny_mask, torch.zeros_like(dist_mat_loss), dist_mat_loss)
-            distogram_loss = torch.where(tiny_mask, torch.zeros_like(distogram_loss), distogram_loss)
-
 
         auxiliary_loss = (
             distogram_loss

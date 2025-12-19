@@ -21,6 +21,8 @@ from loguru import logger
 from lightning.pytorch.utilities.rank_zero import rank_zero_info
 from torch.utils.data import Dataset
 from torch_geometric.data import Data
+import torch_geometric.data.data as tgd
+from torch.serialization import add_safe_globals
 from tqdm import tqdm
 
 from proteinfoundation.openfold_stub.np.residue_constants import resname_to_idx
@@ -598,7 +600,6 @@ class PDBLightningDataModule(BaseLightningDataModule):
         self.clusterid_to_seqid_mappings = None
         self.file_names = None
         self.min_length = dataselector.min_length if dataselector else None
-        self.pre_filter = self._attach_length_filter(self.pre_filter)
 
     def prepare_data(self):
         if self.dataselector:
@@ -615,10 +616,21 @@ class PDBLightningDataModule(BaseLightningDataModule):
                     f"Dataset created with {len(df_data)} entries. Now downloading structure data..."
                 )
                 self._download_structure_data(df_data["pdb"].tolist())
-                # process pdb files into seperate chains and save processed objects as .pt files
-                self._process_structure_data(
-                    df_data["pdb"].tolist(), df_data["chain"].tolist()
-                )
+                has_processed = any(self.processed_dir.glob("*.pt"))
+                if self.overwrite or not has_processed:
+                    # process pdb files into seperate chains and save processed objects as .pt files
+                    self._process_structure_data(
+                        df_data["pdb"].tolist(), df_data["chain"].tolist()
+                    )
+                else:
+                    rank_zero_info("Detected existing processed files; skipping reprocessing and using existing .pt files only.")
+
+                rank_zero_info(f"Post-filtering processed files by minimum length {self.min_length}")
+                expected_files = [f"{p}_{c}" for p, c in zip(df_data["pdb"].tolist(), df_data["chain"].tolist())]
+                keep_files, drop_files = self._filter_processed_by_length(expected_files)
+                keep_set = set(keep_files)
+                rank_zero_info(f"Filtered dataset from {len(df_data)} to {len(keep_set)} samples")
+                df_data = df_data[df_data.apply(lambda r: f"{r.pdb}_{r.chain}" in keep_set, axis=1)]
 
                 # save df_data to disk for later use (in splitting, dataloading etc)
                 rank_zero_info(f"Saving dataset csv to {df_data_name}")
@@ -633,11 +645,18 @@ class PDBLightningDataModule(BaseLightningDataModule):
             else:
                 rank_zero_info(f"{df_data_name} does not exist yet, creating dataset now.")
                 df_data = self._load_pdb_folder_data(self.raw_dir)
-                # process pdb files into seperate chains and save processed objects as .pt files
-                self._process_structure_data(
-                    pdb_codes=df_data["pdb"].tolist(),
-                    chains=None,
-                )
+                has_processed = any(self.processed_dir.glob("*.pt"))
+                if self.overwrite or not has_processed:
+                    # process pdb files into seperate chains and save processed objects as .pt files
+                    self._process_structure_data(
+                        pdb_codes=df_data["pdb"].tolist(),
+                        chains=None,
+                    )
+                else:
+                    rank_zero_info("Detected existing processed files; skipping reprocessing and using existing .pt files only.")
+                keep_files, drop_files = self._filter_processed_by_length(df_data["pdb"].tolist())
+                keep_set = set(keep_files)
+                df_data = df_data[df_data["pdb"].apply(lambda x: x in keep_set)]
                 # save df_data to disk for later use (in splitting, dataloading etc)
                 rank_zero_info(f"Saving dataset csv to {df_data_name}")
                 df_data.to_csv(self.data_dir / df_data_name, index=False)
@@ -668,25 +687,39 @@ class PDBLightningDataModule(BaseLightningDataModule):
         
         return df_data
 
-    def _attach_length_filter(self, base_filter: Optional[Callable]) -> Optional[Callable]:
-        """Combine existing pre_filter with an effective-length check using coord_mask."""
+    def _filter_processed_by_length(self, file_names: List[str]) -> Tuple[List[str], List[str]]:
+        """Post-filter processed .pt files by effective length (coord_mask.any)."""
         if self.min_length is None:
-            return base_filter
+            return file_names, []
 
-        min_len = self.min_length
+        add_safe_globals([tgd.Data])
 
-        def length_filter(graph):
-            nres = int(graph.coord_mask.any(dim=-1).sum().item())
-            return nres >= min_len
+        keep, drop = [], []
+        for fname in file_names:
+            stem = fname if not fname.endswith(".pt") else fname[:-3]
+            path = self.processed_dir / f"{stem}.pt"
+            if not path.exists():
+                drop.append(stem)
+                continue
+            data = torch.load(path, map_location="cpu", weights_only=False)
+            if not hasattr(data, "coord_mask"):
+                drop.append(stem)
+                path.unlink(missing_ok=True)
+                continue
+            nres = int(data.coord_mask.any(dim=-1).sum().item())
+            if nres < self.min_length:
+                drop.append(stem)
+                path.unlink(missing_ok=True)
+            else:
+                keep.append(stem)
 
-        if base_filter:
-            def combined(graph):
-                if not length_filter(graph):
-                    return False
-                return base_filter(graph)
-            return combined
+        if drop:
+            auto_excluded = self.processed_dir.parent / "auto_excluded_too_short.txt"
+            with open(auto_excluded, "a") as f:
+                for stem in drop:
+                    f.write(f"{stem}\n")
 
-        return length_filter
+        return keep, drop
 
     def _get_file_identifier(self, ds):
         file_identifier = (
@@ -885,6 +918,11 @@ class PDBLightningDataModule(BaseLightningDataModule):
                     f"{pdb} not found in raw directory. Are you sure it's downloaded and has the format {format_type}?"
                 )
 
+            def _to_float_tensor(arr):
+                if isinstance(arr, torch.Tensor):
+                    return arr.to(dtype=torch.float32)
+                return torch.as_tensor(np.asarray(arr, dtype=np.float32))
+
             fill_value_coords = 1e-5
             graph = protein_to_pyg(
                 path=path,
@@ -899,6 +937,9 @@ class PDBLightningDataModule(BaseLightningDataModule):
 
             graph.id = fname.split(".")[0]
             graph.protein_id = graph.id  # Add protein_id for CIRPIN conditioning
+            graph.coords = _to_float_tensor(graph.coords)
+            if hasattr(graph, "bfactor"):
+                graph.bfactor = _to_float_tensor(graph.bfactor)
             coord_mask = graph.coords != fill_value_coords
             graph.coord_mask = coord_mask[..., 0]
             graph.residue_type = torch.tensor(
@@ -981,6 +1022,11 @@ class PDBLightningDataModule(BaseLightningDataModule):
                     f"{pdb} not found in raw directory. Are you sure it's downloaded and has the format {self.format}?"
                 )
 
+            def _to_float_tensor(arr):
+                if isinstance(arr, torch.Tensor):
+                    return arr.to(dtype=torch.float32)
+                return torch.as_tensor(np.asarray(arr, dtype=np.float32))
+
             fill_value_coords = 1e-5
             graph = protein_to_pyg(
                 path=path,
@@ -1013,6 +1059,9 @@ class PDBLightningDataModule(BaseLightningDataModule):
         fname = f"{pdb}.pt" if chains == "all" else f"{pdb}_{chains}.pt"
 
         graph.id = fname.split(".")[0]
+        graph.coords = _to_float_tensor(graph.coords)
+        if hasattr(graph, "bfactor"):
+            graph.bfactor = _to_float_tensor(graph.bfactor)
         coord_mask = graph.coords != fill_value_coords
         graph.coord_mask = coord_mask[..., 0]
         graph.residue_type = torch.tensor(
