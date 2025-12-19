@@ -411,6 +411,7 @@ class PDBDataset(Dataset):
         in_memory: bool = False,
         file_names: Optional[List[str]] = None,
         num_workers: int = 64,
+        min_length: Optional[int] = None,
     ):
         """
         Args:
@@ -439,6 +440,7 @@ class PDBDataset(Dataset):
         self.file_names = file_names
         self.num_workers = num_workers
         self.transform = transform
+        self.min_length = min_length
         self.sequence_id_to_idx = None
 
         if self.in_memory:
@@ -480,6 +482,14 @@ class PDBDataset(Dataset):
         if not hasattr(graph, 'coord_mask') or graph.coord_mask is None:
             logger.warning(f"Sample {idx} (file: {fname}) has no coord_mask attribute, skipping and trying next sample.")
             return self.__getitem__((idx + 1) % len(self))
+
+        if self.min_length:
+            nres = int(graph.coord_mask.any(dim=-1).sum().item())
+            if nres < self.min_length:
+                logger.warning(
+                    f"Sample {idx} (file: {fname}) effective length {nres} < min_length {self.min_length}, skipping."
+                )
+                return self.__getitem__((idx + 1) % len(self))
 
         # reorder coords to be in OpenFold and not PDB convention
         graph.coords = graph.coords[:, PDB_TO_OPENFOLD_INDEX_TENSOR, :]
@@ -587,6 +597,8 @@ class PDBLightningDataModule(BaseLightningDataModule):
         self.dfs_splits = None
         self.clusterid_to_seqid_mappings = None
         self.file_names = None
+        self.min_length = dataselector.min_length if dataselector else None
+        self.pre_filter = self._attach_length_filter(self.pre_filter)
 
     def prepare_data(self):
         if self.dataselector:
@@ -655,6 +667,26 @@ class PDBLightningDataModule(BaseLightningDataModule):
         rank_zero_info(f"Found {len(df_data)} {self.format} files in {data_dir}")
         
         return df_data
+
+    def _attach_length_filter(self, base_filter: Optional[Callable]) -> Optional[Callable]:
+        """Combine existing pre_filter with an effective-length check using coord_mask."""
+        if self.min_length is None:
+            return base_filter
+
+        min_len = self.min_length
+
+        def length_filter(graph):
+            nres = int(graph.coord_mask.any(dim=-1).sum().item())
+            return nres >= min_len
+
+        if base_filter:
+            def combined(graph):
+                if not length_filter(graph):
+                    return False
+                return base_filter(graph)
+            return combined
+
+        return length_filter
 
     def _get_file_identifier(self, ds):
         file_identifier = (
@@ -1073,4 +1105,5 @@ class PDBLightningDataModule(BaseLightningDataModule):
             in_memory=self.in_memory,
             file_names=file_names,
             num_workers=self.num_workers,
+            min_length=self.dataselector.min_length if self.dataselector else None,
         )

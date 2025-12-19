@@ -716,12 +716,22 @@ class ModelTrainerBase(L.LightningModule):
             fm_loss = self.compute_fm_loss(
                 x_1, x_1_pred, x_t, t, mask, log_prefix=log_prefix
             )  # [*]
+            if torch.isnan(torch.mean(fm_loss)):
+                for i in range(len(fm_loss)):
+                    if torch.isnan(fm_loss[i]):
+                        print(f"fm_loss is nan at step {self.global_step} for batch {batch_idx} for sample {i}: {batch['id'][i]}")
+                raise ValueError(f"fm_loss is nan at step {self.global_step} for batch {batch_idx}")
             train_loss = torch.mean(fm_loss)
         
         if self.cfg_exp.loss.use_aux_loss:
             auxiliary_loss = self.compute_auxiliary_loss(
                 x_1, x_1_pred, x_t, t, mask, nn_out=nn_out, log_prefix=log_prefix, batch=batch
             )  # [*] already includes loss weights
+            if torch.isnan(torch.mean(auxiliary_loss)):
+                for i in range(len(auxiliary_loss)):
+                    if torch.isnan(auxiliary_loss[i]):
+                        print(f"auxiliary_loss is nan at step {self.global_step} for batch {batch_idx} for sample {i}: {batch['id'][i]}")
+                raise ValueError(f"auxiliary_loss is nan at step {self.global_step} for batch {batch_idx}")
             train_loss = train_loss + torch.mean(auxiliary_loss)
 
         self.log(
@@ -818,7 +828,7 @@ class ModelTrainerBase(L.LightningModule):
                     else None,
                     mask=mask[0],
                     log_prefix=log_prefix,
-                    pair_logits=nn_out.get("pair_logits")[0],
+                    pair_logits=nn_out.get("pair_logits")[0] if "pair_logits" in nn_out else None,
                     residue_type=batch.get("residue_type")[0],
                     use_template_inference=(
                         getattr(self.nn, "predict_coords", True) is False

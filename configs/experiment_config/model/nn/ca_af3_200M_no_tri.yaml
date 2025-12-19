@@ -59,7 +59,7 @@ pair_repr_dim: 512
 # Newer stuff for exploration
 update_pair_repr: False  # whether to update pair representation, automatically overridden to False if `use_attn_pair_bias: False`
 update_pair_repr_every_n: 3  # Update the pair representation every n layers -> For 15 layers we get 5 pair updates (if update pair represnetation is true)
-use_tri_mult: True  # whether to use triangular multiplication layers in pair update, ignored if not updating pair representation
+use_tri_mult: False  # whether to use triangular multiplication layers in pair update, ignored if not updating pair representation
 
 num_registers: 10
 use_qkln: True
