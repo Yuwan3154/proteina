@@ -479,7 +479,6 @@ class ResidueTypeEmbeddingSeqFeat(Feature):
     def __init__(self, seq_emb_dim, **kwargs):
         super().__init__(dim=seq_emb_dim)
         self.embedding = torch.nn.Embedding(21, seq_emb_dim)
-        print(f"seq_emb_dim: {seq_emb_dim}")
 
     def forward(self, batch):
         seq = batch["residue_type"]  # [b, n]
@@ -495,7 +494,6 @@ class ResidueTypeEmbeddingPairFeat(Feature):
         super().__init__(dim=seq_emb_dim)
         self.embedding_1 = torch.nn.Embedding(21, seq_emb_dim)
         self.embedding_2 = torch.nn.Embedding(21, seq_emb_dim)
-        print(f"seq_emb_dim: {seq_emb_dim}")
 
     def forward(self, batch):
         seq = batch["residue_type"]  # [b, n]
@@ -908,7 +906,6 @@ class FeatureFactory(torch.nn.Module):
             features_out += self.residue_type_out(
                 self.residue_type_feat_creator(batch)
                 )
-            print(f"embedding residue type with output shape: {self.residue_type_out(self.residue_type_feat_creator(batch)).shape}")
         if self.use_cirpin_emb and "cirpin_emb_fallback" in batch:
             features_out += self.cirpin_out(
                 self.cirpin_feat_creator(batch)
