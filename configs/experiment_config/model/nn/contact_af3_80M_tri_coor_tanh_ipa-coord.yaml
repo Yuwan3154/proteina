@@ -2,7 +2,7 @@ name: contact_af3_80M_tri_coor_tanh_ipa-coord
 
 # Architecture parameters
 token_dim: 384
-nlayers: 10
+nlayers: 12
 nheads: 8
 residual_mha: True
 residual_transition: True
