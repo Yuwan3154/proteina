@@ -950,10 +950,22 @@ class ModelTrainerBase(L.LightningModule):
             # Save first sample as temporary PDB for logging
             atom37 = self.samples_to_atom37(x_1_pred, residue_type=residue_type).float().detach().cpu().numpy()
             aatype = residue_type.long().detach().cpu().numpy()
-            # Use explicit atom mask derived from residue types, not coordinate magnitudes.
-            # This prevents CA atoms at (0,0,0) (common early in training) from being dropped,
-            # which breaks WandB structure visualization.
-            atom37_mask = rc.RESTYPE_ATOM37_MASK[aatype] * mask.detach().cpu().numpy()[:, None]
+            # Choose an atom mask that matches what the model actually predicts:
+            # - CA-flow predicts CA only: mask only CA (avoid writing fake all-atom zeros)
+            # - Backbone mode predicts N/CA/C only: mask only N/CA/C
+            # - All-atom predictions: use residue-type atom existence mask
+            mask_np = mask.detach().cpu().numpy().astype(np.float32)
+            if x_1_pred.dim() == 3:
+                atom37_mask = np.zeros((aatype.shape[0], 37), dtype=np.float32)
+                atom37_mask[:, rc.atom_order["CA"]] = mask_np
+            elif x_1_pred.dim() == 4 and x_1_pred.shape[-2] == 3:
+                atom37_mask = np.zeros((aatype.shape[0], 37), dtype=np.float32)
+                atom37_mask[:, [rc.atom_order["N"], rc.atom_order["CA"], rc.atom_order["C"]]] = mask_np[:, None]
+            else:
+                # Use explicit atom mask derived from residue types, not coordinate magnitudes.
+                # This prevents CA atoms at (0,0,0) (common early in training) from being dropped,
+                # which breaks WandB structure visualization.
+                atom37_mask = rc.RESTYPE_ATOM37_MASK[aatype] * mask_np[:, None]
             with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False) as tmp_pdb:
                 temp_pdb_path = tmp_pdb.name
             try:

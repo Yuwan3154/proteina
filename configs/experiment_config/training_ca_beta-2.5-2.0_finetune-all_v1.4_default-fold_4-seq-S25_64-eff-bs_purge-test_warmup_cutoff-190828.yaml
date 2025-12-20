@@ -25,7 +25,6 @@ loss:
   num_dist_buckets: 64  # Number of buckets to discretize the pairwise distance
   max_dist_boundary: 1.0  # Given by nanometer
 
-
 defaults:
   - model: caflow  # caflow or frameflow
   - override model/nn: ca_af3_400M_tri
@@ -38,7 +37,6 @@ model:
     residue_type_emb_init_pair: True
     residue_type_emb_cond_pair: True
     seq_emb_dim: 4
-
 
 # Dataset params
 dataset: pdb_train_S25_max384_purge-test_cutoff-190828
@@ -54,9 +52,8 @@ training:
   mask_A_prob: 0.5
   mask_C_prob: 0.5
   fold_label_sample_ratio: [0.5, 0.1, 0.15, 0.25]   # Training proportion for [None, C, CA, CAT]. If specified, will override mask_{C,A,T}_prob  
-  mask_seq_proportion: 0.1
+  mask_seq_proportion: 0.15
   finetune_seq_cond_lora_only: False
-
 
 lora:
   use: False
@@ -65,11 +62,10 @@ lora:
   r: 0
   train_bias: "none"
 
-
 opt:
   lr: 0.0001
-  max_epochs: 100
-  accumulate_grad_batches: 64  # effective batch size = 1*1*64 = 64
+  max_epochs: 500
+  accumulate_grad_batches: 128  # effective batch size = 1*1*128 = 128
   val_check_interval: 1000  # Number of training batches after which we check validation loss
   skip_nan_grad: False  # Skip updates with nan gradient
   grad_and_weight_analysis: False  # Log some statistics of gradients and weights
@@ -77,7 +73,7 @@ opt:
   dist_backend: gloo  # For multi GPU training, applicable when using ddp strategy [nccl, gloo]
   # Learning rate warmup scheduler
   use_lr_warmup: True  # Enable learning rate warmup
-  warmup_steps: 1000  # Number of warmup steps (linear warmup from warmup_start_lr_ratio to 1.0)
+  warmup_steps: 3000  # Number of warmup steps (linear warmup from warmup_start_lr_ratio to 1.0)
   warmup_start_lr_ratio: 0.0  # Starting LR as ratio of target LR (0.0 means start from 0)
   lr_scheduler_type: "cosine"  # Scheduler after warmup: "constant", "linear_decay", or "cosine"
 
@@ -87,8 +83,8 @@ log:
   log_every_n_steps: 1  # How often to log metrics to wandb
   log_structure_every_n_steps: 1  # How often to log structure/contact map visualizations (0 = disabled)
   checkpoint: True  # whether to store checkpoints
-  checkpoint_every_n_steps: 1000  # How often we store a checkpoint, should be greater than val_check_interval above
-  last_ckpt_every_n_steps: 1000  # How often do we update our last ckpt, needed for requeuing without losing progress
+  checkpoint_every_n_steps: 500  # How often we store a checkpoint, should be greater than val_check_interval above
+  last_ckpt_every_n_steps: 500  # How often do we update our last ckpt, needed for requeuing without losing progress
 
 validation_sampling:
   dt: 0.005

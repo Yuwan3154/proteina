@@ -472,7 +472,13 @@ class PDBDataset(Dataset):
             else:
                 fname = f"{self.pdb_codes[idx]}.pt"
 
-            graph = torch.load(self.data_dir / "processed" / fname, weights_only=False)
+            path = self.data_dir / "processed" / fname
+            if not path.exists():
+                logger.warning(
+                    f"Sample {idx} (file: {fname}) is missing at {path}, skipping and trying next sample."
+                )
+                return self.__getitem__((idx + 1) % len(self))
+            graph = torch.load(path, weights_only=False)
 
         # Check if graph has coords attribute before accessing (defensive check for corrupted data)
         if not hasattr(graph, 'coords') or graph.coords is None:
