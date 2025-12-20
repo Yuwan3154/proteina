@@ -1,4 +1,4 @@
-run_name_: contact_50M_coor_tanh_logit-normal--1.0-1.0_default-fold_4-seq-S25_512-eff-bs_purge-test_warmup_cutoff-190828
+run_name_: contact_50M_coor_tanh_ipa-coord_logit-normal--2.0-1.0_default-fold_4-seq-S25_512-eff-bs_purge-test_warmup_cutoff-190828
 
 hardware:
   ncpus_per_task_train_: 16  # Number of CPUs per task during training
@@ -14,7 +14,7 @@ hardware:
 loss:
   t_distribution:
     name: logit-normal
-    p1: -1.0
+    p1: -2.0
     p2: 1.0
   loss_t_clamp: 0.9  # Used for loss stability in frameflow, 1. for no clamping
   use_aux_loss: True  # Whether to use auxiliary loss
@@ -30,7 +30,7 @@ loss:
 
 defaults:
   - model: contactflow  # caflow or contactflow
-  - override model/nn: contact_af3_50M_tri_coor_tanh
+  - override model/nn: contact_af3_50M_tri_coor_tanh_ipa-coord
   - _self_
 
 model:
@@ -56,10 +56,13 @@ training:
   mask_A_prob: 0.5
   mask_C_prob: 0.5
   fold_label_sample_ratio: [0.5, 0.1, 0.15, 0.25]   # Training proportion for [None, C, CA, CAT]. If specified, will override mask_{C,A,T}_prob  
-  mask_seq_proportion: 0.1
+  mask_seq_proportion: 0.15
   finetune_seq_cond_lora_only: False
   contact_map_coord_loss_weight: 1.0  # Weight for coordinate loss when contact_map_mode=True (contact map loss has weight 1.0)
-
+  # For predict_coords: "ipa" only. Controls which frames are used for FAPE.
+  # - predicted_frames: use StructureModule predicted backbone frames (OpenFold-style)
+  # - frames_from_predicted_N_CA_C: derive frames from predicted N/CA/C using Gram–Schmidt
+  ipa_fape_loss_frame: predicted_frames
 
 lora:
   use: False
