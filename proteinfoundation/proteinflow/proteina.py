@@ -287,10 +287,10 @@ class Proteina(ModelTrainerBase):
             Contact map flow matching loss per sample.
         """
         pair_mask = mask[..., :, None] * mask[..., None, :]  # [*, n, n]
-        npairs = torch.sum(pair_mask, dim=(-1, -2))  # [*]
+        npairs = torch.sum(pair_mask, dim=(-1, -2)) - torch.sum(mask, dim=-1) # [*]
 
         loss = torch.nn.functional.mse_loss(c_1_pred, c_1, reduction="none") * pair_mask
-        loss = torch.sum(loss, dim=(-1, -2)) / (npairs - nres + 1e-8)  # [*]
+        loss = torch.sum(loss, dim=(-1, -2)) / (npairs + 1e-8)  # [*]
 
         # Apply time-dependent weighting (same as coordinate loss)
         total_loss_w = 1.0 / ((1.0 - t) ** 2 + 1e-5)
