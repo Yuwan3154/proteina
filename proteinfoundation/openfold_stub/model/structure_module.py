@@ -352,7 +352,7 @@ class InvariantPointAttention(nn.Module):
         pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
         # [*, N_res, N_res]
         square_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
-        square_mask = self.inf * (square_mask - 1)
+        square_mask = self.inf * (~square_mask)
 
         # [*, H, N_res, N_res]
         pt_att = permute_final_dims(pt_att, (2, 0, 1))
@@ -758,44 +758,48 @@ class StructureModule(nn.Module):
         if not hasattr(self, "default_frames"):
             self.register_buffer(
                 "default_frames",
-                torch.tensor(
-                    restype_rigid_group_default_frame,
-                    dtype=float_dtype,
-                    device=device,
-                    requires_grad=False,
-                ),
+                torch.from_numpy(restype_rigid_group_default_frame).to(dtype=float_dtype, device=device),
+                # torch.tensor(
+                #     restype_rigid_group_default_frame,
+                #     dtype=float_dtype,
+                #     device=device,
+                #     requires_grad=False,
+                # ),
                 persistent=False,
             )
         if not hasattr(self, "group_idx"):
             self.register_buffer(
                 "group_idx",
-                torch.tensor(
-                    restype_atom14_to_rigid_group,
-                    device=device,
-                    requires_grad=False,
-                ),
+                torch.from_numpy(restype_atom14_to_rigid_group).to(dtype=int, device=device),
+                # torch.tensor(
+                #     restype_atom14_to_rigid_group,
+                #     device=device,
+                #     requires_grad=False,
+                # ),
                 persistent=False,
             )
         if not hasattr(self, "atom_mask"):
             self.register_buffer(
                 "atom_mask",
-                torch.tensor(
-                    restype_atom14_mask,
-                    dtype=float_dtype,
-                    device=device,
-                    requires_grad=False,
-                ),
+                torch.from_numpy(restype_atom14_mask).to(dtype=float_dtype, device=device),
+                # torch.tensor(
+                #     restype_atom14_mask,
+                #     dtype=float_dtype,
+                #     device=device,
+                #     requires_grad=False,
+                # ),
                 persistent=False,
             )
         if not hasattr(self, "lit_positions"):
             self.register_buffer(
                 "lit_positions",
-                torch.tensor(
-                    restype_atom14_rigid_group_positions,
-                    dtype=float_dtype,
-                    device=device,
-                    requires_grad=False,
-                ),
+                torch.from_numpy(restype_atom14_rigid_group_positions).to(dtype=float_dtype, device=device),
+                # torch.tensor(
+                #     restype_atom14_rigid_group_positions,
+                #     dtype=float_dtype,
+                #     device=device,
+                #     requires_grad=False,
+                # ),
                 persistent=False,
             )
 

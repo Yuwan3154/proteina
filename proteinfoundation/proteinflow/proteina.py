@@ -117,19 +117,29 @@ class Proteina(ModelTrainerBase):
         coords = batch["coords"]  # [b, n, atoms, 3]
         mask = batch["mask_dict"]["coords"][..., 0, 0]  # [b, n] boolean
         predict_coords_mode = getattr(self.nn, "predict_coords", None)
-        if self.contact_map_mode and predict_coords_mode == "ipa":
-            x_1 = coords  # [b, n, 37?, 3]
-        elif self.contact_map_mode and predict_coords_mode == "linear":
-            x_1 = coords[:, :, [0, 1, 2], :]  # backbone N, CA, C
+        if self.contact_map_mode:
+            if predict_coords_mode == "ipa":
+                x_1 = coords  # [b, n, 37?, 3]
+            elif predict_coords_mode == "linear":
+                x_1 = coords[:, :, [0, 1, 2], :]  # backbone N, CA, C
         else:
             x_1 = coords[:, :, 1, :]  # CA only
         if self.cfg_exp.model.augmentation.global_rotation:
-            # CAREFUL: If naug_rot is > 1 this increases "batch size"
-            x_1, mask = self.apply_random_rotation(
-                x_1, mask, naug=self.cfg_exp.model.augmentation.naug_rot
-            )
-        batch_shape = x_1.shape[:-2]
-        n = x_1.shape[-2]
+            if x_1.ndim == 3:
+                # CAREFUL: If naug_rot is > 1 this increases "batch size"
+                x_1, mask = self.apply_random_rotation(
+                    x_1, mask, naug=self.cfg_exp.model.augmentation.naug_rot
+                )
+            else:
+                # Skip rotation augmentation for atomized coordinates.
+                # (Random rotations here would require rotating all atoms consistently.)
+                pass
+        if x_1.dim() == 3:
+            batch_shape = x_1.shape[:-2]  # typically (b,)
+            n = x_1.shape[-2]
+        else:
+            batch_shape = x_1.shape[:-3]  # drop n and atom/coord dims, typically (b,)
+            n = x_1.shape[-3]  # length dimension for atomized coords
         return (
             ang_to_nm(x_1),
             mask,
@@ -327,10 +337,15 @@ class Proteina(ModelTrainerBase):
             Auxiliary loss.
         """
         bs = x_1.shape[0]
-        n = x_1.shape[1]
+        # Use CA coords even when x_1 is atomized (e.g., atom37)
+        if x_1.dim() == 4:
+            x_1_ca = x_1[..., 1, :]  # CA index
+        else:
+            x_1_ca = x_1
+        n = x_1_ca.shape[1]
         nres = mask.sum(-1)  # [*]
 
-        gt_ca_coors = x_1 * mask[..., None]  # [*, n, 3]
+        gt_ca_coors = x_1_ca * mask[..., None]  # [*, n, 3]
         pair_mask = mask[..., None, :] * mask[..., None]  # [*, n, n]
 
         # Pairwise distances from ground truth (always needed for distogram)
@@ -342,7 +357,18 @@ class Proteina(ModelTrainerBase):
         # Compute predicted pairwise distances only if x_1_pred is available
         if self.contact_map_mode:
             if "coords_pred" in nn_out:
-                pred_ca_coors = nn_out.get("coords_pred", None) * mask[..., None]  # [*, n, 3]
+                pred_coords_raw = nn_out.get("coords_pred", None)
+                if pred_coords_raw is not None and pred_coords_raw.dim() == 4:
+                    pred_ca_coors = pred_coords_raw[..., 1, :] * mask[..., None]  # CA
+                else:
+                    pred_ca_coors = pred_coords_raw * mask[..., None] if pred_coords_raw is not None else None
+                if pred_ca_coors is not None and (torch.isnan(pred_ca_coors).any() or torch.isinf(pred_ca_coors).any()):
+                    print(
+                        f"[aux_debug_coords_pred] nan={torch.isnan(pred_ca_coors).any().item()} "
+                        f"inf={torch.isinf(pred_ca_coors).any().item()} "
+                        f"min={pred_ca_coors.min().item()} max={pred_ca_coors.max().item()}"
+                    )
+
                 pred_pair_dists = torch.linalg.norm(
                     pred_ca_coors[:, :, None, :] - pred_ca_coors[:, None, :, :], dim=-1
                 )  # [*, n, n]
@@ -350,7 +376,11 @@ class Proteina(ModelTrainerBase):
             else:
                 pred_pair_dists = None
         else:
-            pred_ca_coors = x_1_pred * mask[..., None]  # [*, n, 3]
+            pred_ca_coors_raw = x_1_pred
+            if pred_ca_coors_raw is not None and pred_ca_coors_raw.dim() == 4:
+                pred_ca_coors = pred_ca_coors_raw[..., 1, :] * mask[..., None]
+            else:
+                pred_ca_coors = pred_ca_coors_raw * mask[..., None]
             pred_pair_dists = torch.linalg.norm(
                 pred_ca_coors[:, :, None, :] - pred_ca_coors[:, None, :, :], dim=-1
             )  # [*, n, n]
@@ -378,6 +408,12 @@ class Proteina(ModelTrainerBase):
         num_dist_buckets = self.cfg_exp.loss.get("num_dist_buckets", 64)
         pair_logits = nn_out.get("pair_logits", None)
         if num_dist_buckets and pair_logits is not None:
+            if torch.isnan(pair_logits).any() or torch.isinf(pair_logits).any():
+                print(
+                    f"[aux_debug] pair_logits nan/inf: nan={torch.isnan(pair_logits).any().item()} "
+                    f"posinf={(pair_logits == float('inf')).any().item()} "
+                    f"neginf={(pair_logits == float('-inf')).any().item()}"
+                )
             assert (
                 num_dist_buckets == pair_logits.shape[-1]
             ), "The number of distance buckets should be equal with the output dim of pair pred head"
@@ -397,10 +433,10 @@ class Proteina(ModelTrainerBase):
             )  # [*, n, n], each value in [0, num_dist_buckets)
 
             # Distogram loss
-            pair_logits = pair_logits.view(bs * n * n, num_dist_buckets)
-            gt_pair_dist_bucket = gt_pair_dist_bucket.view(bs * n * n)
+            pair_logits_flat = pair_logits.view(bs * n * n, num_dist_buckets)
+            gt_pair_dist_bucket_flat = gt_pair_dist_bucket.view(bs * n * n)
             distogram_loss = torch.nn.functional.cross_entropy(
-                pair_logits, gt_pair_dist_bucket, reduction="none"
+                pair_logits_flat, gt_pair_dist_bucket_flat, reduction="none"
             )  # [bs * n * n]
             distogram_loss = distogram_loss.view(bs, n, n)
             distogram_loss = torch.sum(distogram_loss * pair_mask, dim=(-1, -2))  # [bs]
@@ -409,6 +445,25 @@ class Proteina(ModelTrainerBase):
             )  # [bs]
         else:
             distogram_loss = dist_mat_loss * 0
+
+        # Debug prints to pinpoint NaNs in aux loss
+        if torch.isnan(torch.mean(dist_mat_loss)):
+            print(
+                f"[aux_debug] dist_mat_loss nan: "
+                f"gt_pair_dists_nan={torch.isnan(gt_pair_dists).any().item()} "
+                f"pred_pair_dists_nan={(pred_pair_dists is not None and torch.isnan(pred_pair_dists).any().item())} "
+                f"pred_pair_dists_inf={(pred_pair_dists is not None and torch.isinf(pred_pair_dists).any().item())} "
+                f"total_pair_mask_sum={(total_pair_mask.sum(-1).sum(-1)).detach().cpu().tolist()}"
+            )
+        if torch.isnan(torch.mean(distogram_loss)):
+            print(
+                f"[aux_debug] distogram_loss nan: "
+                f"pair_logits_nan={torch.isnan(pair_logits).any().item() if pair_logits is not None else 'None'} "
+                f"pair_logits_inf={torch.isinf(pair_logits).any().item() if pair_logits is not None else 'None'} "
+                f"gt_pair_dists_nan={torch.isnan(gt_pair_dists).any().item()} "
+                f"gt_pair_dists_inf={torch.isinf(gt_pair_dists).any().item()} "
+                f"total_pair_mask_sum={(total_pair_mask.sum(-1).sum(-1)).detach().cpu().tolist()}"
+            )
 
         auxiliary_loss = (
             distogram_loss

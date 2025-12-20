@@ -18,7 +18,7 @@ import tempfile
 
 from abc import abstractmethod
 from functools import partial
-from typing import Dict, List, Literal
+from typing import Dict, List, Literal, Optional
 
 import lightning as L
 import matplotlib.pyplot as plt
@@ -536,11 +536,20 @@ class ModelTrainerBase(L.LightningModule):
         contact_map_mode = getattr(self, "contact_map_mode", False)
         predict_coords = getattr(self.nn, "predict_coords", True)
 
+        # Ensure x_1_pred is always defined for downstream auxiliary loss calls
+        x_1_pred = None
+
         if contact_map_mode:
             # Contact map diffusion mode:
             # - Diffuse ONLY contact map
             # - Coordinates: direct prediction with FAPE loss (no noising)
             c_1 = self.extract_clean_contact_map(batch, mask)
+            if torch.isnan(c_1).any() or torch.isinf(c_1).any():
+                print(
+                    f"[contact_map_debug] c_1 nan={torch.isnan(c_1).any().item()} "
+                    f"inf={torch.isinf(c_1).any().item()} "
+                    f"min={c_1.min().item()} max={c_1.max().item()}"
+                )
             c_0 = self.fm.sample_reference(
                 n=n,
                 shape=batch_shape,
@@ -549,9 +558,21 @@ class ModelTrainerBase(L.LightningModule):
                 mask=mask,
                 modality="contact_map",
             )
+            if torch.isnan(c_0).any() or torch.isinf(c_0).any():
+                print(
+                    f"[contact_map_debug] c_0 nan={torch.isnan(c_0).any().item()} "
+                    f"inf={torch.isinf(c_0).any().item()} "
+                    f"min={c_0.min().item()} max={c_0.max().item()}"
+                )
             c_t = self.fm.interpolate(
                 c_0, c_1, t, mask=mask, modality="contact_map"
             )
+            if torch.isnan(c_t).any() or torch.isinf(c_t).any():
+                print(
+                    f"[contact_map_debug] c_t nan={torch.isnan(c_t).any().item()} "
+                    f"inf={torch.isinf(c_t).any().item()} "
+                    f"min={c_t.min().item()} max={c_t.max().item()}"
+                )
             batch["contact_map_t"] = c_t
             # x_t is a placeholder only (not used for diffusion in this mode)
             x_t = torch.zeros_like(x_1)
@@ -607,6 +628,12 @@ class ModelTrainerBase(L.LightningModule):
         if self.cfg_exp.training.seq_cond:
             # Get the sequence from the batch
             seq = batch["residue_type"]
+            # Preserve the unmasked sequence for logging / IPA geometry (do this before masking)
+            if "residue_type_unmasked" not in batch:
+                residue_type_unmasked = seq.clone()
+                residue_type_unmasked[residue_type_unmasked == -1] = 20
+                batch["residue_type_unmasked"] = residue_type_unmasked
+
             seq[seq == -1] = 20
             # Mask the sequence
             for i in range(len(seq)):
@@ -705,8 +732,32 @@ class ModelTrainerBase(L.LightningModule):
 
             if predict_coords:
                 x_1_pred = nn_out["coords_pred"]
+                pred_frames_tensor7 = None
+                if getattr(self.nn, "predict_coords", None) == "ipa":
+                    ipa_fape_loss_frame = self.cfg_exp.training.get(
+                        "ipa_fape_loss_frame", "predicted_frames"
+                    )
+                    if ipa_fape_loss_frame == "predicted_frames":
+                        pred_frames_tensor7 = nn_out.get("frames_pred", None)
+                        if pred_frames_tensor7 is None:
+                            raise ValueError(
+                                "ipa_fape_loss_frame='predicted_frames' requires "
+                                "nn_out['frames_pred'] from the model forward."
+                            )
+                    elif ipa_fape_loss_frame == "frames_from_predicted_N_CA_C":
+                        pred_frames_tensor7 = None
+                    else:
+                        raise ValueError(
+                            "ipa_fape_loss_frame must be one of "
+                            "('predicted_frames', 'frames_from_predicted_N_CA_C'), "
+                            f"got {ipa_fape_loss_frame!r}"
+                        )
                 coord_loss = self.compute_fape_loss(
-                    x_1, x_1_pred, mask, log_prefix=log_prefix
+                    x_1,
+                    x_1_pred,
+                    mask,
+                    log_prefix=log_prefix,
+                    pred_frames_tensor7=pred_frames_tensor7,
                 )
                 coord_weight = getattr(
                     self, "contact_map_coord_loss_weight", 0.0
@@ -826,14 +877,21 @@ class ModelTrainerBase(L.LightningModule):
             if should_log and not already_logged:
                 self._last_structure_log_step[log_prefix] = log_id
                 self._log_structure_visualization(
-                    x_1_pred=x_1_pred,
+                    # Log only the first sample. Passing the full batch here makes
+                    # `write_prot_to_pdb` treat batch dim as MODEL index, producing a
+                    # multi-model PDB with mismatched aatype/mask (confusing in WandB).
+                    x_1_pred=x_1_pred[:1] if x_1_pred is not None else None,
                     contact_map_pred=self._contact_map_to_viz(self._nn_out_to_c_clean(nn_out, batch)[0])
                     if "contact_map_pred" in nn_out is not None
                     else None,
                     mask=mask[0],
                     log_prefix=log_prefix,
                     pair_logits=nn_out.get("pair_logits")[0] if "pair_logits" in nn_out else None,
-                    residue_type=batch.get("residue_type")[0],
+                    residue_type=(
+                        batch.get("residue_type_unmasked", batch.get("residue_type"))[0]
+                        if batch.get("residue_type_unmasked", batch.get("residue_type")) is not None
+                        else None
+                    ),
                     use_template_inference=(
                         getattr(self.nn, "predict_coords", True) is False
                         and getattr(self, "contact_map_mode", False)
@@ -857,9 +915,10 @@ class ModelTrainerBase(L.LightningModule):
         Logs predicted structure (as temporary PDB) and contact map visualizations.
 
         Args:
-            x_1_pred: Predicted coordinates, shape [b, n, 3]
-            contact_map_pred: Predicted contact map, shape [b, n, n] or None
-            mask: Boolean mask, shape [b, n]
+            x_1_pred: Predicted coordinates, shape [1, n, 3]
+            contact_map_pred: Predicted contact map, shape [n, n] or None
+            mask: Boolean mask, shape [n]
+            residue_type: Residue type, shape [n]
             log_prefix: Prefix for log names ("train" or "validation_loss")
         """
         if (
@@ -890,10 +949,21 @@ class ModelTrainerBase(L.LightningModule):
             # Save first sample as temporary PDB for logging
             atom37 = self.samples_to_atom37(x_1_pred, residue_type=residue_type).float().detach().cpu().numpy()
             aatype = residue_type.long().detach().cpu().numpy()
+            # Use explicit atom mask derived from residue types, not coordinate magnitudes.
+            # This prevents CA atoms at (0,0,0) (common early in training) from being dropped,
+            # which breaks WandB structure visualization.
+            atom37_mask = rc.RESTYPE_ATOM37_MASK[aatype] * mask.detach().cpu().numpy()[:, None]
             with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False) as tmp_pdb:
                 temp_pdb_path = tmp_pdb.name
             try:
-                write_prot_to_pdb(atom37, temp_pdb_path, aatype=aatype, overwrite=True, no_indexing=True)
+                write_prot_to_pdb(
+                    atom37,
+                    temp_pdb_path,
+                    aatype=aatype,
+                    atom37_mask=atom37_mask,
+                    overwrite=True,
+                    no_indexing=True,
+                )
                 self.logger.experiment.log(
                     {
                         f"{log_prefix}/structure": wandb.Molecule(temp_pdb_path),
@@ -957,6 +1027,7 @@ class ModelTrainerBase(L.LightningModule):
         x_1_pred,
         mask,
         log_prefix: str = None,
+        pred_frames_tensor7: Optional[torch.Tensor] = None,
     ):
         """
         Computes FAPE loss. Supports CA-only, backbone (N,CA,C), and all-atom inputs.
@@ -976,20 +1047,41 @@ class ModelTrainerBase(L.LightningModule):
         frames_mask = mask.float()
 
         if x_1_pred.dim() == 4:
-            # Backbone or all-atom: build frames from N, CA, C and flatten atoms for positions
-            n_pred = x_1_pred[..., 0, :]
-            ca_pred = x_1_pred[..., 1, :]
-            c_pred = x_1_pred[..., 2, :]
             n_true = x_1[..., 0, :]
             ca_true = x_1[..., 1, :]
             c_true = x_1[..., 2, :]
 
-            pred_frames = Rigid.make_transform_from_reference(n_pred, ca_pred, c_pred)
-            target_frames = Rigid.make_transform_from_reference(n_true, ca_true, c_true)
+            # Target frames always from ground truth backbone (stable Gram–Schmidt, AF2 Alg. 21)
+            target_frames = Rigid.from_3_points(
+                p_neg_x_axis=c_true, origin=ca_true, p_xy_plane=n_true, eps=1e-8
+            )
+
+            # Predicted frames:
+            # - If pred_frames_tensor7 is provided (StructureModule / IPA path), use those (OpenFold-style)
+            # - Otherwise derive frames from predicted N/CA/C via Gram–Schmidt
+            if pred_frames_tensor7 is not None:
+                if pred_frames_tensor7.shape[-1] != 7:
+                    raise ValueError(
+                        f"pred_frames_tensor7 must have last dim 7, got shape {pred_frames_tensor7.shape}"
+                    )
+                pred_frames = Rigid.from_tensor_7(pred_frames_tensor7)
+            else:
+                # NOTE: This assumes the atom dimension is in atom37/atom14-like order where
+                # N=0, CA=1, C=2 for atom37, and that the ground-truth uses the same ordering.
+                n_pred = x_1_pred[..., 0, :]
+                ca_pred = x_1_pred[..., 1, :]
+                c_pred = x_1_pred[..., 2, :]
+                pred_frames = Rigid.from_3_points(
+                    p_neg_x_axis=c_pred, origin=ca_pred, p_xy_plane=n_pred, eps=1e-8
+                )
 
             pred_positions = x_1_pred.reshape(x_1_pred.shape[0], -1, 3)
             target_positions = x_1.reshape(x_1.shape[0], -1, 3)
-            positions_mask = mask[..., None].expand(-1, -1, x_1_pred.shape[-2]).reshape(x_1_pred.shape[0], -1)
+            positions_mask = (
+                mask[..., None]
+                .expand(-1, -1, x_1_pred.shape[-2])
+                .reshape(x_1_pred.shape[0], -1)
+            )
         elif x_1_pred.dim() == 3:
             # CA-only fallback: identity frames
             rot = torch.eye(3, device=x_1.device, dtype=x_1.dtype)

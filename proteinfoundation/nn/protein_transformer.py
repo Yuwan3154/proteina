@@ -502,9 +502,11 @@ class PairReprUpdate(torch.nn.Module):
                     self.tri_mult_in, *(pair_rep, pair_mask * 1.0), use_reentrant=False
                 )
                 pair_rep = self._apply_mask(pair_rep, pair_mask)  # [b, n, n, pair_dim]
-        pair_rep = pair_rep + checkpoint(
-            self.transition_out, *(pair_rep, pair_mask * 1.0), use_reentrant=False
-        )
+        # NOTE: Avoid non-reentrant checkpointing here. PairTransition has shown
+        # unstable saved-tensor metadata under checkpointing, leading to
+        # CheckpointError in backward. This transition is relatively cheap
+        # vs the triangle multiplicative updates, so we run it without ckpt.
+        pair_rep = pair_rep + self.transition_out(pair_rep, pair_mask * 1.0)
         pair_rep = self._apply_mask(pair_rep, pair_mask)  # [b, n, n, pair_dim]
         return pair_rep
 
@@ -781,11 +783,23 @@ class ProteinTransformerAF3(torch.nn.Module):
             self.coors_3d_decoder = StructureModule(**self.structure_module_cfg)
             self.register_buffer(
                 "restype_atom14_to_atom37",
-                torch.tensor(rc.RESTYPE_ATOM14_TO_ATOM37, dtype=torch.long),
+                torch.from_numpy(rc.RESTYPE_ATOM14_TO_ATOM37).to(dtype=torch.long),
+                # torch.tensor(rc.RESTYPE_ATOM14_TO_ATOM37, dtype=torch.long),
             )
             self.register_buffer(
                 "restype_atom14_mask",
-                torch.tensor(rc.RESTYPE_ATOM14_MASK, dtype=torch.float32),
+                torch.from_numpy(rc.RESTYPE_ATOM14_MASK).to(dtype=torch.float32),
+                # torch.tensor(rc.RESTYPE_ATOM14_MASK, dtype=torch.float32),
+            )
+            # Use atom37<-atom14 gather mapping to avoid scatter overwriting N/CA/C with
+            # dummy indices (OpenFold uses gather-style conversion for this reason).
+            self.register_buffer(
+                "restype_atom37_to_atom14",
+                torch.from_numpy(rc.RESTYPE_ATOM37_TO_ATOM14).to(dtype=torch.long),
+            )
+            self.register_buffer(
+                "restype_atom37_mask",
+                torch.from_numpy(rc.RESTYPE_ATOM37_MASK).to(dtype=torch.float32),
             )
         elif self.predict_coords == "linear":
             self.coors_3d_decoder = torch.nn.Sequential(
@@ -904,9 +918,33 @@ class ProteinTransformerAF3(torch.nn.Module):
             contact_map_embed = self.linear_contact_embed(contact_map) * pair_mask[..., None] # [b, n, n, pair_repr_dim]
             pair_f_repr = self.pair_repr_builder(batch_nn)  # [b, n, n, pair_repr_dim]
             pair_rep = (contact_map_embed + pair_f_repr) * pair_mask[..., None]  # [b, n, n, pair_repr_dim]
+            if torch.isnan(contact_map_embed).any() or torch.isinf(contact_map_embed).any():
+                print(
+                    f"[pair_init_debug] contact_map_embed nan={torch.isnan(contact_map_embed).any().item()} "
+                    f"inf={torch.isinf(contact_map_embed).any().item()} "
+                    f"min={contact_map_embed.min().item()} max={contact_map_embed.max().item()}"
+                )
+            if torch.isnan(pair_f_repr).any() or torch.isinf(pair_f_repr).any():
+                print(
+                    f"[pair_init_debug] pair_f_repr nan={torch.isnan(pair_f_repr).any().item()} "
+                    f"inf={torch.isinf(pair_f_repr).any().item()} "
+                    f"min={pair_f_repr.min().item()} max={pair_f_repr.max().item()}"
+                )
+            if torch.isnan(pair_rep).any() or torch.isinf(pair_rep).any():
+                print(
+                    f"[pair_init_debug] pair_rep nan={torch.isnan(pair_rep).any().item()} "
+                    f"inf={torch.isinf(pair_rep).any().item()} "
+                    f"min={pair_rep.min().item()} max={pair_rep.max().item()}"
+                )
 
             # Sequence representation
             seqs = self.init_repr_factory(batch_nn) * mask[..., None]  # [b, n, token_dim]
+            if torch.isnan(seqs).any() or torch.isinf(seqs).any():
+                print(
+                    f"[seqs_init_debug] nan={torch.isnan(seqs).any().item()} "
+                    f"inf={torch.isinf(seqs).any().item()} "
+                    f"min={seqs.min().item()} max={seqs.max().item()}"
+                )
         else:
             coors_3d = batch_nn["x_t"] * mask[..., None]  # [b, n, 3]
             coors_embed = (
@@ -922,6 +960,15 @@ class ProteinTransformerAF3(torch.nn.Module):
 
         # Apply registers
         seqs, pair_rep, mask, c = self._extend_w_registers(seqs, pair_rep, mask, c)
+        if torch.isnan(seqs).any() or torch.isinf(seqs).any() or torch.isnan(pair_rep).any() or torch.isinf(pair_rep).any():
+            print(
+                f"[after_extend_debug] seqs_nan={torch.isnan(seqs).any().item()} "
+                f"seqs_inf={torch.isinf(seqs).any().item()} "
+                f"seqs_min={seqs.min().item()} seqs_max={seqs.max().item()} "
+                f"pair_nan={torch.isnan(pair_rep).any().item()} "
+                f"pair_inf={torch.isinf(pair_rep).any().item()} "
+                f"pair_min={pair_rep.min().item()} pair_max={pair_rep.max().item()}"
+            )
 
         # Run trunk
         for i in range(self.nlayers):
@@ -935,12 +982,27 @@ class ProteinTransformerAF3(torch.nn.Module):
                         pair_rep = self.pair_update_layers[i](
                             seqs, pair_rep, mask
                         )  # [b, n, n, pair_dim]
+                if torch.isnan(seqs).any() or torch.isinf(seqs).any() or torch.isnan(pair_rep).any() or torch.isinf(pair_rep).any():
+                    print(
+                        f"[trunk_debug_layer{i}] seqs_nan={torch.isnan(seqs).any().item()} "
+                        f"seqs_inf={torch.isinf(seqs).any().item()} "
+                        f"seqs_min={seqs.min().item()} seqs_max={seqs.max().item()} "
+                        f"pair_nan={torch.isnan(pair_rep).any().item()} "
+                        f"pair_inf={torch.isinf(pair_rep).any().item()} "
+                        f"pair_min={pair_rep.min().item()} pair_max={pair_rep.max().item()}"
+                    )
 
         # Undo registers
         seqs, pair_rep, mask = self._undo_registers(seqs, pair_rep, mask)
         
         # Symmetrize pair representation
         pair_rep = (pair_rep + pair_rep.transpose(-2, -3)) / 2.0
+        if torch.isnan(pair_rep).any() or torch.isinf(pair_rep).any():
+            print(
+                f"[pair_rep_sym_debug] nan={torch.isnan(pair_rep).any().item()} "
+                f"inf={torch.isinf(pair_rep).any().item()} "
+                f"min={pair_rep.min().item()} max={pair_rep.max().item()}"
+            )
 
         nn_out = {}
         coords_pred = None
@@ -948,10 +1010,21 @@ class ProteinTransformerAF3(torch.nn.Module):
             coords_pred = self.coors_3d_decoder(seqs) * mask[..., None]  # [b, n, 3]
             nn_out["coords_pred"] = coords_pred
         elif self.contact_map_mode and self.predict_coords == "ipa":
-            aatype = batch_nn.get("residue_type", None)
+            # Use unmasked residue types for IPA geometry if provided (masked residue_type
+            # is still used for sequence-conditioning embeddings).
+            aatype = batch_nn.get("residue_type_unmasked", batch_nn.get("residue_type", None))
             if aatype is None:
                 raise ValueError(
                     "residue_type is required in batch for IPA coordinate prediction."
+                )
+            if torch.isnan(seqs).any() or torch.isinf(seqs).any() or torch.isnan(pair_rep).any() or torch.isinf(pair_rep).any():
+                print(
+                    f"[ipa_input_debug] seqs_nan={torch.isnan(seqs).any().item()} "
+                    f"seqs_inf={torch.isinf(seqs).any().item()} "
+                    f"seqs_min={seqs.min().item()} seqs_max={seqs.max().item()} "
+                    f"pair_nan={torch.isnan(pair_rep).any().item()} "
+                    f"pair_inf={torch.isinf(pair_rep).any().item()} "
+                    f"pair_min={pair_rep.min().item()} pair_max={pair_rep.max().item()}"
                 )
             struct_out = self.coors_3d_decoder(
                 {"single": seqs, "pair": pair_rep},
@@ -960,17 +1033,40 @@ class ProteinTransformerAF3(torch.nn.Module):
                 inplace_safe=False,
                 _offload_inference=False,
             )
+            # Predicted backbone frames from the StructureModule (OpenFold-style).
+            frames7 = (
+                struct_out["frames"][-1]
+                if struct_out["frames"].dim() == 4
+                else struct_out["frames"]
+            )  # [b, n, 7]
             atom14 = struct_out["positions"][-1] if struct_out["positions"].dim() == 5 else struct_out["positions"]
+            if torch.isnan(atom14).any() or torch.isinf(atom14).any():
+                print(
+                    f"[ipa_pos_debug] nan={torch.isnan(atom14).any().item()} "
+                    f"inf={torch.isinf(atom14).any().item()} "
+                    f"min={atom14.min().item()} max={atom14.max().item()}"
+                )
             atom14 = atom14 * mask[..., None, None]
-            aatype_safe = torch.clamp(aatype, min=0, max=self.restype_atom14_to_atom37.shape[0] - 1)
-            residx_atom14_to_atom37 = self.restype_atom14_to_atom37[aatype_safe]
-            atom14_mask = self.restype_atom14_mask[aatype_safe] * mask[..., None]
-            bsz, n_res, _, _ = atom14.shape
-            atom37 = atom14.new_zeros((bsz, n_res, 37, 3))
-            scatter_idx = residx_atom14_to_atom37[..., None].expand(-1, -1, -1, 3)
-            atom37.scatter_(2, scatter_idx, atom14 * atom14_mask[..., None])
-            coords_pred = atom37
+            # Convert atom14 -> atom37 safely via gather (scatter is unsafe because
+            # rc.RESTYPE_ATOM14_TO_ATOM37 uses 0 as a dummy index for missing atoms,
+            # which would overwrite the true N atom at index 0).
+            aatype_safe = torch.clamp(
+                aatype,
+                min=0,
+                max=self.restype_atom37_to_atom14.shape[0] - 1,
+            )
+            residx_atom37_to_atom14 = self.restype_atom37_to_atom14[aatype_safe]  # [b, n, 37]
+            atom37 = atom14.gather(
+                2, residx_atom37_to_atom14[..., None].expand(-1, -1, -1, 3)
+            )  # [b, n, 37, 3]
+            atom37_mask = self.restype_atom37_mask[aatype_safe] * mask[..., None]  # [b, n, 37]
+            atom37 = atom37 * atom37_mask[..., None]
+            # Convert Å -> nm to match the rest of the training pipeline.
+            coords_pred = atom37 / 10.0
             nn_out["coords_pred"] = coords_pred
+            # Convert frame translations Å -> nm (quaternions unchanged).
+            frame_scale = frames7.new_tensor([1.0, 1.0, 1.0, 1.0, 0.1, 0.1, 0.1])
+            nn_out["frames_pred"] = frames7 * frame_scale
         elif self.contact_map_mode and self.predict_coords == "linear":
             raw = self.coors_3d_decoder(seqs)  # [b, n, 9]
             coords_pred = raw.view(raw.shape[0], raw.shape[1], 3, 3)
@@ -979,6 +1075,14 @@ class ProteinTransformerAF3(torch.nn.Module):
 
         if self.update_pair_repr and self.num_buckets_predict_pair is not None:
             pair_logits = self.pair_head_prediction(pair_rep)
+            if torch.isnan(pair_logits).any() or torch.isinf(pair_logits).any():
+                print(
+                    f"[pair_logits_debug] nan={torch.isnan(pair_logits).any().item()} "
+                    f"inf={torch.isinf(pair_logits).any().item()} "
+                    f"pair_rep_nan={torch.isnan(pair_rep).any().item()} "
+                    f"pair_rep_inf={torch.isinf(pair_rep).any().item()} "
+                    f"pair_rep_min={pair_rep.min().item()} pair_rep_max={pair_rep.max().item()}"
+                )
             if coords_pred is not None:
                 coords_pred = coords_pred + torch.mean(pair_logits) * 0.0
                 coords_pred = coords_pred * (mask[..., None] if coords_pred.dim() == 3 else mask[..., None, None])

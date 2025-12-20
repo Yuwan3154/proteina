@@ -45,12 +45,20 @@ class PairTransition(nn.Module):
         self.linear_2 = Linear(self.n * self.c_z, c_z, init="final")
 
     def _transition(self, z, mask):
-        # [*, N_res, N_res, C_hidden]
+        # NOTE: Explicitly flatten/unflatten around the MLP.
+        # This makes activation checkpointing (use_reentrant=False) stable by ensuring
+        # recomputation saves tensors with identical metadata (shape/dtype), regardless
+        # of implicit flattening behavior inside torch.nn.Linear on 4D inputs.
+        orig_shape = z.shape  # [*, N_res, N_res, C_z]
+        z = z.reshape(-1, orig_shape[-1])  # [prod(*,N_res,N_res), C_z]
+
+        # [prod, C_hidden]
         z = self.linear_1(z)
         z = self.relu(z)
 
-        # [*, N_res, N_res, C_z]
-        z = self.linear_2(z) * mask
+        # [prod, C_z]
+        z = self.linear_2(z)
+        z = z.view(orig_shape) * mask
 
         return z
 

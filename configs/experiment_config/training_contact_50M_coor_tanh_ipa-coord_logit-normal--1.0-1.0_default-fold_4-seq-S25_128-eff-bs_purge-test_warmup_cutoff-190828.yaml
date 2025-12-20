@@ -59,6 +59,10 @@ training:
   mask_seq_proportion: 0.1
   finetune_seq_cond_lora_only: False
   contact_map_coord_loss_weight: 0.5  # Weight for coordinate loss when contact_map_mode=True (contact map loss has weight 1.0)
+  # For predict_coords: "ipa" only. Controls which frames are used for FAPE.
+  # - predicted_frames: use StructureModule predicted backbone frames (OpenFold-style)
+  # - frames_from_predicted_N_CA_C: derive frames from predicted N/CA/C using Gram–Schmidt
+  ipa_fape_loss_frame: predicted_frames
 
 
 lora:

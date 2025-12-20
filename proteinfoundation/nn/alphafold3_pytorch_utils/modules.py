@@ -116,7 +116,16 @@ class Transition(torch.nn.Module):
         Returns:
             Updated sequence representation, shape [b, n, dim]
         """
+        # NOTE: We explicitly flatten to 2D before the MLP.
+        # This makes activation checkpointing (use_reentrant=False) stable by ensuring
+        # recomputation saves tensors with identical metadata (shape/dtype), regardless
+        # of input contiguity / implicit flattening inside torch.nn.Linear.
+        orig_shape = x.shape
+        x = x.reshape(-1, orig_shape[-1])
+
         if self.use_layer_norm:
             x = self.ln(x)
+
         x = self.linear_out(self.swish_linear(x))
+        x = x.view(orig_shape)
         return x * mask[..., None]

@@ -10,6 +10,8 @@
 
 
 import math
+import json
+import time
 from typing import Callable, Dict, List, Literal, Optional, Tuple
 
 import torch
@@ -51,10 +53,18 @@ class _CoordinateFlowMatcher:
             Centered x = x - mean(x, dim=-2), shape [*, n, 3].
         """
         if mask is None:
-            x = x - torch.mean(x, dim=-2, keepdim=True)
-        else:
-            x = (x - mean_w_mask(x, mask, keepdim=True)) * mask[..., None]
-        return x
+            return x - torch.mean(x, dim=-2, keepdim=True)
+        if x.dim() == 3:
+            return (x - mean_w_mask(x, mask, keepdim=True)) * mask[..., None]
+        if x.dim() == 4:
+            # Flatten atom/coord dims into feature dim so mean_w_mask sees shape [b, n, d]
+            b, n, a, c = x.shape
+            x_flat = x.view(b, n, a * c)
+            mean_flat = mean_w_mask(x_flat, mask, keepdim=True)  # [b,1,a*c]
+            mean = mean_flat.view(b, 1, a, c)
+            mask_exp = mask[..., None, None]  # [b,n,1,1]
+            return (x - mean) * mask_exp
+        raise ValueError(f"_force_zero_com only supports 3D or 4D tensors, got shape {x.shape}")
 
     def _apply_mask(
         self, x: Float[Tensor, "* n 3"], mask: Optional[Bool[Tensor, "* n"]] = None
@@ -71,7 +81,11 @@ class _CoordinateFlowMatcher:
         """
         if mask is None:
             return x
-        return x * mask[..., None]  # [*, n, 3]
+        if x.dim() == 3:
+            return x * mask[..., None]  # [*, n, 3]
+        if x.dim() == 4:
+            return x * mask[..., None, None]  # [*, n, atoms, 3]
+        raise ValueError(f"_apply_mask only supports 3D or 4D tensors, got shape {x.shape}")
 
     def _mask_and_zero_com(
         self, x, mask: Optional[Bool[Tensor, "* n"]] = None
