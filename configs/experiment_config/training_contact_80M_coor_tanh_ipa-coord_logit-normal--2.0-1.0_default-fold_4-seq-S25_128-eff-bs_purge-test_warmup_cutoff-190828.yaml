@@ -1,0 +1,111 @@
+run_name_: contact_80M_coor_tanh_ipa-coord_logit-normal--2.0-1.0_default-fold_4-seq-S25_128-eff-bs_purge-test_warmup_cutoff-190828
+
+hardware:
+  ncpus_per_task_train_: 16  # Number of CPUs per task during training
+  ncpus_per_task_prepro_: 16  # Number of CPUs used for data preprocessing run
+  accelerator: gpu
+  ngpus_per_node_: 1  # Number of GPUs per node
+  nnodes_: 1  # Number of nodes
+
+# Below, for t_distribution, options are
+# - name: uniform. p2 is the maximum time that we can sample (<=1, p1 is ignored).
+# - name: logit-normal (normal + sigmoid). p1 is the mean of the normal, p2 the std (>0).
+# - name: beta. This is beta(p1, p2).
+loss:
+  t_distribution:
+    name: logit-normal
+    p1: -2.0
+    p2: 1.0
+  loss_t_clamp: 0.9  # Used for loss stability in frameflow, 1. for no clamping
+  use_aux_loss: True  # Whether to use auxiliary loss
+  aux_loss_t_lim: 0.3  # Time limit to apply auxiliary loss
+  thres_aux_2d_loss: 0.6  # This is nm not Å
+  aux_loss_weight: 1.0
+  # Distogram settings (AlphaFold format: 38 bins of 1.25Å width between 3.25-50.75Å + 1 overflow)
+  # Must match num_buckets_predict_pair in nn config
+  num_dist_buckets: 39  # 38 bins + 1 underflow bucket (distances < 3.25Å are rare for CA/CB)
+  distogram_min_bin: 0.325  # 3.25Å in nm (first boundary)
+  distogram_max_bin: 5.075  # 50.75Å in nm (last boundary, overflow bin for >= this)
+
+
+defaults:
+  - model: contactflow  # caflow or contactflow
+  - override model/nn: contact_af3_80M_tri_coor_tanh_ipa-coord
+  - _self_
+
+model:
+  nn:
+    residue_type_emb_init_seq: True
+    residue_type_emb_cond_seq: True
+    residue_type_emb_init_pair: True
+    residue_type_emb_cond_pair: True
+    seq_emb_dim: 4
+
+
+# Dataset params
+dataset: pdb_train_contact_S25_max320_purge-test_cutoff-190828
+dataset_config_subdir: pdb
+
+force_precision_f32: False  # If false will use bf16-mixed precision
+
+training:
+  self_cond: True
+  seq_cond: True
+  fold_cond: True
+  mask_T_prob: 0.5
+  mask_A_prob: 0.5
+  mask_C_prob: 0.5
+  fold_label_sample_ratio: [0.5, 0.1, 0.15, 0.25]   # Training proportion for [None, C, CA, CAT]. If specified, will override mask_{C,A,T}_prob  
+  mask_seq_proportion: 0.15
+  finetune_seq_cond_lora_only: False
+  contact_map_coord_loss_weight: 1.0  # Weight for coordinate loss when contact_map_mode=True (contact map loss has weight 1.0)
+  # For predict_coords: "ipa" only. Controls which frames are used for FAPE.
+  # - predicted_frames: use StructureModule predicted backbone frames (OpenFold-style)
+  # - frames_from_predicted_N_CA_C: derive frames from predicted N/CA/C using Gram–Schmidt
+  ipa_fape_loss_frame: predicted_frames
+
+
+lora:
+  use: False
+  lora_alpha: 32.0
+  lora_dropout: 0.0
+  r: 0
+  train_bias: "none"
+
+
+opt:
+  lr: 0.0001
+  max_epochs: 1000
+  accumulate_grad_batches: 32  # effective batch size = 1*4*32 = 128
+  val_check_interval: 1000  # Number of training batches after which we check validation loss
+  skip_nan_grad: False  # Skip updates with nan gradient
+  grad_and_weight_analysis: False  # Log some statistics of gradients and weights
+  dist_strategy: ddp  # For multi GPU training, do not change
+  dist_backend: nccl  # For multi GPU training, applicable when using ddp strategy [nccl, gloo]
+  # Learning rate warmup scheduler
+  use_lr_warmup: True  # Enable learning rate warmup
+  warmup_steps: 1000  # Number of warmup steps (linear warmup from warmup_start_lr_ratio to 1.0)
+  warmup_start_lr_ratio: 0.0  # Starting LR as ratio of target LR (0.0 means start from 0)
+  lr_scheduler_type: "cosine"  # Scheduler after warmup: "constant", "linear_decay", or "cosine"
+
+log:
+  wandb_project: protein_transformer_big_runs  # Leave this so we can compare runs easily
+  log_wandb: True  # whether to log to wandb
+  log_every_n_steps: 1  # How often to log metrics to wandb
+  log_structure_every_n_steps: 1  # How often to log structure/contact map visualizations (0 = disabled)
+  checkpoint: True  # whether to store checkpoints
+  checkpoint_every_n_steps: 1000  # How often we store a checkpoint, should be greater than val_check_interval above
+  last_ckpt_every_n_steps: 1000  # How often do we update our last ckpt, needed for requeuing without losing progress
+
+validation_sampling:
+  dt: 0.005
+  sampling_mode: sc
+  sc_scale_noise: 0.45
+
+seed: 42
+
+ema:
+  decay: 0.999  # 0 means no EMA, so all the EMA machinery is unused and no EMA checkpoints are stored
+  validate_original_weights: False  # Whether to run validation on regular or EMA weights
+  every_n_steps: 1  # Frequency of EMA updates
+  cpu_offload: False  # Whether to offload EMA weights to cpu
