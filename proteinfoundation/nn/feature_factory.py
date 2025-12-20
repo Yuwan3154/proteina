@@ -18,7 +18,7 @@ from typing import Dict, List, Literal
 import torch
 from loguru import logger
 from torch.nn import functional as F
-from torch_scatter import scatter_mean
+from torch_scatter import scatter_mean, scatter_sum
 
 from proteinfoundation.utils.ff_utils.pdb_utils import extract_cath_code_by_level
 from proteinfoundation.utils.ff_utils.idx_emb_utils import get_index_embedding, get_time_embedding
@@ -143,9 +143,10 @@ class FoldEmbeddingSeqFeat(Feature):
         **kwargs,
     ):
         """
-        multilabel_mode (["sample", "average", "transformer"]): Schemes to handle multiple fold labels
+        multilabel_mode (["sample", "average", "sum", "transformer"]): Schemes to handle multiple fold labels
             "sample": randomly sample one label
             "average": average fold embeddings over all labels
+            "sum": sum fold embeddings over all labels
             "transformer": pad labels together and feed into a transformer, take the average over the output
         """
         super().__init__(dim=fold_emb_dim * 3)
@@ -156,7 +157,7 @@ class FoldEmbeddingSeqFeat(Feature):
         self.embedding_A = torch.nn.Embedding(self.num_classes_A + 1, fold_emb_dim)
         self.embedding_T = torch.nn.Embedding(self.num_classes_T + 1, fold_emb_dim)
         self.register_buffer("_device_param", torch.tensor(0), persistent=False)
-        assert multilabel_mode in ["sample", "average", "transformer"]
+        assert multilabel_mode in ["sample", "average", "sum", "transformer"]
         self.multilabel_mode = multilabel_mode
         if multilabel_mode == "transformer":
             encoder_layer = torch.nn.TransformerEncoderLayer(
@@ -296,6 +297,17 @@ class FoldEmbeddingSeqFeat(Feature):
                 dim=-1,
             )  # [num_code, fold_emb_dim * 3]
             fold_emb = scatter_mean(fold_emb, batch_id, dim=0, dim_size=bs)
+        elif self.multilabel_mode == "sum":
+            cath_code, batch_id = self.flatten(cath_code_list)
+            fold_emb = torch.cat(
+                [
+                    self.embedding_C(cath_code[:, 0]),
+                    self.embedding_A(cath_code[:, 1]),
+                    self.embedding_T(cath_code[:, 2]),
+                ],
+                dim=-1,
+            )  # [num_code, fold_emb_dim * 3]
+            fold_emb = scatter_sum(fold_emb, batch_id, dim=0, dim_size=bs)
         elif self.multilabel_mode == "transformer":
             cath_code, mask = self.pad(cath_code_list)
             fold_emb = torch.cat(
