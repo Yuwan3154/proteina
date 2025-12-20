@@ -758,6 +758,7 @@ class ModelTrainerBase(L.LightningModule):
                     mask,
                     log_prefix=log_prefix,
                     pred_frames_tensor7=pred_frames_tensor7,
+                    residue_type=batch.get("residue_type_unmasked", batch.get("residue_type", None)),
                 )
                 coord_weight = getattr(
                     self, "contact_map_coord_loss_weight", 0.0
@@ -1028,6 +1029,7 @@ class ModelTrainerBase(L.LightningModule):
         mask,
         log_prefix: str = None,
         pred_frames_tensor7: Optional[torch.Tensor] = None,
+        residue_type: Optional[torch.Tensor] = None,
     ):
         """
         Computes FAPE loss. Supports CA-only, backbone (N,CA,C), and all-atom inputs.
@@ -1077,11 +1079,48 @@ class ModelTrainerBase(L.LightningModule):
 
             pred_positions = x_1_pred.reshape(x_1_pred.shape[0], -1, 3)
             target_positions = x_1.reshape(x_1.shape[0], -1, 3)
-            positions_mask = (
-                mask[..., None]
-                .expand(-1, -1, x_1_pred.shape[-2])
-                .reshape(x_1_pred.shape[0], -1)
-            )
+            # Positions mask:
+            # - Prefer atom-existence mask from residue type (OpenFold-style)
+            # - Fall back to residue mask expanded to natoms (legacy behavior)
+            bsz, nres, natoms, _ = x_1_pred.shape
+            if residue_type is not None:
+                residue_type_safe = torch.clamp(
+                    residue_type,
+                    min=0,
+                    max=rc.RESTYPE_ATOM37_MASK.shape[0] - 1,
+                )
+                if natoms == 37:
+                    atom_exists = torch.as_tensor(
+                        rc.RESTYPE_ATOM37_MASK,
+                        device=x_1_pred.device,
+                        dtype=x_1_pred.dtype,
+                    )[residue_type_safe]  # [b, n, 37]
+                    positions_mask = (
+                        atom_exists * mask[..., None].to(dtype=x_1_pred.dtype)
+                    ).reshape(bsz, -1)
+                elif natoms == 14 and hasattr(rc, "RESTYPE_ATOM14_MASK"):
+                    atom_exists = torch.as_tensor(
+                        rc.RESTYPE_ATOM14_MASK,
+                        device=x_1_pred.device,
+                        dtype=x_1_pred.dtype,
+                    )[residue_type_safe]  # [b, n, 14]
+                    positions_mask = (
+                        atom_exists * mask[..., None].to(dtype=x_1_pred.dtype)
+                    ).reshape(bsz, -1)
+                else:
+                    positions_mask = (
+                        mask[..., None]
+                        .to(dtype=x_1_pred.dtype)
+                        .expand(-1, -1, natoms)
+                        .reshape(bsz, -1)
+                    )
+            else:
+                positions_mask = (
+                    mask[..., None]
+                    .to(dtype=x_1_pred.dtype)
+                    .expand(-1, -1, natoms)
+                    .reshape(bsz, -1)
+                )
         elif x_1_pred.dim() == 3:
             # CA-only fallback: identity frames
             rot = torch.eye(3, device=x_1.device, dtype=x_1.dtype)
@@ -1105,8 +1144,10 @@ class ModelTrainerBase(L.LightningModule):
             pred_positions=pred_positions,
             target_positions=target_positions,
             positions_mask=positions_mask,
-            length_scale=10.0,
-            l1_clamp_distance=10.0,
+            # Training-space coordinates are in nm (see ang_to_nm in data extraction).
+            # OpenFold's defaults are 10Å clamp + 10Å scale, which is 1nm + 1nm here.
+            length_scale=1.0,
+            l1_clamp_distance=1.0,
         )
         
         if log_prefix:
