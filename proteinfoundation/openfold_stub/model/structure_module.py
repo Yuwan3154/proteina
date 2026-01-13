@@ -14,6 +14,7 @@
 # limitations under the License.
 from functools import reduce
 import importlib
+import importlib.util
 import math
 import sys
 from operator import mul
@@ -41,7 +42,12 @@ from proteinfoundation.openfold_stub.utils.tensor_utils import (
     flatten_final_dims,
 )
 
-attn_core_inplace_cuda = importlib.import_module("attn_core_inplace_cuda")
+_attn_core_inplace_cuda_spec = importlib.util.find_spec("attn_core_inplace_cuda")
+attn_core_inplace_cuda = (
+    importlib.import_module("attn_core_inplace_cuda")
+    if _attn_core_inplace_cuda_spec is not None
+    else None
+)
 
 
 class AngleResnetBlock(nn.Module):
@@ -361,12 +367,16 @@ class InvariantPointAttention(nn.Module):
             a += pt_att
             del pt_att
             a += square_mask.unsqueeze(-3)
-            # in-place softmax
-            attn_core_inplace_cuda.forward_(
+            if attn_core_inplace_cuda is not None:
+                # in-place softmax (CUDA extension)
+                attn_core_inplace_cuda.forward_(
                 a,
                 reduce(mul, a.shape[:-1]),
                 a.shape[-1],
             )
+            else:
+                # Fallback when the CUDA extension isn't available
+                a = self.softmax(a)
         else:
             a = a + pt_att 
             a = a + square_mask.unsqueeze(-3)

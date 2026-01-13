@@ -344,10 +344,13 @@ class PairReprUpdate(torch.nn.Module):
         expansion_factor_transition=2,
         use_tri_mult=False,
         tri_mult_c=196,
+        use_cueq: bool = True,
     ):
         super().__init__()
 
         self.use_tri_mult = use_tri_mult
+        # Explicit runtime gate for cuequivariance (in addition to availability/shape checks)
+        self.use_cueq = bool(use_cueq)
         self.layer_norm_in = torch.nn.LayerNorm(token_dim)
         self.linear_x = torch.nn.Linear(token_dim, int(2 * pair_dim), bias=False)
 
@@ -482,7 +485,7 @@ class PairReprUpdate(torch.nn.Module):
         )  # [b, n, n, pair_dim]
         pair_rep = self._apply_mask(pair_rep, pair_mask)  # [b, n, n, pair_dim]
         if self.use_tri_mult:
-            if CUEQUIVARIANCE_AVAILABLE and self._cuequivariance_compatible:
+            if self.use_cueq and CUEQUIVARIANCE_AVAILABLE and self._cuequivariance_compatible:
                 # Use fast cuequivariance implementation (requires c_z == c_hidden and both % 32 == 0)
                 pair_rep = pair_rep + checkpoint(
                     self._tri_mult_out_cuet, *(pair_rep, pair_mask), use_reentrant=False
@@ -732,6 +735,7 @@ class ProteinTransformerAF3(torch.nn.Module):
                             pair_dim=kwargs["pair_repr_dim"],
                             use_tri_mult=self.use_tri_mult,
                             tri_mult_c=kwargs["tri_mult_c"],
+                            use_cueq=kwargs.get("use_cueq", True),
                         )
                         if i % self.update_pair_repr_every_n == 0
                         else None
@@ -874,7 +878,7 @@ class ProteinTransformerAF3(torch.nn.Module):
         r = self.num_registers
         return seqs[:, r:, :], pair[:, r:, r:, :], mask[:, r:]
 
-    def forward(self, batch_nn: Dict[str, torch.Tensor]):
+    def forward(self, batch_nn: Dict[str, torch.Tensor], force_compile: bool = False):
         # TorchDynamo treats `requires_grad` / grad-mode as a compile guard. In Lightning we
         # call the model under both grad-enabled (training) and `torch.no_grad()` (validation,
         # validation sampling, self-conditioning helpers). If we always run the compiled graph,
@@ -883,7 +887,7 @@ class ProteinTransformerAF3(torch.nn.Module):
         #
         # To keep training fast/stable and avoid validation recompiles, only use `torch.compile`
         # in grad-enabled contexts and run eager under `no_grad()`.
-        if torch.is_grad_enabled():
+        if torch.is_grad_enabled() or force_compile:
             if getattr(self, "_forward_compiled", None) is None:
                 self._forward_compiled = torch.compile(self._forward_impl)
             return self._forward_compiled(batch_nn)

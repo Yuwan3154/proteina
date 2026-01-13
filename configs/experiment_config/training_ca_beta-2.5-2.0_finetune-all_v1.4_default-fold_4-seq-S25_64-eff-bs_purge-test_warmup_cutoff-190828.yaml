@@ -64,7 +64,7 @@ lora:
 
 opt:
   lr: 0.0001
-  max_epochs: 500
+  max_epochs: 100
   accumulate_grad_batches: 128  # effective batch size = 1*1*128 = 128
   val_check_interval: 1000  # Number of training batches after which we check validation loss
   skip_nan_grad: False  # Skip updates with nan gradient
@@ -83,7 +83,7 @@ log:
   log_every_n_steps: 1  # How often to log metrics to wandb
   log_structure_every_n_steps: 1  # How often to log structure/contact map visualizations (0 = disabled)
   checkpoint: True  # whether to store checkpoints
-  checkpoint_every_n_steps: 500  # How often we store a checkpoint, should be greater than val_check_interval above
+  checkpoint_every_n_steps: 2000  # How often we store a checkpoint, should be greater than val_check_interval above
   last_ckpt_every_n_steps: 500  # How often do we update our last ckpt, needed for requeuing without losing progress
 
 validation_sampling:

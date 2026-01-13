@@ -152,6 +152,36 @@ class ModelTrainerBase(L.LightningModule):
         
         return optimizer
 
+    def on_after_backward(self) -> None:
+        """
+        Per-batch (per backward) check for parameters that did not receive gradients.
+
+        This is intentionally after *every* backward so we can catch rare, batch-dependent
+        unused-parameter cases (e.g., control flow / conditional branches).
+        """
+        if getattr(self, "global_rank", 0) != 0:
+            return
+
+        unused_names: List[str] = []
+        for name, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.grad is None:
+                unused_names.append(name)
+
+        if len(unused_names) > 0:
+            unused_names.sort()
+            head = unused_names[:50]
+            batch_idx = int(getattr(self, "_debug_last_batch_idx", -1))
+            logger.warning(
+                "[unused_params_detected/batch] step={} batch_idx={} n_unused={} first_{}={}",
+                int(getattr(self, "global_step", -1)),
+                batch_idx,
+                len(unused_names),
+                len(head),
+                head,
+            )
+
     def _nn_out_to_x_clean(self, nn_out, batch):
         """
         Transforms the output of the nn to a clean sample prediction. The transformation depends on the
@@ -323,6 +353,7 @@ class ModelTrainerBase(L.LightningModule):
         batch: Dict,
         guidance_weight: float = 1.0,
         autoguidance_ratio: float = 0.0,
+        force_compile: bool = False,
     ):
         """
         Logic for CFG and autoguidance goes here. This computes a clean sample prediction (can be single thing, tuple, etc)
@@ -349,7 +380,7 @@ class ModelTrainerBase(L.LightningModule):
         if self.motif_conditioning and ("fixed_structure_mask" not in batch or "x_motif" not in batch):
             batch.update(self.motif_factory(batch, zeroes = True))  # for generation we have to pass conditioning info in. But for validation do the same as training
 
-        nn_out = self.nn(batch)
+        nn_out = self.nn(batch, force_compile=force_compile)
         x_pred = self._nn_out_to_x_clean(nn_out, batch)
         c_pred = self._nn_out_to_c_clean(nn_out, batch)
         c_logits = self._nn_out_to_c_logits(nn_out, batch)
@@ -521,6 +552,9 @@ class ModelTrainerBase(L.LightningModule):
         Returns:
             Training loss averaged over batches.
         """
+        # For per-batch debug hooks (e.g., unused parameter detection).
+        # This is the raw microbatch index (respects gradient accumulation).
+        self._debug_last_batch_idx = int(batch_idx)
         val_step = batch_idx == -1 or getattr(self, "_in_validation_loop", False)
         log_prefix = "validation_loss" if val_step else "train"
         
@@ -691,11 +725,7 @@ class ModelTrainerBase(L.LightningModule):
                     # `c_pred_sc` is already activated in model/data space.
                     batch["contact_map_sc"] = self.detach_gradients(c_pred_sc)
                 else:
-                    batch["contact_map_sc"] = torch.zeros(
-                        batch_shape + (n, n),
-                        device=self.device,
-                        dtype=c_1.dtype,
-                    )
+                    batch["contact_map_sc"] = torch.zeros_like(c_1)
             else:
                 with torch.no_grad(): 
                     nn_out_sc = self.predict_clean(batch)
@@ -706,11 +736,7 @@ class ModelTrainerBase(L.LightningModule):
                     batch["x_sc"] = torch.zeros_like(x_1)
         else:
             if contact_map_mode:
-                batch["contact_map_sc"] = torch.zeros(
-                    batch_shape + (n, n),
-                    device=self.device,
-                    dtype=x_1.dtype,
-                )
+                batch["contact_map_sc"] = torch.zeros_like(c_1)
             else:
                 batch["x_sc"] = torch.zeros_like(x_1)
 
@@ -1355,6 +1381,7 @@ class ModelTrainerBase(L.LightningModule):
                 - "cath_code": CATH codes for each sample
                 - "cirpin_ids": CIRPIN IDs for each sample
         """
+        force_compile = getattr(self, "_force_compile", False)
         sampling_args = self.inf_cfg.sampling_caflow
 
         cath_code = (
@@ -1391,10 +1418,11 @@ class ModelTrainerBase(L.LightningModule):
             gt_mode=sampling_args["gt_mode"],
             gt_p=sampling_args["gt_p"],
             gt_clamp_val=sampling_args["gt_clamp_val"],
-            mask = mask,
-            x_motif = x_motif,
-            fixed_sequence_mask = fixed_sequence_mask,
-            fixed_structure_mask = fixed_structure_mask,
+            mask=mask,
+            x_motif=x_motif,
+            fixed_sequence_mask=fixed_sequence_mask,
+            fixed_structure_mask=fixed_structure_mask,
+            force_compile=force_compile,
         )
         cirpin_ids = batch.get("cirpin_ids", [None] * len(cath_code))
         coords_atom37 = None
@@ -1448,6 +1476,7 @@ class ModelTrainerBase(L.LightningModule):
         x_motif = None,
         fixed_sequence_mask = None,
         fixed_structure_mask = None,
+        force_compile: bool = False,
     ) -> Dict[str, Tensor]:
         """
         Generates samples by integrating ODE with learned vector field.
@@ -1462,6 +1491,7 @@ class ModelTrainerBase(L.LightningModule):
             self.predict_clean_n_v_w_guidance,
             guidance_weight=guidance_weight,
             autoguidance_ratio=autoguidance_ratio,
+            force_compile=force_compile,
         )
         if mask is None:
             mask = torch.ones(nsamples, n).long().bool().to(self.device)

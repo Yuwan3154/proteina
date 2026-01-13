@@ -257,7 +257,7 @@ def parse_nlens_cfg(cfg):
     """Parse lengths distribution. Either loading an empirical one or build with arguments in yaml file"""
     if cfg.get("nres_lens_distribution_path") is not None:
         # Sample according to length distribution
-        nlens_dict = torch.load(cfg.nres_lens_distribution_path)
+        nlens_dict = torch.load(cfg.nres_lens_distribution_path, weights_only=False)
     else:
         # Sample with pre-specified lengths
         if cfg.nres_lens:
@@ -282,7 +282,7 @@ def parse_len_cath_code(cfg):
         logger.info(
             f"Loading empirical (length, cath_code) distribution from {cfg.len_cath_code_path}"
         )
-        _len_cath_codes = torch.load(cfg.len_cath_code_path)
+        _len_cath_codes = torch.load(cfg.len_cath_code_path, weights_only=False)
         level = cfg.get("cath_code_level")
         len_cath_codes = []
         for i in range(len(_len_cath_codes)):
@@ -331,6 +331,11 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="pt name containing the protein sequence to generate.",
+    )
+    parser.add_argument(
+        "--force_compile",
+        action="store_true",
+        help="Force compile the model.",
     )
     
     args = parser.parse_args()
@@ -394,7 +399,7 @@ if __name__ == "__main__":
             cfg["lora"]["lora_dropout"],
         )
         lora.mark_only_lora_as_trainable(model, bias=cfg["lora"]["train_bias"])
-        ckpt = torch.load(ckpt_file, map_location="cpu")
+        ckpt = torch.load(ckpt_file, map_location="cpu", weights_only=False)
         model.load_state_dict(ckpt["state_dict"])
 
     # Set seed
@@ -415,7 +420,7 @@ if __name__ == "__main__":
     model.configure_inference(cfg, nn_ag=nn_ag)
 
     # Create inference dataset
-    pt = torch.load(os.path.join(cfg.data_dir, "processed", f"{args.pt}.pt"))
+    pt = torch.load(os.path.join(cfg.data_dir, "processed", f"{args.pt}.pt"), weights_only=False)
     cath_codes = pd.read_csv(os.path.join(cfg.data_dir, cfg.cath_code_file))["cath_code"].tolist()
     assert args.pt is not None, "pt must be provided if seq_cond is True"
     
@@ -465,6 +470,9 @@ if __name__ == "__main__":
 
     # Sample the model
     trainer = L.Trainer(accelerator="gpu", devices=1)
+    # Lightning does not support passing custom kwargs through Trainer.predict to predict_step.
+    # Store on the model and read it in predict_step.
+    model._force_compile = bool(args.force_compile)
     predictions = trainer.predict(model, dataloader)
 
     if pt is not None:

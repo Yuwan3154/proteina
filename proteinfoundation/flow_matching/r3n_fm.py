@@ -940,7 +940,7 @@ class _ContactMapFlowMatcher:
 
     def full_simulation(
         self,
-        predict_fn: Callable,
+        predict_clean_n_v: Callable,
         dt: float,
         nsamples: int,
         n: int,
@@ -967,7 +967,7 @@ class _ContactMapFlowMatcher:
         Full simulation for contact map generation with optional coordinate tracking.
 
         Args:
-            predict_fn: Function that takes batch dict and returns dict with keys:
+            predict_clean_n_v: Function that takes batch dict and returns dict with keys:
                 "contact_map", "contact_map_v", "coords", "distogram"
             dt: Time step size
             nsamples: Number of samples
@@ -1041,7 +1041,7 @@ class _ContactMapFlowMatcher:
                     if c_1_pred is not None:
                         nn_in["contact_map_sc"] = c_1_pred
 
-                result = predict_fn(nn_in)
+                result = predict_clean_n_v(nn_in)
                 
                 # Extract predictions
                 x = result.get("coords")
@@ -1253,7 +1253,7 @@ class FlowMatcher:
 
     def full_simulation(
         self,
-        predict_fn: Callable,
+        predict_clean_n_v: Callable,
         dt: float,
         nsamples: int,
         n: int,
@@ -1286,7 +1286,7 @@ class FlowMatcher:
         For contact map mode: runs contact map flow matching with optional coordinate pass-through.
         
         Args:
-            predict_fn: Prediction function that returns dict with "coords", "v", 
+            predict_clean_n_v: Prediction function that returns dict with "coords", "v", 
                        "contact_map", "contact_map_v", "distogram" keys.
             predict_coords: Whether to track coordinate predictions (only for contact map mode).
             modality: Override modality ("coordinates" or "contact_map").
@@ -1302,7 +1302,7 @@ class FlowMatcher:
         if mode == "coordinates":
             # Delegate to coordinate flow matcher
             x = self.coord_fm.full_simulation(
-                predict_fn, dt=dt, nsamples=nsamples, n=n, self_cond=self_cond,
+                predict_clean_n_v, dt=dt, nsamples=nsamples, n=n, self_cond=self_cond,
                 cath_code=cath_code, residue_type=residue_type, device=device,
                 mask=mask, dtype=dtype, schedule_mode=schedule_mode,
                 schedule_p=schedule_p, sampling_mode=sampling_mode,
@@ -1315,7 +1315,7 @@ class FlowMatcher:
         
         # Delegate to contact map flow matcher
         return self.contact_fm.full_simulation(
-            predict_fn, dt=dt, nsamples=nsamples, n=n, self_cond=self_cond,
+            predict_clean_n_v, dt=dt, nsamples=nsamples, n=n, self_cond=self_cond,
             cath_code=cath_code, residue_type=residue_type, device=device,
             mask=mask, dtype=dtype, schedule_mode=schedule_mode,
             schedule_p=schedule_p, sampling_mode=sampling_mode,

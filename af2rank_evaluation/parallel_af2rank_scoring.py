@@ -110,54 +110,54 @@ def process_single_protein_af2rank(args):
     
     logger.info(f"[GPU {gpu_id}] Starting AF2Rank scoring for {protein_name}")
     
-    # Find reference CIF file
-    reference_cif = find_reference_cif(protein_name, cif_dir)
-    logger.info(f"[GPU {gpu_id}] Found reference CIF: {reference_cif}")
-    
-    # Get inference output directory
-    inference_output_dir = generate_protein_output_dir(inference_config, protein_name)
-    
-    if not os.path.exists(inference_output_dir):
-        raise FileNotFoundError(f"Inference output directory not found: {inference_output_dir}")
-    
-    # Check if PDB files exist
-    pdb_files = list(Path(inference_output_dir).glob(f"{protein_name}_*.pdb"))
-    if not pdb_files:
-        raise FileNotFoundError(f"No PDB files found in {inference_output_dir}")
-    
-    logger.info(f"[GPU {gpu_id}] Found {len(pdb_files)} PDB files to score")
-    
-    # Check if we should do plot-only regeneration
-    af2rank_csv = Path(inference_output_dir) / "af2rank_analysis" / f"af2rank_scores_{protein_name}.csv"
-    if regenerate_plots and af2rank_csv.exists():
-        logger.info(f"[GPU {gpu_id}] Skipping plot regeneration (will be handled by CPU workers)")
-        return {'protein': protein_name, 'gpu': gpu_id, 'status': 'skipped', 'reason': 'plot_regeneration_deferred'}
-    else:
-        # Run full AF2Rank scoring
-        logger.info(f"[GPU {gpu_id}] Running full AF2Rank scoring for {protein_name}")
-        result = run_af2rank_scoring(protein_name, reference_cif, inference_output_dir, recycles)
-    
-    if result.returncode != 0:
+        # Find reference CIF file
+        reference_cif = find_reference_cif(protein_name, cif_dir)
+        logger.info(f"[GPU {gpu_id}] Found reference CIF: {reference_cif}")
+        
+        # Get inference output directory
+        inference_output_dir = generate_protein_output_dir(inference_config, protein_name)
+        
+        if not os.path.exists(inference_output_dir):
+            raise FileNotFoundError(f"Inference output directory not found: {inference_output_dir}")
+        
+        # Check if PDB files exist
+        pdb_files = list(Path(inference_output_dir).glob(f"{protein_name}_*.pdb"))
+        if not pdb_files:
+            raise FileNotFoundError(f"No PDB files found in {inference_output_dir}")
+        
+        logger.info(f"[GPU {gpu_id}] Found {len(pdb_files)} PDB files to score")
+        
+        # Check if we should do plot-only regeneration
+        af2rank_csv = Path(inference_output_dir) / "af2rank_analysis" / f"af2rank_scores_{protein_name}.csv"
+        if regenerate_plots and af2rank_csv.exists():
+            logger.info(f"[GPU {gpu_id}] Skipping plot regeneration (will be handled by CPU workers)")
+            return {'protein': protein_name, 'gpu': gpu_id, 'status': 'skipped', 'reason': 'plot_regeneration_deferred'}
+        else:
+            # Run full AF2Rank scoring
+            logger.info(f"[GPU {gpu_id}] Running full AF2Rank scoring for {protein_name}")
+            result = run_af2rank_scoring(protein_name, reference_cif, inference_output_dir, recycles)
+        
+        if result.returncode != 0:
         raise Exception(f"AF2Rank scoring failed with returncode {result.returncode}")
-    
-    logger.info(f"[GPU {gpu_id}] ✅ AF2Rank scoring completed for {protein_name}")
-    
-    # Parse output for summary info
-    af2rank_dir = f"{inference_output_dir}/af2rank_analysis"
-    summary_file = f"{af2rank_dir}/af2rank_summary_{protein_name}.json"
-    
-    summary_info = {}
-    if os.path.exists(summary_file):
-        with open(summary_file, 'r') as f:
-            summary_info = json.load(f)
-    
-    return {
-        'protein': protein_name, 
-        'gpu': gpu_id, 
-        'status': 'success', 
-        'output_dir': af2rank_dir,
-        'summary': summary_info
-    }
+        
+        logger.info(f"[GPU {gpu_id}] ✅ AF2Rank scoring completed for {protein_name}")
+        
+        # Parse output for summary info
+        af2rank_dir = f"{inference_output_dir}/af2rank_analysis"
+        summary_file = f"{af2rank_dir}/af2rank_summary_{protein_name}.json"
+        
+        summary_info = {}
+        if os.path.exists(summary_file):
+            with open(summary_file, 'r') as f:
+                summary_info = json.load(f)
+        
+        return {
+            'protein': protein_name, 
+            'gpu': gpu_id, 
+            'status': 'success', 
+            'output_dir': af2rank_dir,
+            'summary': summary_info
+        }
 
 def run_af2rank_scoring(protein_name, reference_cif, inference_output_dir, recycles=3):
     """Run AF2Rank scoring for a single protein."""
@@ -271,25 +271,25 @@ def process_single_protein_plot_regeneration(args):
     
     logger.info(f"[CPU] Regenerating plots and summary for {protein_name}")
     
-    # Find reference CIF file
-    reference_cif = find_reference_cif(protein_name, cif_dir)
-    
-    # Generate output directory
-    inference_output_dir = generate_protein_output_dir(inference_config, protein_name)
-    
-    # Check if CSV file exists
-    af2rank_csv = Path(inference_output_dir) / "af2rank_analysis" / f"af2rank_scores_{protein_name}.csv"
-    if not af2rank_csv.exists():
-        logger.warning(f"[CPU] No AF2Rank scores found for {protein_name}")
-        return {'protein': protein_name, 'status': 'skipped', 'reason': 'no_csv_file'}
-    
-    # Run plot regeneration (CPU-only)
-    result = run_af2rank_plot_only(protein_name, reference_cif, inference_output_dir, recycles)
-    
-    if result.returncode == 0:
-        logger.info(f"[CPU] ✅ Plot regeneration completed for {protein_name}")
-        return {'protein': protein_name, 'status': 'success'}
-    else:
+        # Find reference CIF file
+        reference_cif = find_reference_cif(protein_name, cif_dir)
+        
+        # Generate output directory
+        inference_output_dir = generate_protein_output_dir(inference_config, protein_name)
+        
+        # Check if CSV file exists
+        af2rank_csv = Path(inference_output_dir) / "af2rank_analysis" / f"af2rank_scores_{protein_name}.csv"
+        if not af2rank_csv.exists():
+            logger.warning(f"[CPU] No AF2Rank scores found for {protein_name}")
+            return {'protein': protein_name, 'status': 'skipped', 'reason': 'no_csv_file'}
+        
+        # Run plot regeneration (CPU-only)
+        result = run_af2rank_plot_only(protein_name, reference_cif, inference_output_dir, recycles)
+        
+        if result.returncode == 0:
+            logger.info(f"[CPU] ✅ Plot regeneration completed for {protein_name}")
+            return {'protein': protein_name, 'status': 'success'}
+        else:
         raise Exception(f"Plot regeneration failed with returncode {result.returncode}")
 
 
@@ -487,20 +487,20 @@ def main():
                 
                 protein_name = future_to_protein[future]
                 # No try-except - let exceptions propagate with full tracebacks
-                result = future.result()
-                all_results.append(result)
-                
-                completed = len([r for r in all_results if r['status'] == 'success'])
-                total = len(scoring_work_items)
-                elapsed = time.time() - start_time
-                
-                if result['status'] == 'success':
-                    summary = result.get('summary', {})
-                    successful_scores = summary.get('successful_scores', 0)
-                    total_structures = summary.get('total_structures', 0)
-                    logger.info(f"✅ GPU Progress: {completed}/{total} proteins completed ({successful_scores}/{total_structures} structures scored, {elapsed:.1f}s elapsed)")
-                else:
-                    logger.error(f"❌ {protein_name} failed: {result.get('error', 'Unknown error')}")
+                    result = future.result()
+                    all_results.append(result)
+                    
+                    completed = len([r for r in all_results if r['status'] == 'success'])
+                    total = len(scoring_work_items)
+                    elapsed = time.time() - start_time
+                    
+                    if result['status'] == 'success':
+                        summary = result.get('summary', {})
+                        successful_scores = summary.get('successful_scores', 0)
+                        total_structures = summary.get('total_structures', 0)
+                        logger.info(f"✅ GPU Progress: {completed}/{total} proteins completed ({successful_scores}/{total_structures} structures scored, {elapsed:.1f}s elapsed)")
+                    else:
+                        logger.error(f"❌ {protein_name} failed: {result.get('error', 'Unknown error')}")
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
             logger.info("✓ GPU executor shut down cleanly")
@@ -530,17 +530,17 @@ def main():
                 
                 protein_name = future_to_protein[future]
                 # No try-except - let exceptions propagate with full tracebacks
-                result = future.result()
-                all_results.append(result)
-                
-                completed = len([r for r in all_results if r['status'] == 'success'])
-                total = len(plot_work_items)
-                elapsed = time.time() - start_time
-                
-                if result['status'] == 'success':
-                    logger.info(f"✅ CPU Progress: {completed}/{total} plots regenerated ({elapsed:.1f}s elapsed)")
-                else:
-                    logger.error(f"❌ {protein_name} plot regeneration failed: {result.get('error', 'Unknown error')}")
+                    result = future.result()
+                    all_results.append(result)
+                    
+                    completed = len([r for r in all_results if r['status'] == 'success'])
+                    total = len(plot_work_items)
+                    elapsed = time.time() - start_time
+                    
+                    if result['status'] == 'success':
+                        logger.info(f"✅ CPU Progress: {completed}/{total} plots regenerated ({elapsed:.1f}s elapsed)")
+                    else:
+                        logger.error(f"❌ {protein_name} plot regeneration failed: {result.get('error', 'Unknown error')}")
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
             logger.info("✓ CPU executor shut down cleanly")

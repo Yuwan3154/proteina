@@ -21,20 +21,22 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import tempfile
 import shutil
 
-# Global flag for graceful shutdown
-shutdown_requested = False
+def _terminate_process_group(signum: int) -> None:
+    """
+    Terminate this job's whole process group (main + worker processes + inference subprocesses).
+    This avoids lingering orphaned GPU processes after Ctrl+C / SIGTERM (e.g. from `timeout`).
+    """
+    # Restore default handlers to avoid re-entering our handler when we signal the group.
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    os.killpg(os.getpgrp(), signum)
+
 
 def signal_handler(signum, frame):
-    """Handle interrupt signals for graceful shutdown."""
-    global shutdown_requested
-    if not shutdown_requested:
-        shutdown_requested = True
-        logger.warning("\n⚠️  Interrupt received! Gracefully shutting down...")
-        logger.warning("⚠️  Waiting for current tasks to complete...")
-        logger.warning("⚠️  Press Ctrl+C again to force quit (not recommended)")
-    else:
-        logger.error("\n❌ Force quit requested. Terminating immediately...")
-        sys.exit(1)
+    """Handle interrupt signals by terminating the whole process group."""
+    sig_name = signal.Signals(signum).name
+    logger.warning(f"\n⚠️  Received {sig_name}. Terminating all worker/inference processes...")
+    _terminate_process_group(signum)
 
 # Register signal handlers
 signal.signal(signal.SIGINT, signal_handler)
@@ -136,7 +138,7 @@ def run_cif_to_pt_conversion(csv_file, csv_column, cif_dir):
             stderr = str(e)
         return MockResult()
 
-def run_proteina_inference(protein_name, inference_config):
+def run_proteina_inference(protein_name, inference_config, force_compile: bool = False):
     """
     Run Proteina inference directly.
     Only uses subprocess for calling proteinfoundation/inference.py.
@@ -147,8 +149,10 @@ def run_proteina_inference(protein_name, inference_config):
     cmd = [
         'python', 'proteinfoundation/inference.py',
         '--pt', protein_name,
-        '--config_name', inference_config
+        '--config_name', inference_config,
     ]
+    if force_compile:
+        cmd.append('--force_compile')
     
     result = subprocess.run(
         cmd, 
@@ -163,7 +167,7 @@ def process_single_protein(args):
     Process a single protein through the entire Proteina pipeline.
     Includes proper error handling and GPU memory cleanup.
     """
-    protein_name, csv_file, csv_column, cif_dir, inference_config, usalign_path, gpu_id = args
+    protein_name, csv_file, csv_column, cif_dir, inference_config, usalign_path, gpu_id, force_compile = args
     
     try:
         # Set GPU for this process
@@ -199,7 +203,7 @@ def process_single_protein(args):
         
         # Step 2: Proteina inference
         logger.info(f"[GPU {gpu_id}] Step 2: Running Proteina inference for {protein_name}")
-        result = run_proteina_inference(protein_name, inference_config)
+        result = run_proteina_inference(protein_name, inference_config, force_compile=force_compile)
         
         if result.returncode != 0:
             error_msg = result.stderr
@@ -277,13 +281,13 @@ def worker_init_proteina(counter, lock, num_gpus):
 # Wrapper function (must be at module level for pickling)
 def process_single_protein_wrapper(args_tuple):
     """Wrapper that uses the GPU assigned during worker init."""
-    protein_name, csv_file, csv_column, cif_dir, inference_config, usalign_path = args_tuple
+    protein_name, csv_file, csv_column, cif_dir, inference_config, usalign_path, force_compile = args_tuple
     
     # Get GPU ID from process-local variable set by worker_init
     gpu_id = getattr(builtins, '_worker_gpu_id', 0)
     
     # Call the actual processing function
-    full_args = (protein_name, csv_file, csv_column, cif_dir, inference_config, usalign_path, gpu_id)
+    full_args = (protein_name, csv_file, csv_column, cif_dir, inference_config, usalign_path, gpu_id, force_compile)
     return process_single_protein(full_args)
 
 def has_multi_char_chain_id(protein_name):
@@ -346,6 +350,11 @@ def main():
     parser.add_argument('--usalign_path', help='Path to USalign executable')
     parser.add_argument('--skip_existing', action='store_true', 
                        help='Skip proteins that already have inference completed')
+    parser.add_argument(
+        '--force_compile',
+        action='store_true',
+        help='Force torch.compile during inference (default: off).',
+    )
     
     args = parser.parse_args()
     
@@ -400,20 +409,13 @@ def main():
     
     try:
         # Submit all jobs (GPU assignment happens via worker init)
-        work_items = [(protein_name, args.csv_file, args.csv_column, args.cif_dir, args.inference_config, args.usalign_path) 
+        work_items = [(protein_name, args.csv_file, args.csv_column, args.cif_dir, args.inference_config, args.usalign_path, args.force_compile) 
                       for protein_name in protein_names]
         future_to_protein = {executor.submit(process_single_protein_wrapper, item): work_items[i][0] 
                             for i, item in enumerate(work_items)}
         
         # Collect results as they complete
         for future in as_completed(future_to_protein):
-            # Check for shutdown request
-            if shutdown_requested:
-                logger.warning("⚠️  Shutdown requested, cancelling remaining tasks...")
-                for f in future_to_protein:
-                    f.cancel()
-                break
-            
             protein_name = future_to_protein[future]
             try:
                 result = future.result()
@@ -463,12 +465,6 @@ def main():
                 error_type = result.get('error_type', 'UNKNOWN')
                 error_preview = str(result.get('error', 'Unknown error'))[:100]
                 logger.info(f"  - {result['protein']} [{error_type}]: {error_preview}")
-    
-    # Check if shutdown was requested
-    if shutdown_requested:
-        logger.warning("\n⚠️  Pipeline interrupted by user")
-        logger.info(f"Processed {successful} proteins before interruption")
-        sys.exit(130)  # Standard exit code for Ctrl+C
     
     # Return appropriate exit code
     sys.exit(0 if failed == 0 else 1)

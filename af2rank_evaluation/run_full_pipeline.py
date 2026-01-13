@@ -85,6 +85,8 @@ def run_with_conda_env(env_name, command_list, cwd=None):
         wrapper_script = os.path.join(script_dir, 'run_with_proteina_env.sh')
     elif env_name == 'colabdesign':
         wrapper_script = os.path.join(script_dir, 'run_with_colabdesign_env.sh')
+    elif env_name == 'proteinebm':
+        wrapper_script = os.path.join(script_dir, 'run_with_proteinebm_env.sh')
     else:
         logger.error(f"❌ Unknown environment: {env_name}")
         return False
@@ -107,7 +109,7 @@ def run_with_conda_env(env_name, command_list, cwd=None):
         logger.error(f"❌ Failed to run command: {e}")
         return False
 
-def run_proteina_inference(csv_file, csv_column, cif_dir, inference_config, num_gpus, usalign_path=None):
+def run_proteina_inference(csv_file, csv_column, cif_dir, inference_config, num_gpus, usalign_path=None, force_compile: bool = False):
     """Run the Proteina inference pipeline."""
     logger.info("🧬 Starting Proteina inference pipeline...")
     
@@ -120,6 +122,8 @@ def run_proteina_inference(csv_file, csv_column, cif_dir, inference_config, num_
         '--num_gpus', str(num_gpus),
         '--skip_existing'  # Always skip existing to avoid re-processing
     ]
+    if force_compile:
+        cmd.append('--force_compile')
     
     if usalign_path:
         cmd.extend(['--usalign_path', usalign_path])
@@ -148,6 +152,28 @@ def run_af2rank_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpu
     # Run in colabdesign environment using shell script wrapper
     return run_with_conda_env('colabdesign', cmd)
 
+def run_proteinebm_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpus, proteinebm_config, proteinebm_checkpoint, proteinebm_template_self_condition=True):
+    """Run the ProteinEBM scoring pipeline."""
+    logger.info("💸 Starting ProteinEBM scoring pipeline...")
+    
+    cmd = [
+        'python', 'parallel_proteinebm_scoring.py',
+        '--csv_file', csv_file,
+        '--csv_column', csv_column,
+        '--cif_dir', cif_dir,
+        '--inference_config', inference_config,
+        '--num_gpus', str(num_gpus),
+        '--filter_existing',  # Always filter to only score proteins needing ProteinEBM
+        '--proteinebm_config', proteinebm_config,
+        '--proteinebm_checkpoint', proteinebm_checkpoint,
+    ]
+    
+    if not proteinebm_template_self_condition:
+        cmd.append('--no-proteinebm_template_self_condition')
+    
+    # Run in proteinebm environment using shell script wrapper
+    return run_with_conda_env('proteinebm', cmd)
+
 def main():
     parser = argparse.ArgumentParser(description='Complete AF2Rank Evaluation Pipeline')
     parser.add_argument('--csv_file', required=True, help='Path to CSV file with protein data')
@@ -155,14 +181,29 @@ def main():
     parser.add_argument('--cif_dir', required=True, help='Directory containing CIF files')
     parser.add_argument('--inference_config', required=True, help='Inference configuration name')
     parser.add_argument('--num_gpus', type=int, default=1, help='Number of GPUs to use')
+    parser.add_argument('--scorer', choices=['af2rank', 'proteinebm'], default='af2rank',
+                       help='Which scoring backend to use in step 2')
     parser.add_argument('--recycles', type=int, default=3, help='Number of AF2 recycles for scoring')
     parser.add_argument('--usalign_path', help='Path to USalign executable')
     parser.add_argument('--skip_inference', action='store_true', 
-                       help='Skip Proteina inference (only run AF2Rank scoring)')
-    parser.add_argument('--skip_af2rank', action='store_true',
-                       help='Skip AF2Rank scoring (only run Proteina inference)')
+                       help='Skip Proteina inference (only run scoring stage)')
+    parser.add_argument('--skip_scoring', action='store_true',
+                       help='Skip scoring stage (AF2Rank or ProteinEBM depending on --scorer)')
     parser.add_argument('--regenerate_plots', action='store_true',
                        help='Regenerate AF2Rank plots even if scoring already completed')
+    parser.add_argument(
+        '--proteina_force_compile',
+        action='store_true',
+        help='Pass --force_compile to Proteina inference (torch.compile even in eval/no_grad).',
+    )
+    
+    # ProteinEBM scoring options
+    parser.add_argument('--proteinebm_checkpoint', default='/home/ubuntu/ProteinEBM/weights/model_1_frozen_1m_md.pt',
+                       help='Path to ProteinEBM checkpoint to use for scoring')
+    parser.add_argument('--proteinebm_config', default='/home/ubuntu/ProteinEBM/protein_ebm/config/base_pretrain.yaml',
+                       help='Path to ProteinEBM base_pretrain.yaml config')
+    parser.add_argument('--proteinebm_template_self_condition', action=argparse.BooleanOptionalAction, default=True,
+                       help='Use template coordinates for self-conditioning (matches ProteinEBM --template_self_condition)')
     
     args = parser.parse_args()
     
@@ -193,6 +234,7 @@ def main():
     logger.info(f"📂 CIF directory: {args.cif_dir}")
     logger.info(f"⚙️  Inference config: {args.inference_config}")
     logger.info(f"🔥 GPUs: {args.num_gpus}")
+    logger.info(f"🧮 Scorer: {args.scorer}")
     logger.info(f"🔄 AF2Rank recycles: {args.recycles}")
     logger.info(f"🐍 Using shell script wrappers for conda environments")
     
@@ -210,7 +252,8 @@ def main():
             args.cif_dir, 
             args.inference_config, 
             args.num_gpus,
-            args.usalign_path
+            args.usalign_path,
+            force_compile=args.proteina_force_compile,
         )
         
         if inference_success:
@@ -221,29 +264,44 @@ def main():
     else:
         logger.info("⏭️  Skipping Proteina inference")
     
-    # Step 2: AF2Rank Scoring
-    if not args.skip_af2rank and success:
+    # Step 2: Scoring (AF2Rank or ProteinEBM)
+    if not args.skip_scoring and success:
         logger.info("\n" + "="*60)
-        logger.info("STEP 2: AF2RANK SCORING")
+        if args.scorer == 'af2rank':
+            logger.info("STEP 2: AF2RANK SCORING")
+        else:
+            logger.info("STEP 2: PROTEINEBM SCORING")
         logger.info("="*60)
         
-        af2rank_success = run_af2rank_scoring(
-            args.csv_file,
-            args.csv_column,
-            args.cif_dir,
-            args.inference_config,
-            args.num_gpus,
-            args.recycles,
-            args.regenerate_plots
-        )
-        
-        if af2rank_success:
-            logger.info("✅ AF2Rank scoring completed successfully")
+        if args.scorer == 'af2rank':
+            scoring_success = run_af2rank_scoring(
+                args.csv_file,
+                args.csv_column,
+                args.cif_dir,
+                args.inference_config,
+                args.num_gpus,
+                args.recycles,
+                args.regenerate_plots
+            )
         else:
-            logger.error("❌ AF2Rank scoring failed")
+            scoring_success = run_proteinebm_scoring(
+                csv_file=args.csv_file,
+                csv_column=args.csv_column,
+                   cif_dir=args.cif_dir,
+                inference_config=args.inference_config,
+                num_gpus=args.num_gpus,
+                proteinebm_config=args.proteinebm_config,
+                proteinebm_checkpoint=args.proteinebm_checkpoint,
+                proteinebm_template_self_condition=args.proteinebm_template_self_condition
+            )
+        
+        if scoring_success:
+            logger.info(f"✅ Scoring completed successfully ({args.scorer})")
+        else:
+            logger.error(f"❌ Scoring failed ({args.scorer})")
             success = False
-    elif args.skip_af2rank:
-        logger.info("⏭️  Skipping AF2Rank scoring")
+    elif args.skip_scoring:
+        logger.info(f"⏭️  Skipping scoring stage ({args.scorer})")
     
     # Final summary
     total_time = time.time() - start_time

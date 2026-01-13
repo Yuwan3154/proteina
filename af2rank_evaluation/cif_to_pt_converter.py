@@ -7,8 +7,9 @@ Utility to convert CIF files to PT format for Proteina inference.
 This script extracts sequence information from CIF files and creates 
 the torch geometric Data objects needed for inference.
 
-The amino acid encoding uses Proteina's exact constants from 
-openfold.np.residue_constants to ensure 100% compatibility.
+The amino acid encoding uses Proteina's exact constants from the bundled
+OpenFold stub to ensure compatibility without requiring the external
+`openfold` package to be installed in the conda env.
 """
 
 import argparse
@@ -29,7 +30,7 @@ from dotenv import load_dotenv
 sys.path.append(os.path.expanduser('~/proteina'))
 
 # Import Proteina's exact amino acid encoding to ensure consistency
-from openfold.np.residue_constants import (
+from proteinfoundation.openfold_stub.np.residue_constants import (
     restypes, 
     restype_order, 
     restype_3to1, 
