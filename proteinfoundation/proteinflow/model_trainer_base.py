@@ -228,6 +228,8 @@ class ModelTrainerBase(L.LightningModule):
             else:
                 # Capture multiple scalars so we can detect changes even if norms match.
                 pre[n] = {
+                    "grad_id": id(g),
+                    "grad_version": int(getattr(g, "_version", -1)),
                     "grad_norm": float(g.norm().item()),
                     "grad_absmax": float(g.abs().max().item()),
                     "grad_sum": float(g.sum().item()),
@@ -291,11 +293,18 @@ class ModelTrainerBase(L.LightningModule):
                         post_norm = float(g.norm().item())
                         post_absmax = float(g.abs().max().item())
                         post_sum = float(g.sum().item())
+                        post_id = id(g)
+                        post_ver = int(getattr(g, "_version", -1))
                         pre = pre_norms.get(n, None)
                         if pre is None:
                             changed = True
                         else:
+                            # Primary signal: did autograd actually accumulate into this grad tensor?
+                            # AccumulateGrad uses in-place adds and increments _version even if the
+                            # values don't change (e.g., all-zero microbatch contribution).
+                            ver_changed = (post_id == int(pre["grad_id"])) and (post_ver != int(pre["grad_version"]))
                             changed = (
+                                ver_changed
                                 abs(post_norm - float(pre["grad_norm"])) > 1e-12
                                 or abs(post_absmax - float(pre["grad_absmax"])) > 1e-12
                                 or abs(post_sum - float(pre["grad_sum"])) > 1e-12
@@ -308,6 +317,8 @@ class ModelTrainerBase(L.LightningModule):
                                     post_norm,
                                     None if pre is None else pre["grad_dtype"],
                                     str(g.dtype),
+                                    None if pre is None else pre.get("grad_version", None),
+                                    post_ver,
                                 )
                             )
                             continue
@@ -384,6 +395,10 @@ class ModelTrainerBase(L.LightningModule):
                     post = float(g.norm().item())
                     pre_norm = None if pre is None else float(pre["grad_norm"])
                     delta = None if pre is None else float(post - pre_norm)
+                    pre_ver = None if pre is None else int(pre.get("grad_version", -1))
+                    post_ver = int(getattr(g, "_version", -1))
+                    pre_id = None if pre is None else int(pre.get("grad_id", -1))
+                    post_id = id(g)
                     deltas.append(
                         (
                             n,
@@ -393,6 +408,10 @@ class ModelTrainerBase(L.LightningModule):
                             delta,
                             str(g.dtype),
                             str(p.dtype),
+                            pre_ver,
+                            post_ver,
+                            pre_id,
+                            post_id,
                         )
                     )
                 logger.warning(
