@@ -152,6 +152,46 @@ class ModelTrainerBase(L.LightningModule):
         
         return optimizer
 
+    def _install_unused_param_backward_hooks(self) -> None:
+        """
+        Installs lightweight per-parameter backward hooks (rank0 only) to detect
+        which parameters actually participate in a given backward pass.
+
+        This is accumulation-safe: it does not rely on grad being None vs non-None,
+        which can be confounded by gradient accumulation (previous microbatches
+        already populated .grad tensors).
+        """
+        if getattr(self, "global_rank", 0) != 0:
+            return
+        if getattr(self, "_unused_param_hooks_installed", False):
+            return
+
+        self._unused_param_hooks_installed = True
+        self._unused_param_used_names = set()
+        self._unused_param_hook_handles = []
+
+        for name, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+
+            def _mark_used(grad, _name=name):
+                self._unused_param_used_names.add(_name)
+                return grad
+
+            self._unused_param_hook_handles.append(p.register_hook(_mark_used))
+
+    def on_before_backward(self, loss: Tensor) -> None:
+        """
+        Called before each backward. We use this to reset per-backward bookkeeping
+        for unused-parameter detection.
+        """
+        if getattr(self, "global_rank", 0) != 0:
+            return
+        self._install_unused_param_backward_hooks()
+        # Reset the used set for this backward pass
+        if getattr(self, "_unused_param_used_names", None) is not None:
+            self._unused_param_used_names.clear()
+
     def on_after_backward(self) -> None:
         """
         Per-batch (per backward) check for parameters that did not receive gradients.
@@ -162,25 +202,46 @@ class ModelTrainerBase(L.LightningModule):
         if getattr(self, "global_rank", 0) != 0:
             return
 
-        unused_names: List[str] = []
-        for name, p in self.named_parameters():
-            if not p.requires_grad:
-                continue
-            if p.grad is None:
-                unused_names.append(name)
+        # Use the per-backward hook set if available (accumulation-safe).
+        used = getattr(self, "_unused_param_used_names", None)
+        if used is None:
+            # Fallback to legacy behavior (should be rare)
+            used = set()
+
+        unused_names: List[str] = [
+            name for name, p in self.named_parameters()
+            if p.requires_grad and (name not in used)
+        ]
 
         if len(unused_names) > 0:
             unused_names.sort()
             head = unused_names[:50]
             batch_idx = int(getattr(self, "_debug_last_batch_idx", -1))
+            accum = int(self.cfg_exp.opt.get("accumulate_grad_batches", 1))
+            is_accum_boundary = (batch_idx >= 0) and (accum > 1) and (batch_idx % accum == 0)
             logger.warning(
-                "[unused_params_detected/batch] step={} batch_idx={} n_unused={} first_{}={}",
+                "[unused_params_detected/batch] step={} batch_idx={} accum={} accum_boundary={} n_unused={} first_{}={}",
                 int(getattr(self, "global_step", -1)),
                 batch_idx,
+                accum,
+                is_accum_boundary,
                 len(unused_names),
                 len(head),
                 head,
             )
+
+            # Extra context for the most suspicious one: contact_map_decoder's linear.
+            # If this shows up, we want to know whether the predicted contact map tensors
+            # were connected to the graph on that batch.
+            if "nn.contact_map_decoder.1.weight" in unused_names:
+                logger.warning(
+                    "[unused_params_detected/contact_map_ctx] step={} batch_idx={} grad_enabled={} c_1_pred_requires_grad={} contact_map_logits_requires_grad={}",
+                    int(getattr(self, "global_step", -1)),
+                    batch_idx,
+                    bool(getattr(self, "_debug_last_grad_enabled", True)),
+                    getattr(self, "_debug_last_c_1_pred_requires_grad", None),
+                    getattr(self, "_debug_last_contact_map_logits_requires_grad", None),
+                )
 
     def _nn_out_to_x_clean(self, nn_out, batch):
         """
@@ -555,6 +616,11 @@ class ModelTrainerBase(L.LightningModule):
         # For per-batch debug hooks (e.g., unused parameter detection).
         # This is the raw microbatch index (respects gradient accumulation).
         self._debug_last_batch_idx = int(batch_idx)
+        # Stash a few tensors' grad connectivity so on_after_backward can explain
+        # unexpected "unused" reports (especially for contact map decoder).
+        self._debug_last_grad_enabled = bool(torch.is_grad_enabled())
+        self._debug_last_c_1_pred_requires_grad = None
+        self._debug_last_contact_map_logits_requires_grad = None
         val_step = batch_idx == -1 or getattr(self, "_in_validation_loop", False)
         log_prefix = "validation_loss" if val_step else "train"
         
@@ -747,6 +813,11 @@ class ModelTrainerBase(L.LightningModule):
             if non_contact_value not in (0, -1):
                 raise ValueError(f"non_contact_value must be 0 or -1, got {non_contact_value}")
             c_1_pred = self._nn_out_to_c_clean(nn_out, batch)
+            if c_1_pred is not None:
+                self._debug_last_c_1_pred_requires_grad = bool(c_1_pred.requires_grad)
+            c_logits = self._nn_out_to_c_logits(nn_out, batch)
+            if c_logits is not None:
+                self._debug_last_contact_map_logits_requires_grad = bool(c_logits.requires_grad)
             if c_1_pred is None:
                 raise ValueError(
                     "contact_map_mode=True requires contact_map_logits/contact_map_pred in model output."
