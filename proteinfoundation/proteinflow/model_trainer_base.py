@@ -305,7 +305,7 @@ class ModelTrainerBase(L.LightningModule):
                             ver_changed = (post_id == int(pre["grad_id"])) and (post_ver != int(pre["grad_version"]))
                             changed = (
                                 ver_changed
-                                abs(post_norm - float(pre["grad_norm"])) > 1e-12
+                                or abs(post_norm - float(pre["grad_norm"])) > 1e-12
                                 or abs(post_absmax - float(pre["grad_absmax"])) > 1e-12
                                 or abs(post_sum - float(pre["grad_sum"])) > 1e-12
                             )
