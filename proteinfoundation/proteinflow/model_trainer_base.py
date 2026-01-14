@@ -202,6 +202,11 @@ class ModelTrainerBase(L.LightningModule):
         if getattr(self, "global_rank", 0) != 0:
             return
 
+        # If any non-finite loss was detected for this backward, skip the optimizer update
+        # by clearing gradients (so optimizer.step sees grad=None and does nothing).
+        if getattr(self, "_skip_update_due_to_nonfinite_loss", False):
+            self.zero_grad()
+
         # Use the per-backward hook set if available (accumulation-safe).
         used = getattr(self, "_unused_param_used_names", None)
         if used is None:
@@ -229,6 +234,20 @@ class ModelTrainerBase(L.LightningModule):
                 len(head),
                 head,
             )
+            mask_sums = getattr(self, "_debug_last_mask_sums", None)
+            if mask_sums is not None and len(mask_sums) > 0:
+                head_sums = mask_sums[:16]
+                logger.warning(
+                    "[unused_params_detected/batch_shape] step={} batch_idx={} bs={} n={} mask_sums_min={} mask_sums_max={} mask_sums_first_{}={}",
+                    int(getattr(self, "global_step", -1)),
+                    batch_idx,
+                    getattr(self, "_debug_last_batch_size", None),
+                    getattr(self, "_debug_last_n", None),
+                    int(min(mask_sums)),
+                    int(max(mask_sums)),
+                    len(head_sums),
+                    head_sums,
+                )
 
             # Extra context for the most suspicious one: contact_map_decoder's linear.
             # If this shows up, we want to know whether the predicted contact map tensors
@@ -621,12 +640,22 @@ class ModelTrainerBase(L.LightningModule):
         self._debug_last_grad_enabled = bool(torch.is_grad_enabled())
         self._debug_last_c_1_pred_requires_grad = None
         self._debug_last_contact_map_logits_requires_grad = None
+        self._debug_last_mask_sums = None
+        self._debug_last_batch_size = None
+        self._debug_last_n = None
+        self._debug_nonfinite_loss_ids = None
+        self._skip_update_due_to_nonfinite_loss = False
         val_step = batch_idx == -1 or getattr(self, "_in_validation_loop", False)
         log_prefix = "validation_loss" if val_step else "train"
         
         # Extract inputs from batch (our dataloader)
         # This may apply augmentations, if requested in the config file
         x_1, mask, batch_shape, n, dtype = self.extract_clean_sample(batch)
+        # Record a compact fingerprint of this training example shape.
+        # This is useful for correlating rare unused-parameter events with data properties.
+        self._debug_last_batch_size = int(mask.shape[0])
+        self._debug_last_n = int(mask.shape[1])
+        self._debug_last_mask_sums = mask.sum(-1).detach().cpu().to(torch.int64).tolist()
 
         # Center and mask input
         x_1 = self.fm._mask_and_zero_com(x_1, mask)
@@ -808,6 +837,53 @@ class ModelTrainerBase(L.LightningModule):
 
         # Main prediction
         nn_out = self.predict_clean(batch)
+
+        def _sanitize_and_log_loss_vec(loss_vec: torch.Tensor, name: str) -> torch.Tensor:
+            """
+            If loss_vec has non-finite entries, log which samples are affected and
+            replace those entries with 0 (detached) so training can continue.
+            Also marks the step to skip the optimizer update for safety.
+            """
+            if loss_vec is None:
+                return loss_vec
+            if loss_vec.numel() == 0:
+                return loss_vec
+            nonfinite = ~(torch.isfinite(loss_vec))
+            if not nonfinite.any():
+                return loss_vec
+
+            idx = nonfinite.nonzero(as_tuple=False).reshape(-1)
+            ids = None
+            if "id" in batch:
+                batch_ids = batch["id"]
+                idx_list = idx.detach().cpu().tolist()
+                # Common cases:
+                # - list/tuple of strings
+                # - 1D tensor of ints/strings-like
+                if isinstance(batch_ids, (list, tuple)):
+                    if len(batch_ids) > 0:
+                        ids = [str(batch_ids[int(i)]) for i in idx_list]
+                elif torch.is_tensor(batch_ids):
+                    # Convert to Python list first
+                    ids_list = batch_ids.detach().cpu().tolist()
+                    ids = [str(ids_list[int(i)]) for i in idx_list]
+
+            self._skip_update_due_to_nonfinite_loss = True
+            self._debug_nonfinite_loss_ids = ids
+
+            logger.warning(
+                "[nonfinite_loss_detected/{}] step={} batch_idx={} n_bad={} bad_indices={} ids={}",
+                name,
+                int(getattr(self, "global_step", -1)),
+                int(getattr(self, "_debug_last_batch_idx", -1)),
+                int(idx.numel()),
+                idx.detach().cpu().tolist()[:32],
+                ids[:32] if ids is not None else None,
+            )
+
+            # Replace non-finite entries with 0 (detached) so grads stay finite.
+            zero = loss_vec.detach() * 0.0
+            return torch.where(torch.isfinite(loss_vec), loss_vec, zero)
         if contact_map_mode:
             non_contact_value = getattr(self.nn, "non_contact_value")
             if non_contact_value not in (0, -1):
@@ -825,6 +901,7 @@ class ModelTrainerBase(L.LightningModule):
             contact_map_loss = self.compute_contact_map_loss(
                 c_1, c_1_pred, batch["contact_map_t"], t, mask, log_prefix=log_prefix
             )
+            contact_map_loss = _sanitize_and_log_loss_vec(contact_map_loss, "contact_map_loss")
             train_loss = torch.mean(contact_map_loss)
 
             if predict_coords:
@@ -857,6 +934,7 @@ class ModelTrainerBase(L.LightningModule):
                     pred_frames_tensor7=pred_frames_tensor7,
                     residue_type=batch.get("residue_type_unmasked", batch.get("residue_type", None)),
                 )
+                coord_loss = _sanitize_and_log_loss_vec(coord_loss, "fape_loss")
                 coord_weight = getattr(
                     self, "contact_map_coord_loss_weight", 0.0
                 )
@@ -869,23 +947,24 @@ class ModelTrainerBase(L.LightningModule):
             fm_loss = self.compute_fm_loss(
                 x_1, x_1_pred, x_t, t, mask, log_prefix=log_prefix
             )  # [*]
-            if torch.isnan(torch.mean(fm_loss)):
-                for i in range(len(fm_loss)):
-                    if torch.isnan(fm_loss[i]):
-                        print(f"fm_loss is nan at step {self.global_step} for batch {batch_idx} for sample {i}: {batch['id'][i]}")
-                raise ValueError(f"fm_loss is nan at step {self.global_step} for batch {batch_idx}")
+            fm_loss = _sanitize_and_log_loss_vec(fm_loss, "fm_loss")
             train_loss = torch.mean(fm_loss)
         
         if self.cfg_exp.loss.use_aux_loss:
             auxiliary_loss = self.compute_auxiliary_loss(
                 x_1, x_1_pred, x_t, t, mask, nn_out=nn_out, log_prefix=log_prefix, batch=batch
             )  # [*] already includes loss weights
-            if torch.isnan(torch.mean(auxiliary_loss)):
-                for i in range(len(auxiliary_loss)):
-                    if torch.isnan(auxiliary_loss[i]):
-                        print(f"auxiliary_loss is nan at step {self.global_step} for batch {batch_idx} for sample {i}: {batch['id'][i]}")
-                raise ValueError(f"auxiliary_loss is nan at step {self.global_step} for batch {batch_idx}")
+            auxiliary_loss = _sanitize_and_log_loss_vec(auxiliary_loss, "auxiliary_loss")
             train_loss = train_loss + torch.mean(auxiliary_loss)
+
+        # If anything non-finite was detected in this backward, skip the update safely.
+        if self._skip_update_due_to_nonfinite_loss:
+            logger.warning(
+                "[nonfinite_loss_skip_update] step={} batch_idx={} ids={}",
+                int(getattr(self, "global_step", -1)),
+                int(getattr(self, "_debug_last_batch_idx", -1)),
+                self._debug_nonfinite_loss_ids[:32] if self._debug_nonfinite_loss_ids is not None else None,
+            )
 
         self.log(
             f"{log_prefix}/loss",
