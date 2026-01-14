@@ -366,7 +366,7 @@ if __name__ == "__main__":
         val_check_interval=cfg_exp.opt.val_check_interval,
         strategy=DDPStrategy(
             process_group_backend=cfg_exp.opt.get("dist_backend", "nccl"),
-            find_unused_parameters=True,
+            find_unused_parameters=False,
             gradient_as_bucket_view=True,  # Memory optimization
             static_graph=False
         ) if cfg_exp.opt.dist_strategy == "ddp" else cfg_exp.opt.dist_strategy,

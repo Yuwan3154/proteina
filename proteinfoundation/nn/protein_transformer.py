@@ -758,6 +758,26 @@ class ProteinTransformerAF3(torch.nn.Module):
                 torch.nn.LayerNorm(kwargs["pair_repr_dim"]),
                 torch.nn.Linear(kwargs["pair_repr_dim"], 1, bias=False),
             )
+
+        # In some distributed + compiled regimes, we can intermittently hit DDP
+        # "unused parameter" errors even though these modules are logically active.
+        # To make training robust, keep a static list of parameters and force a
+        # zero-valued dependency on them in forward (adds exactly 0, no behavior change).
+        self._ddp_force_used_params = []
+        if self.contact_map_mode:
+            modules_maybe = [
+                getattr(self, "contact_map_decoder", None),
+                getattr(self, "cond_factory", None),
+                getattr(self, "init_repr_factory", None),
+                getattr(self, "pair_repr_builder", None),
+                getattr(self, "pair_head_prediction", None),
+            ]
+            for m in modules_maybe:
+                if m is None:
+                    continue
+                for p in m.parameters():
+                    if getattr(p, "requires_grad", False):
+                        self._ddp_force_used_params.append(p)
         
         self.coors_3d_decoder = None
         if not self.contact_map_mode:
@@ -1097,6 +1117,13 @@ class ProteinTransformerAF3(torch.nn.Module):
             contact_map_logits = self.contact_map_decoder(pair_rep)  # [b, n, n, 1]
             contact_map_logits = contact_map_logits.squeeze(-1)  # [b, n, n]
             contact_map_logits = contact_map_logits * pair_mask
+            # Force a zero-dependency on parameters that should be active each batch
+            # to prevent rare DDP unused-parameter failures (esp. under torch.compile).
+            if getattr(self, "_ddp_force_used_params", None):
+                zero = contact_map_logits.sum() * 0.0
+                for p in self._ddp_force_used_params:
+                    zero = zero + p.sum() * 0.0
+                contact_map_logits = contact_map_logits + zero
             nn_out["contact_map_logits"] = contact_map_logits
             if self.non_contact_value == -1:
                 nn_out["contact_map_pred"] = torch.tanh(contact_map_logits)
