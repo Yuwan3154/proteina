@@ -261,6 +261,31 @@ class ModelTrainerBase(L.LightningModule):
                     getattr(self, "_debug_last_c_1_pred_requires_grad", None),
                     getattr(self, "_debug_last_contact_map_logits_requires_grad", None),
                 )
+                # Also log grad presence/norms for contact-map head params to disambiguate
+                # "not used at all" vs. "used but zero grad" (should still be present).
+                name_to_param = dict(self.named_parameters())
+                names_check = [
+                    "nn.contact_map_decoder.0.weight",
+                    "nn.contact_map_decoder.0.bias",
+                    "nn.contact_map_decoder.1.weight",
+                ]
+                rows = []
+                for n in names_check:
+                    p = name_to_param.get(n, None)
+                    if p is None:
+                        rows.append((n, "missing", None, None))
+                        continue
+                    if p.grad is None:
+                        rows.append((n, "grad_none", None, None))
+                        continue
+                    g = p.grad
+                    rows.append((n, "grad_ok", float(g.abs().max().item()), float(g.norm().item())))
+                logger.warning(
+                    "[unused_params_detected/contact_map_grad] step={} batch_idx={} rows={}",
+                    int(getattr(self, "global_step", -1)),
+                    batch_idx,
+                    rows,
+                )
 
     def _nn_out_to_x_clean(self, nn_out, batch):
         """
