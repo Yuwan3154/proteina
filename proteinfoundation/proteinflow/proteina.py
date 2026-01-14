@@ -17,7 +17,7 @@ from typing import Dict
 import torch
 from jaxtyping import Bool, Float
 from lightning.pytorch.utilities.rank_zero import rank_zero_only
-from omegaconf import OmegaConf
+from omegaconf import open_dict
 from scipy.spatial.transform import Rotation as ScipyRotation
 from torch import Tensor
 
@@ -97,13 +97,13 @@ class Proteina(ModelTrainerBase):
         # - cuequivariance_torch is available, AND
         # - triangle-mult dimensions are compatible (checked inside ProteinTransformerAF3).
         use_cueq_opt = cfg_exp.opt.get("use_cueq", None)
-        # NOTE: keep resolve=False to avoid requiring all interpolations/env-vars
-        # (e.g., DATA_PATH) at import-time; Hydra will resolve them in the actual
-        # training environment.
-        nn_kwargs = OmegaConf.to_container(cfg_exp.model.nn, resolve=False)
         if use_cueq_opt is not None:
-            nn_kwargs["use_cueq"] = bool(use_cueq_opt)
-        self.nn = ProteinTransformerAF3(**nn_kwargs)
+            # cfg_exp is a structured OmegaConf; use open_dict to allow adding new keys.
+            with open_dict(cfg_exp.model.nn):
+                cfg_exp.model.nn.use_cueq = bool(use_cueq_opt)
+        # Pass the DictConfig through so OmegaConf interpolations (e.g. ${oc.env:DATA_PATH})
+        # resolve correctly in the actual training environment.
+        self.nn = ProteinTransformerAF3(**cfg_exp.model.nn)
         self.non_contact_value = cfg_exp.model.nn.get("non_contact_value", 0)
         if self.non_contact_value not in (0, -1):
             raise ValueError(f"non_contact_value must be 0 or -1, got {self.non_contact_value}")
