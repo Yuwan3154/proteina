@@ -5,6 +5,8 @@ Complete AF2Rank Evaluation Pipeline
 This script runs the complete pipeline:
 1. Proteina inference (parallel across GPUs)
 2. AF2Rank scoring (parallel across GPUs)
+3. (Optional) AF2Rank scoring on ProteinEBM top-k templates (per protein)
+4. Cross-protein plots (always)
 
 Usage:
     python run_full_pipeline.py --csv_file data.csv --cif_dir /path/to/cif --inference_config config_name --num_gpus 4
@@ -174,16 +176,121 @@ def run_proteinebm_scoring(csv_file, csv_column, cif_dir, inference_config, num_
     # Run in proteinebm environment using shell script wrapper
     return run_with_conda_env('proteinebm', cmd)
 
+def run_cross_protein_plots(
+    inference_dir: str,
+    output_dir: str,
+    scorer: str,
+    dataset_file: str,
+    id_column: str,
+    tms_column: str,
+    af2rank_top_k: int,
+    proteinebm_plot_mode: str = "tm",
+) -> bool:
+    """Run generate_cross_protein_plots.py for the requested scorer."""
+    cmd = [
+        "python",
+        "generate_cross_protein_plots.py",
+        "--inference_dir",
+        inference_dir,
+        "--output_dir",
+        output_dir,
+        "--scorer",
+        scorer,
+        "--dataset_file",
+        dataset_file,
+        "--id_column",
+        id_column,
+        "--tms_column",
+        tms_column,
+    ]
+
+    if scorer == "proteinebm":
+        cmd.extend(["--proteinebm_plot_mode", proteinebm_plot_mode])
+
+    if scorer == "af2rank_on_proteinebm_topk":
+        cmd.extend(["--af2rank_top_k", str(int(af2rank_top_k))])
+
+    return run_with_conda_env("proteina", cmd, cwd=os.path.dirname(os.path.abspath(__file__)))
+
+
+def run_af2rank_on_proteinebm_topk(
+    inference_dir: str,
+    dataset_file: str,
+    id_column: str,
+    tms_column: str,
+    top_k: int,
+    recycles: int,
+    num_gpus: int,
+    filter_existing: bool = True,
+) -> bool:
+    """Run AF2Rank scoring on the ProteinEBM top-k templates per protein."""
+    logger.info("🧪 Starting AF2Rank-on-ProteinEBM-topk step...")
+
+    if top_k <= 0:
+        logger.error("top_k must be > 0 for AF2Rank-on-ProteinEBM-topk")
+        return False
+
+    cmd = [
+        "python",
+        "run_af2rank_on_proteinebm_topk.py",
+        "--inference_dir",
+        inference_dir,
+        "--top_k",
+        str(int(top_k)),
+        "--recycles",
+        str(int(recycles)),
+        "--num_gpus",
+        str(int(num_gpus)),
+    ]
+
+    if dataset_file:
+        cmd.extend(
+            [
+                "--dataset_file",
+                dataset_file,
+                "--id_column",
+                id_column,
+                "--tms_column",
+                tms_column,
+            ]
+        )
+
+    if filter_existing:
+        cmd.append("--filter_existing")
+    else:
+        cmd.append("--no-filter_existing")
+
+    # This script launches colabdesign subprocesses internally via wrapper script,
+    # but the driver itself can run under proteina env.
+    return run_with_conda_env("proteina", cmd, cwd=os.path.dirname(os.path.abspath(__file__)))
+
+
 def main():
     parser = argparse.ArgumentParser(description='Complete AF2Rank Evaluation Pipeline')
-    parser.add_argument('--csv_file', required=True, help='Path to CSV file with protein data')
-    parser.add_argument('--csv_column', required=True, help='Column name in CSV file to use for protein selection')
+    # Prefer consistent naming: dataset_file + id_column.
+    # Keep --csv_file/--csv_column as hidden aliases for backward compatibility.
+    parser.add_argument('--dataset_file', required=True, help='Path to dataset CSV file with protein ids and reference TM scores')
+    parser.add_argument('--id_column', required=True, help='Column name in dataset CSV to use as protein ID (e.g. pdb)')
+    parser.add_argument('--csv_file', dest='dataset_file', help=argparse.SUPPRESS)
+    parser.add_argument('--csv_column', dest='id_column', help=argparse.SUPPRESS)
     parser.add_argument('--cif_dir', required=True, help='Directory containing CIF files')
     parser.add_argument('--inference_config', required=True, help='Inference configuration name')
     parser.add_argument('--num_gpus', type=int, default=1, help='Number of GPUs to use')
     parser.add_argument('--scorer', choices=['af2rank', 'proteinebm'], default='af2rank',
                        help='Which scoring backend to use in step 2')
     parser.add_argument('--recycles', type=int, default=3, help='Number of AF2 recycles for scoring')
+    parser.add_argument(
+        '--af2rank_top_k',
+        type=int,
+        default=0,
+        help='If > 0 and --scorer=proteinebm, run AF2Rank on the ProteinEBM top-k templates per protein (rank by energy, then AF2Rank ranks by pTM)',
+    )
+    parser.add_argument(
+        '--af2rank_topk_filter_existing',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Skip proteins whose af2rank_on_proteinebm_topk outputs already exist.',
+    )
     parser.add_argument('--usalign_path', help='Path to USalign executable')
     parser.add_argument('--skip_inference', action='store_true', 
                        help='Skip Proteina inference (only run scoring stage)')
@@ -195,6 +302,19 @@ def main():
         '--proteina_force_compile',
         action='store_true',
         help='Pass --force_compile to Proteina inference (torch.compile even in eval/no_grad).',
+    )
+    parser.add_argument('--tms_column', required=True,
+                       help='Dataset column name to use as reference TM score (required, used for cross-protein plots)')
+    parser.add_argument(
+        '--cross_protein_output_dir',
+        required=True,
+        help='Output directory for cross-protein plots',
+    )
+    parser.add_argument(
+        '--proteinebm_cross_protein_plot_mode',
+        choices=['tm', 'energy'],
+        default='tm',
+        help='When --scorer=proteinebm, which ProteinEBM cross-protein plot mode to run in the final plotting step',
     )
     
     # ProteinEBM scoring options
@@ -208,8 +328,8 @@ def main():
     args = parser.parse_args()
     
     # Validate inputs
-    if not os.path.exists(args.csv_file):
-        logger.error(f"CSV file not found: {args.csv_file}")
+    if not os.path.exists(args.dataset_file):
+        logger.error(f"Dataset file not found: {args.dataset_file}")
         sys.exit(1)
     
     if not os.path.exists(args.cif_dir):
@@ -228,15 +348,18 @@ def main():
         args.num_gpus = gpu_count
     
     start_time = time.time()
+    project_root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
     
     logger.info(f"🚀 Starting complete AF2Rank evaluation pipeline")
-    logger.info(f"📊 CSV file: {args.csv_file}")
+    logger.info(f"📊 Dataset file: {args.dataset_file}")
     logger.info(f"📂 CIF directory: {args.cif_dir}")
     logger.info(f"⚙️  Inference config: {args.inference_config}")
     logger.info(f"🔥 GPUs: {args.num_gpus}")
     logger.info(f"🧮 Scorer: {args.scorer}")
     logger.info(f"🔄 AF2Rank recycles: {args.recycles}")
     logger.info(f"🐍 Using shell script wrappers for conda environments")
+    logger.info(f"🔑 ID column: {args.id_column}")
+    logger.info(f"🔑 TM score column: {args.tms_column}")
     
     success = True
     
@@ -247,8 +370,8 @@ def main():
         logger.info("="*60)
         
         inference_success = run_proteina_inference(
-            args.csv_file, 
-            args.csv_column,
+            args.dataset_file,
+            args.id_column,
             args.cif_dir, 
             args.inference_config, 
             args.num_gpus,
@@ -275,8 +398,8 @@ def main():
         
         if args.scorer == 'af2rank':
             scoring_success = run_af2rank_scoring(
-                args.csv_file,
-                args.csv_column,
+                args.dataset_file,
+                args.id_column,
                 args.cif_dir,
                 args.inference_config,
                 args.num_gpus,
@@ -285,8 +408,8 @@ def main():
             )
         else:
             scoring_success = run_proteinebm_scoring(
-                csv_file=args.csv_file,
-                csv_column=args.csv_column,
+                csv_file=args.dataset_file,
+                csv_column=args.id_column,
                    cif_dir=args.cif_dir,
                 inference_config=args.inference_config,
                 num_gpus=args.num_gpus,
@@ -302,6 +425,73 @@ def main():
             success = False
     elif args.skip_scoring:
         logger.info(f"⏭️  Skipping scoring stage ({args.scorer})")
+
+    # Step 3: Optional AF2Rank scoring on ProteinEBM top-k templates
+    if success and (not args.skip_scoring) and args.scorer == "proteinebm" and int(args.af2rank_top_k) > 0:
+        logger.info("\n" + "="*60)
+        logger.info("STEP 3: AF2RANK ON PROTEINEBM TOP-K TEMPLATES")
+        logger.info("="*60)
+
+        inference_dir = os.path.join(project_root, "inference", args.inference_config)
+        topk_success = run_af2rank_on_proteinebm_topk(
+            inference_dir=inference_dir,
+            dataset_file=args.dataset_file,
+            id_column=args.id_column,
+            tms_column=args.tms_column,
+            top_k=int(args.af2rank_top_k),
+            recycles=int(args.recycles),
+            num_gpus=int(args.num_gpus),
+            filter_existing=bool(args.af2rank_topk_filter_existing),
+        )
+
+        if topk_success:
+            logger.info("✅ AF2Rank-on-ProteinEBM-topk completed successfully")
+        else:
+            logger.error("❌ AF2Rank-on-ProteinEBM-topk failed")
+            success = False
+
+    # Step 4: Cross-protein plots (always, if previous steps succeeded)
+    if success:
+        logger.info("\n" + "="*60)
+        logger.info("STEP 4: CROSS-PROTEIN PLOTS")
+        logger.info("="*60)
+
+        inference_dir = os.path.join(project_root, "inference", args.inference_config)
+        if args.cross_protein_output_dir:
+            cross_out_dir = os.path.abspath(os.path.expanduser(args.cross_protein_output_dir))
+        else:
+            cross_out_dir = os.path.join(inference_dir, f"{Path(args.dataset_file).stem}_cross_protein_analysis")
+
+        plot_success = run_cross_protein_plots(
+            inference_dir=inference_dir,
+            output_dir=cross_out_dir,
+            scorer=args.scorer,
+            dataset_file=args.dataset_file,
+            id_column=args.id_column,
+            tms_column=args.tms_column,
+            af2rank_top_k=int(args.af2rank_top_k),
+            proteinebm_plot_mode=str(args.proteinebm_cross_protein_plot_mode),
+        )
+        if not plot_success:
+            logger.error("❌ Cross-protein plotting failed")
+            success = False
+
+        if success and args.scorer == "proteinebm" and int(args.af2rank_top_k) > 0:
+            plot_success_2 = run_cross_protein_plots(
+                inference_dir=inference_dir,
+                output_dir=cross_out_dir,
+                scorer="af2rank_on_proteinebm_topk",
+                dataset_file=args.dataset_file,
+                id_column=args.id_column,
+                tms_column=args.tms_column,
+                af2rank_top_k=int(args.af2rank_top_k),
+                proteinebm_plot_mode=str(args.proteinebm_cross_protein_plot_mode),
+            )
+            if not plot_success_2:
+                # This commonly occurs if AF2Rank-on-ProteinEBM-top-k hasn't been run yet
+                # for this inference_dir/dataset combination. Treat as a warning so the
+                # pipeline can still complete after producing the primary plots.
+                logger.warning("⚠️  Cross-protein plotting skipped/failed (af2rank_on_proteinebm_topk)")
     
     # Final summary
     total_time = time.time() - start_time
@@ -313,9 +503,7 @@ def main():
     if success:
         logger.info(f"🎉 Pipeline completed successfully in {total_time:.1f}s")
         # Construct results path dynamically
-        current_dir = os.getcwd()
-        results_path = os.path.join(current_dir, '..', 'inference', args.inference_config)
-        results_path = os.path.abspath(results_path)
+        results_path = os.path.join(project_root, "inference", args.inference_config)
         logger.info(f"📁 Results should be available at: {results_path}/")
     else:
         logger.error(f"💥 Pipeline failed after {total_time:.1f}s")

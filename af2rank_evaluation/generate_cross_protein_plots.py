@@ -5,6 +5,7 @@ Cross-Protein Scoring Analysis
 This script generates summary plots across all protein chains from scoring analysis results.
 Supported scorers:
 - AF2Rank (requires `af2rank_analysis/af2rank_summary_*.json`)
+- AF2Rank-on-ProteinEBM-topk (requires `af2rank_on_proteinebm_top_k/af2rank_analysis/af2rank_scores_*.csv`)
 - ProteinEBM
   - TM mode (default): requires `proteinebm_analysis/proteinebm_summary_*.json`
   - energy mode: requires `proteinebm_analysis/proteinebm_scores_*.csv`
@@ -67,6 +68,165 @@ def find_proteinebm_summaries(inference_base_dir: str) -> List[str]:
     summary_files = glob.glob(pattern)
     logger.info(f"Found {len(summary_files)} ProteinEBM summary files")
     return summary_files
+
+
+def find_af2rank_on_proteinebm_topk_score_files(inference_base_dir: str, top_k: int) -> List[str]:
+    """
+    Find all AF2Rank score CSVs produced by the AF2Rank-on-ProteinEBM-topk protocol.
+    Expected path pattern:
+      <inference_base_dir>/<protein_id>/af2rank_on_proteinebm_top_k/af2rank_analysis/af2rank_scores_<protein_id>.csv
+    """
+    pattern = os.path.join(
+        inference_base_dir,
+        "*",
+        "af2rank_on_proteinebm_top_k",
+        "af2rank_analysis",
+        "af2rank_scores_*.csv",
+    )
+    score_files = glob.glob(pattern)
+    logger.info(f"Found {len(score_files)} AF2Rank-on-ProteinEBM-topk score files (using folder af2rank_on_proteinebm_top_k)")
+    return score_files
+
+
+def load_af2rank_on_proteinebm_topk_data(
+    score_files: List[str],
+    dataset_file: str,
+    id_column: str,
+    tms_column: str,
+    top_k: int,
+) -> pd.DataFrame:
+    """
+    Load per-protein summary metrics from AF2Rank-on-ProteinEBM-topk score CSVs.
+
+    We rank templates by AF2Rank pTM (descending) and then take only the top-K entries
+    (K is provided by the caller). For each protein:
+      - top_1_tm_ref_pred: tm_ref_pred at rank 1
+      - top_5_tm_ref_pred: best tm_ref_pred among top min(5, n) by pTM
+      - n_scored: number of AF2Rank-scored templates available in that folder
+
+    If fewer than 5 entries exist, we use whatever is present.
+    """
+    data = []
+
+    dataset_df = pd.read_csv(dataset_file)
+    dataset_proteins = set(dataset_df[id_column].tolist())
+    logger.info(f"Dataset contains {len(dataset_proteins)} proteins")
+
+    for score_file in score_files:
+        protein_id = Path(score_file).parent.parent.parent.name
+        if protein_id not in dataset_proteins:
+            continue
+
+        df = pd.read_csv(score_file)
+        needed = {"ptm", "tm_ref_pred"}
+        missing = sorted([c for c in needed if c not in df.columns])
+        if missing:
+            raise KeyError(f"Missing columns {missing} in {score_file}. Columns: {df.columns.tolist()}")
+
+        df = df.dropna(subset=["ptm", "tm_ref_pred"]).copy()
+        if len(df) == 0:
+            continue
+
+        df["ptm"] = pd.to_numeric(df["ptm"], errors="coerce")
+        df["tm_ref_pred"] = pd.to_numeric(df["tm_ref_pred"], errors="coerce")
+        df = df.dropna(subset=["ptm", "tm_ref_pred"]).sort_values("ptm", ascending=False).reset_index(drop=True)
+        if len(df) == 0:
+            continue
+
+        k_eff_total = int(min(int(top_k), int(len(df))))
+        if k_eff_total <= 0:
+            continue
+        df = df.iloc[:k_eff_total].reset_index(drop=True)
+
+        n_scored = int(len(df))
+        top_1_tm_ref_pred = float(df.iloc[0]["tm_ref_pred"])
+        k_eff_5 = int(min(5, n_scored))
+        top_5_tm_ref_pred = float(df.iloc[:k_eff_5]["tm_ref_pred"].max())
+
+        data.append(
+            {
+                "protein_id": protein_id,
+                "n_scored": n_scored,
+                "top_1_tm_ref_pred": top_1_tm_ref_pred,
+                "top_5_tm_ref_pred": top_5_tm_ref_pred,
+                "scores_csv": str(score_file),
+            }
+        )
+
+    if len(data) == 0:
+        # Return an empty frame with the expected schema so callers can handle it cleanly.
+        return pd.DataFrame(
+            columns=[
+                "protein_id",
+                "n_scored",
+                "top_1_tm_ref_pred",
+                "top_5_tm_ref_pred",
+                "scores_csv",
+                tms_column,
+                "in_train",
+                "length",
+            ]
+        )
+
+    out = pd.DataFrame(data)
+    logger.info(f"Loaded {len(out)} proteins from AF2Rank-on-ProteinEBM-topk results (filtered by dataset)")
+
+    out = out.merge(
+        dataset_df[[id_column, tms_column, "in_train", "length"]],
+        left_on="protein_id",
+        right_on=id_column,
+        how="left",
+    )
+    out.drop(columns=[id_column], inplace=True)
+    return out
+
+
+def create_af2rank_on_proteinebm_topk_plots(df: pd.DataFrame, output_dir: str, tms_column: str, top_k: int) -> None:
+    """
+    Create cross-protein plots for AF2Rank-on-ProteinEBM-topk:
+      - Reference TM vs Top-1 tm_ref_pred (rank by pTM)
+      - Reference TM vs Top-5 tm_ref_pred (rank by pTM; uses min(5, n_scored))
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    plt.style.use("default")
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 8))
+
+    valid_1 = df.dropna(subset=[tms_column, "top_1_tm_ref_pred", "in_train", "length"])
+    if len(valid_1) > 0:
+        ax1.scatter(
+            valid_1[tms_column],
+            valid_1["top_1_tm_ref_pred"],
+            alpha=0.3,
+            c=valid_1["in_train"].map({True: "blue", False: "red"}),
+            s=valid_1["length"] / 1.5,
+        )
+        ax1.plot([0, 1], [0, 1], "r--", alpha=0.75, linewidth=2)
+        ax1.set_xlabel("Reference TM Score", fontsize=12)
+        ax1.set_ylabel("Top-1 Prediction TM (tm_ref_pred) by pTM", fontsize=12)
+        ax1.set_title(f"Reference TM vs Top-1 prediction TM\n(AF2Rank on ProteinEBM top-{int(top_k)} templates; rank by pTM)", fontsize=13)
+        ax1.grid(True, alpha=0.3)
+
+    valid_2 = df.dropna(subset=[tms_column, "top_5_tm_ref_pred", "in_train", "length"])
+    if len(valid_2) > 0:
+        ax2.scatter(
+            valid_2[tms_column],
+            valid_2["top_5_tm_ref_pred"],
+            alpha=0.3,
+            c=valid_2["in_train"].map({True: "blue", False: "red"}),
+            s=valid_2["length"] / 1.5,
+        )
+        ax2.plot([0, 1], [0, 1], "r--", alpha=0.75, linewidth=2)
+        ax2.set_xlabel("Reference TM Score", fontsize=12)
+        ax2.set_ylabel("Top-5 Prediction TM (best tm_ref_pred in top-5 by pTM)", fontsize=12)
+        ax2.set_title(f"Reference TM vs Top-5 prediction TM\n(AF2Rank on ProteinEBM top-{int(top_k)} templates; rank by pTM)", fontsize=13)
+        ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    out_path = os.path.join(output_dir, f"cross_protein_af2rank_on_proteinebm_top_k_top_analysis_top{int(top_k)}.png")
+    plt.savefig(out_path, dpi=900, bbox_inches="tight")
+    logger.info(f"Saved AF2Rank-on-ProteinEBM-topk plot: {out_path}")
+    plt.close()
 
 
 def load_summary_data(summary_files: List[str], dataset_file: str, id_column: str, tms_column: str) -> pd.DataFrame:
@@ -821,9 +981,15 @@ def main():
                        help='Output directory for plots and summary files')
     parser.add_argument(
         '--scorer',
-        choices=['af2rank', 'proteinebm'],
+        choices=['af2rank', 'proteinebm', 'af2rank_on_proteinebm_topk'],
         default='af2rank',
         help='Which scorer outputs to aggregate',
+    )
+    parser.add_argument(
+        '--af2rank_top_k',
+        type=int,
+        default=0,
+        help='When --scorer=af2rank_on_proteinebm_topk, use this K cutoff when ranking by pTM (folder is always af2rank_on_proteinebm_top_k).',
     )
     parser.add_argument(
         '--proteinebm_plot_mode',
@@ -872,6 +1038,21 @@ def main():
 
         # Load and compile data
         df = load_summary_data(summary_files, args.dataset_file, args.id_column, args.tms_column)
+    elif args.scorer == "af2rank_on_proteinebm_topk":
+        if int(args.af2rank_top_k) <= 0:
+            logger.error("--af2rank_top_k must be > 0 when --scorer=af2rank_on_proteinebm_topk")
+            sys.exit(1)
+        score_files = find_af2rank_on_proteinebm_topk_score_files(args.inference_dir, int(args.af2rank_top_k))
+        if not score_files:
+            logger.error("No AF2Rank-on-ProteinEBM-topk score files found")
+            sys.exit(1)
+        df = load_af2rank_on_proteinebm_topk_data(
+            score_files,
+            args.dataset_file,
+            args.id_column,
+            args.tms_column,
+            top_k=int(args.af2rank_top_k),
+        )
     else:
         if args.proteinebm_plot_mode == "tm":
             summary_files = find_proteinebm_summaries(args.inference_dir)
@@ -900,6 +1081,12 @@ def main():
         create_summary_plots(df, args.output_dir, args.tms_column, scorer=args.scorer)
         # Save summary statistics
         save_summary_statistics(df, args.output_dir, scorer=args.scorer)
+    elif args.scorer == "af2rank_on_proteinebm_topk":
+        create_af2rank_on_proteinebm_topk_plots(df, args.output_dir, args.tms_column, int(args.af2rank_top_k))
+        # Save the full dataset for debugging/inspection.
+        csv_path = os.path.join(args.output_dir, "cross_protein_summary_data.csv")
+        df.to_csv(csv_path, index=False)
+        logger.info(f"Saved summary data: {csv_path}")
     else:
         if args.proteinebm_plot_mode == "tm":
             # TM-based (AF2Rank-style) summaries.
