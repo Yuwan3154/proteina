@@ -204,6 +204,16 @@ class ModelTrainerBase(L.LightningModule):
                 "nn.contact_map_decoder.1.weight",
                 "nn.contact_map_decoder.0.weight",
                 "nn.contact_map_decoder.0.bias",
+                "nn.cond_factory.linear_out.weight",
+                "nn.cond_factory.residue_type_out.weight",
+                "nn.init_repr_factory.linear_out.weight",
+                "nn.init_repr_factory.residue_type_out.weight",
+                "nn.pair_head_prediction.1.weight",
+                "nn.pair_head_prediction.1.bias",
+                "nn.pair_repr_builder.cond_factory.linear_out.weight",
+                "nn.pair_repr_builder.cond_factory.residue_type_out.weight",
+                "nn.pair_repr_builder.init_repr_factory.linear_out.weight",
+                "nn.pair_repr_builder.init_repr_factory.residue_type_out.weight",
             ]
         )
         pre = {}
@@ -216,7 +226,14 @@ class ModelTrainerBase(L.LightningModule):
             if g is None:
                 pre[n] = None
             else:
-                pre[n] = float(g.norm().item())
+                # Capture multiple scalars so we can detect changes even if norms match.
+                pre[n] = {
+                    "grad_norm": float(g.norm().item()),
+                    "grad_absmax": float(g.abs().max().item()),
+                    "grad_sum": float(g.sum().item()),
+                    "grad_dtype": str(g.dtype),
+                    "param_dtype": str(p.dtype),
+                }
         self._unused_param_pre_grad_norms = pre
 
     def on_after_backward(self) -> None:
@@ -245,6 +262,17 @@ class ModelTrainerBase(L.LightningModule):
             if p.requires_grad and (name not in used)
         ]
 
+        # Seed watchlist with newly observed unused names (capped) so we can compute
+        # pre/post grad deltas for them on subsequent occurrences without logging everything.
+        if len(unused_names) > 0:
+            if getattr(self, "_unused_param_watchlist", None) is None:
+                self._unused_param_watchlist = set()
+            for n in unused_names[:128]:
+                self._unused_param_watchlist.add(n)
+            # Cap to avoid unbounded growth
+            if len(self._unused_param_watchlist) > 512:
+                self._unused_param_watchlist = set(list(self._unused_param_watchlist)[:512])
+
         # If hook-based detection says a parameter is unused, but its grad norm
         # changed during this backward (vs pre-backward), treat it as used and
         # log a one-line diagnostic. This keeps the detector actionable even if
@@ -259,11 +287,29 @@ class ModelTrainerBase(L.LightningModule):
                 if n in watch:
                     p = name_to_param.get(n, None)
                     if p is not None and p.grad is not None:
-                        post = float(p.grad.norm().item())
+                        g = p.grad
+                        post_norm = float(g.norm().item())
+                        post_absmax = float(g.abs().max().item())
+                        post_sum = float(g.sum().item())
                         pre = pre_norms.get(n, None)
-                        changed = (pre is None) or (abs(post - float(pre)) > 1e-12)
+                        if pre is None:
+                            changed = True
+                        else:
+                            changed = (
+                                abs(post_norm - float(pre["grad_norm"])) > 1e-12
+                                or abs(post_absmax - float(pre["grad_absmax"])) > 1e-12
+                                or abs(post_sum - float(pre["grad_sum"])) > 1e-12
+                            )
                         if changed:
-                            hook_missed_but_grad_changed.append((n, pre, post))
+                            hook_missed_but_grad_changed.append(
+                                (
+                                    n,
+                                    None if pre is None else pre["grad_norm"],
+                                    post_norm,
+                                    None if pre is None else pre["grad_dtype"],
+                                    str(g.dtype),
+                                )
+                            )
                             continue
                 filtered.append(n)
             unused_names = filtered
@@ -336,8 +382,19 @@ class ModelTrainerBase(L.LightningModule):
                     rows.append((n, "grad_ok", float(g.abs().max().item()), float(g.norm().item())))
                     pre = pre_norms.get(n, None)
                     post = float(g.norm().item())
-                    delta = None if pre is None else float(post - float(pre))
-                    deltas.append((n, "grad_ok", pre, post, delta))
+                    pre_norm = None if pre is None else float(pre["grad_norm"])
+                    delta = None if pre is None else float(post - pre_norm)
+                    deltas.append(
+                        (
+                            n,
+                            "grad_ok",
+                            pre_norm,
+                            post,
+                            delta,
+                            str(g.dtype),
+                            str(p.dtype),
+                        )
+                    )
                 logger.warning(
                     "[unused_params_detected/contact_map_grad] step={} batch_idx={} rows={}",
                     int(getattr(self, "global_step", -1)),
@@ -349,6 +406,45 @@ class ModelTrainerBase(L.LightningModule):
                     int(getattr(self, "global_step", -1)),
                     batch_idx,
                     deltas,
+                )
+                # If the Linear weight shows no grad change but LN does, log parameter magnitudes.
+                try_linear = None
+                try_ln_w = None
+                try_ln_b = None
+                p_lin = name_to_param.get("nn.contact_map_decoder.1.weight", None)
+                p_lnw = name_to_param.get("nn.contact_map_decoder.0.weight", None)
+                p_lnb = name_to_param.get("nn.contact_map_decoder.0.bias", None)
+                if p_lin is not None:
+                    try_linear = (float(p_lin.data.abs().max().item()), float(p_lin.data.norm().item()))
+                if p_lnw is not None:
+                    try_ln_w = (float(p_lnw.data.abs().max().item()), float(p_lnw.data.norm().item()))
+                if p_lnb is not None:
+                    try_ln_b = (float(p_lnb.data.abs().max().item()), float(p_lnb.data.norm().item()))
+                logger.warning(
+                    "[unused_params_detected/contact_map_param_stats] step={} batch_idx={} ln_w_absmax_norm={} ln_b_absmax_norm={} lin_w_absmax_norm={}",
+                    int(getattr(self, "global_step", -1)),
+                    batch_idx,
+                    try_ln_w,
+                    try_ln_b,
+                    try_linear,
+                )
+
+                # AMP / autocast context: underflow/quantization hypotheses show up here.
+                scaler = getattr(getattr(self.trainer, "strategy", None), "precision_plugin", None)
+                scale = None
+                if scaler is not None and hasattr(scaler, "scaler") and scaler.scaler is not None:
+                    try:
+                        scale = float(scaler.scaler.get_scale())
+                    except Exception:
+                        scale = None
+                logger.warning(
+                    "[unused_params_detected/amp_ctx] step={} batch_idx={} autocast_enabled={} autocast_dtype_cuda={} grad_enabled={} grad_scaler_scale={}",
+                    int(getattr(self, "global_step", -1)),
+                    batch_idx,
+                    bool(torch.is_autocast_enabled()),
+                    str(torch.get_autocast_gpu_dtype()) if torch.cuda.is_available() else None,
+                    bool(torch.is_grad_enabled()),
+                    scale,
                 )
 
         if len(hook_missed_but_grad_changed) > 0:
