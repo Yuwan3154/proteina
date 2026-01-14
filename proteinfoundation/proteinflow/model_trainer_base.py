@@ -448,6 +448,49 @@ class ModelTrainerBase(L.LightningModule):
                     try_linear,
                 )
 
+                # If the linear weight did NOT accumulate any grad this microbatch,
+                # log batch-level stats to diagnose why the head dropped from the graph.
+                no_accum = False
+                pre_lin = pre_norms.get("nn.contact_map_decoder.1.weight", None)
+                if p_lin is None:
+                    no_accum = True
+                elif p_lin.grad is None:
+                    no_accum = True
+                elif pre_lin is not None:
+                    g = p_lin.grad
+                    pre_id = int(pre_lin.get("grad_id", -1))
+                    pre_ver = int(pre_lin.get("grad_version", -1))
+                    post_id = id(g)
+                    post_ver = int(getattr(g, "_version", -1))
+                    if pre_id == post_id and pre_ver == post_ver:
+                        no_accum = True
+                if no_accum:
+                    pair_sums = getattr(self, "_debug_last_contact_map_pair_mask_sums", None)
+                    logits_abs_sums = getattr(self, "_debug_last_contact_map_logits_abs_sums", None)
+                    pair_head = pair_sums[:4] if pair_sums is not None else None
+                    logits_head = logits_abs_sums[:4] if logits_abs_sums is not None else None
+                    pair_min = int(min(pair_sums)) if pair_sums else None
+                    pair_max = int(max(pair_sums)) if pair_sums else None
+                    logits_min = float(min(logits_abs_sums)) if logits_abs_sums else None
+                    logits_max = float(max(logits_abs_sums)) if logits_abs_sums else None
+                    logger.warning(
+                        "[unused_params_detected/contact_map_zero_accum_ctx] step={} batch_idx={} pair_mask_sums_min={} pair_mask_sums_max={} pair_mask_sums_first_{}={} logits_abs_sums_min={} logits_abs_sums_max={} logits_abs_sums_first_{}={} logits_min={} logits_max={} logits_mean={} logits_nnz={}",
+                        int(getattr(self, "global_step", -1)),
+                        batch_idx,
+                        pair_min,
+                        pair_max,
+                        len(pair_head) if pair_head is not None else None,
+                        pair_head,
+                        logits_min,
+                        logits_max,
+                        len(logits_head) if logits_head is not None else None,
+                        logits_head,
+                        getattr(self, "_debug_last_contact_map_logits_min", None),
+                        getattr(self, "_debug_last_contact_map_logits_max", None),
+                        getattr(self, "_debug_last_contact_map_logits_mean", None),
+                        getattr(self, "_debug_last_contact_map_logits_nnz", None),
+                    )
+
                 # AMP / autocast context: underflow/quantization hypotheses show up here.
                 scaler = getattr(getattr(self.trainer, "strategy", None), "precision_plugin", None)
                 scale = None
@@ -855,6 +898,12 @@ class ModelTrainerBase(L.LightningModule):
         self._debug_last_grad_enabled = bool(torch.is_grad_enabled())
         self._debug_last_c_1_pred_requires_grad = None
         self._debug_last_contact_map_logits_requires_grad = None
+        self._debug_last_contact_map_pair_mask_sums = None
+        self._debug_last_contact_map_logits_abs_sums = None
+        self._debug_last_contact_map_logits_min = None
+        self._debug_last_contact_map_logits_max = None
+        self._debug_last_contact_map_logits_mean = None
+        self._debug_last_contact_map_logits_nnz = None
         self._debug_last_mask_sums = None
         self._debug_last_batch_size = None
         self._debug_last_n = None
@@ -1030,7 +1079,7 @@ class ModelTrainerBase(L.LightningModule):
                 # to extract contact_map_pred for self-conditioning.
                 with torch.no_grad():
                     nn_out_sc = self.nn(batch)
-                c_pred_sc = self._nn_out_to_c_clean(nn_out_sc, batch)
+                    c_pred_sc = self._nn_out_to_c_clean(nn_out_sc, batch)
                 if c_pred_sc is not None:
                     # `c_pred_sc` is already activated in model/data space.
                     batch["contact_map_sc"] = self.detach_gradients(c_pred_sc)
@@ -1109,6 +1158,16 @@ class ModelTrainerBase(L.LightningModule):
             c_logits = self._nn_out_to_c_logits(nn_out, batch)
             if c_logits is not None:
                 self._debug_last_contact_map_logits_requires_grad = bool(c_logits.requires_grad)
+                # Targeted per-batch stats for diagnosing "contact_map_decoder" non-accumulation.
+                pair_mask = mask[..., :, None] * mask[..., None, :]  # [b, n, n]
+                pair_mask_sums = pair_mask.sum(dim=(-1, -2))  # [b]
+                self._debug_last_contact_map_pair_mask_sums = pair_mask_sums.detach().cpu().to(torch.int64).tolist()
+                abs_sums = c_logits.abs().sum(dim=(-1, -2))  # [b]
+                self._debug_last_contact_map_logits_abs_sums = abs_sums.detach().cpu().tolist()
+                self._debug_last_contact_map_logits_min = float(c_logits.min().item())
+                self._debug_last_contact_map_logits_max = float(c_logits.max().item())
+                self._debug_last_contact_map_logits_mean = float(c_logits.mean().item())
+                self._debug_last_contact_map_logits_nnz = int(torch.count_nonzero(c_logits).item())
             if c_1_pred is None:
                 raise ValueError(
                     "contact_map_mode=True requires contact_map_logits/contact_map_pred in model output."
