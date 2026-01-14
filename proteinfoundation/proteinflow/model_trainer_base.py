@@ -192,6 +192,33 @@ class ModelTrainerBase(L.LightningModule):
         if getattr(self, "_unused_param_used_names", None) is not None:
             self._unused_param_used_names.clear()
 
+        # In addition to backward hooks, keep a small "watchlist" of parameters and
+        # record their grad norms before backward. This helps disambiguate:
+        # - truly unused this microbatch vs
+        # - hook missed even though grad changed (can happen under some compilation regimes).
+        if getattr(self, "_unused_param_watchlist", None) is None:
+            self._unused_param_watchlist = set()
+        # Seed with the most commonly suspicious names (safe if they don't exist).
+        self._unused_param_watchlist.update(
+            [
+                "nn.contact_map_decoder.1.weight",
+                "nn.contact_map_decoder.0.weight",
+                "nn.contact_map_decoder.0.bias",
+            ]
+        )
+        pre = {}
+        name_to_param = dict(self.named_parameters())
+        for n in list(self._unused_param_watchlist)[:128]:
+            p = name_to_param.get(n, None)
+            if p is None or (not getattr(p, "requires_grad", False)):
+                continue
+            g = p.grad
+            if g is None:
+                pre[n] = None
+            else:
+                pre[n] = float(g.norm().item())
+        self._unused_param_pre_grad_norms = pre
+
     def on_after_backward(self) -> None:
         """
         Per-batch (per backward) check for parameters that did not receive gradients.
@@ -217,6 +244,29 @@ class ModelTrainerBase(L.LightningModule):
             name for name, p in self.named_parameters()
             if p.requires_grad and (name not in used)
         ]
+
+        # If hook-based detection says a parameter is unused, but its grad norm
+        # changed during this backward (vs pre-backward), treat it as used and
+        # log a one-line diagnostic. This keeps the detector actionable even if
+        # some parameter hooks don't fire under torch.compile.
+        hook_missed_but_grad_changed = []
+        pre_norms = getattr(self, "_unused_param_pre_grad_norms", {}) or {}
+        watch = getattr(self, "_unused_param_watchlist", set()) or set()
+        if len(unused_names) > 0 and len(watch) > 0:
+            name_to_param = dict(self.named_parameters())
+            filtered = []
+            for n in unused_names:
+                if n in watch:
+                    p = name_to_param.get(n, None)
+                    if p is not None and p.grad is not None:
+                        post = float(p.grad.norm().item())
+                        pre = pre_norms.get(n, None)
+                        changed = (pre is None) or (abs(post - float(pre)) > 1e-12)
+                        if changed:
+                            hook_missed_but_grad_changed.append((n, pre, post))
+                            continue
+                filtered.append(n)
+            unused_names = filtered
 
         if len(unused_names) > 0:
             unused_names.sort()
@@ -286,6 +336,17 @@ class ModelTrainerBase(L.LightningModule):
                     batch_idx,
                     rows,
                 )
+
+        if len(hook_missed_but_grad_changed) > 0:
+            batch_idx = int(getattr(self, "_debug_last_batch_idx", -1))
+            logger.warning(
+                "[unused_params_detected/hook_miss_grad_changed] step={} batch_idx={} n={} first_{}={}",
+                int(getattr(self, "global_step", -1)),
+                batch_idx,
+                len(hook_missed_but_grad_changed),
+                min(16, len(hook_missed_but_grad_changed)),
+                hook_missed_but_grad_changed[:16],
+            )
 
     def _nn_out_to_x_clean(self, nn_out, batch):
         """
