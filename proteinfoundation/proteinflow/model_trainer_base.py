@@ -320,21 +320,35 @@ class ModelTrainerBase(L.LightningModule):
                     "nn.contact_map_decoder.1.weight",
                 ]
                 rows = []
+                deltas = []
+                pre_norms = getattr(self, "_unused_param_pre_grad_norms", {}) or {}
                 for n in names_check:
                     p = name_to_param.get(n, None)
                     if p is None:
                         rows.append((n, "missing", None, None))
+                        deltas.append((n, "missing", None, None, None))
                         continue
                     if p.grad is None:
                         rows.append((n, "grad_none", None, None))
+                        deltas.append((n, "grad_none", pre_norms.get(n, None), None, None))
                         continue
                     g = p.grad
                     rows.append((n, "grad_ok", float(g.abs().max().item()), float(g.norm().item())))
+                    pre = pre_norms.get(n, None)
+                    post = float(g.norm().item())
+                    delta = None if pre is None else float(post - float(pre))
+                    deltas.append((n, "grad_ok", pre, post, delta))
                 logger.warning(
                     "[unused_params_detected/contact_map_grad] step={} batch_idx={} rows={}",
                     int(getattr(self, "global_step", -1)),
                     batch_idx,
                     rows,
+                )
+                logger.warning(
+                    "[unused_params_detected/contact_map_grad_delta] step={} batch_idx={} deltas={}",
+                    int(getattr(self, "global_step", -1)),
+                    batch_idx,
+                    deltas,
                 )
 
         if len(hook_missed_but_grad_changed) > 0:
