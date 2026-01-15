@@ -74,6 +74,9 @@ class ModelTrainerBase(L.LightningModule):
             opt_params = []
             opt_params_names = []
             for name, param in self.named_parameters():
+                if name.startswith("nn_sc."):
+                    param.requires_grad = False
+                    continue
                 if "residue_type" in name or "lora" in name:
                     param.requires_grad = True
                     opt_params.append(param)
@@ -85,10 +88,14 @@ class ModelTrainerBase(L.LightningModule):
             )
             print(f"Finetuning {opt_params_names}")
         else:
-            for param in self.parameters():
-                param.requires_grad = True
+            for name, param in self.named_parameters():
+                if name.startswith("nn_sc."):
+                    param.requires_grad = False
+                else:
+                    param.requires_grad = True
             optimizer = torch.optim.Adam(
-                self.parameters(), lr=self.cfg_exp.opt.lr
+                [p for p in self.parameters() if p.requires_grad],
+                lr=self.cfg_exp.opt.lr,
             )
         
         # Check if learning rate warmup is enabled
