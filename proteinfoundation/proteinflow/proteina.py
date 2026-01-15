@@ -9,6 +9,7 @@
 # its affiliates is strictly prohibited.
 
 
+import copy
 import os
 import random
 from math import prod
@@ -104,6 +105,11 @@ class Proteina(ModelTrainerBase):
         # Pass the DictConfig through so OmegaConf interpolations (e.g. ${oc.env:DATA_PATH})
         # resolve correctly in the actual training environment.
         self.nn = ProteinTransformerAF3(**cfg_exp.model.nn)
+        self.nn_sc = None
+        if cfg_exp.training.get("self_cond_use_copy", False):
+            self.nn_sc = copy.deepcopy(self.nn)
+            for p in self.nn_sc.parameters():
+                p.requires_grad = False
         self.non_contact_value = cfg_exp.model.nn.get("non_contact_value", 0)
         if self.non_contact_value not in (0, -1):
             raise ValueError(f"non_contact_value must be 0 or -1, got {self.non_contact_value}")

@@ -59,6 +59,8 @@ training:
   mask_seq_proportion: 0.15
   finetune_seq_cond_lora_only: False
   contact_map_coord_loss_weight: 1.0  # Weight for coordinate loss when contact_map_mode=True (contact map loss has weight 1.0)
+  self_cond_use_copy: True
+  self_cond_copy_update_every: 10  # Update every 10 optimizer steps
   # For predict_coords: "ipa" only. Controls which frames are used for FAPE.
   # - predicted_frames: use StructureModule predicted backbone frames (OpenFold-style)
   # - frames_from_predicted_N_CA_C: derive frames from predicted N/CA/C using Gram–Schmidt
@@ -84,15 +86,16 @@ opt:
   dist_backend: nccl  # For multi GPU training, applicable when using ddp strategy [nccl, gloo]
   # Learning rate warmup scheduler
   use_lr_warmup: True  # Enable learning rate warmup
-  warmup_steps: 1000  # Number of warmup steps (linear warmup from warmup_start_lr_ratio to 1.0)
+  warmup_steps: 3000  # Number of warmup steps (linear warmup from warmup_start_lr_ratio to 1.0)
   warmup_start_lr_ratio: 0.0  # Starting LR as ratio of target LR (0.0 means start from 0)
   lr_scheduler_type: "cosine"  # Scheduler after warmup: "constant", "linear_decay", or "cosine"
+  use_cueq: False  # Whether to use cuequivariance for triangle operations
 
 log:
   wandb_project: protein_transformer_big_runs  # Leave this so we can compare runs easily
   log_wandb: True  # whether to log to wandb
   log_every_n_steps: 1  # How often to log metrics to wandb
-  log_structure_every_n_steps: 1  # How often to log structure/contact map visualizations (0 = disabled)
+  log_structure_every_n_steps: 100  # How often to log structure/contact map visualizations (0 = disabled)
   checkpoint: True  # whether to store checkpoints
   checkpoint_every_n_steps: 1000  # How often we store a checkpoint, should be greater than val_check_interval above
   last_ckpt_every_n_steps: 1000  # How often do we update our last ckpt, needed for requeuing without losing progress

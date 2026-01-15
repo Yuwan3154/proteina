@@ -150,7 +150,7 @@ if __name__ == "__main__":
             "must (must resume existing), None (same as allow when id is set). Default is allow."
         ),
     )
-    args = parser.parse_args()
+    args, overrides = parser.parse_known_args()
 
     logger.add(
         sys.stdout,
@@ -162,7 +162,7 @@ if __name__ == "__main__":
     # Load experiment config
     config_path = "../configs/experiment_config"
     with hydra.initialize(config_path, version_base=hydra.__version__):
-        cfg_exp = hydra.compose(config_name=args.config_name)
+        cfg_exp = hydra.compose(config_name=args.config_name, overrides=overrides)
         if args.single:
             # Rewrite number of GPUs and nodes for local runs or if single flag is used
             cfg_exp.hardware.ngpus_per_node_ = 1

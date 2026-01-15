@@ -67,6 +67,7 @@ class ModelTrainerBase(L.LightningModule):
         # Lazy OpenFold template inference helper
         self._template_inference = None
         self._logged_val_traj_epoch = -1
+        self._self_cond_copy_last_step = None
 
     def configure_optimizers(self):
         if self.cfg_exp.training.finetune_seq_cond_lora_only:
@@ -152,373 +153,27 @@ class ModelTrainerBase(L.LightningModule):
         
         return optimizer
 
-    def _install_unused_param_backward_hooks(self) -> None:
-        """
-        Installs lightweight per-parameter backward hooks (rank0 only) to detect
-        which parameters actually participate in a given backward pass.
-
-        This is accumulation-safe: it does not rely on grad being None vs non-None,
-        which can be confounded by gradient accumulation (previous microbatches
-        already populated .grad tensors).
-        """
-        if getattr(self, "global_rank", 0) != 0:
+    def _maybe_update_self_cond_copy(self) -> None:
+        """Optionally sync a frozen self-conditioning model copy from the main model."""
+        nn_sc = getattr(self, "nn_sc", None)
+        if nn_sc is None:
             return
-        if getattr(self, "_unused_param_hooks_installed", False):
+        update_every = int(self.cfg_exp.training.get("self_cond_copy_update_every", 1))
+        if update_every <= 0:
             return
-
-        self._unused_param_hooks_installed = True
-        self._unused_param_used_names = set()
-        self._unused_param_hook_handles = []
-
-        for name, p in self.named_parameters():
-            if not p.requires_grad:
-                continue
-
-            def _mark_used(grad, _name=name):
-                self._unused_param_used_names.add(_name)
-                return grad
-
-            self._unused_param_hook_handles.append(p.register_hook(_mark_used))
-
-    def on_before_backward(self, loss: Tensor) -> None:
-        """
-        Called before each backward. We use this to reset per-backward bookkeeping
-        for unused-parameter detection.
-        """
-        if getattr(self, "global_rank", 0) != 0:
-            return
-        self._install_unused_param_backward_hooks()
-        # Reset the used set for this backward pass
-        if getattr(self, "_unused_param_used_names", None) is not None:
-            self._unused_param_used_names.clear()
-
-        # In addition to backward hooks, keep a small "watchlist" of parameters and
-        # record their grad norms before backward. This helps disambiguate:
-        # - truly unused this microbatch vs
-        # - hook missed even though grad changed (can happen under some compilation regimes).
-        if getattr(self, "_unused_param_watchlist", None) is None:
-            self._unused_param_watchlist = set()
-        # Seed with the most commonly suspicious names (safe if they don't exist).
-        self._unused_param_watchlist.update(
-            [
-                "nn.contact_map_decoder.1.weight",
-                "nn.contact_map_decoder.0.weight",
-                "nn.contact_map_decoder.0.bias",
-                "nn.cond_factory.linear_out.weight",
-                "nn.cond_factory.residue_type_out.weight",
-                "nn.init_repr_factory.linear_out.weight",
-                "nn.init_repr_factory.residue_type_out.weight",
-                "nn.pair_head_prediction.1.weight",
-                "nn.pair_head_prediction.1.bias",
-                "nn.pair_repr_builder.cond_factory.linear_out.weight",
-                "nn.pair_repr_builder.cond_factory.residue_type_out.weight",
-                "nn.pair_repr_builder.init_repr_factory.linear_out.weight",
-                "nn.pair_repr_builder.init_repr_factory.residue_type_out.weight",
-            ]
-        )
-        pre = {}
-        name_to_param = dict(self.named_parameters())
-        for n in list(self._unused_param_watchlist)[:128]:
-            p = name_to_param.get(n, None)
-            if p is None or (not getattr(p, "requires_grad", False)):
-                continue
-            g = p.grad
-            if g is None:
-                pre[n] = None
-            else:
-                # Capture multiple scalars so we can detect changes even if norms match.
-                pre[n] = {
-                    "grad_id": id(g),
-                    "grad_version": int(getattr(g, "_version", -1)),
-                    "grad_norm": float(g.norm().item()),
-                    "grad_absmax": float(g.abs().max().item()),
-                    "grad_sum": float(g.sum().item()),
-                    "grad_dtype": str(g.dtype),
-                    "param_dtype": str(p.dtype),
-                }
-        self._unused_param_pre_grad_norms = pre
+        step = int(getattr(self, "global_step", 0))
+        last = self._self_cond_copy_last_step
+        if last is None or (step - int(last)) >= update_every:
+            with torch.no_grad():
+                nn_sc.load_state_dict(self.nn.state_dict(), strict=True)
+            self._self_cond_copy_last_step = step
 
     def on_after_backward(self) -> None:
-        """
-        Per-batch (per backward) check for parameters that did not receive gradients.
-
-        This is intentionally after *every* backward so we can catch rare, batch-dependent
-        unused-parameter cases (e.g., control flow / conditional branches).
-        """
+        """Clears gradients when a non-finite loss was detected for this backward."""
         if getattr(self, "global_rank", 0) != 0:
             return
-
-        # If any non-finite loss was detected for this backward, skip the optimizer update
-        # by clearing gradients (so optimizer.step sees grad=None and does nothing).
         if getattr(self, "_skip_update_due_to_nonfinite_loss", False):
             self.zero_grad()
-
-        # Use the per-backward hook set if available (accumulation-safe).
-        used = getattr(self, "_unused_param_used_names", None)
-        if used is None:
-            # Fallback to legacy behavior (should be rare)
-            used = set()
-
-        unused_names: List[str] = [
-            name for name, p in self.named_parameters()
-            if p.requires_grad and (name not in used)
-        ]
-
-        # Seed watchlist with newly observed unused names (capped) so we can compute
-        # pre/post grad deltas for them on subsequent occurrences without logging everything.
-        if len(unused_names) > 0:
-            if getattr(self, "_unused_param_watchlist", None) is None:
-                self._unused_param_watchlist = set()
-            for n in unused_names[:128]:
-                self._unused_param_watchlist.add(n)
-            # Cap to avoid unbounded growth
-            if len(self._unused_param_watchlist) > 512:
-                self._unused_param_watchlist = set(list(self._unused_param_watchlist)[:512])
-
-        # If hook-based detection says a parameter is unused, but its grad norm
-        # changed during this backward (vs pre-backward), treat it as used and
-        # log a one-line diagnostic. This keeps the detector actionable even if
-        # some parameter hooks don't fire under torch.compile.
-        hook_missed_but_grad_changed = []
-        pre_norms = getattr(self, "_unused_param_pre_grad_norms", {}) or {}
-        watch = getattr(self, "_unused_param_watchlist", set()) or set()
-        if len(unused_names) > 0 and len(watch) > 0:
-            name_to_param = dict(self.named_parameters())
-            filtered = []
-            for n in unused_names:
-                if n in watch:
-                    p = name_to_param.get(n, None)
-                    if p is not None and p.grad is not None:
-                        g = p.grad
-                        post_norm = float(g.norm().item())
-                        post_absmax = float(g.abs().max().item())
-                        post_sum = float(g.sum().item())
-                        post_id = id(g)
-                        post_ver = int(getattr(g, "_version", -1))
-                        pre = pre_norms.get(n, None)
-                        if pre is None:
-                            changed = True
-                        else:
-                            # Primary signal: did autograd actually accumulate into this grad tensor?
-                            # AccumulateGrad uses in-place adds and increments _version even if the
-                            # values don't change (e.g., all-zero microbatch contribution).
-                            ver_changed = (post_id == int(pre["grad_id"])) and (post_ver != int(pre["grad_version"]))
-                            changed = (
-                                ver_changed
-                                or abs(post_norm - float(pre["grad_norm"])) > 1e-12
-                                or abs(post_absmax - float(pre["grad_absmax"])) > 1e-12
-                                or abs(post_sum - float(pre["grad_sum"])) > 1e-12
-                            )
-                        if changed:
-                            hook_missed_but_grad_changed.append(
-                                (
-                                    n,
-                                    None if pre is None else pre["grad_norm"],
-                                    post_norm,
-                                    None if pre is None else pre["grad_dtype"],
-                                    str(g.dtype),
-                                    None if pre is None else pre.get("grad_version", None),
-                                    post_ver,
-                                )
-                            )
-                            continue
-                filtered.append(n)
-            unused_names = filtered
-
-        if len(unused_names) > 0:
-            unused_names.sort()
-            head = unused_names[:50]
-            batch_idx = int(getattr(self, "_debug_last_batch_idx", -1))
-            accum = int(self.cfg_exp.opt.get("accumulate_grad_batches", 1))
-            is_accum_boundary = (batch_idx >= 0) and (accum > 1) and (batch_idx % accum == 0)
-            logger.warning(
-                "[unused_params_detected/batch] step={} batch_idx={} accum={} accum_boundary={} n_unused={} first_{}={}",
-                int(getattr(self, "global_step", -1)),
-                batch_idx,
-                accum,
-                is_accum_boundary,
-                len(unused_names),
-                len(head),
-                head,
-            )
-            mask_sums = getattr(self, "_debug_last_mask_sums", None)
-            if mask_sums is not None and len(mask_sums) > 0:
-                head_sums = mask_sums[:16]
-                logger.warning(
-                    "[unused_params_detected/batch_shape] step={} batch_idx={} bs={} n={} mask_sums_min={} mask_sums_max={} mask_sums_first_{}={}",
-                    int(getattr(self, "global_step", -1)),
-                    batch_idx,
-                    getattr(self, "_debug_last_batch_size", None),
-                    getattr(self, "_debug_last_n", None),
-                    int(min(mask_sums)),
-                    int(max(mask_sums)),
-                    len(head_sums),
-                    head_sums,
-                )
-
-            # Extra context for the most suspicious one: contact_map_decoder's linear.
-            # If this shows up, we want to know whether the predicted contact map tensors
-            # were connected to the graph on that batch.
-            if "nn.contact_map_decoder.1.weight" in unused_names:
-                logger.warning(
-                    "[unused_params_detected/contact_map_ctx] step={} batch_idx={} grad_enabled={} c_1_pred_requires_grad={} contact_map_logits_requires_grad={}",
-                    int(getattr(self, "global_step", -1)),
-                    batch_idx,
-                    bool(getattr(self, "_debug_last_grad_enabled", True)),
-                    getattr(self, "_debug_last_c_1_pred_requires_grad", None),
-                    getattr(self, "_debug_last_contact_map_logits_requires_grad", None),
-                )
-                # Also log grad presence/norms for contact-map head params to disambiguate
-                # "not used at all" vs. "used but zero grad" (should still be present).
-                name_to_param = dict(self.named_parameters())
-                names_check = [
-                    "nn.contact_map_decoder.0.weight",
-                    "nn.contact_map_decoder.0.bias",
-                    "nn.contact_map_decoder.1.weight",
-                ]
-                rows = []
-                deltas = []
-                pre_norms = getattr(self, "_unused_param_pre_grad_norms", {}) or {}
-                for n in names_check:
-                    p = name_to_param.get(n, None)
-                    if p is None:
-                        rows.append((n, "missing", None, None))
-                        deltas.append((n, "missing", None, None, None))
-                        continue
-                    if p.grad is None:
-                        rows.append((n, "grad_none", None, None))
-                        deltas.append((n, "grad_none", pre_norms.get(n, None), None, None))
-                        continue
-                    g = p.grad
-                    rows.append((n, "grad_ok", float(g.abs().max().item()), float(g.norm().item())))
-                    pre = pre_norms.get(n, None)
-                    post = float(g.norm().item())
-                    pre_norm = None if pre is None else float(pre["grad_norm"])
-                    delta = None if pre is None else float(post - pre_norm)
-                    pre_ver = None if pre is None else int(pre.get("grad_version", -1))
-                    post_ver = int(getattr(g, "_version", -1))
-                    pre_id = None if pre is None else int(pre.get("grad_id", -1))
-                    post_id = id(g)
-                    deltas.append(
-                        (
-                            n,
-                            "grad_ok",
-                            pre_norm,
-                            post,
-                            delta,
-                            str(g.dtype),
-                            str(p.dtype),
-                            pre_ver,
-                            post_ver,
-                            pre_id,
-                            post_id,
-                        )
-                    )
-                logger.warning(
-                    "[unused_params_detected/contact_map_grad] step={} batch_idx={} rows={}",
-                    int(getattr(self, "global_step", -1)),
-                    batch_idx,
-                    rows,
-                )
-                logger.warning(
-                    "[unused_params_detected/contact_map_grad_delta] step={} batch_idx={} deltas={}",
-                    int(getattr(self, "global_step", -1)),
-                    batch_idx,
-                    deltas,
-                )
-                # If the Linear weight shows no grad change but LN does, log parameter magnitudes.
-                try_linear = None
-                try_ln_w = None
-                try_ln_b = None
-                p_lin = name_to_param.get("nn.contact_map_decoder.1.weight", None)
-                p_lnw = name_to_param.get("nn.contact_map_decoder.0.weight", None)
-                p_lnb = name_to_param.get("nn.contact_map_decoder.0.bias", None)
-                if p_lin is not None:
-                    try_linear = (float(p_lin.data.abs().max().item()), float(p_lin.data.norm().item()))
-                if p_lnw is not None:
-                    try_ln_w = (float(p_lnw.data.abs().max().item()), float(p_lnw.data.norm().item()))
-                if p_lnb is not None:
-                    try_ln_b = (float(p_lnb.data.abs().max().item()), float(p_lnb.data.norm().item()))
-                logger.warning(
-                    "[unused_params_detected/contact_map_param_stats] step={} batch_idx={} ln_w_absmax_norm={} ln_b_absmax_norm={} lin_w_absmax_norm={}",
-                    int(getattr(self, "global_step", -1)),
-                    batch_idx,
-                    try_ln_w,
-                    try_ln_b,
-                    try_linear,
-                )
-
-                # If the linear weight did NOT accumulate any grad this microbatch,
-                # log batch-level stats to diagnose why the head dropped from the graph.
-                no_accum = False
-                pre_lin = pre_norms.get("nn.contact_map_decoder.1.weight", None)
-                if p_lin is None:
-                    no_accum = True
-                elif p_lin.grad is None:
-                    no_accum = True
-                elif pre_lin is not None:
-                    g = p_lin.grad
-                    pre_id = int(pre_lin.get("grad_id", -1))
-                    pre_ver = int(pre_lin.get("grad_version", -1))
-                    post_id = id(g)
-                    post_ver = int(getattr(g, "_version", -1))
-                    if pre_id == post_id and pre_ver == post_ver:
-                        no_accum = True
-                if no_accum:
-                    pair_sums = getattr(self, "_debug_last_contact_map_pair_mask_sums", None)
-                    logits_abs_sums = getattr(self, "_debug_last_contact_map_logits_abs_sums", None)
-                    pair_head = pair_sums[:4] if pair_sums is not None else None
-                    logits_head = logits_abs_sums[:4] if logits_abs_sums is not None else None
-                    pair_min = int(min(pair_sums)) if pair_sums else None
-                    pair_max = int(max(pair_sums)) if pair_sums else None
-                    logits_min = float(min(logits_abs_sums)) if logits_abs_sums else None
-                    logits_max = float(max(logits_abs_sums)) if logits_abs_sums else None
-                    logger.warning(
-                        "[unused_params_detected/contact_map_zero_accum_ctx] step={} batch_idx={} pair_mask_sums_min={} pair_mask_sums_max={} pair_mask_sums_first_{}={} logits_abs_sums_min={} logits_abs_sums_max={} logits_abs_sums_first_{}={} logits_min={} logits_max={} logits_mean={} logits_nnz={}",
-                        int(getattr(self, "global_step", -1)),
-                        batch_idx,
-                        pair_min,
-                        pair_max,
-                        len(pair_head) if pair_head is not None else None,
-                        pair_head,
-                        logits_min,
-                        logits_max,
-                        len(logits_head) if logits_head is not None else None,
-                        logits_head,
-                        getattr(self, "_debug_last_contact_map_logits_min", None),
-                        getattr(self, "_debug_last_contact_map_logits_max", None),
-                        getattr(self, "_debug_last_contact_map_logits_mean", None),
-                        getattr(self, "_debug_last_contact_map_logits_nnz", None),
-                    )
-
-                # AMP / autocast context: underflow/quantization hypotheses show up here.
-                scaler = getattr(getattr(self.trainer, "strategy", None), "precision_plugin", None)
-                scale = None
-                if scaler is not None and hasattr(scaler, "scaler") and scaler.scaler is not None:
-                    try:
-                        scale = float(scaler.scaler.get_scale())
-                    except Exception:
-                        scale = None
-                logger.warning(
-                    "[unused_params_detected/amp_ctx] step={} batch_idx={} autocast_enabled={} autocast_dtype_cuda={} grad_enabled={} grad_scaler_scale={}",
-                    int(getattr(self, "global_step", -1)),
-                    batch_idx,
-                    bool(torch.is_autocast_enabled()),
-                    str(torch.get_autocast_gpu_dtype()) if torch.cuda.is_available() else None,
-                    bool(torch.is_grad_enabled()),
-                    scale,
-                )
-
-        if len(hook_missed_but_grad_changed) > 0:
-            batch_idx = int(getattr(self, "_debug_last_batch_idx", -1))
-            logger.warning(
-                "[unused_params_detected/hook_miss_grad_changed] step={} batch_idx={} n={} first_{}={}",
-                int(getattr(self, "global_step", -1)),
-                batch_idx,
-                len(hook_missed_but_grad_changed),
-                min(16, len(hook_missed_but_grad_changed)),
-                hook_missed_but_grad_changed[:16],
-            )
 
     def _nn_out_to_x_clean(self, nn_out, batch):
         """
@@ -890,23 +545,7 @@ class ModelTrainerBase(L.LightningModule):
         Returns:
             Training loss averaged over batches.
         """
-        # For per-batch debug hooks (e.g., unused parameter detection).
-        # This is the raw microbatch index (respects gradient accumulation).
         self._debug_last_batch_idx = int(batch_idx)
-        # Stash a few tensors' grad connectivity so on_after_backward can explain
-        # unexpected "unused" reports (especially for contact map decoder).
-        self._debug_last_grad_enabled = bool(torch.is_grad_enabled())
-        self._debug_last_c_1_pred_requires_grad = None
-        self._debug_last_contact_map_logits_requires_grad = None
-        self._debug_last_contact_map_pair_mask_sums = None
-        self._debug_last_contact_map_logits_abs_sums = None
-        self._debug_last_contact_map_logits_min = None
-        self._debug_last_contact_map_logits_max = None
-        self._debug_last_contact_map_logits_mean = None
-        self._debug_last_contact_map_logits_nnz = None
-        self._debug_last_mask_sums = None
-        self._debug_last_batch_size = None
-        self._debug_last_n = None
         self._debug_nonfinite_loss_ids = None
         self._skip_update_due_to_nonfinite_loss = False
         val_step = batch_idx == -1 or getattr(self, "_in_validation_loop", False)
@@ -915,12 +554,6 @@ class ModelTrainerBase(L.LightningModule):
         # Extract inputs from batch (our dataloader)
         # This may apply augmentations, if requested in the config file
         x_1, mask, batch_shape, n, dtype = self.extract_clean_sample(batch)
-        # Record a compact fingerprint of this training example shape.
-        # This is useful for correlating rare unused-parameter events with data properties.
-        self._debug_last_batch_size = int(mask.shape[0])
-        self._debug_last_n = int(mask.shape[1])
-        self._debug_last_mask_sums = mask.sum(-1).detach().cpu().to(torch.int64).tolist()
-
         # Center and mask input
         x_1 = self.fm._mask_and_zero_com(x_1, mask)
 
@@ -937,12 +570,6 @@ class ModelTrainerBase(L.LightningModule):
             # - Diffuse ONLY contact map
             # - Coordinates: direct prediction with FAPE loss (no noising)
             c_1 = self.extract_clean_contact_map(batch, mask)
-            if torch.isnan(c_1).any() or torch.isinf(c_1).any():
-                print(
-                    f"[contact_map_debug] c_1 nan={torch.isnan(c_1).any().item()} "
-                    f"inf={torch.isinf(c_1).any().item()} "
-                    f"min={c_1.min().item()} max={c_1.max().item()}"
-                )
             c_0 = self.fm.sample_reference(
                 n=n,
                 shape=batch_shape,
@@ -951,21 +578,9 @@ class ModelTrainerBase(L.LightningModule):
                 mask=mask,
                 modality="contact_map",
             )
-            if torch.isnan(c_0).any() or torch.isinf(c_0).any():
-                print(
-                    f"[contact_map_debug] c_0 nan={torch.isnan(c_0).any().item()} "
-                    f"inf={torch.isinf(c_0).any().item()} "
-                    f"min={c_0.min().item()} max={c_0.max().item()}"
-                )
             c_t = self.fm.interpolate(
                 c_0, c_1, t, mask=mask, modality="contact_map"
             )
-            if torch.isnan(c_t).any() or torch.isinf(c_t).any():
-                print(
-                    f"[contact_map_debug] c_t nan={torch.isnan(c_t).any().item()} "
-                    f"inf={torch.isinf(c_t).any().item()} "
-                    f"min={c_t.min().item()} max={c_t.max().item()}"
-                )
             batch["contact_map_t"] = c_t
             # x_t is a placeholder only (not used for diffusion in this mode)
             x_t = torch.zeros_like(x_1)
@@ -1078,7 +693,9 @@ class ModelTrainerBase(L.LightningModule):
                 # coordinate path is not applicable. We only need the raw nn outputs
                 # to extract contact_map_pred for self-conditioning.
                 with torch.no_grad():
-                    nn_out_sc = self.nn(batch)
+                    self._maybe_update_self_cond_copy()
+                    sc_model = getattr(self, "nn_sc", None) or self.nn
+                    nn_out_sc = sc_model(batch)
                     c_pred_sc = self._nn_out_to_c_clean(nn_out_sc, batch)
                 if c_pred_sc is not None:
                     # `c_pred_sc` is already activated in model/data space.
@@ -1087,7 +704,9 @@ class ModelTrainerBase(L.LightningModule):
                     batch["contact_map_sc"] = torch.zeros_like(c_1)
             else:
                 with torch.no_grad(): 
-                    nn_out_sc = self.predict_clean(batch)
+                    self._maybe_update_self_cond_copy()
+                    sc_model = getattr(self, "nn_sc", None) or self.nn
+                    nn_out_sc = sc_model(batch)
                     x_pred_sc = self._nn_out_to_x_clean(nn_out_sc, batch)
                 if x_pred_sc is not None:
                     batch["x_sc"] = self.detach_gradients(x_pred_sc)
@@ -1153,24 +772,9 @@ class ModelTrainerBase(L.LightningModule):
             if non_contact_value not in (0, -1):
                 raise ValueError(f"non_contact_value must be 0 or -1, got {non_contact_value}")
             c_1_pred = self._nn_out_to_c_clean(nn_out, batch)
-            if c_1_pred is not None:
-                self._debug_last_c_1_pred_requires_grad = bool(c_1_pred.requires_grad)
-            c_logits = self._nn_out_to_c_logits(nn_out, batch)
-            if c_logits is not None:
-                self._debug_last_contact_map_logits_requires_grad = bool(c_logits.requires_grad)
-                # Targeted per-batch stats for diagnosing "contact_map_decoder" non-accumulation.
-                pair_mask = mask[..., :, None] * mask[..., None, :]  # [b, n, n]
-                pair_mask_sums = pair_mask.sum(dim=(-1, -2))  # [b]
-                self._debug_last_contact_map_pair_mask_sums = pair_mask_sums.detach().cpu().to(torch.int64).tolist()
-                abs_sums = c_logits.abs().sum(dim=(-1, -2))  # [b]
-                self._debug_last_contact_map_logits_abs_sums = abs_sums.detach().cpu().tolist()
-                self._debug_last_contact_map_logits_min = float(c_logits.min().item())
-                self._debug_last_contact_map_logits_max = float(c_logits.max().item())
-                self._debug_last_contact_map_logits_mean = float(c_logits.mean().item())
-                self._debug_last_contact_map_logits_nnz = int(torch.count_nonzero(c_logits).item())
             if c_1_pred is None:
                 raise ValueError(
-                    "contact_map_mode=True requires contact_map_logits/contact_map_pred in model output."
+                    "contact_map_mode=True requires contact_map_pred in model output."
                 )
             contact_map_loss = self.compute_contact_map_loss(
                 c_1, c_1_pred, batch["contact_map_t"], t, mask, log_prefix=log_prefix
