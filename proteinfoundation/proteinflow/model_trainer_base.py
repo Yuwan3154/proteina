@@ -1528,6 +1528,8 @@ class ModelTrainerBase(L.LightningModule):
             autoguidance_ratio=autoguidance_ratio,
             force_compile=force_compile,
         )
+        if torch.is_tensor(residue_type) and residue_type.dim() == 2 and residue_type.shape[0] == 1 and nsamples > 1:
+            residue_type = residue_type.expand(nsamples, -1)
         if mask is None:
             mask = torch.ones(nsamples, n).long().bool().to(self.device)
 

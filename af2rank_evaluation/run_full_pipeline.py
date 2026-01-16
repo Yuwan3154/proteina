@@ -300,7 +300,8 @@ def main():
                        help='Regenerate AF2Rank plots even if scoring already completed')
     parser.add_argument(
         '--proteina_force_compile',
-        action='store_true',
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help='Pass --force_compile to Proteina inference (torch.compile even in eval/no_grad).',
     )
     parser.add_argument('--tms_column', required=True,

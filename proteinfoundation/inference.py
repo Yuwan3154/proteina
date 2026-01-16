@@ -41,6 +41,7 @@ from proteinfoundation.metrics.metric_factory import (
 )
 from proteinfoundation.proteinflow.proteina import Proteina
 from proteinfoundation.utils.ff_utils.pdb_utils import mask_cath_code_by_level, write_prot_to_pdb
+from proteinfoundation.utils.openfold_inference import OpenFoldDistogramOnlyInference
 
 
 # Length dataloader for validation and inference
@@ -334,8 +335,15 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--force_compile",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Force compile the model.",
+    )
+    parser.add_argument(
+        "--use_cueq",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use cuequivariance triangle updates when available.",
     )
     
     args = parser.parse_args()
@@ -418,12 +426,31 @@ if __name__ == "__main__":
         nn_ag = model_ag.nn
 
     model.configure_inference(cfg, nn_ag=nn_ag)
+    use_cueq = bool(args.use_cueq)
+    pair_update_layers = getattr(model.nn, "pair_update_layers", None)
+    if pair_update_layers is not None:
+        for layer in pair_update_layers:
+            if layer is not None and hasattr(layer, "use_cueq"):
+                layer.use_cueq = use_cueq
 
     # Create inference dataset
     pt = torch.load(os.path.join(cfg.data_dir, "processed", f"{args.pt}.pt"), weights_only=False)
     cath_codes = pd.read_csv(os.path.join(cfg.data_dir, cfg.cath_code_file))["cath_code"].tolist()
     assert args.pt is not None, "pt must be provided if seq_cond is True"
     
+    residue_type_tensor = None
+    mask_tensor = None
+    if pt is not None:
+        residue_type_tensor = getattr(pt, "residue_type", None)
+        if residue_type_tensor is not None:
+            residue_type_tensor = torch.as_tensor(residue_type_tensor).long()
+        coord_mask = getattr(pt, "coord_mask", None)
+        if coord_mask is not None:
+            coord_mask = torch.as_tensor(coord_mask)
+            mask_tensor = (coord_mask.sum(dim=-1) > 0).float()
+        elif residue_type_tensor is not None:
+            mask_tensor = torch.ones_like(residue_type_tensor, dtype=torch.float32)
+
     # Choose the appropriate dataset class based on CIRPIN conditioning
     if cfg.get("cirpin_cond", False):
         dataset = GenDatasetWithSeqCathCirpin(
@@ -481,6 +508,10 @@ if __name__ == "__main__":
         aatype = None
     
     samples_per_length = {}
+    openfold_infer = None
+    openfold_residue_type = None
+    openfold_mask = None
+    openfold_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     for pred in predictions:
         # Unpack dictionary returned by predict_step
         coors_atom37 = pred["coords_atom37"]  # [b, n, 37, 3]
@@ -511,16 +542,43 @@ if __name__ == "__main__":
                 filename_parts.append(f"cirpin_{current_cirpin_id}")
             filename_parts.append(str(sample_idx))
             
-            if coors_atom37 is not None:
+            if coors_atom37 is not None or distogram is not None:
                 pdb_fname = "_".join(filename_parts) + ".pdb"
                 pdb_path = os.path.join(root_path, pdb_fname)
-                write_prot_to_pdb(
-                    coors_atom37[i].numpy(),
-                    pdb_path,
-                    aatype=aatype,
-                    overwrite=True,
-                    no_indexing=True,
-                )
+                if distogram is not None and residue_type_tensor is not None and mask_tensor is not None:
+                    if openfold_infer is None:
+                        openfold_infer = OpenFoldDistogramOnlyInference(
+                            model_name="model_1_ptm",
+                            jax_params_path="/home/ubuntu/params/params_model_1_ptm.npz",
+                            device=openfold_device,
+                        )
+                        openfold_residue_type = residue_type_tensor.to(openfold_device)
+                        openfold_mask = mask_tensor.to(openfold_device)
+                    dist_i = distogram[i] if distogram.dim() == 4 else distogram
+                    if dist_i.dim() == 3:
+                        dist_i = dist_i.unsqueeze(0)
+                    with torch.no_grad():
+                        out = openfold_infer(
+                            dist_i.to(openfold_device),
+                            openfold_residue_type.unsqueeze(0),
+                            openfold_mask.unsqueeze(0),
+                        )
+                    atom37 = out["atom37"][0].detach().cpu().numpy()
+                    write_prot_to_pdb(
+                        atom37,
+                        pdb_path,
+                        aatype=aatype,
+                        overwrite=True,
+                        no_indexing=True,
+                    )
+                elif coors_atom37 is not None:
+                    write_prot_to_pdb(
+                        coors_atom37[i].numpy(),
+                        pdb_path,
+                        aatype=aatype,
+                        overwrite=True,
+                        no_indexing=True,
+                    )
             
             # Save contact map as .pt if present
             if contact_map is not None:

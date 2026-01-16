@@ -157,6 +157,31 @@ def _write_pdb(prot: protein.Protein, out_path: str) -> None:
     with open(out_path, "w") as f:
         f.write(pdb_str)
 
+def _compare_template_batches(batch_a: dict, batch_b: dict, *, atol: float = 1e-6) -> None:
+    keys = {k for k in batch_a if k.startswith("template_")} | {k for k in batch_b if k.startswith("template_")}
+    for key in sorted(keys):
+        if key not in batch_a:
+            print(f"{key}: only in full_template_zero_coords")
+            continue
+        if key not in batch_b:
+            print(f"{key}: only in distogram_only")
+            continue
+        a = batch_a[key]
+        b = batch_b[key]
+        if a.shape != b.shape:
+            print(f"{key}: shape {tuple(a.shape)} vs {tuple(b.shape)}")
+            continue
+        if torch.is_floating_point(a) or torch.is_floating_point(b):
+            diff = (a - b).abs()
+            max_diff = diff.max().item()
+            mean_diff = diff.mean().item()
+            frac_diff = (diff > atol).float().mean().item()
+            if frac_diff > 0:
+                print(f"{key}: max={max_diff:.6f} mean={mean_diff:.6f} frac>{atol}={frac_diff:.4f}")
+        else:
+            frac_diff = (a != b).float().mean().item()
+            if frac_diff > 0:
+                print(f"{key}: frac_diff={frac_diff:.4f}")
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -164,7 +189,36 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"])
     parser.add_argument("--model_name", type=str, default="model_1_ptm")
     parser.add_argument("--jax_params", type=str, default="/home/ubuntu/params/params_model_1_ptm.npz")
-    parser.add_argument("--template_all_x", action="store_true")
+    parser.add_argument(
+        "--template_mode",
+        type=str,
+        default="distogram_only",
+        choices=["distogram_only", "full_template", "full_template_zero_coords"],
+        help="Template featurization mode for the template run.",
+    )
+    parser.add_argument(
+        "--template_mmcif_path",
+        type=str,
+        default=None,
+        help="Path to template mmCIF file or directory (required for full_template modes, optional for distogram_only).",
+    )
+    parser.add_argument(
+        "--template_chain_id",
+        type=str,
+        default=None,
+        help="Template chain ID for mmCIF (default: chain from input PDB).",
+    )
+    parser.add_argument(
+        "--kalign_binary_path",
+        type=str,
+        default=None,
+        help="Path to kalign binary (required for full_template modes, optional for distogram_only).",
+    )
+    parser.add_argument(
+        "--template_all_x",
+        action="store_true",
+        help="Mask template_aatype to X (index 20) for the template run.",
+    )
     parser.add_argument("--recycles", type=int, default=3)
     parser.add_argument("--out_dir", type=str, default="/home/ubuntu")
     parser.add_argument(
@@ -172,11 +226,21 @@ def main() -> None:
         action="store_true",
         help="If set, raise if template inference does not improve USalign-aligned RMSD vs baseline.",
     )
+    parser.add_argument(
+        "--compare_features",
+        action="store_true",
+        help="Compare template_* features between distogram_only and full_template_zero_coords modes.",
+    )
     args = parser.parse_args()
 
     parsed = _load_pdb(args.pdb)
     if parsed.pseudo_beta.shape[0] == 0:
         raise ValueError(f"No pseudo beta coordinates found for {args.pdb}")
+    if args.template_mode in ("full_template", "full_template_zero_coords"):
+        if args.template_mmcif_path is None:
+            raise ValueError("template_mmcif_path is required for full_template modes")
+        if args.kalign_binary_path is None:
+            raise ValueError("kalign_binary_path is required for full_template modes")
 
     device = torch.device(args.device)
     pseudo_beta = torch.tensor(parsed.pseudo_beta, dtype=torch.float32, device=device)
@@ -208,17 +272,58 @@ def main() -> None:
         model_name=args.model_name,
         jax_params_path=args.jax_params,
         device=device,
-        template_sequence_all_x=args.template_all_x,
+        rm_template_sequence=args.template_all_x,
         max_recycling_iters=args.recycles,
     )
-    out = infer(dist_probs, residue_type, mask)
+    template_chain_id = args.template_chain_id or parsed.chain_id
+    if args.compare_features:
+        if args.template_mmcif_path is None:
+            raise ValueError("template_mmcif_path is required to compare features")
+        if args.kalign_binary_path is None:
+            raise ValueError("kalign_binary_path is required to compare features")
+        dist_batch = infer.build_batch(
+            dist_probs,
+            residue_type,
+            mask,
+            template_mode="distogram_only",
+            mask_template_aatype=args.template_all_x,
+        )
+        zero_batch = infer.build_batch(
+            dist_probs,
+            residue_type,
+            mask,
+            template_mode="full_template_zero_coords",
+            template_mmcif_path=args.template_mmcif_path,
+            template_chain_id=template_chain_id,
+            kalign_binary_path=args.kalign_binary_path,
+            mask_template_aatype=args.template_all_x,
+        )
+        print("\nTemplate feature diffs: distogram_only vs full_template_zero_coords")
+        _compare_template_batches(dist_batch, zero_batch)
+
+    out = infer(
+        dist_probs,
+        residue_type,
+        mask,
+        template_mode=args.template_mode,
+        template_mmcif_path=args.template_mmcif_path,
+        template_chain_id=template_chain_id,
+        kalign_binary_path=args.kalign_binary_path,
+        mask_template_aatype=args.template_all_x,
+    )
     atom37_w_t = out["atom37"]
     if atom37_w_t.ndim != 4 or atom37_w_t.shape[0] != 1 or atom37_w_t.shape[2] != rc.atom_type_num or atom37_w_t.shape[3] != 3:
         raise ValueError(f"Unexpected atom37 shape from template run: {tuple(atom37_w_t.shape)}")
 
     # Baseline: no template = feed uniform distogram
     uniform = torch.full_like(dist_probs, 1.0 / dist_probs.shape[-1])
-    out0 = infer(uniform, residue_type, mask)
+    out0 = infer(
+        uniform,
+        residue_type,
+        mask,
+        template_mode="distogram_only",
+        mask_template_aatype=args.template_all_x,
+    )
     atom37_no_t = out0["atom37"]
     if atom37_no_t.ndim != 4 or atom37_no_t.shape[0] != 1 or atom37_no_t.shape[2] != rc.atom_type_num or atom37_no_t.shape[3] != 3:
         raise ValueError(f"Unexpected atom37 shape from baseline run: {tuple(atom37_no_t.shape)}")
@@ -228,11 +333,12 @@ def main() -> None:
     # Save PDBs + run USalign vs GT (more interpretable than RMSD here)
     pdb_id = os.path.splitext(os.path.basename(args.pdb))[0]
     tag = f"{pdb_id}_chain{parsed.chain_id}_recycles{args.recycles}"
+    template_tag = args.template_mode
     if args.template_all_x:
-        tag += "_templateAllX"
+        template_tag += "_templateAllX"
 
     gt_path = os.path.join(args.out_dir, f"{tag}_gt.pdb")
-    pred_template_path = os.path.join(args.out_dir, f"{tag}_pred_distogram_template.pdb")
+    pred_template_path = os.path.join(args.out_dir, f"{tag}_pred_{template_tag}.pdb")
     pred_baseline_path = os.path.join(args.out_dir, f"{tag}_pred_no_template.pdb")
 
     _write_pdb(prot_gt, gt_path)
@@ -242,7 +348,7 @@ def main() -> None:
         aatype=prot_gt.aatype,
         residue_index=prot_gt.residue_index,
         chain_index=prot_gt.chain_index,
-        remark="Predicted by OpenFold with distogram-only template",
+        remark=f"Predicted by OpenFold with template mode: {args.template_mode}",
     )
     _write_pdb(prot_pred_template, pred_template_path)
 
@@ -262,7 +368,8 @@ def main() -> None:
     usalign = "/home/ubuntu/.local/bin/USalign"
     baseline_metrics = None
     template_metrics = None
-    for label, pred_path in [("baseline", pred_baseline_path), ("template", pred_template_path)]:
+    template_label = f"template_{args.template_mode}"
+    for label, pred_path in [("baseline", pred_baseline_path), (template_label, pred_template_path)]:
         r = subprocess.run(
             [usalign, pred_path, gt_path, "-mol", "prot", "-outfmt", "2", "-ter", "2"],
             check=True,
