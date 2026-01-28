@@ -1,4 +1,4 @@
-name: contactflow
+name: contactflow_discrete_md4
 
 defaults:
   - _self_
@@ -7,11 +7,8 @@ defaults:
 target_pred: c_1
 
 discrete_diffusion:
-  enabled: false
+  enabled: true
   type: md4  # md4 or genmd4
-  position_bias:
-    enabled: false
-    mode: diagonal_distance
   md4:
     vocab_size: 2
     noise_schedule: cosine

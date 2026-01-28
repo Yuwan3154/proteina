@@ -665,7 +665,14 @@ class ProteinTransformerAF3(torch.nn.Module):
         self.non_contact_value = non_contact_value
         if self.contact_map_mode:
             # To encode corrupted contact map
-            self.linear_contact_embed = torch.nn.Linear(1, kwargs["pair_repr_dim"], bias=False)
+            self.contact_map_input_dim = int(kwargs.get("contact_map_input_dim", 1))
+            if self.contact_map_input_dim <= 0:
+                raise ValueError(
+                    f"contact_map_input_dim must be positive, got {self.contact_map_input_dim}"
+                )
+            self.linear_contact_embed = torch.nn.Linear(
+                self.contact_map_input_dim, kwargs["pair_repr_dim"], bias=False
+            )
         else:
             # To encode corrupted 3d positions
             self.linear_3d_embed = torch.nn.Linear(3, kwargs["token_dim"], bias=False)
@@ -919,7 +926,19 @@ class ProteinTransformerAF3(torch.nn.Module):
 
         # Prepare input - coordinates and initial sequence representation from features
         if self.contact_map_mode:
-            contact_map = batch_nn["contact_map_t"].unsqueeze(-1)  # [b, n, n, 1]
+            contact_map = batch_nn["contact_map_t"]
+            if contact_map.dim() == 3:
+                contact_map = contact_map.unsqueeze(-1)
+            elif contact_map.dim() != 4:
+                raise ValueError(
+                    "contact_map_t must have shape [b,n,n] or [b,n,n,c], "
+                    f"got {tuple(contact_map.shape)}"
+                )
+            if contact_map.shape[-1] != self.contact_map_input_dim:
+                raise ValueError(
+                    f"contact_map_t last dim {contact_map.shape[-1]} does not match "
+                    f"contact_map_input_dim {self.contact_map_input_dim}"
+                )
             contact_map_embed = self.linear_contact_embed(contact_map) * pair_mask[..., None] # [b, n, n, pair_repr_dim]
             pair_f_repr = self.pair_repr_builder(batch_nn)  # [b, n, n, pair_repr_dim]
             pair_rep = (contact_map_embed + pair_f_repr) * pair_mask[..., None]  # [b, n, n, pair_repr_dim]

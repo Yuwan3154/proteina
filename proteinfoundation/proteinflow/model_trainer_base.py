@@ -30,6 +30,10 @@ from loguru import logger
 from PIL import Image
 from torch import Tensor
 
+from proteinfoundation.flow_matching.discrete_md4 import (
+    GenMD4DiscreteDiffusion,
+    MD4DiscreteDiffusion,
+)
 from proteinfoundation.utils.ff_utils.pdb_utils import (
     mask_cath_code_by_level,
     mask_seq,
@@ -63,6 +67,9 @@ class ModelTrainerBase(L.LightningModule):
         # For autoguidance, overridden in `self.configure_inference`
         self.nn_ag = None
         self.motif_conditioning = cfg_exp.training.get("motif_conditioning", False)
+        self.discrete_diffusion = None
+        self.discrete_diffusion_type = None
+        self._init_discrete_diffusion()
 
         # Lazy OpenFold template inference helper
         self._template_inference = None
@@ -397,9 +404,11 @@ class ModelTrainerBase(L.LightningModule):
                 nn_out_ag = self.nn_ag(batch)
                 x_pred_ag = self._nn_out_to_x_clean(nn_out_ag, batch) if x_pred is not None else None
                 c_pred_ag = self._nn_out_to_c_clean(nn_out_ag, batch) if c_pred is not None else None
+                c_logits_ag = self._nn_out_to_c_logits(nn_out_ag, batch) if c_logits is not None else None
             else:
                 x_pred_ag = torch.zeros_like(x_pred) if x_pred is not None else None
                 c_pred_ag = torch.zeros_like(c_pred) if c_pred is not None else None
+                c_logits_ag = torch.zeros_like(c_logits) if c_logits is not None else None
 
             # Get unconditional predictions (CFG)
             nn_out_uncond = None
@@ -412,9 +421,11 @@ class ModelTrainerBase(L.LightningModule):
                 nn_out_uncond = self.nn(uncond_batch)
                 x_pred_uncond = self._nn_out_to_x_clean(nn_out_uncond, uncond_batch) if x_pred is not None else None
                 c_pred_uncond = self._nn_out_to_c_clean(nn_out_uncond, uncond_batch) if c_pred is not None else None
+                c_logits_uncond = self._nn_out_to_c_logits(nn_out_uncond, uncond_batch) if c_logits is not None else None
             else:
                 x_pred_uncond = torch.zeros_like(x_pred) if x_pred is not None else None
                 c_pred_uncond = torch.zeros_like(c_pred) if c_pred is not None else None
+                c_logits_uncond = torch.zeros_like(c_logits) if c_logits is not None else None
 
             # Apply guidance to coordinates
             if x_pred is not None:
@@ -428,6 +439,11 @@ class ModelTrainerBase(L.LightningModule):
                 c_pred = guidance_weight * c_pred + (1 - guidance_weight) * (
                     autoguidance_ratio * c_pred_ag
                     + (1 - autoguidance_ratio) * c_pred_uncond
+                )
+            if c_logits is not None:
+                c_logits = guidance_weight * c_logits + (1 - guidance_weight) * (
+                    autoguidance_ratio * c_logits_ag
+                    + (1 - autoguidance_ratio) * c_logits_uncond
                 )
 
         result = {}
@@ -451,8 +467,12 @@ class ModelTrainerBase(L.LightningModule):
             # - non_contact_value == 0  -> in [0, 1] (sigmoid)
             # - non_contact_value == -1 -> in [-1, 1] (tanh)
             result["contact_map"] = c_pred
-            # Only compute velocity in contact map diffusion mode
-            if contact_map_mode and "contact_map_t" in batch:
+            # Only compute velocity in continuous contact map diffusion mode
+            if (
+                contact_map_mode
+                and "contact_map_t" in batch
+                and not self._discrete_diffusion_enabled()
+            ):
                 result["contact_map_v"] = self.fm.xt_dot(
                     c_pred,
                     batch["contact_map_t"],
@@ -515,21 +535,131 @@ class ModelTrainerBase(L.LightningModule):
             Clean contact map of shape [b, n, n].
         """
 
+    def _get_discrete_diffusion_cfg(self):
+        cfg = self.cfg_exp.model.get("discrete_diffusion", None)
+        if cfg is None or not cfg.get("enabled", False):
+            return None
+        return cfg
+
+    def _init_discrete_diffusion(self):
+        cfg = self._get_discrete_diffusion_cfg()
+        if cfg is None:
+            return
+        if not self.cfg_exp.model.nn.get("contact_map_mode", False):
+            raise ValueError(
+                "discrete_diffusion requires contact_map_mode=True in model.nn config."
+            )
+        diffusion_type = cfg.get("type", "md4")
+        position_bias = self.cfg_exp.training.get("position_bias", None)
+        if diffusion_type == "md4":
+            md4_cfg = cfg.get("md4", {})
+            self.discrete_diffusion = MD4DiscreteDiffusion(
+                vocab_size=md4_cfg.get("vocab_size", 2),
+                noise_schedule_type=md4_cfg.get("noise_schedule", "cosine"),
+                timesteps=md4_cfg.get("timesteps", 1000),
+                cont_time=md4_cfg.get("cont_time", True),
+                sampling_grid=md4_cfg.get("sampling_grid", "cosine"),
+                eps=md4_cfg.get("eps", 1e-4),
+                position_bias=position_bias,
+            )
+        elif diffusion_type == "genmd4":
+            gen_cfg = cfg.get("genmd4", {})
+            self.discrete_diffusion = GenMD4DiscreteDiffusion(
+                vocab_size=gen_cfg.get("vocab_size", 2),
+                noise_schedule_type=gen_cfg.get("noise_schedule", "poly"),
+                power_init=gen_cfg.get("power_init", 1.0),
+                t1=gen_cfg.get("t1", 1e-3),
+                eps=gen_cfg.get("eps", 1e-4),
+                position_bias=position_bias,
+            )
+        else:
+            raise ValueError(
+                f"Unknown discrete diffusion type {diffusion_type}. "
+                "Use 'md4' or 'genmd4'."
+            )
+        self.discrete_diffusion_type = diffusion_type
+
+    def _discrete_diffusion_enabled(self) -> bool:
+        return self.discrete_diffusion is not None
+
+    def _pair_mask(self, mask: torch.Tensor) -> torch.Tensor:
+        return mask[..., :, None] * mask[..., None, :]
+
+    def _apply_pair_mask(self, pair_tensor: torch.Tensor, pair_mask: torch.Tensor) -> torch.Tensor:
+        mask = pair_mask.float()
+        if pair_tensor.dim() == mask.dim() + 1:
+            mask = mask.unsqueeze(-1)
+        return pair_tensor * mask
+
+    def _contact_tokens_to_input(self, tokens: torch.Tensor) -> torch.Tensor:
+        input_dim = int(getattr(self.nn, "contact_map_input_dim", 1))
+        if input_dim == 1:
+            non_contact_value = getattr(self.nn, "non_contact_value", 0)
+            if non_contact_value == -1:
+                contact = torch.ones_like(tokens, dtype=torch.float32)
+                non_contact = -torch.ones_like(tokens, dtype=torch.float32)
+                mask_val = torch.zeros_like(tokens, dtype=torch.float32)
+                return torch.where(
+                    tokens == self.discrete_diffusion.mask_token,
+                    mask_val,
+                    torch.where(tokens == 1, contact, non_contact),
+                )
+            return tokens.float()
+        if input_dim == 3:
+            num_classes = self.discrete_diffusion.vocab_size + 1
+            return torch.nn.functional.one_hot(tokens, num_classes=num_classes).float()
+        raise ValueError(
+            f"Unsupported contact_map_input_dim {input_dim}. Expected 1 or 3."
+        )
+
+    def _contact_tokens_to_output(self, tokens: torch.Tensor) -> torch.Tensor:
+        non_contact_value = getattr(self.nn, "non_contact_value", 0)
+        if non_contact_value == -1:
+            contact = torch.ones_like(tokens, dtype=torch.float32)
+            non_contact = -torch.ones_like(tokens, dtype=torch.float32)
+            return torch.where(tokens == 1, contact, non_contact)
+        return tokens.float()
+
+    def _set_contact_map_self_cond(self, batch: Dict, c_1: torch.Tensor, use_self_cond: bool):
+        if use_self_cond:
+            with torch.no_grad():
+                self._maybe_update_self_cond_copy()
+                sc_model = getattr(self, "nn_sc", None) or self.nn
+                nn_out_sc = sc_model(batch)
+                c_pred_sc = self._nn_out_to_c_clean(nn_out_sc, batch)
+            if c_pred_sc is not None:
+                batch["contact_map_sc"] = self.detach_gradients(c_pred_sc)
+            else:
+                batch["contact_map_sc"] = torch.zeros_like(c_1)
+        else:
+            batch["contact_map_sc"] = torch.zeros_like(c_1)
+
     def sample_t(self, shape):
-        if self.cfg_exp.loss.t_distribution.name == "uniform":
+        dist_name = self.cfg_exp.loss.t_distribution.name
+        if self._discrete_diffusion_enabled() and dist_name not in ("uniform", "cosine", "cosine_cdf"):
+            raise ValueError(
+                f"Discrete diffusion only supports t_distribution uniform or cosine "
+                f"(got {dist_name})."
+            )
+        if dist_name == "uniform":
             t_max = self.cfg_exp.loss.t_distribution.p2
             return torch.rand(shape, device=self.device) * t_max  # [*]
-        elif self.cfg_exp.loss.t_distribution.name == "logit-normal":
+        elif dist_name in ("cosine", "cosine_cdf"):
+            t = torch.rand(shape, device=self.device)
+            t = torch.sin(0.5 * math.pi * t)
+            t_max = self.cfg_exp.loss.t_distribution.get("p2", 1.0)
+            return t * t_max
+        elif dist_name == "logit-normal":
             mean = self.cfg_exp.loss.t_distribution.p1
             std = self.cfg_exp.loss.t_distribution.p2
             noise = torch.randn(shape, device=self.device) * std + mean  # [*]
             return torch.nn.functional.sigmoid(noise)  # [*]
-        elif self.cfg_exp.loss.t_distribution.name == "beta":
+        elif dist_name == "beta":
             p1 = self.cfg_exp.loss.t_distribution.p1
             p2 = self.cfg_exp.loss.t_distribution.p2
             dist = torch.distributions.beta.Beta(p1, p2)
             return dist.sample(shape).to(self.device)
-        elif self.cfg_exp.loss.t_distribution.name == "mix_up02_beta":
+        elif dist_name == "mix_up02_beta":
             p1 = self.cfg_exp.loss.t_distribution.p1
             p2 = self.cfg_exp.loss.t_distribution.p2
             dist = torch.distributions.beta.Beta(p1, p2)
@@ -568,29 +698,62 @@ class ModelTrainerBase(L.LightningModule):
         t = self.sample_t(batch_shape)
         contact_map_mode = getattr(self, "contact_map_mode", False)
         predict_coords = getattr(self.nn, "predict_coords", True)
+        discrete_enabled = contact_map_mode and self._discrete_diffusion_enabled()
+        if discrete_enabled and self.cfg_exp.model.target_pred != "c_1":
+            raise ValueError(
+                "Discrete contact-map diffusion requires model.target_pred == 'c_1'."
+            )
 
         # Ensure x_1_pred is always defined for downstream auxiliary loss calls
         x_1_pred = None
+        c_tokens = None
+        pair_mask = None
+        c_1 = None
+        zt = None
+        zt_2 = None
+        contact_map_t_1 = None
 
         if contact_map_mode:
-            # Contact map diffusion mode:
-            # - Diffuse ONLY contact map
-            # - Coordinates: direct prediction with FAPE loss (no noising)
-            c_1 = self.extract_clean_contact_map(batch, mask)
-            c_0 = self.fm.sample_reference(
-                n=n,
-                shape=batch_shape,
-                device=self.device,
-                dtype=dtype,
-                mask=mask,
-                modality="contact_map",
-            )
-            c_t = self.fm.interpolate(
-                c_0, c_1, t, mask=mask, modality="contact_map"
-            )
-            batch["contact_map_t"] = c_t
-            # x_t is a placeholder only (not used for diffusion in this mode)
-            x_t = torch.zeros_like(x_1)
+            if discrete_enabled:
+                if "contact_map" not in batch:
+                    raise ValueError(
+                        "contact_map not found in batch. Ensure ContactMapTransform is enabled."
+                    )
+                pair_mask = self._pair_mask(mask)
+                c_tokens = (batch["contact_map"].float() > 0.5).long()
+                c_tokens = c_tokens * pair_mask.long()
+                c_1 = self._contact_tokens_to_output(c_tokens)
+                c_1 = c_1 * pair_mask.float()
+                if self.discrete_diffusion_type == "genmd4":
+                    t1 = self.discrete_diffusion.t1
+                    t = (1.0 - t1) * t + t1
+                zt = self.discrete_diffusion.forward_sample(c_tokens, t)
+                if self.discrete_diffusion_type == "genmd4":
+                    zt_2 = self.discrete_diffusion.forward_sample(c_tokens, t)
+                contact_map_t_1 = self._contact_tokens_to_input(zt)
+                contact_map_t_1 = self._apply_pair_mask(contact_map_t_1, pair_mask)
+                batch["contact_map_t"] = contact_map_t_1
+                # x_t is a placeholder only (not used for diffusion in this mode)
+                x_t = torch.zeros_like(x_1)
+            else:
+                # Contact map diffusion mode:
+                # - Diffuse ONLY contact map
+                # - Coordinates: direct prediction with FAPE loss (no noising)
+                c_1 = self.extract_clean_contact_map(batch, mask)
+                c_0 = self.fm.sample_reference(
+                    n=n,
+                    shape=batch_shape,
+                    device=self.device,
+                    dtype=dtype,
+                    mask=mask,
+                    modality="contact_map",
+                )
+                c_t = self.fm.interpolate(
+                    c_0, c_1, t, mask=mask, modality="contact_map"
+                )
+                batch["contact_map_t"] = c_t
+                # x_t is a placeholder only (not used for diffusion in this mode)
+                x_t = torch.zeros_like(x_1)
         else:
             x_0 = self.fm.sample_reference(
                 n=n,
@@ -783,9 +946,55 @@ class ModelTrainerBase(L.LightningModule):
                 raise ValueError(
                     "contact_map_mode=True requires contact_map_pred in model output."
                 )
-            contact_map_loss = self.compute_contact_map_loss(
-                c_1, c_1_pred, batch["contact_map_t"], t, mask, log_prefix=log_prefix
-            )
+            if discrete_enabled:
+                c_logits = self._nn_out_to_c_logits(nn_out, batch)
+                if c_logits is None:
+                    raise ValueError(
+                        "discrete diffusion requires contact_map_logits in model output."
+                    )
+                if self.discrete_diffusion_type == "genmd4":
+                    if zt_2 is None:
+                        zt_2 = self.discrete_diffusion.forward_sample(c_tokens, t)
+                    contact_map_t_2 = self._contact_tokens_to_input(zt_2)
+                    contact_map_t_2 = self._apply_pair_mask(contact_map_t_2, pair_mask)
+                    batch["contact_map_t"] = contact_map_t_2
+                    nn_out_2 = self.predict_clean(batch)
+                    c_logits_2 = self._nn_out_to_c_logits(nn_out_2, batch)
+                    if c_logits_2 is None:
+                        raise ValueError(
+                            "discrete diffusion requires contact_map_logits in model output."
+                        )
+                    loss_diff_1 = self.discrete_diffusion.diffusion_loss(
+                        c_logits, c_tokens, zt, t, pair_mask
+                    )
+                    loss_diff_2 = self.discrete_diffusion.diffusion_loss(
+                        c_logits_2, c_tokens, zt_2, t, pair_mask
+                    )
+                    rloo = self.discrete_diffusion.reinforce_loss(
+                        t, c_tokens, zt, zt_2, loss_diff_1, loss_diff_2, pair_mask
+                    )
+                    loss_diff = 0.5 * (loss_diff_1 + loss_diff_2)
+                    loss_diff_sg = loss_diff + rloo
+                    recon_loss = self.discrete_diffusion.recon_loss(c_tokens, pair_mask)
+                    prior_loss = self.discrete_diffusion.latent_loss(
+                        c_tokens.shape[0], c_tokens.device
+                    )
+                    contact_map_loss = loss_diff_sg + recon_loss + prior_loss
+                    if contact_map_t_1 is not None:
+                        batch["contact_map_t"] = contact_map_t_1
+                else:
+                    loss_diff = self.discrete_diffusion.diffusion_loss(
+                        c_logits, c_tokens, zt, t, pair_mask
+                    )
+                    recon_loss = self.discrete_diffusion.recon_loss(pair_mask)
+                    prior_loss = self.discrete_diffusion.latent_loss(
+                        c_tokens.shape[0], c_tokens.device
+                    )
+                    contact_map_loss = loss_diff + recon_loss + prior_loss
+            else:
+                contact_map_loss = self.compute_contact_map_loss(
+                    c_1, c_1_pred, batch["contact_map_t"], t, mask, log_prefix=log_prefix
+                )
             contact_map_loss = _sanitize_and_log_loss_vec(contact_map_loss, "contact_map_loss")
             train_loss = torch.mean(contact_map_loss)
 
@@ -927,7 +1136,10 @@ class ModelTrainerBase(L.LightningModule):
         # Log structure visualization (train + validation)
         log_every_n = self.cfg_exp.log.get("log_structure_every_n_steps", 0)
         if log_every_n > 0:
-            log_id = f"{log_prefix}_{self.global_step if not val_step else batch_idx}"
+            if val_step:
+                log_id = f"{log_prefix}_{self.global_step}_{batch_idx}"
+            else:
+                log_id = f"{log_prefix}_{self.global_step}"
             if not hasattr(self, "_last_structure_log_step"):
                 self._last_structure_log_step = {}
             already_logged = self._last_structure_log_step.get(log_prefix) == log_id
@@ -938,14 +1150,20 @@ class ModelTrainerBase(L.LightningModule):
                 should_log = self.global_step % log_every_n == 0
             if should_log and not already_logged:
                 self._last_structure_log_step[log_prefix] = log_id
+                c_pred_full = (
+                    self._nn_out_to_c_clean(nn_out, batch)
+                    if "contact_map_pred" in nn_out
+                    else None
+                )
+                contact_map_pred = (
+                    self._contact_map_to_viz(c_pred_full[0]) if c_pred_full is not None else None
+                )
                 self._log_structure_visualization(
                     # Log only the first sample. Passing the full batch here makes
                     # `write_prot_to_pdb` treat batch dim as MODEL index, producing a
                     # multi-model PDB with mismatched aatype/mask (confusing in WandB).
                     x_1_pred=x_1_pred[:1] if x_1_pred is not None else None,
-                    contact_map_pred=self._contact_map_to_viz(self._nn_out_to_c_clean(nn_out, batch)[0])
-                    if "contact_map_pred" in nn_out is not None
-                    else None,
+                    contact_map_pred=contact_map_pred,
                     mask=mask[0],
                     log_prefix=log_prefix,
                     pair_logits=nn_out.get("pair_logits")[0] if "pair_logits" in nn_out else None,
@@ -960,6 +1178,22 @@ class ModelTrainerBase(L.LightningModule):
                         and self.cfg_exp.model.nn.get("predict_structure_from_distogram", False)
                     ),
                 )
+                gt_contact_map = (
+                    self._contact_map_to_viz(c_1[0]) if c_1 is not None else None
+                )
+                self._log_structure_visualization(
+                    x_1_pred=x_1[:1] if x_1 is not None else None,
+                    contact_map_pred=gt_contact_map,
+                    mask=mask[0],
+                    log_prefix=log_prefix,
+                    key_suffix="_gt",
+                    residue_type=(
+                        batch.get("residue_type_unmasked", batch.get("residue_type"))[0]
+                        if batch.get("residue_type_unmasked", batch.get("residue_type"))
+                        is not None
+                        else None
+                    ),
+                )
 
         return train_loss
     
@@ -969,6 +1203,7 @@ class ModelTrainerBase(L.LightningModule):
         contact_map_pred: torch.Tensor,
         mask: torch.Tensor,
         log_prefix: str,
+        key_suffix: str = "",
         pair_logits: torch.Tensor = None,
         residue_type: torch.Tensor = None,
         use_template_inference: bool = False,
@@ -982,6 +1217,7 @@ class ModelTrainerBase(L.LightningModule):
             mask: Boolean mask, shape [n]
             residue_type: Residue type, shape [n]
             log_prefix: Prefix for log names ("train" or "validation_loss")
+            key_suffix: Suffix appended to logged keys (e.g., "_gt")
         """
         if (
             self.logger is None
@@ -1040,7 +1276,9 @@ class ModelTrainerBase(L.LightningModule):
                 )
                 self.logger.experiment.log(
                     {
-                        f"{log_prefix}/structure": wandb.Molecule(temp_pdb_path),
+                        f"{log_prefix}/structure{key_suffix}": wandb.Molecule(
+                            temp_pdb_path
+                        ),
                         "global_step": self.global_step,
                     }
                 )
@@ -1072,7 +1310,7 @@ class ModelTrainerBase(L.LightningModule):
 
         self.logger.experiment.log(
             {
-                f"{log_prefix}/contact_map": wandb.Image(img_contact),
+                f"{log_prefix}/contact_map{key_suffix}": wandb.Image(img_contact),
                 "global_step": self.global_step,
             }
         )
@@ -1318,6 +1556,9 @@ class ModelTrainerBase(L.LightningModule):
         sampling_mode = val_sampling_cfg.get("sampling_mode", "sc")
         sc_scale_noise = float(val_sampling_cfg.get("sc_scale_noise", 0.45))
         sc_scale_score = float(val_sampling_cfg.get("sc_scale_score", 1.0))
+        schedule_mode = val_sampling_cfg.get("schedule_mode", "uniform")
+        schedule_p = float(val_sampling_cfg.get("schedule_p", 1.0))
+        sampling_grid = val_sampling_cfg.get("sampling_grid", None)
 
         nsamples = 1
         mask = batch["mask"][:nsamples].to(self.device)
@@ -1338,29 +1579,42 @@ class ModelTrainerBase(L.LightningModule):
         if fixed_sequence_mask is not None:
             fixed_sequence_mask = fixed_sequence_mask[:nsamples].to(self.device)
 
-        result = self.generate(
-            nsamples=nsamples,
-            n=n,
-            dt=dt,
-            self_cond=self.cfg_exp.training.self_cond,
-            cath_code=cath_code,
-            residue_type=residue_type,
-            guidance_weight=1.0,
-            autoguidance_ratio=0.0,
-            dtype=torch.float32,
-            schedule_mode="uniform",
-            schedule_p=1.0,
-            sampling_mode=sampling_mode,
-            sc_scale_noise=sc_scale_noise,
-            sc_scale_score=sc_scale_score,
-            gt_mode="us",
-            gt_p=1.0,
-            gt_clamp_val=None,
-            mask=mask,
-            x_motif=x_motif,
-            fixed_sequence_mask=fixed_sequence_mask,
-            fixed_structure_mask=None,
-        )
+        discrete_enabled = getattr(self, "contact_map_mode", False) and self._discrete_diffusion_enabled()
+        prev_sampling_grid = None
+        if discrete_enabled and sampling_grid is not None:
+            if sampling_grid not in ("uniform", "cosine"):
+                raise ValueError(
+                    f"validation_sampling.sampling_grid must be 'uniform' or 'cosine', got {sampling_grid!r}"
+                )
+            prev_sampling_grid = getattr(self.discrete_diffusion, "sampling_grid", None)
+            self.discrete_diffusion.sampling_grid = sampling_grid
+        try:
+            result = self.generate(
+                nsamples=nsamples,
+                n=n,
+                dt=dt,
+                self_cond=self.cfg_exp.training.self_cond,
+                cath_code=cath_code,
+                residue_type=residue_type,
+                guidance_weight=1.0,
+                autoguidance_ratio=0.0,
+                dtype=torch.float32,
+                schedule_mode=schedule_mode,
+                schedule_p=schedule_p,
+                sampling_mode=sampling_mode,
+                sc_scale_noise=sc_scale_noise,
+                sc_scale_score=sc_scale_score,
+                gt_mode="us",
+                gt_p=1.0,
+                gt_clamp_val=None,
+                mask=mask,
+                x_motif=x_motif,
+                fixed_sequence_mask=fixed_sequence_mask,
+                fixed_structure_mask=None,
+            )
+        finally:
+            if prev_sampling_grid is not None:
+                self.discrete_diffusion.sampling_grid = prev_sampling_grid
 
         coords = result.get("coords")
         contact_map = result.get("contact_map")
@@ -1534,6 +1788,71 @@ class ModelTrainerBase(L.LightningModule):
             mask = torch.ones(nsamples, n).long().bool().to(self.device)
 
         contact_map_mode = getattr(self, "contact_map_mode", False)
+        discrete_enabled = contact_map_mode and self._discrete_diffusion_enabled()
+        if discrete_enabled:
+            if self.discrete_diffusion_type != "md4":
+                raise ValueError("GenMD4 sampling is not implemented for inference.")
+            timesteps = self.discrete_diffusion.timesteps
+            pair_mask = self._pair_mask(mask)
+            zt = self.discrete_diffusion.prior_sample(
+                (nsamples, n, n), device=self.device
+            )
+            contact_map_sc = None
+            distogram = None
+            coords = None
+            c_logits = None
+            for i in range(timesteps):
+                s, t = self.discrete_diffusion.get_sampling_grid(i, timesteps)
+                t_tensor = torch.full((nsamples,), t, device=self.device, dtype=torch.float32)
+                contact_map_t = self._contact_tokens_to_input(zt)
+                contact_map_t = self._apply_pair_mask(contact_map_t, pair_mask)
+                nn_in = {
+                    "x_t": torch.zeros(
+                        nsamples, n, 3, device=self.device, dtype=dtype or torch.float32
+                    ),
+                    "contact_map_t": contact_map_t,
+                    "t": t_tensor,
+                    "mask": mask,
+                }
+                if cath_code is not None:
+                    nn_in["cath_code"] = cath_code
+                if residue_type is not None:
+                    nn_in["residue_type"] = residue_type
+                if fixed_sequence_mask is not None:
+                    nn_in["fixed_sequence_mask"] = fixed_sequence_mask
+                if fixed_structure_mask is not None:
+                    nn_in["fixed_structure_mask"] = fixed_structure_mask
+                if x_motif is not None:
+                    nn_in["x_motif"] = x_motif
+                if self_cond:
+                    if contact_map_sc is None:
+                        contact_map_sc = torch.zeros(
+                            nsamples,
+                            n,
+                            n,
+                            device=self.device,
+                            dtype=contact_map_t.dtype,
+                        )
+                    nn_in["contact_map_sc"] = contact_map_sc
+                result = predict_clean_n_v_w_guidance(nn_in)
+                c_logits = result.get("contact_map_logits")
+                if c_logits is None:
+                    raise ValueError(
+                        "discrete diffusion sampling requires contact_map_logits in model output."
+                    )
+                zt = self.discrete_diffusion.sample_step(zt, c_logits, s, t)
+                distogram = result.get("distogram")
+                coords = result.get("coords")
+                if self_cond:
+                    c_pred = result.get("contact_map")
+                    if c_pred is not None:
+                        contact_map_sc = c_pred.detach()
+            if c_logits is None:
+                raise ValueError("discrete diffusion sampling produced no logits.")
+            z0 = self.discrete_diffusion.decode(zt, c_logits)
+            contact_map = self._contact_tokens_to_output(z0)
+            contact_map = self._apply_pair_mask(contact_map, pair_mask)
+            return {"coords": coords, "contact_map": contact_map, "distogram": distogram}
         modality = "contact_map" if contact_map_mode else "coordinates"
         predict_coords = getattr(self.nn, "predict_coords", True)
 

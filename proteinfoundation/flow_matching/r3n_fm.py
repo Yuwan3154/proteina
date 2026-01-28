@@ -708,6 +708,8 @@ class _ContactMapFlowMatcher:
         if mask is None:
             return contact_map
         pair_mask = mask[..., :, None] * mask[..., None, :]  # [*, n, n]
+        if contact_map.dim() == pair_mask.dim() + 1:
+            pair_mask = pair_mask.unsqueeze(-1)
         return contact_map * pair_mask
 
     def _extend_t(
