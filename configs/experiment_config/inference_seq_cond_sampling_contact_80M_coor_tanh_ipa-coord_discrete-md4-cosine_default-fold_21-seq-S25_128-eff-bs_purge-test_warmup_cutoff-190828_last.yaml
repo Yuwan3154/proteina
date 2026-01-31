@@ -1,0 +1,48 @@
+defaults:
+  - inference_base
+  - _self_
+
+run_name_: seq_cond_discrete_md4_cosine
+ckpt_name: contact_80M_coor_tanh_ipa-coord_discrete-md4-cosine_default-fold_21-seq-S25_128-eff-bs_purge-test_warmup_cutoff-190828_last.ckpt
+
+self_cond: True
+fold_cond: False
+cath_code_level: "T"  # Guidance level -- C, A, or T
+seq_cond: True
+data_dir: ${oc.env:DATA_PATH}/pdb_train/ # Directory where the dataset is stored
+cath_code_file: cath_codes_train_df_pdb_f1_minl50_maxl384_mtprotein_etdiffractionEM_minoNone_maxoNone_minr0.0_maxr5.0_hl_rl_rnsrTrue_rpuTrue_l_rcuFalse_ex11.csv
+
+# Sampling
+dt: 0.005
+nsamples_per_len: 1
+max_nsamples: 1
+
+# Discrete MD4 inference overrides
+sampling_grid: cosine
+position_bias:
+  enabled: true
+  mode: sigmoid
+  w_min: 0.4
+  w_max: 2.5
+  k: 30
+
+# Trajectory logging
+save_trajectory: false
+save_trajectory_gif: true
+trajectory_stride: 1
+trajectory_gif_fps: 30
+
+# LoRA -- if you use lora, set the same parameters as for training
+lora:
+  use: False
+  lora_alpha: 32.0
+  lora_dropout: 0.0
+  r: 0
+  train_bias: "none"
+
+sampling_caflow:
+  sampling_mode: sc  # "vf" for ODE sampling, "sc" for SDE sampling
+  sc_scale_noise: 0.45  # noise scale, used if sampling_mode == "sc"
+
+compute_designability: False
+compute_fid: False

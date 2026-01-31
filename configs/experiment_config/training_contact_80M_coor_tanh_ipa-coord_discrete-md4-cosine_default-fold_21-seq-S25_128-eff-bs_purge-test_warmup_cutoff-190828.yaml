@@ -44,7 +44,7 @@ model:
 
 
 # Dataset params
-dataset: pdb_train_contact_S25_max320_purge-test_cutoff-190828
+dataset: pdb_train_contact-CB-10A_S25_max320_purge-test_cutoff-190828
 dataset_config_subdir: pdb
 
 force_precision_f32: False  # If false will use bf16-mixed precision
@@ -55,9 +55,10 @@ training:
   fold_cond: True
   position_bias:
     enabled: false
-    mode: diagonal_distance
+    mode: sigmoid
     w_min: 0.4
     w_max: 2.5
+    k: 30
   mask_T_prob: 0.5
   mask_A_prob: 0.5
   mask_C_prob: 0.5

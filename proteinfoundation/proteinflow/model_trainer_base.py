@@ -33,6 +33,7 @@ from torch import Tensor
 from proteinfoundation.flow_matching.discrete_md4 import (
     GenMD4DiscreteDiffusion,
     MD4DiscreteDiffusion,
+    _normalize_position_bias_mode,
 )
 from proteinfoundation.utils.ff_utils.pdb_utils import (
     mask_cath_code_by_level,
@@ -1654,6 +1655,28 @@ class ModelTrainerBase(L.LightningModule):
         and autoguidance network (or None if not provided)."""
         self.inf_cfg = inf_cfg
         self.nn_ag = nn_ag
+        if self.discrete_diffusion is not None:
+            sampling_grid = inf_cfg.get("sampling_grid", None)
+            if sampling_grid is not None:
+                if sampling_grid not in ("uniform", "cosine"):
+                    raise ValueError(
+                        "sampling_grid must be 'uniform' or 'cosine' "
+                        f"(got {sampling_grid!r})."
+                    )
+                self.discrete_diffusion.sampling_grid = sampling_grid
+            position_bias = inf_cfg.get("position_bias", None)
+            if position_bias is not None:
+                enabled = bool(position_bias.get("enabled", False))
+                mode = _normalize_position_bias_mode(position_bias.get("mode", "polynomial"))
+                w_min = float(position_bias.get("w_min", 0.2))
+                w_max = float(position_bias.get("w_max", 5.0))
+                k = float(position_bias.get("k", 30.0))
+                self.discrete_diffusion.position_bias = dict(position_bias)
+                self.discrete_diffusion.position_bias_enabled = enabled
+                self.discrete_diffusion.position_bias_mode = mode
+                self.discrete_diffusion.position_bias_w_min = w_min
+                self.discrete_diffusion.position_bias_w_max = w_max
+                self.discrete_diffusion.position_bias_k = k
 
     def predict_step(self, batch, batch_idx):
         """
@@ -1689,6 +1712,10 @@ class ModelTrainerBase(L.LightningModule):
             fixed_sequence_mask, x_motif, fixed_structure_mask = None, None, None
             fixed_sequence_mask = None
 
+        save_trajectory = bool(self.inf_cfg.get("save_trajectory", False))
+        save_trajectory_gif = bool(self.inf_cfg.get("save_trajectory_gif", False))
+        return_trajectory = save_trajectory or save_trajectory_gif
+        trajectory_stride = int(self.inf_cfg.get("trajectory_stride", 1))
         result = self.generate(
             nsamples=batch["nsamples"],
             n=batch["nres"],
@@ -1712,6 +1739,8 @@ class ModelTrainerBase(L.LightningModule):
             fixed_sequence_mask=fixed_sequence_mask,
             fixed_structure_mask=fixed_structure_mask,
             force_compile=force_compile,
+            return_trajectory=return_trajectory,
+            trajectory_stride=trajectory_stride,
         )
         cirpin_ids = batch.get("cirpin_ids", [None] * len(cath_code))
         coords_atom37 = None
@@ -1740,6 +1769,7 @@ class ModelTrainerBase(L.LightningModule):
             "distogram": distogram,
             "cath_code": cath_code,
             "cirpin_ids": cirpin_ids,
+            "trajectory_tokens": result.get("trajectory_tokens"),
         }
 
     def generate(
@@ -1766,6 +1796,8 @@ class ModelTrainerBase(L.LightningModule):
         fixed_sequence_mask = None,
         fixed_structure_mask = None,
         force_compile: bool = False,
+        return_trajectory: bool = False,
+        trajectory_stride: int = 1,
     ) -> Dict[str, Tensor]:
         """
         Generates samples by integrating ODE with learned vector field.
@@ -1801,6 +1833,8 @@ class ModelTrainerBase(L.LightningModule):
             distogram = None
             coords = None
             c_logits = None
+            stride = max(1, int(trajectory_stride))
+            trajectory_tokens = [] if return_trajectory else None
             for i in range(timesteps):
                 s, t = self.discrete_diffusion.get_sampling_grid(i, timesteps)
                 t_tensor = torch.full((nsamples,), t, device=self.device, dtype=torch.float32)
@@ -1841,6 +1875,8 @@ class ModelTrainerBase(L.LightningModule):
                         "discrete diffusion sampling requires contact_map_logits in model output."
                     )
                 zt = self.discrete_diffusion.sample_step(zt, c_logits, s, t)
+                if return_trajectory and (i % stride == 0):
+                    trajectory_tokens.append(zt.detach().cpu())
                 distogram = result.get("distogram")
                 coords = result.get("coords")
                 if self_cond:
@@ -1852,7 +1888,15 @@ class ModelTrainerBase(L.LightningModule):
             z0 = self.discrete_diffusion.decode(zt, c_logits)
             contact_map = self._contact_tokens_to_output(z0)
             contact_map = self._apply_pair_mask(contact_map, pair_mask)
-            return {"coords": coords, "contact_map": contact_map, "distogram": distogram}
+            result = {"coords": coords, "contact_map": contact_map, "distogram": distogram}
+            if return_trajectory:
+                if trajectory_tokens:
+                    result["trajectory_tokens"] = torch.stack(trajectory_tokens, dim=0)
+                else:
+                    result["trajectory_tokens"] = torch.empty(
+                        (0, nsamples, n, n), dtype=torch.long
+                    )
+            return result
         modality = "contact_map" if contact_map_mode else "coordinates"
         predict_coords = getattr(self.nn, "predict_coords", True)
 

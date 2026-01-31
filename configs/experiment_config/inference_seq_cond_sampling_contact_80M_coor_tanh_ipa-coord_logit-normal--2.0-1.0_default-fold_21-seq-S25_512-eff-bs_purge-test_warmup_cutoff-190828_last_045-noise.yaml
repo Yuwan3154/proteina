@@ -14,7 +14,7 @@ cath_code_file: cath_codes_train_df_pdb_f1_minl50_maxl384_mtprotein_etdiffractio
 
 # Sampling
 dt: 0.005
-nsamples_per_len: 16
+nsamples_per_len: 160
 max_nsamples: 16
 
 # LoRA -- if you use lora, set the same parameters as for training

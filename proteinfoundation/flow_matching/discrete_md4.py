@@ -38,6 +38,37 @@ def _distance_w(
     return w_min * ratio**frac
 
 
+def _normalize_position_bias_mode(mode: str) -> str:
+    if mode in ("diagonal_distance", "polynomial"):
+        return "polynomial"
+    if mode in ("diagonal_sigmoid", "sigmoid"):
+        return "sigmoid"
+    return mode
+
+
+def _param_sigmoid(x: Tensor, k: Tensor, d: Tensor) -> Tensor:
+    return 1.0 - 1.0 / (1.0 + torch.exp(-k * (x - d)))
+
+
+def _param_sigmoid_prime(x: Tensor, k: Tensor, d: Tensor) -> Tensor:
+    s = _param_sigmoid(x, k, d)
+    return -k * s * (1.0 - s)
+
+
+def _sigmoid_alpha(
+    t_ext: Tensor, d_pos: Tensor, k: Tensor, eps: float
+) -> tuple[Tensor, Tensor]:
+    alpha_raw = _param_sigmoid(t_ext, k, d_pos)
+    alpha0 = _param_sigmoid(torch.zeros_like(t_ext), k, d_pos)
+    alpha1 = _param_sigmoid(torch.ones_like(t_ext), k, d_pos)
+    denom = (alpha0 - alpha1).clamp_min(1e-12)
+    alpha = (alpha_raw - alpha1) / denom
+    if eps > 0:
+        alpha = alpha.clamp(min=eps, max=1.0 - eps)
+    dalpha = _param_sigmoid_prime(t_ext, k, d_pos) / denom
+    return alpha, dalpha
+
+
 class MaskingSchedule(nn.Module):
     """Scalar masking schedule for MD4."""
 
@@ -143,9 +174,12 @@ class MD4DiscreteDiffusion(nn.Module):
         self.sampling_grid = sampling_grid
         self.position_bias = position_bias or {}
         self.position_bias_enabled = bool(self.position_bias.get("enabled", False))
-        self.position_bias_mode = self.position_bias.get("mode", "diagonal_distance")
+        self.position_bias_mode = _normalize_position_bias_mode(
+            self.position_bias.get("mode", "polynomial")
+        )
         self.position_bias_w_min = float(self.position_bias.get("w_min", 0.2))
         self.position_bias_w_max = float(self.position_bias.get("w_max", 5.0))
+        self.position_bias_k = float(self.position_bias.get("k", 30.0))
         self.noise_schedule = MaskingSchedule(
             schedule_fn_type=noise_schedule_type, eps=eps
         )
@@ -153,7 +187,7 @@ class MD4DiscreteDiffusion(nn.Module):
     def _position_w(self, n: int, device: torch.device, dtype: torch.dtype) -> Optional[Tensor]:
         if not self.position_bias_enabled:
             return None
-        if self.position_bias_mode != "diagonal_distance":
+        if self.position_bias_mode != "polynomial":
             raise NotImplementedError(
                 f"Unknown position bias mode {self.position_bias_mode}"
             )
@@ -174,6 +208,15 @@ class MD4DiscreteDiffusion(nn.Module):
             dgamma = self.noise_schedule.dgamma_times_alpha(t)
             return alpha, dgamma
         n = x_shape[-1]
+        if self.position_bias_mode == "sigmoid":
+            t_ext = _reverse_broadcast(t, len(x_shape))
+            d_pos = _distance_fraction(n, device=device, dtype=dtype)
+            k = torch.tensor(self.position_bias_k, device=device, dtype=dtype)
+            alpha_pos, dalpha = _sigmoid_alpha(
+                t_ext, d_pos, k, self.noise_schedule.eps
+            )
+            dgamma_pos = dalpha / (1.0 - alpha_pos).clamp_min(1e-8)
+            return alpha_pos, dgamma_pos
         w_pos = self._position_w(n, device=device, dtype=dtype)
         if w_pos is None:
             dgamma = self.noise_schedule.dgamma_times_alpha(t)
@@ -330,9 +373,12 @@ class GenMD4DiscreteDiffusion(nn.Module):
         self.t1 = t1
         self.position_bias = position_bias or {}
         self.position_bias_enabled = bool(self.position_bias.get("enabled", False))
-        self.position_bias_mode = self.position_bias.get("mode", "diagonal_distance")
+        self.position_bias_mode = _normalize_position_bias_mode(
+            self.position_bias.get("mode", "polynomial")
+        )
         self.position_bias_w_min = float(self.position_bias.get("w_min", 0.2))
         self.position_bias_w_max = float(self.position_bias.get("w_max", 5.0))
+        self.position_bias_k = float(self.position_bias.get("k", 30.0))
         self.noise_schedule = LearnableVecMaskingSchedule(
             vocab_size=vocab_size,
             schedule_fn_type=noise_schedule_type,
@@ -343,7 +389,7 @@ class GenMD4DiscreteDiffusion(nn.Module):
     def _position_w(self, n: int, device: torch.device, dtype: torch.dtype) -> Optional[Tensor]:
         if not self.position_bias_enabled:
             return None
-        if self.position_bias_mode != "diagonal_distance":
+        if self.position_bias_mode != "polynomial":
             raise NotImplementedError(
                 f"Unknown position bias mode {self.position_bias_mode}"
             )
@@ -363,6 +409,16 @@ class GenMD4DiscreteDiffusion(nn.Module):
         if not self.position_bias_enabled:
             return alpha, self.noise_schedule.dgamma_times_alpha(t_ext)
         n = x_shape[-1]
+        if self.position_bias_mode == "sigmoid":
+            d_pos = _distance_fraction(n, device=device, dtype=dtype).unsqueeze(0).unsqueeze(-1)
+            k = torch.tensor(self.position_bias_k, device=device, dtype=dtype)
+            w_vec = self.noise_schedule.power
+            k_eff = k * w_vec.view(1, 1, 1, -1)
+            alpha_pos, dalpha = _sigmoid_alpha(
+                t_ext, d_pos, k_eff, self.noise_schedule.eps
+            )
+            dgamma_pos = dalpha / (1.0 - alpha_pos).clamp_min(1e-8)
+            return alpha_pos, dgamma_pos
         w_pos = self._position_w(n, device=device, dtype=dtype)
         if w_pos is None:
             return alpha, self.noise_schedule.dgamma_times_alpha(t_ext)
@@ -445,16 +501,26 @@ class GenMD4DiscreteDiffusion(nn.Module):
         w_x = (w * one_hot_x).sum(dim=-1)
         t_ext = _reverse_broadcast(t, x.dim())
         t_ext = t_ext.clamp(min=1e-6, max=1.0)
-        w_eff = w_x
-        if self.position_bias_enabled:
-            w_pos = self._position_w(x.shape[-1], x.device, x.dtype)
-            if w_pos is not None:
-                w_eff = w_eff * w_pos
-        alpha_t_x = 1.0 - (1.0 - eps) * t_ext ** w_eff
-        log_q_mask = torch.log(
-            torch.tensor(1.0 - eps, device=x.device)
-        ) + w_eff * torch.log(t_ext)
-        log_q_unmask = torch.log(alpha_t_x.clamp_min(1e-12))
+        if self.position_bias_enabled and self.position_bias_mode == "sigmoid":
+            d_pos = _distance_fraction(x.shape[-1], x.device, x.dtype)
+            k = torch.tensor(self.position_bias_k, device=x.device, dtype=x.dtype)
+            k_eff = k * w_x
+            alpha_t_x, _ = _sigmoid_alpha(
+                t_ext, d_pos, k_eff, self.noise_schedule.eps
+            )
+            log_q_mask = torch.log((1.0 - alpha_t_x).clamp_min(1e-12))
+            log_q_unmask = torch.log(alpha_t_x.clamp_min(1e-12))
+        else:
+            w_eff = w_x
+            if self.position_bias_enabled:
+                w_pos = self._position_w(x.shape[-1], x.device, x.dtype)
+                if w_pos is not None:
+                    w_eff = w_eff * w_pos
+            alpha_t_x = 1.0 - (1.0 - eps) * t_ext ** w_eff
+            log_q_mask = torch.log(
+                torch.tensor(1.0 - eps, device=x.device)
+            ) + w_eff * torch.log(t_ext)
+            log_q_unmask = torch.log(alpha_t_x.clamp_min(1e-12))
 
         log_q1 = torch.where(zt_1 == self.mask_token, log_q_mask, log_q_unmask)
         log_q2 = torch.where(zt_2 == self.mask_token, log_q_mask, log_q_unmask)

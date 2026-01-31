@@ -1,4 +1,4 @@
-run_name_: contact_80M_coor_tanh_ipa-coord_logit-normal--2.0-1.0_default-fold_21-seq-S25_512-eff-bs_purge-test_warmup_cutoff-190828
+run_name_: contact-confind_80M_coor_tanh_ipa-coord_logit-normal--2.0-1.0_default-fold_21-seq-S25_512-eff-bs_purge-test_warmup_cutoff-190828
 
 hardware:
   ncpus_per_task_train_: 16  # Number of CPUs per task during training
@@ -43,7 +43,7 @@ model:
 
 
 # Dataset params
-dataset: pdb_train_contact-CB-10A_S25_max320_purge-test_cutoff-190828
+dataset: pdb_train_contact-confind_S25_max256_purge-test_cutoff-190828
 dataset_config_subdir: pdb
 
 force_precision_f32: False  # If false will use bf16-mixed precision

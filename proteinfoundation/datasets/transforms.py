@@ -15,7 +15,7 @@ import re
 from collections import defaultdict
 from math import prod
 from pathlib import Path
-from typing import Dict, Literal, Tuple
+from typing import Dict, Literal, Optional, Tuple
 
 import numpy as np
 import torch
@@ -383,6 +383,10 @@ class ContactMapTransform(T.BaseTransform):
         self,
         contact_atom_type: Literal["CA", "CB"] = "CB",
         contact_distance_cutoff: float = 8.0,
+        contact_method: Literal["distance", "confind"] = "distance",
+        confind_bin: str = "confind",
+        confind_rotamer_lib: Optional[str] = None,
+        confind_contact_threshold: float = 0.0,
     ):
         """Initializes the transform.
 
@@ -391,9 +395,19 @@ class ContactMapTransform(T.BaseTransform):
                 "CA" for alpha-carbon, "CB" for beta-carbon (pseudo-CB for Glycine).
             contact_distance_cutoff: Distance threshold in Angstroms for defining contacts.
                 Residue pairs with distance <= cutoff are considered in contact.
+            contact_method: Contact map generation mode ("distance" or "confind").
+                When set to "confind", this transform expects precomputed raw maps
+                in the graph under contact_map_confind.
+            confind_bin: Path to the confind binary (kept for config compatibility).
+            confind_rotamer_lib: Path to rotamer library directory containing EBL.out/BEBL.out.
+            confind_contact_threshold: Minimum confind contact score to include (>=).
         """
         self.contact_atom_type = contact_atom_type
         self.contact_distance_cutoff = contact_distance_cutoff
+        self.contact_method = contact_method
+        self.confind_bin = confind_bin
+        self.confind_rotamer_lib = confind_rotamer_lib
+        self.confind_contact_threshold = confind_contact_threshold
 
     def _compute_pseudo_cb(self, coords: torch.Tensor) -> torch.Tensor:
         """Computes pseudo-CB position for residues (used for Glycine).
@@ -432,6 +446,60 @@ class ContactMapTransform(T.BaseTransform):
         
         return pseudo_cb
 
+    def _contact_map_from_distance(self, graph: Data) -> torch.Tensor:
+        coords = graph.coords  # [L, num_atoms, 3]
+
+        if self.contact_atom_type == "CA":
+            # CA is at index 1
+            atom_coords = coords[:, 1, :]  # [L, 3]
+        elif self.contact_atom_type == "CB":
+            # CB is at index 4, but Glycine doesn't have CB
+            cb_coords = coords[:, 4, :]  # [L, 3]
+
+            # Check for missing CB (coordinates might be zero or a fill value)
+            # Compute pseudo-CB for all residues and use it where CB is missing
+            pseudo_cb = self._compute_pseudo_cb(coords)  # [L, 3]
+
+            # Detect missing CB: if CB coords are very close to zero or a fill value
+            # Use residue_type if available to detect Glycine (index 5 in OpenFold)
+            if hasattr(graph, "residue_type"):
+                is_glycine = (graph.residue_type == 5)  # Glycine index
+                atom_coords = torch.where(
+                    is_glycine.unsqueeze(-1).expand(-1, 3),
+                    pseudo_cb,
+                    cb_coords,
+                )
+            else:
+                # Fallback: use pseudo-CB where CB coords seem invalid (near zero)
+                cb_norm = torch.linalg.norm(cb_coords, dim=-1)
+                is_missing = cb_norm < 0.1
+                atom_coords = torch.where(
+                    is_missing.unsqueeze(-1).expand(-1, 3),
+                    pseudo_cb,
+                    cb_coords,
+                )
+        else:
+            raise ValueError(f"Unknown contact_atom_type: {self.contact_atom_type}")
+
+        # Compute pairwise distances
+        diff = atom_coords.unsqueeze(0) - atom_coords.unsqueeze(1)  # [L, L, 3]
+        distances = torch.linalg.norm(diff, dim=-1)  # [L, L]
+        return (distances <= self.contact_distance_cutoff).to(dtype=coords.dtype)
+
+    def _contact_map_from_confind_precomputed(self, graph: Data) -> torch.Tensor:
+        raw_map = getattr(graph, "contact_map_confind", None)
+        if raw_map is None:
+            raise ValueError(
+                "contact_map_confind is missing; run the confind precompute step first."
+            )
+        if not isinstance(raw_map, torch.Tensor):
+            raw_map = torch.as_tensor(raw_map)
+        if raw_map.shape[0] != graph.coords.shape[0] or raw_map.shape[1] != graph.coords.shape[0]:
+            raise ValueError(
+                f"contact_map_confind has shape {raw_map.shape}, expected [{graph.coords.shape[0]}, {graph.coords.shape[0]}]."
+            )
+        return (raw_map.float() >= self.confind_contact_threshold).to(dtype=graph.coords.dtype)
+
     def forward(self, graph: Data) -> Data:
         """Extracts contact map and adds it to the graph.
 
@@ -441,48 +509,12 @@ class ContactMapTransform(T.BaseTransform):
         Returns:
             Graph with added contact_map tensor of shape [L, L] with values 0.0 or 1.0
         """
-        coords = graph.coords  # [L, num_atoms, 3]
-        L = coords.shape[0]
-
-        if self.contact_atom_type == "CA":
-            # CA is at index 1
-            atom_coords = coords[:, 1, :]  # [L, 3]
-        elif self.contact_atom_type == "CB":
-            # CB is at index 4, but Glycine doesn't have CB
-            cb_coords = coords[:, 4, :]  # [L, 3]
-            
-            # Check for missing CB (coordinates might be zero or a fill value)
-            # Compute pseudo-CB for all residues and use it where CB is missing
-            pseudo_cb = self._compute_pseudo_cb(coords)  # [L, 3]
-            
-            # Detect missing CB: if CB coords are very close to zero or a fill value
-            # Use residue_type if available to detect Glycine (index 5 in OpenFold)
-            if hasattr(graph, 'residue_type'):
-                is_glycine = (graph.residue_type == 5)  # Glycine index
-                atom_coords = torch.where(
-                    is_glycine.unsqueeze(-1).expand(-1, 3),
-                    pseudo_cb,
-                    cb_coords
-                )
-            else:
-                # Fallback: use pseudo-CB where CB coords seem invalid (near zero)
-                cb_norm = torch.linalg.norm(cb_coords, dim=-1)
-                is_missing = cb_norm < 0.1
-                atom_coords = torch.where(
-                    is_missing.unsqueeze(-1).expand(-1, 3),
-                    pseudo_cb,
-                    cb_coords
-                )
+        if self.contact_method == "distance":
+            contact_map = self._contact_map_from_distance(graph)
+        elif self.contact_method == "confind":
+            contact_map = self._contact_map_from_confind_precomputed(graph)
         else:
-            raise ValueError(f"Unknown contact_atom_type: {self.contact_atom_type}")
-
-        # Compute pairwise distances
-        # atom_coords: [L, 3]
-        diff = atom_coords.unsqueeze(0) - atom_coords.unsqueeze(1)  # [L, L, 3]
-        distances = torch.linalg.norm(diff, dim=-1)  # [L, L]
-
-        # Create binary contact map (1 if distance <= cutoff, 0 otherwise)
-        contact_map = (distances <= self.contact_distance_cutoff).to(dtype=coords.dtype)  # [L, L]
+            raise ValueError(f"Unknown contact_method: {self.contact_method}")
 
         graph.contact_map = contact_map
 
@@ -492,7 +524,8 @@ class ContactMapTransform(T.BaseTransform):
         return (
             f"{self.__class__.__name__}("
             f"contact_atom_type={self.contact_atom_type}, "
-            f"contact_distance_cutoff={self.contact_distance_cutoff})"
+            f"contact_distance_cutoff={self.contact_distance_cutoff}, "
+            f"contact_method={self.contact_method})"
         )
 
 

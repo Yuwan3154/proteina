@@ -43,7 +43,7 @@ model:
 
 
 # Dataset params
-dataset: pdb_train_contact_S25_max320_purge-test_cutoff-190828
+dataset: pdb_train_contact-CB-10A_S25_max320_purge-test_cutoff-190828
 dataset_config_subdir: pdb
 
 force_precision_f32: False  # If false will use bf16-mixed precision

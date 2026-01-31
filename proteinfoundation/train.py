@@ -10,6 +10,7 @@
 
 import os
 import sys
+import time
 
 # # Set CUDA environment variables
 # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
@@ -40,6 +41,7 @@ from loguru import logger
 from omegaconf import OmegaConf
 
 from proteinfoundation.proteinflow.proteina import Proteina
+from proteinfoundation.utils.precompute_confind_maps import run_precompute
 from proteinfoundation.utils.ema_utils.ema_callback import EMA, EmaModelCheckpoint
 from proteinfoundation.utils.fetch_last_ckpt import fetch_last_ckpt
 from proteinfoundation.utils.lora_utils import replace_lora_layers
@@ -116,6 +118,26 @@ def wandb_safe_name(name: str, max_len: int = 128) -> str:
     return f"{name[:keep]}-{digest}"
 
 
+def _slurm_task_info():
+    array_id = os.getenv("SLURM_ARRAY_TASK_ID")
+    array_count = os.getenv("SLURM_ARRAY_TASK_COUNT")
+    if array_id is not None and array_count is not None:
+        return int(array_id), int(array_count)
+    proc_id = os.getenv("SLURM_PROCID")
+    n_tasks = os.getenv("SLURM_NTASKS")
+    if proc_id is not None and n_tasks is not None:
+        return int(proc_id), int(n_tasks)
+    return 0, 1
+
+
+def _dataset_csv_path(datamodule) -> Optional[str]:
+    if getattr(datamodule, "dataselector", None) is not None:
+        file_identifier = datamodule._get_file_identifier(datamodule.dataselector)
+    else:
+        file_identifier = datamodule.data_dir.name
+    return os.path.join(datamodule.data_dir, f"{file_identifier}.csv")
+
+
 if __name__ == "__main__":
 
     load_dotenv()
@@ -149,6 +171,11 @@ if __name__ == "__main__":
             "Resume option: allow (resume if exists, create if not), never (always create new), "
             "must (must resume existing), None (same as allow when id is set). Default is allow."
         ),
+    )
+    parser.add_argument(
+        "--prepare_data_only",
+        action="store_true",
+        help="Run dataset preparation (and confind precompute if applicable) then exit.",
     )
     args, overrides = parser.parse_known_args()
 
@@ -267,6 +294,84 @@ if __name__ == "__main__":
     # Ensure data preparation only happens on rank 0 to avoid duplicate processing
     if hasattr(datamodule, 'prepare_data'):
         datamodule.prepare_data = rank_zero_only(datamodule.prepare_data)
+
+    # Run dataset preparation immediately to ensure CSV exists
+    if hasattr(datamodule, "prepare_data"):
+        slurm_task_id, slurm_task_count = _slurm_task_info()
+        dataset_csv = _dataset_csv_path(datamodule)
+        if slurm_task_count > 1 and slurm_task_id != 0:
+            wait_sec = int(os.getenv("DATA_PREP_WAIT_SEC", "21600"))
+            log_info(
+                f"SLURM task {slurm_task_id}/{slurm_task_count}: waiting for dataset CSV {dataset_csv}"
+            )
+            start_wait = time.time()
+            while not os.path.exists(dataset_csv):
+                if time.time() - start_wait > wait_sec:
+                    raise RuntimeError(
+                        f"Timed out waiting for dataset CSV {dataset_csv}"
+                    )
+                time.sleep(30)
+            log_info(f"Dataset CSV found: {dataset_csv}")
+        else:
+            log_info("Preparing dataset...")
+            datamodule.prepare_data()
+
+    # If confind contact maps are requested, precompute and cache them
+    transforms_cfg = cfg_data.datamodule.get("transforms")
+    transforms_list = (
+        OmegaConf.to_container(transforms_cfg, resolve=True)
+        if transforms_cfg is not None
+        else []
+    )
+    confind_transform = None
+    for t in transforms_list:
+        if isinstance(t, dict) and t.get("_target_") == "proteinfoundation.datasets.transforms.ContactMapTransform":
+            if t.get("contact_method") == "confind":
+                confind_transform = t
+                break
+    if confind_transform is not None:
+        @rank_zero_only
+        def _run_confind_precompute():
+            log_info("Confind contact maps requested; precomputing raw maps...")
+            processed_dir = os.path.join(cfg_data.datamodule.data_dir, "processed")
+            rotlib = confind_transform.get("confind_rotamer_lib")
+            dataselector_cfg = cfg_data.datamodule.get("dataselector")
+            dataselector_dict = (
+                OmegaConf.to_container(dataselector_cfg, resolve=True)
+                if dataselector_cfg is not None
+                else None
+            )
+            use_slurm = bool(
+                os.getenv("SLURM_ARRAY_TASK_ID")
+                or os.getenv("SLURM_PROCID")
+                or os.getenv("SLURM_NTASKS")
+            )
+            workers = int(
+                os.getenv("SLURM_CPUS_PER_TASK") or cfg_data.datamodule.num_workers
+            )
+            omp_threads = int(os.getenv("OMP_NUM_THREADS") or 1)
+            if not rotlib:
+                rotlib = os.getenv("MSL_ROTLIB")
+            if not rotlib:
+                candidate = os.path.join(cfg_data.datamodule.data_dir, "rotlibs")
+                if os.path.isdir(candidate):
+                    rotlib = candidate
+            run_precompute(
+                processed_dir=Path(processed_dir),
+                rotlib=rotlib,
+                dataselector=dataselector_dict,
+                confind_bin=os.getenv("CONFIND_BIN", "confind"),
+                omp_threads=omp_threads,
+                workers=workers,
+                use_slurm=use_slurm,
+                output_csv=str(Path(processed_dir).parent / "confind_precompute.csv"),
+            )
+
+        _run_confind_precompute()
+
+    if args.prepare_data_only:
+        log_info("prepare_data_only set; exiting after dataset preparation.")
+        sys.exit(0)
 
     # Set logger
     wandb_logger = None

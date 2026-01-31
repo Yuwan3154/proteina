@@ -11,7 +11,7 @@ discrete_diffusion:
   type: md4  # md4 or genmd4
   position_bias:
     enabled: false
-    mode: diagonal_distance
+    mode: polynomial
   md4:
     vocab_size: 2
     noise_schedule: cosine

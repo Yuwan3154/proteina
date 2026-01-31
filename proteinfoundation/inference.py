@@ -29,6 +29,7 @@ torch.set_float32_matmul_precision("medium")
 from dotenv import load_dotenv
 from loguru import logger
 from omegaconf import OmegaConf
+from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from proteinfoundation.utils.lora_utils import replace_lora_layers
 from proteinfoundation.utils.cirpin_utils import CirpinEmbeddingLoader
@@ -213,6 +214,13 @@ class GenDatasetWithSeqCath(Dataset):
             "residue_type": residue_type,
         }
         return result
+
+
+def _tokens_to_palette_image(tokens: np.ndarray) -> Image.Image:
+    img = Image.fromarray(tokens.astype(np.uint8), mode="P")
+    palette = [0, 0, 0, 255, 0, 0, 160, 160, 160] + [0] * (256 * 3 - 9)
+    img.putpalette(palette)
+    return img
 
 
 def split_nlens(nlens_dict, max_nsamples=16, n_replica=1):
@@ -426,6 +434,9 @@ if __name__ == "__main__":
         nn_ag = model_ag.nn
 
     model.configure_inference(cfg, nn_ag=nn_ag)
+    save_trajectory = bool(cfg.get("save_trajectory", False))
+    save_trajectory_gif = bool(cfg.get("save_trajectory_gif", False))
+    trajectory_gif_fps = int(cfg.get("trajectory_gif_fps", 30))
     use_cueq = bool(args.use_cueq)
     pair_update_layers = getattr(model.nn, "pair_update_layers", None)
     if pair_update_layers is not None:
@@ -519,6 +530,9 @@ if __name__ == "__main__":
         cirpin_ids_batch = pred["cirpin_ids"]
         contact_map = pred.get("contact_map")  # [b, n, n] or None
         distogram = pred.get("distogram")  # [b, n, n, num_buckets] or None
+        trajectory_tokens = pred.get("trajectory_tokens")
+        if torch.is_tensor(trajectory_tokens):
+            trajectory_tokens = trajectory_tokens.cpu()
 
         batch_size = len(cath_codes_batch)
         # Save each generation
@@ -591,6 +605,38 @@ if __name__ == "__main__":
                 distogram_fname = "_".join(filename_parts) + "_distogram.pt"
                 distogram_path = os.path.join(root_path, distogram_fname)
                 torch.save(distogram[i].cpu(), distogram_path)
+
+            # Save trajectory and GIF if enabled
+            if trajectory_tokens is not None and (save_trajectory or save_trajectory_gif):
+                traj_i = (
+                    trajectory_tokens[:, i]
+                    if trajectory_tokens.dim() == 4
+                    else trajectory_tokens
+                )
+                if save_trajectory:
+                    traj_fname = "_".join(filename_parts) + "_trajectory.pt"
+                    traj_path = os.path.join(root_path, traj_fname)
+                    torch.save(traj_i, traj_path)
+                if save_trajectory_gif:
+                    mask_token = int(
+                        getattr(getattr(model, "discrete_diffusion", None), "mask_token", 2)
+                    )
+                    tokens_np = traj_i.numpy()
+                    if mask_token != 2:
+                        tokens_np = tokens_np.copy()
+                        tokens_np[tokens_np == mask_token] = 2
+                    frames = [_tokens_to_palette_image(frame) for frame in tokens_np]
+                    if frames:
+                        gif_fname = "_".join(filename_parts) + "_trajectory.gif"
+                        gif_path = os.path.join(root_path, gif_fname)
+                        duration = max(1, int(1000 / max(1, trajectory_gif_fps)))
+                        frames[0].save(
+                            gif_path,
+                            save_all=True,
+                            append_images=frames[1:],
+                            duration=duration,
+                            loop=0,
+                        )
             
             samples_per_length[sample_key] += 1
     
