@@ -40,7 +40,6 @@ from lightning.pytorch.strategies import DDPStrategy
 from loguru import logger
 from omegaconf import OmegaConf
 
-from proteinfoundation.proteinflow.proteina import Proteina
 from proteinfoundation.utils.precompute_confind_maps import run_precompute
 from proteinfoundation.utils.ema_utils.ema_callback import EMA, EmaModelCheckpoint
 from proteinfoundation.utils.fetch_last_ckpt import fetch_last_ckpt
@@ -55,16 +54,15 @@ from proteinfoundation.utils.training_analysis_utils import (
     LogSetpTimeCallback,
     SkipNanGradCallback,
 )
-# Try to import cuequivariance for faster triangle multiplicative updates
-try:
-    import cuequivariance_torch as cuet
-    CUEQUIVARIANCE_AVAILABLE = True
-    from cueuivariance_ops_torch import init_triton_cache
-except ImportError:
-    CUEQUIVARIANCE_AVAILABLE = False
-
-if CUEQUIVARIANCE_AVAILABLE:
-    init_triton_cache()
+def _maybe_init_cuequivariance():
+    try:
+        import cuequivariance_torch as cuet  # noqa: F401
+        from cueuivariance_ops_torch import init_triton_cache
+        init_triton_cache()
+        return True
+    except Exception as exc:
+        log_info(f"Skipping cuequivariance init: {exc}")
+        return False
 
 @rank_zero_only
 def wandb_login():
@@ -373,6 +371,8 @@ if __name__ == "__main__":
         log_info("prepare_data_only set; exiting after dataset preparation.")
         sys.exit(0)
 
+    _maybe_init_cuequivariance()
+
     # Set logger
     wandb_logger = None
     if cfg_exp.log.log_wandb and not args.nolog:
@@ -439,6 +439,7 @@ if __name__ == "__main__":
         callbacks.append(SkipNanGradCallback())
 
     # Define model
+    from proteinfoundation.proteinflow.proteina import Proteina
     model = Proteina(cfg_exp, store_dir=root_run)
 
     # If LoRA is tunred on, replace Linear with LoRA layers
