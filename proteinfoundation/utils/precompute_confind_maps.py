@@ -8,7 +8,7 @@ import os
 import time
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple, Any
+from typing import Dict, Iterable, List, Optional, Tuple, Any, Callable
 
 import numpy as np
 import torch
@@ -175,14 +175,18 @@ def _process_async(
     log_path: Optional[Path],
     log_every: int,
     log_every_sec: float,
-) -> List[Dict[str, float]]:
-    results: List[Dict[str, float]] = []
+    result_callback: Optional[Callable[[Dict[str, float]], None]] = None,
+    collect_results: bool = True,
+) -> Tuple[List[Dict[str, float]], Dict[str, float]]:
+    results: List[Dict[str, float]] = [] if collect_results else []
     items_iter = iter(items)
     total = len(items)
     completed = 0
     processed = 0
     skipped = 0
     failed = 0
+    confind_sum = 0.0
+    total_sum = 0.0
     last_log = time.perf_counter()
     start = time.perf_counter()
     with ProcessPoolExecutor(max_workers=workers) as executor:
@@ -224,11 +228,16 @@ def _process_async(
                 else:
                     if result["status"] == "processed":
                         processed += 1
+                        confind_sum += float(result.get("confind_sec", 0.0))
+                        total_sum += float(result.get("total_sec", 0.0))
                     elif result["status"] == "skipped":
                         skipped += 1
                     else:
                         failed += 1
-                results.append(result)
+                if result_callback is not None:
+                    result_callback(result)
+                if collect_results:
+                    results.append(result)
                 completed += 1
                 now = time.perf_counter()
                 should_log = (completed % log_every == 0) or (
@@ -260,7 +269,15 @@ def _process_async(
                 )
                 futures.add(future)
                 future_to_path[future] = path
-    return results
+    stats = {
+        "total": completed,
+        "processed": processed,
+        "skipped": skipped,
+        "failed": failed,
+        "confind_sum": confind_sum,
+        "total_sum": total_sum,
+    }
+    return results, stats
 
 
 def _resolve_from_config(config_path: Path) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, Any]]]:
@@ -367,6 +384,7 @@ def run_precompute(
     log_path: Optional[Path] = None,
     log_every: int = 50,
     log_every_sec: float = 60.0,
+    stream_csv: bool = True,
 ) -> Dict[str, Any]:
     if omp_threads is None:
         omp_threads = int(os.getenv("OMP_NUM_THREADS") or 1)
@@ -378,11 +396,16 @@ def run_precompute(
     files = list(_iter_processed_files(processed_dir))
     length_cache = length_cache or (processed_dir / "length_cache.csv")
 
-    if output_csv.endswith("confind_precompute.csv"):
-        output_csv = output_csv.replace(
-            "confind_precompute.csv",
-            f"confind_precompute_shard{shard_id}_of_{num_shards}.csv",
+    output_csv_path = Path(output_csv)
+    if num_shards > 1:
+        output_csv_path = output_csv_path.with_name(
+            f"{output_csv_path.stem}_shard{shard_id}_of_{num_shards}{output_csv_path.suffix}"
         )
+    elif output_csv_path.name == "confind_precompute.csv":
+        output_csv_path = output_csv_path.with_name(
+            f"confind_precompute_shard{shard_id}_of_{num_shards}{output_csv_path.suffix}"
+        )
+    output_csv = str(output_csv_path)
     log_path = log_path or Path(output_csv).with_suffix(".log")
     if log_path.parent != Path("."):
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -456,27 +479,14 @@ def run_precompute(
     if limit and limit > 0:
         items = items[:limit]
 
-    start = time.perf_counter()
-    results = _process_async(
-        items,
-        workers=workers,
-        rotlib_path=rotlib,
-        confind_bin=confind_bin,
-        omp_threads=omp_threads,
-        overwrite=overwrite,
-        log_path=log_path,
-        log_every=log_every,
-        log_every_sec=log_every_sec,
-    )
-
-    total_sec = time.perf_counter() - start
-    processed = [r for r in results if r["status"] == "processed"]
-    avg_confind = float(np.mean([r["confind_sec"] for r in processed])) if processed else 0.0
-    avg_total = float(np.mean([r["total_sec"] for r in processed])) if processed else 0.0
-
-    with open(output_csv, "w", newline="") as handle:
-        writer = csv.DictWriter(
-            handle,
+    csv_writer = None
+    csv_handle = None
+    if stream_csv:
+        csv_path = Path(output_csv)
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        csv_handle = open(csv_path, "a", newline="")
+        csv_writer = csv.DictWriter(
+            csv_handle,
             fieldnames=[
                 "file",
                 "status",
@@ -486,11 +496,54 @@ def run_precompute(
                 "total_sec",
             ],
         )
-        writer.writeheader()
-        writer.writerows(results)
+        if csv_path.stat().st_size == 0:
+            csv_writer.writeheader()
+
+    def _write_row(result: Dict[str, float]) -> None:
+        if csv_writer is None:
+            return
+        csv_writer.writerow(result)
+        csv_handle.flush()
+
+    start = time.perf_counter()
+    results, stats = _process_async(
+        items,
+        workers=workers,
+        rotlib_path=rotlib,
+        confind_bin=confind_bin,
+        omp_threads=omp_threads,
+        overwrite=overwrite,
+        log_path=log_path,
+        log_every=log_every,
+        log_every_sec=log_every_sec,
+        result_callback=_write_row if stream_csv else None,
+        collect_results=not stream_csv,
+    )
+    if csv_handle is not None:
+        csv_handle.close()
+
+    total_sec = time.perf_counter() - start
+    processed_count = stats["processed"]
+    avg_confind = stats["confind_sum"] / processed_count if processed_count else 0.0
+    avg_total = stats["total_sum"] / processed_count if processed_count else 0.0
+    if not stream_csv:
+        with open(output_csv, "w", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=[
+                    "file",
+                    "status",
+                    "load_sec",
+                    "confind_sec",
+                    "save_sec",
+                    "total_sec",
+                ],
+            )
+            writer.writeheader()
+            writer.writerows(results)
 
     _log_message(
-        f"Processed files: {len(processed)} / {len(results)}",
+        f"Processed files: {processed_count} / {stats['total']}",
         log_path=log_path,
     )
     _log_message(f"Total wall time: {total_sec:.2f}s", log_path=log_path)
@@ -503,8 +556,8 @@ def run_precompute(
     _log_message(f"Wrote: {output_csv}", log_path=log_path)
 
     return {
-        "processed": len(processed),
-        "total": len(results),
+        "processed": processed_count,
+        "total": stats["total"],
         "avg_confind_sec": avg_confind,
         "avg_total_sec": avg_total,
         "total_sec": total_sec,
@@ -533,6 +586,8 @@ def main() -> None:
     parser.add_argument("--length-cache-timeout", type=float, default=3600.0)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--output-csv", default="confind_precompute.csv")
+    parser.add_argument("--no-stream-csv", dest="stream_csv", action="store_false")
+    parser.set_defaults(stream_csv=True)
     parser.add_argument("--log-path", default=None)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--log-every-sec", type=float, default=60.0)
@@ -586,6 +641,7 @@ def main() -> None:
         log_path=Path(args.log_path) if args.log_path else None,
         log_every=args.log_every,
         log_every_sec=args.log_every_sec,
+        stream_csv=args.stream_csv,
     )
 
 

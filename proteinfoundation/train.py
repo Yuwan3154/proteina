@@ -345,9 +345,13 @@ if __name__ == "__main__":
                 or os.getenv("SLURM_PROCID")
                 or os.getenv("SLURM_NTASKS")
             )
-            workers = int(
-                os.getenv("SLURM_CPUS_PER_TASK") or cfg_data.datamodule.num_workers
+            visible_cores = int(
+                os.getenv("SLURM_CPUS_PER_TASK")
+                or os.cpu_count()
+                or cfg_data.datamodule.num_workers
             )
+            workers = max(1, visible_cores // 2)
+            log_info(f"Confind precompute workers set to {workers}/{visible_cores} cores")
             omp_threads = int(os.getenv("OMP_NUM_THREADS") or 1)
             if not rotlib:
                 rotlib = os.getenv("MSL_ROTLIB")
