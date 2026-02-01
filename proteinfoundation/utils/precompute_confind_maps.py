@@ -538,6 +538,9 @@ def run_precompute(
     log_every: int = 50,
     log_every_sec: float = 60.0,
     stream_csv: bool = True,
+    format_type: str = "cif",
+    store_het: bool = False,
+    store_bfactor: bool = True,
 ) -> Dict[str, Any]:
     if omp_threads is None:
         omp_threads = int(os.getenv("OMP_NUM_THREADS") or 1)
@@ -545,6 +548,8 @@ def run_precompute(
         workers = int(os.getenv("SLURM_CPUS_PER_TASK") or os.cpu_count() or 1)
 
     shard_id, num_shards = _resolve_shard_from_slurm(shard_id, num_shards, use_slurm)
+    raw_dir = processed_dir.parent / "raw"
+    raw_dir = raw_dir if raw_dir.exists() else None
 
     files = list(_iter_processed_files(processed_dir))
     length_cache = length_cache or (processed_dir / "length_cache.csv")
@@ -597,7 +602,15 @@ def run_precompute(
                         f"Building length cache for {len(missing)} entries...",
                         log_path=log_path,
                     )
-                    new_items = _collect_lengths_async(missing, workers=workers)
+                    new_items = _collect_lengths_async(
+                        missing,
+                        workers=workers,
+                        raw_dir=raw_dir,
+                        processed_dir=processed_dir,
+                        format_type=format_type,
+                        store_het=store_het,
+                        store_bfactor=store_bfactor,
+                    )
                     merged = [
                         (processed_dir / name, length)
                         for name, length in cache_map.items()
@@ -666,6 +679,11 @@ def run_precompute(
         confind_bin=confind_bin,
         omp_threads=omp_threads,
         overwrite=overwrite,
+        raw_dir=raw_dir,
+        processed_dir=processed_dir,
+        format_type=format_type,
+        store_het=store_het,
+        store_bfactor=store_bfactor,
         log_path=log_path,
         log_every=log_every,
         log_every_sec=log_every_sec,
