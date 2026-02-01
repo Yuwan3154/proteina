@@ -24,6 +24,7 @@ sys.path.append(root)  # Adds project's root directory
 import argparse
 import hashlib
 import json
+import inspect
 import pickle
 from pathlib import Path
 from typing import Optional
@@ -359,19 +360,24 @@ if __name__ == "__main__":
                 candidate = os.path.join(cfg_data.datamodule.data_dir, "rotlibs")
                 if os.path.isdir(candidate):
                     rotlib = candidate
-            run_precompute(
-                processed_dir=Path(processed_dir),
-                rotlib=rotlib,
-                dataselector=dataselector_dict,
-                confind_bin=os.getenv("CONFIND_BIN", "confind"),
-                omp_threads=omp_threads,
-                workers=workers,
-                use_slurm=use_slurm,
-                output_csv=str(Path(processed_dir).parent / "confind_precompute.csv"),
-                format_type=cfg_data.datamodule.get("format", "cif"),
-                store_het=cfg_data.datamodule.get("store_het", False),
-                store_bfactor=cfg_data.datamodule.get("store_bfactor", True),
-            )
+            precompute_kwargs = {
+                "processed_dir": Path(processed_dir),
+                "rotlib": rotlib,
+                "dataselector": dataselector_dict,
+                "confind_bin": os.getenv("CONFIND_BIN", "confind"),
+                "omp_threads": omp_threads,
+                "workers": workers,
+                "use_slurm": use_slurm,
+                "output_csv": str(Path(processed_dir).parent / "confind_precompute.csv"),
+                "format_type": cfg_data.datamodule.get("format", "cif"),
+                "store_het": cfg_data.datamodule.get("store_het", False),
+                "store_bfactor": cfg_data.datamodule.get("store_bfactor", True),
+            }
+            sig = inspect.signature(run_precompute)
+            filtered_kwargs = {
+                key: value for key, value in precompute_kwargs.items() if key in sig.parameters
+            }
+            run_precompute(**filtered_kwargs)
 
         _run_confind_precompute()
 
