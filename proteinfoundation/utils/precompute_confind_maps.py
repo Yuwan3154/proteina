@@ -204,9 +204,20 @@ def _collect_lengths_async(
     format_type: str,
     store_het: bool,
     store_bfactor: bool,
+    log_path: Optional[Path] = None,
+    log_every: int = 5000,
+    log_every_sec: float = 30.0,
 ) -> List[Tuple[Path, Optional[int]]]:
     results: List[Tuple[Path, Optional[int]]] = []
     paths_iter = iter(paths)
+    total = len(paths)
+    completed = 0
+    last_log = time.perf_counter()
+    start = time.perf_counter()
+    _log_message(
+        f"Collecting lengths async: total={total} workers={workers}",
+        log_path=log_path,
+    )
     with ProcessPoolExecutor(max_workers=workers) as executor:
         futures = set()
         while len(futures) < workers:
@@ -230,6 +241,22 @@ def _collect_lengths_async(
             done, futures = wait(futures, return_when=FIRST_COMPLETED)
             for future in done:
                 results.append(future.result())
+                completed += 1
+                now = time.perf_counter()
+                should_log = (completed % log_every == 0) or (
+                    now - last_log >= log_every_sec
+                )
+                if should_log:
+                    elapsed = now - start
+                    rate = completed / elapsed if elapsed > 0 else 0.0
+                    remaining = total - completed
+                    eta_sec = remaining / rate if rate > 0 else 0.0
+                    _log_message(
+                        f"Length cache progress {completed}/{total} "
+                        f"rate={rate:.2f}/s eta={eta_sec/60.0:.1f}m",
+                        log_path=log_path,
+                    )
+                    last_log = now
                 try:
                     path = next(paths_iter)
                 except StopIteration:
@@ -325,6 +352,11 @@ def _process_async(
     confind_bin: str,
     omp_threads: int,
     overwrite: bool,
+    raw_dir: Optional[Path],
+    processed_dir: Path,
+    format_type: str,
+    store_het: bool,
+    store_bfactor: bool,
     log_path: Optional[Path],
     log_every: int,
     log_every_sec: float,
@@ -342,6 +374,10 @@ def _process_async(
     total_sum = 0.0
     last_log = time.perf_counter()
     start = time.perf_counter()
+    _log_message(
+        f"Starting async processing: total={total} workers={workers}",
+        log_path=log_path,
+    )
     with ProcessPoolExecutor(max_workers=workers) as executor:
         futures = set()
         future_to_path = {}
@@ -357,6 +393,11 @@ def _process_async(
                 confind_bin,
                 omp_threads,
                 overwrite,
+                raw_dir,
+                processed_dir,
+                format_type,
+                store_het,
+                store_bfactor,
             )
             futures.add(future)
             future_to_path[future] = path
@@ -419,6 +460,11 @@ def _process_async(
                     confind_bin,
                     omp_threads,
                     overwrite,
+                    raw_dir,
+                    processed_dir,
+                    format_type,
+                    store_het,
+                    store_bfactor,
                 )
                 futures.add(future)
                 future_to_path[future] = path
@@ -451,31 +497,54 @@ def _dataselector_identifier(ds: Dict[str, Any]) -> str:
     def _join(vals):
         return "".join(vals) if vals else ""
 
+    def _default(name: str, default: Any) -> Any:
+        val = ds.get(name, default)
+        return default if val is None else val
+
+    fraction = _default("fraction", 1.0)
+    min_length = _default("min_length", None)
+    max_length = _default("max_length", None)
+    molecule_type = _default("molecule_type", None)
+    experiment_types = _default("experiment_types", None)
+    oligomeric_min = _default("oligomeric_min", None)
+    oligomeric_max = _default("oligomeric_max", None)
+    best_resolution = _default("best_resolution", None)
+    worst_resolution = _default("worst_resolution", None)
+    has_ligands = _default("has_ligands", None)
+    remove_ligands = _default("remove_ligands", None)
+    remove_non_standard_residues = _default("remove_non_standard_residues", True)
+    remove_pdb_unavailable = _default("remove_pdb_unavailable", True)
+    labels = _default("labels", None)
+    remove_cath_unavailable = _default("remove_cath_unavailable", False)
+    exclude_ids = _default("exclude_ids", None)
+
     return (
-        f"df_pdb_f{ds.get('fraction')}_minl{ds.get('min_length')}_maxl{ds.get('max_length')}"
-        f"_mt{ds.get('molecule_type')}"
-        f"_et{_join(ds.get('experiment_types'))}"
-        f"_mino{ds.get('oligomeric_min')}_maxo{ds.get('oligomeric_max')}"
-        f"_minr{ds.get('best_resolution')}_maxr{ds.get('worst_resolution')}"
-        f"_hl{_join(ds.get('has_ligands'))}"
-        f"_rl{_join(ds.get('remove_ligands'))}"
-        f"_rnsr{ds.get('remove_non_standard_residues')}"
-        f"_rpu{ds.get('remove_pdb_unavailable')}"
-        f"_l{_join(ds.get('labels'))}"
-        f"_rcu{ds.get('remove_cath_unavailable')}"
-        f"_ex{len(ds.get('exclude_ids') or [])}"
+        f"df_pdb_f{fraction}_minl{min_length}_maxl{max_length}"
+        f"_mt{molecule_type}"
+        f"_et{_join(experiment_types)}"
+        f"_mino{oligomeric_min}_maxo{oligomeric_max}"
+        f"_minr{best_resolution}_maxr{worst_resolution}"
+        f"_hl{_join(has_ligands)}"
+        f"_rl{_join(remove_ligands)}"
+        f"_rnsr{remove_non_standard_residues}"
+        f"_rpu{remove_pdb_unavailable}"
+        f"_l{_join(labels)}"
+        f"_rcu{remove_cath_unavailable}"
+        f"_ex{len(exclude_ids or [])}"
     )
 
 
-def _read_lengths_from_dataset_csv(csv_path: Path) -> Dict[str, int]:
+def _read_lengths_from_dataset_csv(csv_path: Path) -> Tuple[Dict[str, int], int]:
     lengths: Dict[str, int] = {}
+    row_count = 0
     if not csv_path.exists():
-        return lengths
+        return lengths, row_count
     with open(csv_path, "r") as handle:
         reader = csv.DictReader(handle)
         if "length" not in reader.fieldnames:
-            return lengths
+            return lengths, row_count
         for row in reader:
+            row_count += 1
             length = row.get("length")
             if length is None:
                 continue
@@ -501,7 +570,7 @@ def _read_lengths_from_dataset_csv(csv_path: Path) -> Dict[str, int]:
             else:
                 lengths[f"{name.lower()}.pt"] = length_int
                 lengths[f"{name.upper()}.pt"] = length_int
-    return lengths
+    return lengths, row_count
 
 
 def _resolve_shard_from_slurm(
@@ -587,22 +656,38 @@ def run_precompute(
         f"length_cache={length_cache}",
         log_path=log_path,
     )
+    _log_message(f"Found {len(files)} processed .pt files", log_path=log_path)
+
+    dataset_lengths: Dict[str, int] = {}
+    dataset_rows = 0
+    if dataselector is not None:
+        data_dir = processed_dir.parent
+        csv_name = _dataselector_identifier(dataselector) + ".csv"
+        dataset_csv = data_dir / csv_name
+        dataset_lengths, dataset_rows = _read_lengths_from_dataset_csv(dataset_csv)
+        if dataset_lengths:
+            _log_message(
+                f"Loaded {len(dataset_lengths)} lengths from {dataset_csv} "
+                f"(rows={dataset_rows})",
+                log_path=log_path,
+            )
+            files = [path for path in files if path.name in dataset_lengths]
+            _log_message(
+                f"Filtered processed files by dataset csv: {len(files)} files",
+                log_path=log_path,
+            )
 
     items: List[Tuple[Path, int]] = []
     if sort_by_length:
         cache_map = _read_length_cache(length_cache)
-        if dataselector is not None and not cache_map:
-            data_dir = processed_dir.parent
-            csv_name = _dataselector_identifier(dataselector) + ".csv"
-            dataset_csv = data_dir / csv_name
-            dataset_lengths = _read_lengths_from_dataset_csv(dataset_csv)
-            if dataset_lengths:
-                cache_map.update(dataset_lengths)
-                _log_message(
-                    f"Loaded {len(dataset_lengths)} lengths from {dataset_csv}",
-                    log_path=log_path,
-                )
+        _log_message(
+            f"Loaded {len(cache_map)} cached lengths from {length_cache}",
+            log_path=log_path,
+        )
+        if dataset_lengths:
+            cache_map.update(dataset_lengths)
         missing = [path for path in files if path.name not in cache_map]
+        _log_message(f"Missing length entries: {len(missing)}", log_path=log_path)
         if missing:
             if length_cache_readonly:
                 raise ValueError(
@@ -615,6 +700,8 @@ def run_precompute(
                         f"Building length cache for {len(missing)} entries...",
                         log_path=log_path,
                     )
+                    length_log_every = max(1000, log_every * 100)
+                    length_log_every_sec = max(30.0, log_every_sec)
                     new_items = _collect_lengths_async(
                         missing,
                         workers=workers,
@@ -623,6 +710,9 @@ def run_precompute(
                         format_type=format_type,
                         store_het=store_het,
                         store_bfactor=store_bfactor,
+                        log_path=log_path,
+                        log_every=length_log_every,
+                        log_every_sec=length_log_every_sec,
                     )
                     merged = [
                         (processed_dir / name, length)
@@ -641,6 +731,10 @@ def run_precompute(
                 while not length_cache.exists():
                     time.sleep(5.0)
                 cache_map = _read_length_cache(length_cache)
+                _log_message(
+                    f"Reloaded {len(cache_map)} cached lengths from {length_cache}",
+                    log_path=log_path,
+                )
 
         for path in files:
             length = cache_map.get(path.name)
@@ -653,10 +747,15 @@ def run_precompute(
 
     if num_shards > 1:
         items = [item for idx, item in enumerate(items) if idx % num_shards == shard_id]
+        _log_message(
+            f"Sharded items: {len(items)} for shard {shard_id}/{num_shards}",
+            log_path=log_path,
+        )
 
     items = items[offset:] if offset else items
     if limit and limit > 0:
         items = items[:limit]
+    _log_message(f"Final items to process: {len(items)}", log_path=log_path)
 
     csv_writer = None
     csv_handle = None

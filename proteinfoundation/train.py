@@ -377,6 +377,10 @@ if __name__ == "__main__":
             filtered_kwargs = {
                 key: value for key, value in precompute_kwargs.items() if key in sig.parameters
             }
+            log_every = int(os.getenv("CONFIND_LOG_EVERY", "10"))
+            log_every_sec = float(os.getenv("CONFIND_LOG_EVERY_SEC", "10"))
+            filtered_kwargs["log_every"] = log_every
+            filtered_kwargs["log_every_sec"] = log_every_sec
             run_precompute(**filtered_kwargs)
 
         _run_confind_precompute()
