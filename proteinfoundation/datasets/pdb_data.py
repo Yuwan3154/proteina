@@ -914,11 +914,16 @@ class PDBLightningDataModule(BaseLightningDataModule):
             else:
                 raise ValueError("index_pdb_tuple must have 2 or 3 elements")
 
-            path = raw_dir / f"{pdb}.{format_type}"
+            pdb_code = pdb.lower()
+            path = raw_dir / f"{pdb_code}.{format_type}"
             if path.exists():
                 path = str(path)
+            elif (raw_dir / f"{pdb}.{format_type}").exists():
+                path = str(raw_dir / f"{pdb}.{format_type}")
             elif path.with_suffix("." + format_type + ".gz").exists():
                 path = str(path.with_suffix("." + format_type + ".gz"))
+            elif (raw_dir / f"{pdb}.{format_type}.gz").exists():
+                path = str(raw_dir / f"{pdb}.{format_type}.gz")
             else:
                 raise FileNotFoundError(
                     f"{pdb} not found in raw directory. Are you sure it's downloaded and has the format {format_type}?"
@@ -1018,11 +1023,16 @@ class PDBLightningDataModule(BaseLightningDataModule):
             else:
                 raise ValueError("index_pdb_tuple must have 2 or 3 elements")
 
-            path = self.raw_dir / f"{pdb}.{self.format}"
+            pdb_code = pdb.lower()
+            path = self.raw_dir / f"{pdb_code}.{self.format}"
             if path.exists():
                 path = str(path)
+            elif (self.raw_dir / f"{pdb}.{self.format}").exists():
+                path = str(self.raw_dir / f"{pdb}.{self.format}")
             elif path.with_suffix("." + self.format + ".gz").exists():
                 path = str(path.with_suffix("." + self.format + ".gz"))
+            elif (self.raw_dir / f"{pdb}.{self.format}.gz").exists():
+                path = str(self.raw_dir / f"{pdb}.{self.format}.gz")
             else:
                 raise FileNotFoundError(
                     f"{pdb} not found in raw directory. Are you sure it's downloaded and has the format {self.format}?"

@@ -487,7 +487,20 @@ def _read_lengths_from_dataset_csv(csv_path: Path) -> Dict[str, int]:
                 name = row["pdb"]
             else:
                 continue
-            lengths[f"{name}.pt"] = int(length)
+            try:
+                length_int = int(length)
+            except (TypeError, ValueError):
+                continue
+            if length_int <= 0:
+                continue
+            lengths[f"{name}.pt"] = length_int
+            if "_" in name:
+                pdb, chain = name.split("_", 1)
+                lengths[f"{pdb.lower()}_{chain}.pt"] = length_int
+                lengths[f"{pdb.upper()}_{chain}.pt"] = length_int
+            else:
+                lengths[f"{name.lower()}.pt"] = length_int
+                lengths[f"{name.upper()}.pt"] = length_int
     return lengths
 
 
