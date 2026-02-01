@@ -27,14 +27,110 @@ def _load_graph(path: Path):
     return torch.load(path, map_location="cpu", weights_only=False)
 
 
-def _get_length(path: Path) -> Tuple[Path, int]:
-    graph = _load_graph(path)
+def _parse_pdb_chain_from_path(path: Path) -> Tuple[str, str]:
+    stem = path.stem
+    if "_" in stem:
+        pdb, chain = stem.split("_", 1)
+        return pdb, chain
+    return stem, "all"
+
+
+def _try_regenerate(
+    path: Path,
+    raw_dir: Path,
+    processed_dir: Path,
+    format_type: str,
+    store_het: bool,
+    store_bfactor: bool,
+) -> bool:
+    try:
+        from proteinfoundation.datasets.pdb_data import PDBLightningDataModule
+    except Exception:
+        return False
+    pdb, chain = _parse_pdb_chain_from_path(path)
+    index_pdb_tuple: Tuple[int, str] | Tuple[int, str, str]
+    if chain == "all":
+        index_pdb_tuple = (0, pdb)
+    else:
+        index_pdb_tuple = (0, pdb, chain)
+    result = PDBLightningDataModule._process_single_pdb(
+        index_pdb_tuple=index_pdb_tuple,
+        raw_dir=raw_dir,
+        processed_dir=processed_dir,
+        format_type=format_type,
+        store_het=store_het,
+        store_bfactor=store_bfactor,
+        pre_transform=None,
+        pre_filter=None,
+    )
+    return result is not None
+
+
+def _load_graph_with_repair(
+    path: Path,
+    raw_dir: Optional[Path],
+    processed_dir: Path,
+    format_type: str,
+    store_het: bool,
+    store_bfactor: bool,
+) -> Optional[object]:
+    try:
+        graph = _load_graph(path)
+    except Exception:
+        graph = None
+    if graph is not None and getattr(graph, "coords", None) is not None:
+        return graph
+    if raw_dir is None:
+        return None
+    try:
+        repaired = _try_regenerate(
+            path,
+            raw_dir=raw_dir,
+            processed_dir=processed_dir,
+            format_type=format_type,
+            store_het=store_het,
+            store_bfactor=store_bfactor,
+        )
+    except Exception:
+        repaired = False
+    if not repaired:
+        return None
+    try:
+        graph = _load_graph(path)
+    except Exception:
+        return None
+    if getattr(graph, "coords", None) is None:
+        return None
+    return graph
+
+
+def _get_length(
+    path: Path,
+    raw_dir: Optional[Path],
+    processed_dir: Path,
+    format_type: str,
+    store_het: bool,
+    store_bfactor: bool,
+) -> Tuple[Path, Optional[int]]:
+    graph = _load_graph_with_repair(
+        path,
+        raw_dir=raw_dir,
+        processed_dir=processed_dir,
+        format_type=format_type,
+        store_het=store_het,
+        store_bfactor=store_bfactor,
+    )
+    if graph is None:
+        return path, None
     coord_mask = getattr(graph, "coord_mask", None)
     if coord_mask is not None:
         length = int(coord_mask.any(dim=-1).sum().item())
     else:
-        length = int(graph.coords.shape[0])
-    return path, length
+        coords = getattr(graph, "coords", None)
+        if coords is None:
+            return path, None
+        length = int(coords.shape[0])
+    return path, length if length > 0 else None
 
 
 def _log_message(message: str, log_path: Optional[Path] = None) -> None:
@@ -56,16 +152,23 @@ def _read_length_cache(cache_path: Path) -> Dict[str, int]:
             name = row.get("file")
             length = row.get("length")
             if name and length is not None:
-                lengths[name] = int(length)
+                try:
+                    length_int = int(length)
+                except (TypeError, ValueError):
+                    continue
+                if length_int > 0:
+                    lengths[name] = length_int
     return lengths
 
 
-def _write_length_cache(cache_path: Path, items: List[Tuple[Path, int]]) -> None:
+def _write_length_cache(cache_path: Path, items: List[Tuple[Path, Optional[int]]]) -> None:
     tmp_path = cache_path.with_suffix(cache_path.suffix + f".tmp.{os.getpid()}")
     with open(tmp_path, "w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=["file", "length"])
         writer.writeheader()
         for path, length in items:
+            if length is None or length <= 0:
+                continue
             writer.writerow({"file": path.name, "length": length})
     tmp_path.replace(cache_path)
 
@@ -93,8 +196,16 @@ def _release_lock(lock_path: Path) -> None:
         return
 
 
-def _collect_lengths_async(paths: List[Path], workers: int) -> List[Tuple[Path, int]]:
-    results: List[Tuple[Path, int]] = []
+def _collect_lengths_async(
+    paths: List[Path],
+    workers: int,
+    raw_dir: Optional[Path],
+    processed_dir: Path,
+    format_type: str,
+    store_het: bool,
+    store_bfactor: bool,
+) -> List[Tuple[Path, Optional[int]]]:
+    results: List[Tuple[Path, Optional[int]]] = []
     paths_iter = iter(paths)
     with ProcessPoolExecutor(max_workers=workers) as executor:
         futures = set()
@@ -103,7 +214,17 @@ def _collect_lengths_async(paths: List[Path], workers: int) -> List[Tuple[Path, 
                 path = next(paths_iter)
             except StopIteration:
                 break
-            futures.add(executor.submit(_get_length, path))
+            futures.add(
+                executor.submit(
+                    _get_length,
+                    path,
+                    raw_dir,
+                    processed_dir,
+                    format_type,
+                    store_het,
+                    store_bfactor,
+                )
+            )
 
         while futures:
             done, futures = wait(futures, return_when=FIRST_COMPLETED)
@@ -113,7 +234,17 @@ def _collect_lengths_async(paths: List[Path], workers: int) -> List[Tuple[Path, 
                     path = next(paths_iter)
                 except StopIteration:
                     continue
-                futures.add(executor.submit(_get_length, path))
+                futures.add(
+                    executor.submit(
+                        _get_length,
+                        path,
+                        raw_dir,
+                        processed_dir,
+                        format_type,
+                        store_het,
+                        store_bfactor,
+                    )
+                )
     return results
 
 
@@ -123,10 +254,32 @@ def _process_one(
     confind_bin: str,
     omp_threads: int,
     overwrite: bool,
+    raw_dir: Optional[Path],
+    processed_dir: Path,
+    format_type: str,
+    store_het: bool,
+    store_bfactor: bool,
 ) -> Dict[str, float]:
     start = time.perf_counter()
-    graph = _load_graph(path)
+    graph = _load_graph_with_repair(
+        path,
+        raw_dir=raw_dir,
+        processed_dir=processed_dir,
+        format_type=format_type,
+        store_het=store_het,
+        store_bfactor=store_bfactor,
+    )
     load_end = time.perf_counter()
+    if graph is None:
+        return {
+            "file": path.name,
+            "status": "failed",
+            "error": "missing_coords_after_repair",
+            "load_sec": load_end - start,
+            "confind_sec": 0.0,
+            "save_sec": 0.0,
+            "total_sec": load_end - start,
+        }
 
     if hasattr(graph, "contact_map_confind") and graph.contact_map_confind is not None:
         if not overwrite:
@@ -465,7 +618,7 @@ def run_precompute(
 
         for path in files:
             length = cache_map.get(path.name)
-            if length is None:
+            if length is None or length <= 0:
                 continue
             items.append((path, length))
         items.sort(key=lambda x: x[1], reverse=True)
@@ -599,8 +752,15 @@ def main() -> None:
     processed_dir = None
     rotlib = args.rotlib
     dataselector = None
+    format_type = "cif"
+    store_het = False
+    store_bfactor = True
     if args.config:
         data_dir, cfg_rotlib, dataselector = _resolve_from_config(Path(args.config))
+        datamodule_cfg = OmegaConf.load(Path(args.config)).get("datamodule", {})
+        format_type = datamodule_cfg.get("format", "cif")
+        store_het = datamodule_cfg.get("store_het", False)
+        store_bfactor = datamodule_cfg.get("store_bfactor", True)
         if processed_dir is None and data_dir is not None:
             processed_dir = Path(data_dir) / "processed"
         if rotlib is None:
@@ -642,6 +802,9 @@ def main() -> None:
         log_every=args.log_every,
         log_every_sec=args.log_every_sec,
         stream_csv=args.stream_csv,
+        format_type=format_type,
+        store_het=store_het,
+        store_bfactor=store_bfactor,
     )
 
 

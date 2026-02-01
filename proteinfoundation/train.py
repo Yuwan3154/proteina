@@ -368,6 +368,9 @@ if __name__ == "__main__":
                 workers=workers,
                 use_slurm=use_slurm,
                 output_csv=str(Path(processed_dir).parent / "confind_precompute.csv"),
+                format_type=cfg_data.datamodule.get("format", "cif"),
+                store_het=cfg_data.datamodule.get("store_het", False),
+                store_bfactor=cfg_data.datamodule.get("store_bfactor", True),
             )
 
         _run_confind_precompute()
