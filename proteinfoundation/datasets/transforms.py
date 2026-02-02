@@ -510,6 +510,8 @@ class ContactMapTransform(T.BaseTransform):
             Graph with added contact_map tensor of shape [L, L] with values 0.0 or 1.0
         """
         if self.contact_method == "distance":
+            if hasattr(graph, "contact_map_confind"):
+                del graph["contact_map_confind"]
             contact_map = self._contact_map_from_distance(graph)
         elif self.contact_method == "confind":
             contact_map = self._contact_map_from_confind_precomputed(graph)
