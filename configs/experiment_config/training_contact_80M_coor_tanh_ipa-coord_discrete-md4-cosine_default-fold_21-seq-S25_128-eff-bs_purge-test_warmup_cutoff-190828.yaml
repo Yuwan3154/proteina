@@ -55,7 +55,7 @@ training:
   fold_cond: True
   position_bias:
     enabled: false
-    mode: sigmoid
+    mode: polynomial
     w_min: 0.4
     w_max: 2.5
     k: 30

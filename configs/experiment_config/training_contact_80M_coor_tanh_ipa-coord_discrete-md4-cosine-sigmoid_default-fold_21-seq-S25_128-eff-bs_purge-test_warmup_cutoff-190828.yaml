@@ -1,10 +1,11 @@
-run_name_: contact-confind_80M_coor_tanh_ipa-coord_logit-normal--2.0-1.0_default-fold_21-seq-S25_512-eff-bs_purge-test_warmup_cutoff-190828
+run_name_: contact_80M_coor_tanh_ipa-coord_discrete-md4-cosine-sigmoid_default-fold_21-seq-S25_128-eff-bs_purge-test_warmup_cutoff-190828
+pretrain_ckpt_path: /home/ubuntu/proteina/data/weights/contact_80M_coor_tanh_ipa-coord_discrete-md4-cosine_default-fold_21-seq-S25_128-eff-bs_purge-test_warmup_cutoff-190828_last.ckpt
 
 hardware:
   ncpus_per_task_train_: 16  # Number of CPUs per task during training
   ncpus_per_task_prepro_: 16  # Number of CPUs used for data preprocessing run
   accelerator: gpu
-  ngpus_per_node_: 4  # Number of GPUs per node
+  ngpus_per_node_: 1  # Number of GPUs per node
   nnodes_: 1  # Number of nodes
 
 # Below, for t_distribution, options are
@@ -13,7 +14,7 @@ hardware:
 # - name: beta. This is beta(p1, p2).
 loss:
   t_distribution:
-    name: logit-normal
+    name: cosine_cdf
     p1: -2.0
     p2: 1.0
   loss_t_clamp: 0.9  # Used for loss stability in frameflow, 1. for no clamping
@@ -29,8 +30,8 @@ loss:
 
 
 defaults:
-  - model: contactflow  # caflow or contactflow
-  - override model/nn: contact_af3_80M_tri_coor_tanh_ipa-coord
+  - model: contactflow_discrete_md4  # caflow or contactflow
+  - override model/nn: contact_af3_80M_tri_coor_tanh_ipa-coord_discrete
   - _self_
 
 model:
@@ -43,7 +44,7 @@ model:
 
 
 # Dataset params
-dataset: pdb_train_contact-confind_S25_max320_purge-test_cutoff-190828
+dataset: pdb_train_contact-CB-10A_S25_max320_purge-test_cutoff-190828
 dataset_config_subdir: pdb
 
 force_precision_f32: False  # If false will use bf16-mixed precision
@@ -52,6 +53,12 @@ training:
   self_cond: True
   seq_cond: True
   fold_cond: True
+  position_bias:
+    enabled: false
+    mode: sigmoid
+    w_min: 0.4
+    w_max: 2.5
+    k: 30
   mask_T_prob: 0.5
   mask_A_prob: 0.5
   mask_C_prob: 0.5
@@ -77,8 +84,8 @@ lora:
 
 opt:
   lr: 0.0001
-  max_epochs: 2000
-  accumulate_grad_batches: 32  # effective batch size = 4*4*32 = 512
+  max_epochs: 10000
+  accumulate_grad_batches: 32  # effective batch size = 1*4*32 = 128
   val_check_interval: 1000  # Number of training batches after which we check validation loss
   skip_nan_grad: False  # Skip updates with nan gradient
   grad_and_weight_analysis: False  # Log some statistics of gradients and weights
@@ -104,6 +111,7 @@ validation_sampling:
   dt: 0.005
   sampling_mode: sc
   sc_scale_noise: 0.45
+  sampling_grid: cosine
 
 seed: 42
 
