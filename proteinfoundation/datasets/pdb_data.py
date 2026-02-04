@@ -499,6 +499,12 @@ class PDBDataset(Dataset):
                 )
                 return self.__getitem__((idx + 1) % len(self))
 
+        if not hasattr(graph, "protein_id") or graph.protein_id is None:
+            if hasattr(graph, "id") and graph.id is not None:
+                graph.protein_id = str(graph.id)
+            else:
+                graph.protein_id = fname[:-3]
+
         # reorder coords to be in OpenFold and not PDB convention
         graph.coords = graph.coords[:, PDB_TO_OPENFOLD_INDEX_TENSOR, :]
         graph.coord_mask = graph.coord_mask[:, PDB_TO_OPENFOLD_INDEX_TENSOR]
