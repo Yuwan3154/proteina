@@ -944,10 +944,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
- store_het=store_het,
-        store_bfactor=store_bfactor,
-    )
-
-
-if __name__ == "__main__":
-    main()
