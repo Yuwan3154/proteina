@@ -332,7 +332,11 @@ def _process_one(
     graph.contact_map_confind = torch.as_tensor(raw_map, dtype=torch.float16)
 
     save_start = time.perf_counter()
-    torch.save(graph, path)
+    # Atomic save: write to a temp file then rename to avoid corrupting the
+    # original if a reader (e.g. training DataLoader) accesses it mid-write.
+    tmp_path = path.with_suffix(".pt.tmp")
+    torch.save(graph, tmp_path)
+    tmp_path.rename(path)
     save_end = time.perf_counter()
 
     return {
@@ -934,6 +938,13 @@ def main() -> None:
         stream_csv=args.stream_csv,
         format_type=format_type,
         store_het=store_het,
+        store_bfactor=store_bfactor,
+    )
+
+
+if __name__ == "__main__":
+    main()
+ store_het=store_het,
         store_bfactor=store_bfactor,
     )
 

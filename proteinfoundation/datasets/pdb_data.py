@@ -452,67 +452,72 @@ class PDBDataset(Dataset):
     def __len__(self):
         return len(self.file_names)
 
+    _MAX_GETITEM_RETRIES = 50
+
     def __getitem__(self, idx: int) -> Data:
         """Return PyTorch Geometric Data object for a given index.
 
-        Args:
-            idx (int): Index to retrieve.
-
-        Returns:
-            Data: PyTorch Geometric Data object.
+        Uses a bounded retry loop (not recursion) to skip invalid samples.
         """
-        if self.in_memory:
-            graph = self.data[idx]
-            fname = f"{graph.id}.pt"
-        else:
-            if self.file_names is not None:
-                fname = f"{self.file_names[idx]}.pt"
-            elif self.chains is not None:
-                fname = f"{self.pdb_codes[idx]}_{self.chains[idx]}.pt"
+        n = len(self)
+        for attempt in range(self._MAX_GETITEM_RETRIES):
+            cur = (idx + attempt) % n
+
+            # --- resolve filename ---
+            if self.in_memory:
+                graph = self.data[cur]
+                fname = f"{graph.id}.pt"
             else:
-                fname = f"{self.pdb_codes[idx]}.pt"
+                if self.file_names is not None:
+                    fname = f"{self.file_names[cur]}.pt"
+                elif self.chains is not None:
+                    fname = f"{self.pdb_codes[cur]}_{self.chains[cur]}.pt"
+                else:
+                    fname = f"{self.pdb_codes[cur]}.pt"
 
-            path = self.data_dir / "processed" / fname
-            if not path.exists():
-                logger.warning(
-                    f"Sample {idx} (file: {fname}) is missing at {path}, skipping and trying next sample."
-                )
-                return self.__getitem__((idx + 1) % len(self))
-            graph = torch.load(path, weights_only=False)
+                path = self.data_dir / "processed" / fname
+                if not path.exists():
+                    logger.warning(f"[getitem] {fname} missing, skip (attempt {attempt+1})")
+                    continue
+                try:
+                    graph = torch.load(path, weights_only=False)
+                except Exception as e:
+                    logger.warning(f"[getitem] {fname} load failed: {e!r}, skip (attempt {attempt+1})")
+                    continue
 
-        # Check if graph has coords attribute before accessing (defensive check for corrupted data)
-        if not hasattr(graph, 'coords') or graph.coords is None:
-            logger.warning(f"Sample {idx} (file: {fname}) has no coords attribute, skipping and trying next sample.")
-            # Return next valid sample (with wraparound to avoid infinite loop)
-            return self.__getitem__((idx + 1) % len(self))
-        
-        # Check if graph has coord_mask attribute
-        if not hasattr(graph, 'coord_mask') or graph.coord_mask is None:
-            logger.warning(f"Sample {idx} (file: {fname}) has no coord_mask attribute, skipping and trying next sample.")
-            return self.__getitem__((idx + 1) % len(self))
+            # --- validate required attributes ---
+            if not hasattr(graph, 'coords') or graph.coords is None:
+                logger.warning(f"[getitem] {fname} no coords, skip (attempt {attempt+1})")
+                continue
+            if not hasattr(graph, 'coord_mask') or graph.coord_mask is None:
+                logger.warning(f"[getitem] {fname} no coord_mask, skip (attempt {attempt+1})")
+                continue
+            if self.min_length:
+                nres = int(graph.coord_mask.any(dim=-1).sum().item())
+                if nres < self.min_length:
+                    logger.warning(f"[getitem] {fname} len {nres} < {self.min_length}, skip")
+                    continue
 
-        if self.min_length:
-            nres = int(graph.coord_mask.any(dim=-1).sum().item())
-            if nres < self.min_length:
-                logger.warning(
-                    f"Sample {idx} (file: {fname}) effective length {nres} < min_length {self.min_length}, skipping."
-                )
-                return self.__getitem__((idx + 1) % len(self))
+            # --- success: finish loading ---
+            if not hasattr(graph, "protein_id") or graph.protein_id is None:
+                if hasattr(graph, "id") and graph.id is not None:
+                    graph.protein_id = str(graph.id)
+                else:
+                    graph.protein_id = fname[:-3]
 
-        if not hasattr(graph, "protein_id") or graph.protein_id is None:
-            if hasattr(graph, "id") and graph.id is not None:
-                graph.protein_id = str(graph.id)
-            else:
-                graph.protein_id = fname[:-3]
+            graph.coords = graph.coords[:, PDB_TO_OPENFOLD_INDEX_TENSOR, :]
+            graph.coord_mask = graph.coord_mask[:, PDB_TO_OPENFOLD_INDEX_TENSOR]
 
-        # reorder coords to be in OpenFold and not PDB convention
-        graph.coords = graph.coords[:, PDB_TO_OPENFOLD_INDEX_TENSOR, :]
-        graph.coord_mask = graph.coord_mask[:, PDB_TO_OPENFOLD_INDEX_TENSOR]
+            if self.transform:
+                graph = self.transform(graph)
 
-        if self.transform:
-            graph = self.transform(graph)
+            return graph
 
-        return graph
+        # exhausted retries
+        raise RuntimeError(
+            f"Failed to load valid sample after {self._MAX_GETITEM_RETRIES} "
+            f"attempts (start idx={idx}). Dataset may be severely corrupted."
+        )
 
 
 class PDBLightningDataModule(BaseLightningDataModule):

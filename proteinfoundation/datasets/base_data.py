@@ -163,6 +163,11 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         if hasattr(self, 'overfit_pdb_chains') and self.overfit_pdb_chains is not None:
             drop_last = False
 
+        # timeout (seconds): if a DataLoader worker hangs (e.g. on a
+        # corrupted file or NFS stall), raise instead of blocking forever.
+        # 300 s is generous enough for even very slow I/O.
+        dl_timeout = 300 if self.num_workers > 0 else 0
+
         return dataloader_class(
             dataset,
             batch_size=self.batch_size,
@@ -172,6 +177,7 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             pin_memory=self.pin_memory,
             drop_last=drop_last,
             prefetch_factor=self.prefetch_factor,
+            timeout=dl_timeout,
         )
 
     def train_dataloader(self) -> DataLoader:
