@@ -8,7 +8,9 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+import os
 import pathlib
+import time
 from typing import Callable, Dict, List, Literal, Optional, Tuple, Union
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -19,7 +21,7 @@ import pandas as pd
 import torch
 from loguru import logger
 from lightning.pytorch.utilities.rank_zero import rank_zero_info
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, get_worker_info
 from torch_geometric.data import Data
 import torch_geometric.data.data as tgd
 from torch.serialization import add_safe_globals
@@ -444,6 +446,9 @@ class PDBDataset(Dataset):
         self.transform = transform
         self.min_length = min_length
         self.sequence_id_to_idx = None
+        # For DATA_LOADING_DEBUG: set by datamodule before creating DataLoader
+        self._rank_for_logging = -1
+        self._debug_data_loading = os.environ.get("DATA_LOADING_DEBUG", "0") == "1"
 
         if self.in_memory:
             rank_zero_info("Reading data into memory")
@@ -454,12 +459,22 @@ class PDBDataset(Dataset):
 
     _MAX_GETITEM_RETRIES = 50
 
+    def _data_load_log_prefix(self) -> str:
+        """Prefix for DATA_LOADING_DEBUG logs: [R{rank} W{worker_id}]."""
+        rank = getattr(self, "_rank_for_logging", -1)
+        wi = get_worker_info()
+        worker_id = wi.id if wi is not None else -1
+        return f"[R{rank} W{worker_id}]"
+
     def __getitem__(self, idx: int) -> Data:
         """Return PyTorch Geometric Data object for a given index.
 
         Uses a bounded retry loop (not recursion) to skip invalid samples.
+        When DATA_LOADING_DEBUG=1, logs every attempt/load/skip per rank and worker.
         """
+        debug = getattr(self, "_debug_data_loading", False)
         n = len(self)
+
         for attempt in range(self._MAX_GETITEM_RETRIES):
             cur = (idx + attempt) % n
 
@@ -476,26 +491,72 @@ class PDBDataset(Dataset):
                     fname = f"{self.pdb_codes[cur]}.pt"
 
                 path = self.data_dir / "processed" / fname
+
+                if debug:
+                    logger.info(
+                        f"{self._data_load_log_prefix()} getitem idx={idx} cur={cur} "
+                        f"fname={fname} attempt={attempt + 1}/{self._MAX_GETITEM_RETRIES}"
+                    )
+
                 if not path.exists():
-                    logger.warning(f"[getitem] {fname} missing, skip (attempt {attempt+1})")
+                    if debug:
+                        logger.warning(
+                            f"{self._data_load_log_prefix()} skip fname={fname} reason=missing_file"
+                        )
+                    else:
+                        logger.warning(f"[getitem] {fname} missing, skip (attempt {attempt+1})")
                     continue
+
+                t0 = time.perf_counter()
+                if debug:
+                    logger.info(f"{self._data_load_log_prefix()} loading fname={fname} ...")
                 try:
                     graph = torch.load(path, weights_only=False)
                 except Exception as e:
-                    logger.warning(f"[getitem] {fname} load failed: {e!r}, skip (attempt {attempt+1})")
+                    elapsed = time.perf_counter() - t0
+                    if debug:
+                        logger.warning(
+                            f"{self._data_load_log_prefix()} skip fname={fname} "
+                            f"reason=load_failed after {elapsed:.2f}s err={e!r}"
+                        )
+                    else:
+                        logger.warning(
+                            f"[getitem] {fname} load failed: {e!r}, skip (attempt {attempt+1})"
+                        )
                     continue
+                elapsed = time.perf_counter() - t0
+                if debug:
+                    logger.info(
+                        f"{self._data_load_log_prefix()} loaded fname={fname} in {elapsed:.2f}s"
+                    )
 
             # --- validate required attributes ---
             if not hasattr(graph, 'coords') or graph.coords is None:
-                logger.warning(f"[getitem] {fname} no coords, skip (attempt {attempt+1})")
+                if debug:
+                    logger.warning(
+                        f"{self._data_load_log_prefix()} skip fname={fname} reason=no_coords"
+                    )
+                else:
+                    logger.warning(f"[getitem] {fname} no coords, skip (attempt {attempt+1})")
                 continue
             if not hasattr(graph, 'coord_mask') or graph.coord_mask is None:
-                logger.warning(f"[getitem] {fname} no coord_mask, skip (attempt {attempt+1})")
+                if debug:
+                    logger.warning(
+                        f"{self._data_load_log_prefix()} skip fname={fname} reason=no_coord_mask"
+                    )
+                else:
+                    logger.warning(f"[getitem] {fname} no coord_mask, skip (attempt {attempt+1})")
                 continue
             if self.min_length:
                 nres = int(graph.coord_mask.any(dim=-1).sum().item())
                 if nres < self.min_length:
-                    logger.warning(f"[getitem] {fname} len {nres} < {self.min_length}, skip")
+                    if debug:
+                        logger.warning(
+                            f"{self._data_load_log_prefix()} skip fname={fname} "
+                            f"reason=len_{nres}_lt_{self.min_length}"
+                        )
+                    else:
+                        logger.warning(f"[getitem] {fname} len {nres} < {self.min_length}, skip")
                     continue
 
             # --- success: finish loading ---
@@ -511,6 +572,10 @@ class PDBDataset(Dataset):
             if self.transform:
                 graph = self.transform(graph)
 
+            if debug:
+                logger.info(
+                    f"{self._data_load_log_prefix()} success fname={fname} attempt={attempt + 1}"
+                )
             return graph
 
         # exhausted retries

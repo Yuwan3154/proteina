@@ -8,12 +8,14 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+import time
 from collections import defaultdict
 from collections.abc import Mapping
 from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch.utils.data
+from loguru import logger
 import torch_geometric
 import torch_sparse
 from torch.utils.data.dataloader import default_collate
@@ -343,10 +345,14 @@ class DensePaddingCollater:
         dataset: Union[Dataset, Sequence[BaseData], DatasetAdapter],
         follow_batch: Optional[List[str]] = None,
         exclude_keys: Optional[List[str]] = None,
+        rank_for_logging: int = -1,
+        debug_data_loading: bool = False,
     ):
         self.dataset = dataset
         self.follow_batch = follow_batch
         self.exclude_keys = exclude_keys
+        self._rank_for_logging = rank_for_logging
+        self._debug_data_loading = debug_data_loading
 
     def __call__(self, batch: List[Any]) -> Any:
         """Collates a python list of data objects to the internal storage format of
@@ -360,11 +366,30 @@ class DensePaddingCollater:
         """
         elem = batch[0]
         if isinstance(elem, BaseData):
-            return dense_padded_from_data_list(
+            debug = getattr(self, "_debug_data_loading", False)
+            rank = getattr(self, "_rank_for_logging", -1)
+            if debug:
+                protein_ids = [
+                    getattr(b, "protein_id", getattr(b, "id", "?"))
+                    for b in batch
+                ]
+                t0 = time.perf_counter()
+                logger.info(
+                    f"[R{rank}] collate start batch_size={len(batch)} "
+                    f"protein_ids={protein_ids}"
+                )
+            out = dense_padded_from_data_list(
                 batch,
                 follow_batch=self.follow_batch,
                 exclude_keys=self.exclude_keys,
             )
+            if debug:
+                elapsed = time.perf_counter() - t0
+                logger.info(
+                    f"[R{rank}] collate done batch_size={len(batch)} "
+                    f"in {elapsed:.2f}s"
+                )
+            return out
         elif isinstance(elem, torch.Tensor):
             return default_collate(batch)
         elif isinstance(elem, TensorFrame):
@@ -425,6 +450,8 @@ class DensePaddingDataLoader(torch.utils.data.DataLoader):
         shuffle: bool = False,
         follow_batch: Optional[List[str]] = None,
         exclude_keys: Optional[List[str]] = None,
+        rank_for_logging: int = -1,
+        debug_data_loading: bool = False,
         **kwargs,
     ):
         # Remove for PyTorch Lightning:
@@ -434,7 +461,13 @@ class DensePaddingDataLoader(torch.utils.data.DataLoader):
         self.follow_batch = follow_batch
         self.exclude_keys = exclude_keys
 
-        self.collator = DensePaddingCollater(dataset, follow_batch, exclude_keys)
+        self.collator = DensePaddingCollater(
+            dataset,
+            follow_batch,
+            exclude_keys,
+            rank_for_logging=rank_for_logging,
+            debug_data_loading=debug_data_loading,
+        )
 
         if isinstance(dataset, OnDiskDataset):
             dataset = range(len(dataset))

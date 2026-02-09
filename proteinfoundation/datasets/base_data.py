@@ -8,10 +8,12 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+import os
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, Iterable, List, Literal, Optional
 
 import lightning as L
+import torch
 from loguru import logger
 from torch_geometric import transforms as T
 from torch_geometric.data import Dataset
@@ -168,8 +170,24 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         # 300 s is generous enough for even very slow I/O.
         dl_timeout = 300 if self.num_workers > 0 else 0
 
-        return dataloader_class(
-            dataset,
+        # For DATA_LOADING_DEBUG: set rank and debug on dataset so workers log per rank/worker
+        rank_for_logging = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_initialized()
+            else 0
+        )
+        debug_data_loading = os.environ.get("DATA_LOADING_DEBUG", "0") == "1"
+        if debug_data_loading and rank_for_logging == 0:
+            logger.info(
+                "DATA_LOADING_DEBUG=1: per-rank, per-worker data load and collate "
+                "logging enabled. Log lines are prefixed with [R{rank} W{worker_id}]."
+            )
+        if hasattr(dataset, "_rank_for_logging"):
+            dataset._rank_for_logging = rank_for_logging
+        if hasattr(dataset, "_debug_data_loading"):
+            dataset._debug_data_loading = debug_data_loading
+
+        kwargs = dict(
             batch_size=self.batch_size,
             sampler=sampler,
             shuffle=shuffle,
@@ -179,6 +197,11 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             prefetch_factor=self.prefetch_factor,
             timeout=dl_timeout,
         )
+        if dataloader_class is DensePaddingDataLoader:
+            kwargs["rank_for_logging"] = rank_for_logging
+            kwargs["debug_data_loading"] = debug_data_loading
+
+        return dataloader_class(dataset, **kwargs)
 
     def train_dataloader(self) -> DataLoader:
         if self.train_ds is None:
