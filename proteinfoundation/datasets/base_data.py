@@ -170,17 +170,20 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         # 300 s is generous enough for even very slow I/O.
         dl_timeout = 300 if self.num_workers > 0 else 0
 
-        # For DATA_LOADING_DEBUG: set rank and debug on dataset so workers log per rank/worker
+        # For DATA_LOADING_DEBUG: set rank and debug on dataset so workers log per rank/worker.
+        # When running distributed, enable verbose logging by default so we can see which
+        # rank/worker/sample is stuck; set DATA_LOADING_DEBUG=0 to disable.
         rank_for_logging = (
             torch.distributed.get_rank()
             if torch.distributed.is_initialized()
             else 0
         )
-        debug_data_loading = os.environ.get("DATA_LOADING_DEBUG", "0") == "1"
+        default_debug = "1" if torch.distributed.is_initialized() else "0"
+        debug_data_loading = os.environ.get("DATA_LOADING_DEBUG", default_debug) == "1"
         if debug_data_loading and rank_for_logging == 0:
             logger.info(
-                "DATA_LOADING_DEBUG=1: per-rank, per-worker data load and collate "
-                "logging enabled. Log lines are prefixed with [R{rank} W{worker_id}]."
+                "Data-load debug: per-rank, per-worker data load and collate logging "
+                "enabled (set DATA_LOADING_DEBUG=0 to disable). Log prefix [R{rank} W{worker_id}]."
             )
         if hasattr(dataset, "_rank_for_logging"):
             dataset._rank_for_logging = rank_for_logging

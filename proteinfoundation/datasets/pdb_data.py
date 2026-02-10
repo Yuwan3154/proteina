@@ -514,6 +514,17 @@ class PDBDataset(Dataset):
                     graph = torch.load(path, weights_only=False)
                 except Exception as e:
                     elapsed = time.perf_counter() - t0
+                    err_msg = str(e).lower()
+                    is_corrupt_zip = (
+                        "zip archive" in err_msg
+                        or "central directory" in err_msg
+                        or "pytorchstreamreader" in err_msg
+                    )
+                    if is_corrupt_zip:
+                        logger.error(
+                            f"[getitem] CORRUPT .pt file (truncated/incomplete): {path} "
+                            f"err={e!r} - remove or regenerate this file."
+                        )
                     if debug:
                         logger.warning(
                             f"{self._data_load_log_prefix()} skip fname={fname} "
@@ -570,7 +581,17 @@ class PDBDataset(Dataset):
             graph.coord_mask = graph.coord_mask[:, PDB_TO_OPENFOLD_INDEX_TENSOR]
 
             if self.transform:
-                graph = self.transform(graph)
+                try:
+                    graph = self.transform(graph)
+                except Exception as e:
+                    if debug:
+                        logger.warning(
+                            f"{self._data_load_log_prefix()} skip fname={fname} "
+                            f"reason=transform_failed err={e!r}"
+                        )
+                    else:
+                        logger.warning(f"[getitem] {fname} transform failed: {e!r}, skip (attempt {attempt+1})")
+                    continue
 
             if debug:
                 logger.info(
