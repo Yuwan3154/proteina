@@ -683,6 +683,8 @@ class ModelTrainerBase(L.LightningModule):
         Returns:
             Training loss averaged over batches.
         """
+        t0 = time.time()
+        logger.info(f"DEBUG_TRACE: training_step start batch_idx={batch_idx}")
         self._debug_last_batch_idx = int(batch_idx)
         self._debug_nonfinite_loss_ids = None
         self._skip_update_due_to_nonfinite_loss = False
@@ -694,6 +696,7 @@ class ModelTrainerBase(L.LightningModule):
         x_1, mask, batch_shape, n, dtype = self.extract_clean_sample(batch)
         # Center and mask input
         x_1 = self.fm._mask_and_zero_com(x_1, mask)
+        logger.info(f"DEBUG_TRACE: extracted clean sample batch_idx={batch_idx} t={time.time()-t0:.3f}s")
 
         # Sample time
         t = self.sample_t(batch_shape)
@@ -773,6 +776,7 @@ class ModelTrainerBase(L.LightningModule):
         batch["t"] = t
         batch["mask"] = mask
         batch["x_t"] = x_t
+        logger.info(f"DEBUG_TRACE: pre-forward prep done batch_idx={batch_idx} t={time.time()-t0:.3f}s")
 
         # Fold conditional training
         if self.cfg_exp.training.fold_cond:
@@ -856,6 +860,8 @@ class ModelTrainerBase(L.LightningModule):
             # Remove cirpin_emb_fallback from batch when cirpin_cond is False (optional cleanup)
             if "cirpin_emb_fallback" in batch:
                 batch.pop("cirpin_emb_fallback")
+        
+        logger.info(f"DEBUG_TRACE: cond prep done batch_idx={batch_idx} t={time.time()-t0:.3f}s")
 
         # Prediction for self-conditioning
         if random.random() > 0.5 and self.cfg_exp.training.self_cond:
@@ -866,7 +872,9 @@ class ModelTrainerBase(L.LightningModule):
                 with torch.no_grad():
                     self._maybe_update_self_cond_copy()
                     sc_model = getattr(self, "nn_sc", None) or self.nn
+                    logger.info(f"DEBUG_TRACE: starting self-cond forward batch_idx={batch_idx} t={time.time()-t0:.3f}s")
                     nn_out_sc = sc_model(batch)
+                    logger.info(f"DEBUG_TRACE: finished self-cond forward batch_idx={batch_idx} t={time.time()-t0:.3f}s")
                     c_pred_sc = self._nn_out_to_c_clean(nn_out_sc, batch)
                 if c_pred_sc is not None:
                     # `c_pred_sc` is already activated in model/data space.
@@ -877,7 +885,9 @@ class ModelTrainerBase(L.LightningModule):
                 with torch.no_grad(): 
                     self._maybe_update_self_cond_copy()
                     sc_model = getattr(self, "nn_sc", None) or self.nn
+                    logger.info(f"DEBUG_TRACE: starting self-cond forward batch_idx={batch_idx} t={time.time()-t0:.3f}s")
                     nn_out_sc = sc_model(batch)
+                    logger.info(f"DEBUG_TRACE: finished self-cond forward batch_idx={batch_idx} t={time.time()-t0:.3f}s")
                     x_pred_sc = self._nn_out_to_x_clean(nn_out_sc, batch)
                 if x_pred_sc is not None:
                     batch["x_sc"] = self.detach_gradients(x_pred_sc)
@@ -890,7 +900,9 @@ class ModelTrainerBase(L.LightningModule):
                 batch["x_sc"] = torch.zeros_like(x_1)
 
         # Main prediction
+        logger.info(f"DEBUG_TRACE: starting main forward batch_idx={batch_idx} t={time.time()-t0:.3f}s")
         nn_out = self.predict_clean(batch)
+        logger.info(f"DEBUG_TRACE: finished main forward batch_idx={batch_idx} t={time.time()-t0:.3f}s")
 
         def _sanitize_and_log_loss_vec(loss_vec: torch.Tensor, name: str) -> torch.Tensor:
             """
@@ -1073,6 +1085,8 @@ class ModelTrainerBase(L.LightningModule):
             add_dataloader_idx=False,
         )
 
+        logger.info(f"DEBUG_TRACE: loss computed batch_idx={batch_idx} t={time.time()-t0:.3f}s")
+
         # Don't log if validation step (indicated by batch_id)
         if not val_step:
             self.log(
@@ -1196,6 +1210,7 @@ class ModelTrainerBase(L.LightningModule):
                     ),
                 )
 
+        logger.info(f"DEBUG_TRACE: training_step end batch_idx={batch_idx} t={time.time()-t0:.3f}s")
         return train_loss
     
     def _log_structure_visualization(
