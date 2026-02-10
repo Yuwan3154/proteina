@@ -319,34 +319,45 @@ def _process_one(
                 "total_sec": load_end - start,
             }
 
-    confind_start = time.perf_counter()
-    raw_map = confind_raw_contact_map(
-        graph,
-        rotlib_path=rotlib_path,
-        confind_bin=confind_bin,
-        omp_threads=omp_threads,
-        renumber=True,
-    )
-    confind_end = time.perf_counter()
+    try:
+        confind_start = time.perf_counter()
+        raw_map = confind_raw_contact_map(
+            graph,
+            rotlib_path=rotlib_path,
+            confind_bin=confind_bin,
+            omp_threads=omp_threads,
+            renumber=True,
+        )
+        confind_end = time.perf_counter()
 
-    graph.contact_map_confind = torch.as_tensor(raw_map, dtype=torch.float16)
+        graph.contact_map_confind = torch.as_tensor(raw_map, dtype=torch.float16)
 
-    save_start = time.perf_counter()
-    # Atomic save: write to a temp file then rename to avoid corrupting the
-    # original if a reader (e.g. training DataLoader) accesses it mid-write.
-    tmp_path = path.with_suffix(".pt.tmp")
-    torch.save(graph, tmp_path)
-    tmp_path.rename(path)
-    save_end = time.perf_counter()
+        save_start = time.perf_counter()
+        # Atomic save: write to a temp file then rename to avoid corrupting the
+        # original if a reader (e.g. training DataLoader) accesses it mid-write.
+        tmp_path = path.with_suffix(".pt.tmp")
+        torch.save(graph, tmp_path)
+        tmp_path.rename(path)
+        save_end = time.perf_counter()
 
-    return {
-        "file": path.name,
-        "status": "processed",
-        "load_sec": load_end - start,
-        "confind_sec": confind_end - confind_start,
-        "save_sec": save_end - save_start,
-        "total_sec": save_end - start,
-    }
+        return {
+            "file": path.name,
+            "status": "processed",
+            "load_sec": load_end - start,
+            "confind_sec": confind_end - confind_start,
+            "save_sec": save_end - save_start,
+            "total_sec": save_end - start,
+        }
+    except Exception as e:
+        return {
+            "file": path.name,
+            "status": "failed",
+            "error": str(e),
+            "load_sec": load_end - start,
+            "confind_sec": 0.0,
+            "save_sec": 0.0,
+            "total_sec": time.perf_counter() - start,
+        }
 
 
 def _process_async(
@@ -432,6 +443,11 @@ def _process_async(
                         skipped += 1
                     else:
                         failed += 1
+                        if "error" in result:
+                            _log_message(
+                                f"Failed {result['file']}: {result['error']}",
+                                log_path=log_path,
+                            )
                 if result_callback is not None:
                     result_callback(result)
                 if collect_results:
@@ -776,6 +792,7 @@ def run_precompute(
                 "confind_sec",
                 "save_sec",
                 "total_sec",
+                "error",
             ],
         )
         if csv_path.stat().st_size == 0:
@@ -824,6 +841,7 @@ def run_precompute(
                     "confind_sec",
                     "save_sec",
                     "total_sec",
+                    "error",
                 ],
             )
             writer.writeheader()
