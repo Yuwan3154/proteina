@@ -56,6 +56,26 @@ from proteinfoundation.utils.training_analysis_utils import (
     LogSetpTimeCallback,
     SkipNanGradCallback,
 )
+
+class DebugCallback(L.Callback):
+    def on_sanity_check_start(self, trainer, pl_module):
+        log_info("DebugCallback: on_sanity_check_start")
+    
+    def on_sanity_check_end(self, trainer, pl_module):
+        log_info("DebugCallback: on_sanity_check_end")
+    
+    def on_train_start(self, trainer, pl_module):
+        log_info("DebugCallback: on_train_start")
+    
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        log_info(f"DebugCallback: on_train_batch_start batch_idx={batch_idx}")
+    
+    def on_validation_start(self, trainer, pl_module):
+        log_info("DebugCallback: on_validation_start")
+    
+    def on_validation_batch_start(self, trainer, pl_module, batch, batch_idx, dataloader_idx=0):
+        log_info(f"DebugCallback: on_validation_batch_start batch_idx={batch_idx}")
+
 def _maybe_init_cuequivariance():
     try:
         import cuequivariance_torch as cuet  # noqa: F401
@@ -179,12 +199,16 @@ if __name__ == "__main__":
     )
     args, overrides = parser.parse_known_args()
 
+    # Disable verbose data loading logs by default unless explicitly requested
+    if "DATA_LOADING_DEBUG" not in os.environ:
+        os.environ["DATA_LOADING_DEBUG"] = "0"
+
     logger.add(
         sys.stdout,
         format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {file}:{line} | {message}",
     )  # Send to stdout
     log_info(f"Avoid wandb and checkpointing: {args.nolog}")
-    callbacks = [SeedCallback()]  # Different devices will be assigend different seeds
+    callbacks = [SeedCallback(), DebugCallback()]  # Different devices will be assigend different seeds
 
     # Load experiment config
     config_path = "../configs/experiment_config"
