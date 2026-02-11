@@ -42,8 +42,8 @@ def sample_uniform_rotation(
     shape=tuple(), dtype=None, device=None
 ) -> Float[Tensor, "*batch 3 3"]:
     """
-    Samples rotations distributed uniformly.
-
+    Samples rotations distributed uniformly using pure PyTorch (QR decomposition of Gaussian).
+    
     Args:
         shape: tuple (if empty then samples single rotation)
         dtype: used for samples
@@ -52,11 +52,43 @@ def sample_uniform_rotation(
     Returns:
         Uniformly samples rotation matrices [*shape, 3, 3]
     """
-    return torch.tensor(
-        ScipyRotation.random(prod(shape)).as_matrix(),
-        device=device,
-        dtype=dtype,
-    ).reshape(*shape, 3, 3)
+    if dtype is None:
+        dtype = torch.float32
+    if device is None:
+        device = torch.device("cpu")
+        
+    num = int(prod(shape))
+    # Sample random Gaussian matrix
+    M = torch.randn(num, 3, 3, device=device, dtype=dtype)
+    
+    # QR decomposition
+    Q, R = torch.linalg.qr(M)
+    
+    # Ensure uniformity by correcting for the diagonal of R
+    # R is upper triangular. The diagonal elements R_ii can be positive or negative.
+    # We want R to have positive diagonal elements for the decomposition to be unique (modulo signs).
+    # Equivalent to multiplying columns of Q by sign(R_ii).
+    d = torch.diagonal(R, dim1=-2, dim2=-1) # [num, 3]
+    sign = torch.sign(d) # [num, 3]
+    
+    # Expand sign for broadcasting
+    sign = sign.unsqueeze(1) # [num, 1, 3]
+    
+    Q = Q * sign # Multiply columns by sign
+    
+    # Now Q is uniformly distributed in O(3).
+    # We want SO(3), so determinant must be 1.
+    # If det(Q) = -1, flip the sign of the first column.
+    det = torch.linalg.det(Q) # [num]
+    
+    # Construct correction vector [det, 1, 1]
+    correction = torch.ones(num, 3, device=device, dtype=dtype)
+    correction[:, 0] = det
+    
+    # Expand for broadcasting: Q is [num, 3, 3], correction is [num, 3] (acting on columns)
+    Q = Q * correction.unsqueeze(1)
+    
+    return Q.reshape(*shape, 3, 3)
 
 
 class Proteina(ModelTrainerBase):
