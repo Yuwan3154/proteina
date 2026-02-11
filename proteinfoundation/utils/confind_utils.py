@@ -27,6 +27,8 @@ def write_graph_pdb(graph, pdb_path: Path) -> None:
         raise ValueError("Graph missing coord_mask; cannot write PDB for confind.")
 
     coords = coords[:, PDB_TO_OPENFOLD_INDEX_TENSOR, :]
+    # center the coordinates of shape (n_res, 37, 3) to avoid confind OOM
+    coords[:,:3] = coords[:,:3] - coords[:,:3].mean(dim=(0,1), keepdim=True)
     coord_mask = coord_mask[:, PDB_TO_OPENFOLD_INDEX_TENSOR]
 
     write_prot_to_pdb(
