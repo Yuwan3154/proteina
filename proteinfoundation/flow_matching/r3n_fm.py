@@ -50,18 +50,31 @@ class _CoordinateFlowMatcher:
         Returns:
             Centered x = x - mean(x, dim=-2), shape [*, n, 3].
         """
+        import time
+        t0 = time.time()
+        print(f"DEBUG_TRACE_FM: _force_zero_com start shape={x.shape} device={x.device}")
+        
         if mask is None:
-            return x - torch.mean(x, dim=-2, keepdim=True)
+            res = x - torch.mean(x, dim=-2, keepdim=True)
+            print(f"DEBUG_TRACE_FM: _force_zero_com (no mask) done t={time.time()-t0:.3f}s")
+            return res
         if x.dim() == 3:
-            return (x - mean_w_mask(x, mask, keepdim=True)) * mask[..., None]
+            mean = mean_w_mask(x, mask, keepdim=True)
+            print(f"DEBUG_TRACE_FM: _force_zero_com (dim3) mean computed t={time.time()-t0:.3f}s")
+            res = (x - mean) * mask[..., None]
+            print(f"DEBUG_TRACE_FM: _force_zero_com (dim3) done t={time.time()-t0:.3f}s")
+            return res
         if x.dim() == 4:
             # Flatten atom/coord dims into feature dim so mean_w_mask sees shape [b, n, d]
             b, n, a, c = x.shape
             x_flat = x.view(b, n, a * c)
             mean_flat = mean_w_mask(x_flat, mask, keepdim=True)  # [b,1,a*c]
+            print(f"DEBUG_TRACE_FM: _force_zero_com (dim4) mean computed t={time.time()-t0:.3f}s")
             mean = mean_flat.view(b, 1, a, c)
             mask_exp = mask[..., None, None]  # [b,n,1,1]
-            return (x - mean) * mask_exp
+            res = (x - mean) * mask_exp
+            print(f"DEBUG_TRACE_FM: _force_zero_com (dim4) done t={time.time()-t0:.3f}s")
+            return res
         raise ValueError(f"_force_zero_com only supports 3D or 4D tensors, got shape {x.shape}")
 
     def _apply_mask(
@@ -98,9 +111,17 @@ class _CoordinateFlowMatcher:
         Returns:
             Masked (and possibly center) samples.
         """
+        import time
+        t0 = time.time()
+        print(f"DEBUG_TRACE_FM: _mask_and_zero_com start zero_com={self.zero_com}")
+        
         x = self._apply_mask(x, mask)
+        print(f"DEBUG_TRACE_FM: _apply_mask done t={time.time()-t0:.3f}s")
+        
         if self.zero_com:
             x = self._force_zero_com(x, mask)
+            print(f"DEBUG_TRACE_FM: _force_zero_com done t={time.time()-t0:.3f}s")
+        
         return x
 
     def _extend_t(self, n: int, t: Float[Tensor, "*"]) -> Float[Tensor, "* n"]:

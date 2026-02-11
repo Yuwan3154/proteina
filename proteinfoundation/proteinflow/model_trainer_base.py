@@ -685,7 +685,8 @@ class ModelTrainerBase(L.LightningModule):
             Training loss averaged over batches.
         """
         t0 = time.time()
-        logger.info(f"DEBUG_TRACE: training_step start batch_idx={batch_idx}")
+        rank = getattr(self, "global_rank", -1)
+        logger.info(f"DEBUG_TRACE: [rank={rank}] training_step start batch_idx={batch_idx}")
         self._debug_last_batch_idx = int(batch_idx)
         self._debug_nonfinite_loss_ids = None
         self._skip_update_due_to_nonfinite_loss = False
@@ -695,9 +696,11 @@ class ModelTrainerBase(L.LightningModule):
         # Extract inputs from batch (our dataloader)
         # This may apply augmentations, if requested in the config file
         x_1, mask, batch_shape, n, dtype = self.extract_clean_sample(batch)
+        logger.info(f"DEBUG_TRACE: [rank={rank}] extract_clean_sample done batch_idx={batch_idx} t={time.time()-t0:.3f}s")
+        
         # Center and mask input
         x_1 = self.fm._mask_and_zero_com(x_1, mask)
-        logger.info(f"DEBUG_TRACE: extracted clean sample batch_idx={batch_idx} t={time.time()-t0:.3f}s")
+        logger.info(f"DEBUG_TRACE: [rank={rank}] _mask_and_zero_com done batch_idx={batch_idx} t={time.time()-t0:.3f}s")
 
         # Sample time
         t = self.sample_t(batch_shape)

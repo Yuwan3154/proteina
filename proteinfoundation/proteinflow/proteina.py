@@ -267,30 +267,41 @@ class Proteina(ModelTrainerBase):
         naug * b. This should likely be implemented in the dataloaders.
 
         Args:
-            - x: Data batch, shape [b, n, 3]
+            - x: Data batch, shape [b, n, 3] or [b, n, atoms, 3]
             - mask: Binary, shape [b, n]
             - naug: Number of augmentations to apply to each sample, effectively increasing batch size if >1.
 
         Returns:
-            Augmented samples and mask, shapes [b * naug, n, 3] and [B * naug, n].
+            Augmented samples and mask, shapes [b * naug, n, 3] (or 4D) and [B * naug, n].
         """
-        assert (
-            x.ndim == 3
-        ), f"Augmetations can only be used for simple (x_1) batches [b, n, 3], current shape is {x.shape}"
         assert (
             mask.ndim == 2
         ), f"Augmetations can only be used for simple (mask) batches [b, n], current shape is {mask.shape}"
         assert naug >= 1, f"Number of augmentations (int) should >= 1, currently {naug}"
 
         # Repeat for multiple augmentations per sample
-        x = x.repeat([naug, 1, 1])  # [naug * b, n, 3]
+        # x shape: [b, ...]
+        repeats = [naug] + [1] * (x.ndim - 1)
+        x = x.repeat(repeats)  # [naug * b, ...]
         mask = mask.repeat([naug, 1])  # [naug * b, n]
 
-        # Sample and apply rotations
+        bs = x.shape[0]
+        # Sample rotations [bs, 3, 3]
         rots = sample_uniform_rotation(
-            shape=x.shape[:-2], dtype=x.dtype, device=x.device
-        )  # [naug * b, 3, 3]
-        x_rot = torch.matmul(x, rots)
+            shape=(bs,), dtype=x.dtype, device=x.device
+        )
+        
+        # Flatten x to [bs, -1, 3] for matmul
+        original_shape = x.shape
+        x_flat = x.view(bs, -1, 3)
+        
+        # Apply rotation: x_rot = x R (since x is row vectors)
+        # [bs, N, 3] @ [bs, 3, 3] -> [bs, N, 3]
+        x_rot_flat = torch.matmul(x_flat, rots)
+        
+        # Reshape back
+        x_rot = x_rot_flat.view(original_shape)
+        
         return self.fm._mask_and_zero_com(x_rot, mask), mask
 
     def compute_loss_weight(
