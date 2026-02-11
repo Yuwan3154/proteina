@@ -166,10 +166,10 @@ class Proteina(ModelTrainerBase):
         Returns:
             Tuple (x_1, mask, batch_shape, n, dtype)
         """
-        logger.info("DEBUG_TRACE: extract_clean_sample start")
+        self.logger.info("DEBUG_TRACE: extract_clean_sample start")
         coords = batch["coords"]  # [b, n, atoms, 3]
         mask = batch["mask_dict"]["coords"][..., 0, 0]  # [b, n] boolean
-        logger.info(f"DEBUG_TRACE: coords shape={coords.shape}, mask shape={mask.shape}")
+        self.logger.info(f"DEBUG_TRACE: coords shape={coords.shape}, mask shape={mask.shape}")
 
         predict_coords_mode = getattr(self.nn, "predict_coords", None)
         if self.contact_map_mode:
@@ -180,16 +180,16 @@ class Proteina(ModelTrainerBase):
         else:
             x_1 = coords[:, :, 1, :]  # CA only
         
-        logger.info(f"DEBUG_TRACE: x_1 shape={x_1.shape}")
+        self.logger.info(f"DEBUG_TRACE: x_1 shape={x_1.shape}")
 
         if self.cfg_exp.model.augmentation.global_rotation:
             if x_1.ndim == 3:
                 # CAREFUL: If naug_rot is > 1 this increases "batch size"
-                logger.info("DEBUG_TRACE: applying random rotation")
+                self.logger.info("DEBUG_TRACE: applying random rotation")
                 x_1, mask = self.apply_random_rotation(
                     x_1, mask, naug=self.cfg_exp.model.augmentation.naug_rot
                 )
-                logger.info("DEBUG_TRACE: random rotation applied")
+                self.logger.info("DEBUG_TRACE: random rotation applied")
             else:
                 # Skip rotation augmentation for atomized coordinates.
                 # (Random rotations here would require rotating all atoms consistently.)
@@ -202,7 +202,7 @@ class Proteina(ModelTrainerBase):
             batch_shape = x_1.shape[:-3]  # drop n and atom/coord dims, typically (b,)
             n = x_1.shape[-3]  # length dimension for atomized coords
         
-        logger.info("DEBUG_TRACE: extract_clean_sample end")
+        self.logger.info("DEBUG_TRACE: extract_clean_sample end")
         return (
             ang_to_nm(x_1),
             mask,
