@@ -166,10 +166,23 @@ class Proteina(ModelTrainerBase):
         Returns:
             Tuple (x_1, mask, batch_shape, n, dtype)
         """
-        print("DEBUG_TRACE: extract_clean_sample start")
+        import time
+        t_start = time.time()
+        print(f"DEBUG_TRACE: extract_clean_sample start t={t_start}")
+
+        # Try to identify batch
+        if "id" in batch:
+            print(f"DEBUG_TRACE: batch ids={batch['id']}")
+        elif "pdb_id" in batch:
+            print(f"DEBUG_TRACE: batch pdb_ids={batch['pdb_id']}")
+        elif "name" in batch:
+            print(f"DEBUG_TRACE: batch names={batch['name']}")
+        else:
+            print(f"DEBUG_TRACE: batch keys={list(batch.keys())}")
+
         coords = batch["coords"]  # [b, n, atoms, 3]
         mask = batch["mask_dict"]["coords"][..., 0, 0]  # [b, n] boolean
-        print(f"DEBUG_TRACE: coords shape={coords.shape}, mask shape={mask.shape}")
+        print(f"DEBUG_TRACE: coords shape={coords.shape} device={coords.device} dtype={coords.dtype} mask shape={mask.shape}")
 
         predict_coords_mode = getattr(self.nn, "predict_coords", None)
         if self.contact_map_mode:
@@ -180,19 +193,21 @@ class Proteina(ModelTrainerBase):
         else:
             x_1 = coords[:, :, 1, :]  # CA only
         
-        print(f"DEBUG_TRACE: x_1 shape={x_1.shape}")
+        print(f"DEBUG_TRACE: x_1 shape={x_1.shape} device={x_1.device} dtype={x_1.dtype}")
 
         if self.cfg_exp.model.augmentation.global_rotation:
             if x_1.ndim == 3:
                 # CAREFUL: If naug_rot is > 1 this increases "batch size"
                 print("DEBUG_TRACE: applying random rotation")
+                t_rot = time.time()
                 x_1, mask = self.apply_random_rotation(
                     x_1, mask, naug=self.cfg_exp.model.augmentation.naug_rot
                 )
-                print("DEBUG_TRACE: random rotation applied")
+                print(f"DEBUG_TRACE: random rotation applied t={time.time() - t_rot:.3f}s")
             else:
                 # Skip rotation augmentation for atomized coordinates.
                 # (Random rotations here would require rotating all atoms consistently.)
+                print("DEBUG_TRACE: skipping rotation (x_1.ndim != 3)")
                 pass
         
         if x_1.dim() == 3:
@@ -202,9 +217,14 @@ class Proteina(ModelTrainerBase):
             batch_shape = x_1.shape[:-3]  # drop n and atom/coord dims, typically (b,)
             n = x_1.shape[-3]  # length dimension for atomized coords
         
-        print("DEBUG_TRACE: extract_clean_sample end")
+        t_conv = time.time()
+        print(f"DEBUG_TRACE: starting ang_to_nm conversion t={t_conv}")
+        x_1_nm = ang_to_nm(x_1)
+        print(f"DEBUG_TRACE: finished ang_to_nm conversion t={time.time() - t_conv:.3f}s")
+        
+        print(f"DEBUG_TRACE: extract_clean_sample end total_t={time.time() - t_start:.3f}s")
         return (
-            ang_to_nm(x_1),
+            x_1_nm,
             mask,
             batch_shape,
             n,
