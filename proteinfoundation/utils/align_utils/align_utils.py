@@ -32,16 +32,41 @@ def mean_w_mask(a, mask, keepdim=True):
     Returns:
         Masked mean of a across dimension -2 (or n)
     """
+    import time
+    import torch.distributed as dist
+    rank = dist.get_rank() if dist.is_initialized() else -1
+    t0 = time.time()
+    print(f"DEBUG_TRACE_ALIGN: [rank={rank}] mean_w_mask start shape={a.shape} mask={mask.shape}")
+
     mask = mask[..., None]  # [*, n, 1]
-    num_elements = torch.sum(mask, dim=-2, keepdim=True)  # [*, 1, 1]
-    num_elements = torch.where(
-        num_elements == 0, torch.tensor(1.0, device=num_elements.device, dtype=num_elements.dtype), num_elements
-    )  # [*, 1, 1]
+    print(f"DEBUG_TRACE_ALIGN: [rank={rank}] mask unsqueezed t={time.time()-t0:.4f}s")
+
+    # Ensure num_elements is float for division
+    num_elements = torch.sum(mask, dim=-2, keepdim=True).float()  # [*, 1, 1]
+    print(f"DEBUG_TRACE_ALIGN: [rank={rank}] num_elements sum done t={time.time()-t0:.4f}s")
+
+    # Use clamp to avoid 0 division and avoid creating host tensors for synchronization
+    denom = num_elements.clamp(min=1.0)
+    print(f"DEBUG_TRACE_ALIGN: [rank={rank}] denom clamp done t={time.time()-t0:.4f}s")
+
     a_masked = torch.masked_fill(a, ~mask, 0.0)  # [*, n, d]
-    mean = torch.sum(a_masked, dim=-2, keepdim=True) / num_elements  # [*, 1, d]
+    print(f"DEBUG_TRACE_ALIGN: [rank={rank}] masked_fill done t={time.time()-t0:.4f}s")
+
+    sum_a = torch.sum(a_masked, dim=-2, keepdim=True)
+    print(f"DEBUG_TRACE_ALIGN: [rank={rank}] sum_a done t={time.time()-t0:.4f}s")
+
+    mean = sum_a / denom  # [*, 1, d]
+    print(f"DEBUG_TRACE_ALIGN: [rank={rank}] div done t={time.time()-t0:.4f}s")
+
+    # Re-masking is technically redundant if sum_a is 0 where mask is 0, but good for safety
+    # Using num_elements (which has 0s) to mask
     mean = torch.masked_fill(mean, num_elements == 0, 0.0)  # [*, 1, d]
+    print(f"DEBUG_TRACE_ALIGN: [rank={rank}] final masked_fill done t={time.time()-t0:.4f}s")
+
     if not keepdim:
         mean = einops.rearrange(mean, "... () d -> ... d")
+    
+    print(f"DEBUG_TRACE_ALIGN: [rank={rank}] mean_w_mask done t={time.time()-t0:.4f}s")
     return mean
 
 
