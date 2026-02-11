@@ -29,9 +29,10 @@
 import io
 import os
 import re
-from typing import Any, List, Literal, Mapping, Optional
+from typing import Any, List, Literal, Mapping, Optional, Union
 
 import numpy as np
+import torch
 from Bio.PDB import PDBParser
 
 from proteinfoundation.openfold_stub.np import residue_constants
@@ -377,7 +378,7 @@ def mask_cath_code_by_level(
         _cath_code.append(".".join(code))
     return _cath_code
 
-def mask_seq(seq: np.ndarray, mask_seq_proportion: float) -> np.ndarray:
+def mask_seq(seq: Union[np.ndarray, torch.Tensor], mask_seq_proportion: float) -> Union[np.ndarray, torch.Tensor]:
     """Mask sequence.
 
     Args:
@@ -387,6 +388,13 @@ def mask_seq(seq: np.ndarray, mask_seq_proportion: float) -> np.ndarray:
     if mask_seq_proportion == 0:
         return seq
     seq_len = seq.shape[0]
-    mask_idx = np.random.choice(range(seq_len), size=int(seq_len * mask_seq_proportion), replace=False)
-    seq[mask_idx] = 20
+    num_mask = int(seq_len * mask_seq_proportion)
+    
+    if isinstance(seq, torch.Tensor):
+        if num_mask > 0:
+            mask_idx = torch.randperm(seq_len, device=seq.device)[:num_mask]
+            seq[mask_idx] = 20
+    else:
+        mask_idx = np.random.choice(range(seq_len), size=num_mask, replace=False)
+        seq[mask_idx] = 20
     return seq
