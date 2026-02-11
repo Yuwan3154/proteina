@@ -390,11 +390,15 @@ def mask_seq(seq: Union[np.ndarray, torch.Tensor], mask_seq_proportion: float) -
     seq_len = seq.shape[0]
     num_mask = int(seq_len * mask_seq_proportion)
     
+    print(f"DEBUG_PDB: mask_seq len={seq_len} type={type(seq)} num_mask={num_mask}", flush=True)
+
     if isinstance(seq, torch.Tensor):
         if num_mask > 0:
             mask_idx = torch.randperm(seq_len, device=seq.device)[:num_mask]
             seq[mask_idx] = 20
+        print("DEBUG_PDB: mask_seq tensor done", flush=True)
     else:
         mask_idx = np.random.choice(range(seq_len), size=num_mask, replace=False)
         seq[mask_idx] = 20
+        print("DEBUG_PDB: mask_seq numpy done", flush=True)
     return seq

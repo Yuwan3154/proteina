@@ -818,13 +818,15 @@ class ModelTrainerBase(L.LightningModule):
             logger.info(f"DEBUG_TRACE: [rank={rank}] seq_cond start batch_idx={batch_idx}")
             # Get the sequence from the batch
             seq = batch["residue_type"]
+            seq[seq == -1] = 20
             # Preserve the unmasked sequence for logging / IPA geometry (do this before masking)
             if "residue_type_unmasked" not in batch:
+                print(f"DEBUG_TRACE: [rank={rank}] residue_type_unmasked not in batch creating clone")
                 residue_type_unmasked = seq.clone()
-                residue_type_unmasked[residue_type_unmasked == -1] = 20
+                print(f"DEBUG_TRACE: [rank={rank}] residue_type_unmasked cloned batch_idx={batch_idx}")
                 batch["residue_type_unmasked"] = residue_type_unmasked
+                print(f"DEBUG_TRACE: [rank={rank}] residue_type_unmasked added to batch batch_idx={batch_idx}")
 
-            seq[seq == -1] = 20
             # Mask the sequence
             for i in range(len(seq)):
                 seq[i] = mask_seq(seq[i], self.cfg_exp.training.mask_seq_proportion)
