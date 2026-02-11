@@ -784,6 +784,7 @@ class ModelTrainerBase(L.LightningModule):
 
         # Fold conditional training
         if self.cfg_exp.training.fold_cond:
+            logger.info(f"DEBUG_TRACE: [rank={rank}] fold_cond start batch_idx={batch_idx}")
             bs = x_1.shape[0]
             cath_code_list = batch.cath_code
             for i in range(bs):
@@ -807,12 +808,14 @@ class ModelTrainerBase(L.LightningModule):
                                 cath_code_list[i], level="C"
                             )
             batch.cath_code = cath_code_list
+            logger.info(f"DEBUG_TRACE: [rank={rank}] fold_cond end batch_idx={batch_idx}")
         else:
             if "cath_code" in batch:
                 batch.pop("cath_code")
 
         # Sequence conditional training
         if self.cfg_exp.training.seq_cond:
+            logger.info(f"DEBUG_TRACE: [rank={rank}] seq_cond start batch_idx={batch_idx}")
             # Get the sequence from the batch
             seq = batch["residue_type"]
             # Preserve the unmasked sequence for logging / IPA geometry (do this before masking)
@@ -826,6 +829,7 @@ class ModelTrainerBase(L.LightningModule):
             for i in range(len(seq)):
                 seq[i] = mask_seq(seq[i], self.cfg_exp.training.mask_seq_proportion)
             batch["residue_type"] = seq
+            logger.info(f"DEBUG_TRACE: [rank={rank}] seq_cond end batch_idx={batch_idx}")
         else:
             # Keep residue_type if IPA coordinates are needed for contact_map_mode
             need_residue_type = (

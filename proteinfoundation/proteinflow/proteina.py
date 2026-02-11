@@ -316,9 +316,11 @@ class Proteina(ModelTrainerBase):
 
         bs = x.shape[0]
         # Sample rotations [bs, 3, 3]
+        print(f"DEBUG_TRACE: apply_random_rotation: sampling rotation bs={bs}", flush=True)
         rots = sample_uniform_rotation(
             shape=(bs,), dtype=x.dtype, device=x.device
         )
+        print(f"DEBUG_TRACE: apply_random_rotation: rotation sampled", flush=True)
         
         # Flatten x to [bs, -1, 3] for matmul
         original_shape = x.shape
@@ -331,6 +333,7 @@ class Proteina(ModelTrainerBase):
         # Reshape back
         x_rot = x_rot_flat.view(original_shape)
         
+        print(f"DEBUG_TRACE: apply_random_rotation: rotation applied, calling _mask_and_zero_com", flush=True)
         return self.fm._mask_and_zero_com(x_rot, mask), mask
 
     def compute_loss_weight(
