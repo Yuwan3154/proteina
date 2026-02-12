@@ -394,8 +394,13 @@ def mask_seq(seq: Union[np.ndarray, torch.Tensor], mask_seq_proportion: float) -
 
     if isinstance(seq, torch.Tensor):
         if num_mask > 0:
-            mask_idx = torch.randperm(seq_len, device=seq.device)[:num_mask]
+            # Generate on CPU to avoid potential CUDA RNG issues/hangs
+            print("DEBUG_PDB: generating mask_idx on CPU", flush=True)
+            mask_idx = torch.randperm(seq_len, device='cpu')[:num_mask].to(seq.device)
+            
+            print(f"DEBUG_PDB: generated mask_idx (moved to {seq.device}), assigning value", flush=True)
             seq[mask_idx] = 20
+            print("DEBUG_PDB: assigned value", flush=True)
         print("DEBUG_PDB: mask_seq tensor done", flush=True)
     else:
         mask_idx = np.random.choice(range(seq_len), size=num_mask, replace=False)

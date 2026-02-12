@@ -828,9 +828,15 @@ class ModelTrainerBase(L.LightningModule):
                 print(f"DEBUG_TRACE: [rank={rank}] residue_type_unmasked added to batch batch_idx={batch_idx}")
 
             # Mask the sequence
+            print(f"DEBUG_TRACE: [rank={rank}] starting mask_seq loop batch_idx={batch_idx}", flush=True)
             for i in range(len(seq)):
                 seq[i] = mask_seq(seq[i], self.cfg_exp.training.mask_seq_proportion)
+                print(f"DEBUG_TRACE: [rank={rank}] mask_seq done for i={i} batch_idx={batch_idx}", flush=True)
+            
+            print(f"DEBUG_TRACE: [rank={rank}] assigning seq to batch batch_idx={batch_idx}", flush=True)
             batch["residue_type"] = seq
+            print(f"DEBUG_TRACE: [rank={rank}] assigned seq to batch batch_idx={batch_idx}", flush=True)
+
             logger.info(f"DEBUG_TRACE: [rank={rank}] seq_cond end batch_idx={batch_idx}")
         else:
             # Keep residue_type if IPA coordinates are needed for contact_map_mode
