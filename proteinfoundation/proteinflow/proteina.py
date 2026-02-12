@@ -198,26 +198,8 @@ class Proteina(ModelTrainerBase):
         Returns:
             Tuple (x_1, mask, batch_shape, n, dtype)
         """
-        import time
-        import torch.distributed as dist
-        
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        t_start = time.time()
-        print(f"DEBUG_TRACE: [rank={rank}] extract_clean_sample start t={t_start}")
-
-        # Try to identify batch
-        if "id" in batch:
-            print(f"DEBUG_TRACE: [rank={rank}] batch ids={batch['id']}")
-        elif "pdb_id" in batch:
-            print(f"DEBUG_TRACE: [rank={rank}] batch pdb_ids={batch['pdb_id']}")
-        elif "name" in batch:
-            print(f"DEBUG_TRACE: [rank={rank}] batch names={batch['name']}")
-        else:
-            print(f"DEBUG_TRACE: [rank={rank}] batch keys={list(batch.keys())}")
-
         coords = batch["coords"]  # [b, n, atoms, 3]
         mask = batch["mask_dict"]["coords"][..., 0, 0]  # [b, n] boolean
-        print(f"DEBUG_TRACE: [rank={rank}] coords shape={coords.shape} device={coords.device} dtype={coords.dtype} mask shape={mask.shape}")
 
         predict_coords_mode = getattr(self.nn, "predict_coords", None)
         if self.contact_map_mode:
@@ -228,16 +210,11 @@ class Proteina(ModelTrainerBase):
         else:
             x_1 = coords[:, :, 1, :]  # CA only
         
-        print(f"DEBUG_TRACE: [rank={rank}] x_1 shape={x_1.shape} device={x_1.device} dtype={x_1.dtype}")
-
         if self.cfg_exp.model.augmentation.global_rotation:
             # CAREFUL: If naug_rot is > 1 this increases "batch size"
-            print(f"DEBUG_TRACE: [rank={rank}] applying random rotation")
-            t_rot = time.time()
             x_1, mask = self.apply_random_rotation(
                 x_1, mask, naug=self.cfg_exp.model.augmentation.naug_rot
             )
-            print(f"DEBUG_TRACE: [rank={rank}] random rotation applied t={time.time() - t_rot:.3f}s")
         
         if x_1.dim() == 3:
             batch_shape = x_1.shape[:-2]  # typically (b,)
@@ -246,12 +223,7 @@ class Proteina(ModelTrainerBase):
             batch_shape = x_1.shape[:-3]  # drop n and atom/coord dims, typically (b,)
             n = x_1.shape[-3]  # length dimension for atomized coords
         
-        t_conv = time.time()
-        print(f"DEBUG_TRACE: [rank={rank}] starting ang_to_nm conversion t={t_conv}")
         x_1_nm = ang_to_nm(x_1)
-        print(f"DEBUG_TRACE: [rank={rank}] finished ang_to_nm conversion t={time.time() - t_conv:.3f}s")
-        
-        print(f"DEBUG_TRACE: [rank={rank}] extract_clean_sample end total_t={time.time() - t_start:.3f}s")
         return (
             x_1_nm,
             mask,
@@ -316,11 +288,9 @@ class Proteina(ModelTrainerBase):
 
         bs = x.shape[0]
         # Sample rotations [bs, 3, 3]
-        print(f"DEBUG_TRACE: apply_random_rotation: sampling rotation bs={bs}", flush=True)
         rots = sample_uniform_rotation(
             shape=(bs,), dtype=x.dtype, device=x.device
         )
-        print(f"DEBUG_TRACE: apply_random_rotation: rotation sampled", flush=True)
         
         # Flatten x to [bs, -1, 3] for matmul
         original_shape = x.shape
@@ -333,7 +303,6 @@ class Proteina(ModelTrainerBase):
         # Reshape back
         x_rot = x_rot_flat.view(original_shape)
         
-        print(f"DEBUG_TRACE: apply_random_rotation: rotation applied, calling _mask_and_zero_com", flush=True)
         return self.fm._mask_and_zero_com(x_rot, mask), mask
 
     def compute_loss_weight(
