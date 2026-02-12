@@ -378,16 +378,17 @@ def mask_cath_code_by_level(
         _cath_code.append(".".join(code))
     return _cath_code
 
-def mask_seq(seq: Union[np.ndarray, torch.Tensor], mask_seq_proportion: float) -> Union[np.ndarray, torch.Tensor]:
+def mask_seq(seq: Union[np.ndarray, torch.Tensor], mask: Union[np.ndarray, torch.Tensor], mask_seq_proportion: float) -> Union[np.ndarray, torch.Tensor]:
     """Mask sequence.
 
     Args:
       seq: Sequence.
+      mask: Mask.
       mask_seq_proportion: Proportion of sequence to be masked.
     """
     if mask_seq_proportion == 0:
         return seq
-    seq_len = seq.shape[0]
+    seq_len = mask.sum().int().item()
     num_mask = int(seq_len * mask_seq_proportion)
     
     print(f"DEBUG_PDB: mask_seq len={seq_len} type={type(seq)} num_mask={num_mask}", flush=True)
@@ -396,7 +397,9 @@ def mask_seq(seq: Union[np.ndarray, torch.Tensor], mask_seq_proportion: float) -
         if num_mask > 0:
             # Generate on CPU to avoid potential CUDA RNG issues/hangs
             print("DEBUG_PDB: generating mask_idx on CPU", flush=True)
-            mask_idx = torch.randperm(seq_len, device='cpu')[:num_mask].to(seq.device)
+            mask_idx = torch.randperm(seq_len, device=seq.device)
+            print(f"DEBUG_PDB: subsetting mask_idx to {num_mask}", flush=True)
+            mask_idx = mask_idx[:num_mask]
             
             print(f"DEBUG_PDB: generated mask_idx (moved to {seq.device}), assigning value", flush=True)
             seq[mask_idx] = 20
