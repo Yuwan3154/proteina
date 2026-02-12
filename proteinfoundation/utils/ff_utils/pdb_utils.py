@@ -388,27 +388,47 @@ def mask_seq(seq: Union[np.ndarray, torch.Tensor], mask: Union[np.ndarray, torch
     """
     if mask_seq_proportion == 0:
         return seq
-    print(f"DEBUG_PDB: summing mask type={type(mask)}", flush=True)
-    seq_len = mask.detach().cpu().numpy().sum()
-    print(f"DEBUG_PDB: seq_len={seq_len} type={type(seq_len)}", flush=True)
-    num_mask = int(seq_len * mask_seq_proportion)
-    
-    print(f"DEBUG_PDB: mask_seq len={seq_len} type={type(seq)} num_mask={num_mask}", flush=True)
 
     if isinstance(seq, torch.Tensor):
+        # GPU-friendly implementation avoiding CPU sync
+        # Assume mask is also a tensor on the same device
+        seq_len = mask.sum()
+        num_mask = (seq_len.float() * mask_seq_proportion).long()
+        
         if num_mask > 0:
-            # Generate on CPU to avoid potential CUDA RNG issues/hangs
-            print(f"DEBUG_PDB: generating mask_idx on device={seq.device}", flush=True)
-            mask_idx = torch.randperm(seq_len, device=seq.device)
-            print(f"DEBUG_PDB: subsetting mask_idx to {num_mask}", flush=True)
-            mask_idx = mask_idx[:num_mask]
+            # Generate random noise for sorting
+            # Assign -inf to masked positions (padding) so they are sorted to the end
+            noise = torch.rand_like(seq, dtype=torch.float32)
+            noise = torch.where(mask.bool(), noise, torch.tensor(-1e9, device=seq.device))
             
-            print(f"DEBUG_PDB: generated mask_idx (moved to {seq.device}), assigning value", flush=True)
-            seq[mask_idx] = 20
-            print("DEBUG_PDB: assigned value", flush=True)
-        print("DEBUG_PDB: mask_seq tensor done", flush=True)
+            # Sort descending to get random valid indices at the top
+            _, sorted_indices = torch.sort(noise, descending=True)
+            
+            # Select the top num_mask indices
+            # Create a range [0, 1, ..., L-1] to compare against num_mask
+            indices_range = torch.arange(seq.size(0), device=seq.device)
+            target_mask = indices_range < num_mask
+            selected_indices = sorted_indices[target_mask]
+            
+            # Apply masking
+            seq[selected_indices] = 20
+            
     else:
-        mask_idx = np.random.choice(range(seq_len), size=num_mask, replace=False)
-        seq[mask_idx] = 20
-        print("DEBUG_PDB: mask_seq numpy done", flush=True)
+        # Numpy fallback
+        if hasattr(mask, "detach"):
+            mask_np = mask.detach().cpu().numpy()
+        elif isinstance(mask, np.ndarray):
+            mask_np = mask
+        else:
+            mask_np = np.array(mask)
+            
+        seq_len = mask_np.sum()
+        num_mask = int(seq_len * mask_seq_proportion)
+        
+        if num_mask > 0:
+            # Note: This assumes valid elements are contiguous at the start [0..seq_len-1]
+            # which matches the behavior of the original torch.randperm implementation.
+            mask_idx = np.random.choice(range(int(seq_len)), size=num_mask, replace=False)
+            seq[mask_idx] = 20
+
     return seq
