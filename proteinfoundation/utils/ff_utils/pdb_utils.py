@@ -393,6 +393,7 @@ def mask_seq(seq: Union[np.ndarray, torch.Tensor], mask: Union[np.ndarray, torch
         # GPU-friendly implementation avoiding CPU sync
         # Assume mask is also a tensor on the same device
         seq_len = mask.sum()
+        print(f"DEBUG_PDB: seq_len={seq_len} type={type(seq_len)}", flush=True)
         num_mask = (seq_len.float() * mask_seq_proportion).long()
         
         if num_mask > 0:
