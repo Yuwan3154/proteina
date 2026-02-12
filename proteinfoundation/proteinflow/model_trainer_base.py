@@ -686,7 +686,6 @@ class ModelTrainerBase(L.LightningModule):
         """
         t0 = time.time()
         rank = getattr(self, "global_rank", -1)
-        logger.info(f"DEBUG_TRACE: [rank={rank}] training_step start batch_idx={batch_idx}")
         self._debug_last_batch_idx = int(batch_idx)
         self._debug_nonfinite_loss_ids = None
         self._skip_update_due_to_nonfinite_loss = False
@@ -696,11 +695,9 @@ class ModelTrainerBase(L.LightningModule):
         # Extract inputs from batch (our dataloader)
         # This may apply augmentations, if requested in the config file
         x_1, mask, batch_shape, n, dtype = self.extract_clean_sample(batch)
-        logger.info(f"DEBUG_TRACE: [rank={rank}] extract_clean_sample done batch_idx={batch_idx} t={time.time()-t0:.3f}s")
         
         # Center and mask input
         x_1 = self.fm._mask_and_zero_com(x_1, mask)
-        logger.info(f"DEBUG_TRACE: [rank={rank}] _mask_and_zero_com done batch_idx={batch_idx} t={time.time()-t0:.3f}s")
 
         # Sample time
         t = self.sample_t(batch_shape)
@@ -780,11 +777,9 @@ class ModelTrainerBase(L.LightningModule):
         batch["t"] = t
         batch["mask"] = mask
         batch["x_t"] = x_t
-        logger.info(f"DEBUG_TRACE: pre-forward prep done batch_idx={batch_idx} t={time.time()-t0:.3f}s")
 
         # Fold conditional training
         if self.cfg_exp.training.fold_cond:
-            logger.info(f"DEBUG_TRACE: [rank={rank}] fold_cond start batch_idx={batch_idx}")
             bs = x_1.shape[0]
             cath_code_list = batch.cath_code
             for i in range(bs):
@@ -808,40 +803,26 @@ class ModelTrainerBase(L.LightningModule):
                                 cath_code_list[i], level="C"
                             )
             batch.cath_code = cath_code_list
-            logger.info(f"DEBUG_TRACE: [rank={rank}] fold_cond end batch_idx={batch_idx}")
         else:
             if "cath_code" in batch:
                 batch.pop("cath_code")
 
         # Sequence conditional training
         if self.cfg_exp.training.seq_cond:
-            logger.info(f"DEBUG_TRACE: [rank={rank}] seq_cond start batch_idx={batch_idx}")
             # Get the sequence from the batch
             seq = batch["residue_type"]
             seq[seq == -1] = 20
             # Preserve the unmasked sequence for logging / IPA geometry (do this before masking)
             if "residue_type_unmasked" not in batch:
-                print(f"DEBUG_TRACE: [rank={rank}] residue_type_unmasked not in batch creating clone")
                 residue_type_unmasked = seq.clone().detach()
-                print(f"DEBUG_TRACE: [rank={rank}] residue_type_unmasked cloned batch_idx={batch_idx}")
                 batch["residue_type_unmasked"] = residue_type_unmasked
-                print(f"DEBUG_TRACE: [rank={rank}] residue_type_unmasked added to batch batch_idx={batch_idx}")
 
             # Mask the sequence
-            if torch.distributed.is_initialized():
-                torch.distributed.barrier()
-            print(f"DEBUG_TRACE: [rank={rank}] starting mask_seq loop batch_idx={batch_idx}", flush=True)
             for i in range(len(seq)):
                 seq[i] = mask_seq(seq[i], mask[i], self.cfg_exp.training.mask_seq_proportion)
-                print(f"DEBUG_TRACE: [rank={rank}] mask_seq done for i={i} batch_idx={batch_idx}", flush=True)
             
-            print(f"DEBUG_TRACE: [rank={rank}] assigning seq to batch batch_idx={batch_idx}", flush=True)
             batch["residue_type"] = seq
-            print(f"DEBUG_TRACE: [rank={rank}] assigned seq to batch batch_idx={batch_idx}", flush=True)
-            if torch.distributed.is_initialized():
-                torch.distributed.barrier()
 
-            logger.info(f"DEBUG_TRACE: [rank={rank}] seq_cond end batch_idx={batch_idx}")
         else:
             # Keep residue_type if IPA coordinates are needed for contact_map_mode
             need_residue_type = (
@@ -850,7 +831,6 @@ class ModelTrainerBase(L.LightningModule):
             )
             if "residue_type" in batch and not need_residue_type:
                 batch.pop("residue_type")
-                print("residue_type removed from batch")
 
         # CIRPIN conditional training
         if self.cfg_exp.training.get("cirpin_cond", False):
@@ -881,8 +861,6 @@ class ModelTrainerBase(L.LightningModule):
             if "cirpin_emb_fallback" in batch:
                 batch.pop("cirpin_emb_fallback")
         
-        logger.info(f"DEBUG_TRACE: cond prep done batch_idx={batch_idx} t={time.time()-t0:.3f}s")
-
         # Prediction for self-conditioning
         if random.random() > 0.5 and self.cfg_exp.training.self_cond:
             if contact_map_mode:
@@ -892,9 +870,7 @@ class ModelTrainerBase(L.LightningModule):
                 with torch.no_grad():
                     self._maybe_update_self_cond_copy()
                     sc_model = getattr(self, "nn_sc", None) or self.nn
-                    logger.info(f"DEBUG_TRACE: starting self-cond forward batch_idx={batch_idx} t={time.time()-t0:.3f}s")
                     nn_out_sc = sc_model(batch)
-                    logger.info(f"DEBUG_TRACE: finished self-cond forward batch_idx={batch_idx} t={time.time()-t0:.3f}s")
                     c_pred_sc = self._nn_out_to_c_clean(nn_out_sc, batch)
                 if c_pred_sc is not None:
                     # `c_pred_sc` is already activated in model/data space.
@@ -905,9 +881,7 @@ class ModelTrainerBase(L.LightningModule):
                 with torch.no_grad(): 
                     self._maybe_update_self_cond_copy()
                     sc_model = getattr(self, "nn_sc", None) or self.nn
-                    logger.info(f"DEBUG_TRACE: starting self-cond forward batch_idx={batch_idx} t={time.time()-t0:.3f}s")
                     nn_out_sc = sc_model(batch)
-                    logger.info(f"DEBUG_TRACE: finished self-cond forward batch_idx={batch_idx} t={time.time()-t0:.3f}s")
                     x_pred_sc = self._nn_out_to_x_clean(nn_out_sc, batch)
                 if x_pred_sc is not None:
                     batch["x_sc"] = self.detach_gradients(x_pred_sc)
@@ -920,9 +894,7 @@ class ModelTrainerBase(L.LightningModule):
                 batch["x_sc"] = torch.zeros_like(x_1)
 
         # Main prediction
-        logger.info(f"DEBUG_TRACE: starting main forward batch_idx={batch_idx} t={time.time()-t0:.3f}s")
         nn_out = self.predict_clean(batch)
-        logger.info(f"DEBUG_TRACE: finished main forward batch_idx={batch_idx} t={time.time()-t0:.3f}s")
 
         def _sanitize_and_log_loss_vec(loss_vec: torch.Tensor, name: str) -> torch.Tensor:
             """
@@ -1105,8 +1077,6 @@ class ModelTrainerBase(L.LightningModule):
             add_dataloader_idx=False,
         )
 
-        logger.info(f"DEBUG_TRACE: loss computed batch_idx={batch_idx} t={time.time()-t0:.3f}s")
-
         # Don't log if validation step (indicated by batch_id)
         if not val_step:
             self.log(
@@ -1230,7 +1200,6 @@ class ModelTrainerBase(L.LightningModule):
                     ),
                 )
 
-        logger.info(f"DEBUG_TRACE: training_step end batch_idx={batch_idx} t={time.time()-t0:.3f}s")
         return train_loss
     
     def _log_structure_visualization(

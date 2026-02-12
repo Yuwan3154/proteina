@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import numpy as np
-import torch
 
 from proteinfoundation.utils.constants import PDB_TO_OPENFOLD_INDEX_TENSOR
 from proteinfoundation.utils.ff_utils.pdb_utils import write_prot_to_pdb
