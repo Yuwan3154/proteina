@@ -388,7 +388,9 @@ def mask_seq(seq: Union[np.ndarray, torch.Tensor], mask: Union[np.ndarray, torch
     """
     if mask_seq_proportion == 0:
         return seq
-    seq_len = mask.sum().int().item()
+    print(f"DEBUG_PDB: summing mask type={type(mask)}", flush=True)
+    seq_len = mask.detach().cpu().long().sum().item()
+    print(f"DEBUG_PDB: seq_len={seq_len} type={type(seq_len)}", flush=True)
     num_mask = int(seq_len * mask_seq_proportion)
     
     print(f"DEBUG_PDB: mask_seq len={seq_len} type={type(seq)} num_mask={num_mask}", flush=True)
@@ -396,7 +398,7 @@ def mask_seq(seq: Union[np.ndarray, torch.Tensor], mask: Union[np.ndarray, torch
     if isinstance(seq, torch.Tensor):
         if num_mask > 0:
             # Generate on CPU to avoid potential CUDA RNG issues/hangs
-            print("DEBUG_PDB: generating mask_idx on CPU", flush=True)
+            print(f"DEBUG_PDB: generating mask_idx on device={seq.device}", flush=True)
             mask_idx = torch.randperm(seq_len, device=seq.device)
             print(f"DEBUG_PDB: subsetting mask_idx to {num_mask}", flush=True)
             mask_idx = mask_idx[:num_mask]
