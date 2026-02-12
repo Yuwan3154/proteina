@@ -389,7 +389,7 @@ def mask_seq(seq: Union[np.ndarray, torch.Tensor], mask: Union[np.ndarray, torch
     if mask_seq_proportion == 0:
         return seq
     print(f"DEBUG_PDB: summing mask type={type(mask)}", flush=True)
-    seq_len = mask.detach().cpu().long().sum().item()
+    seq_len = mask.detach().cpu().numpy().sum()
     print(f"DEBUG_PDB: seq_len={seq_len} type={type(seq_len)}", flush=True)
     num_mask = int(seq_len * mask_seq_proportion)
     
