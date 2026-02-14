@@ -12,10 +12,11 @@ import numpy as np
 
 from proteinfoundation.utils.constants import PDB_TO_OPENFOLD_INDEX_TENSOR
 from proteinfoundation.utils.ff_utils.pdb_utils import write_prot_to_pdb
+from proteinfoundation.utils.align_utils.align_utils import mean_w_mask
 
 
 def write_graph_pdb(graph, pdb_path: Path) -> None:
-    coords = graph.coords
+    coords = graph.coords.detach().clone()
     coord_mask = getattr(graph, "coord_mask", None)
     residue_type = getattr(graph, "residue_type", None)
     chain_index = getattr(graph, "chains", None)
@@ -25,10 +26,16 @@ def write_graph_pdb(graph, pdb_path: Path) -> None:
     if coord_mask is None:
         raise ValueError("Graph missing coord_mask; cannot write PDB for confind.")
 
-    coords = coords[:, PDB_TO_OPENFOLD_INDEX_TENSOR, :]
-    # center the coordinates of shape (n_res, 37, 3) to avoid confind OOM
-    coords[:,:3] = coords[:,:3] - coords[:,:3].mean(dim=(0,1), keepdim=True)
-    coord_mask = coord_mask[:, PDB_TO_OPENFOLD_INDEX_TENSOR]
+    idx = PDB_TO_OPENFOLD_INDEX_TENSOR.to(coords.device)
+    coords = coords[:, idx, :]
+    coord_mask = coord_mask[:, idx]
+
+    # Mask: coord_mask > 0.5 indicates valid (non-fill) coordinates in .pt files
+    mask_bool = coord_mask > 0.5
+    coords_flat = coords.reshape(1, -1, 3)
+    mask_flat = mask_bool.reshape(1, -1)
+    mean = mean_w_mask(coords_flat, mask_flat, keepdim=True)
+    coords = coords - mean
 
     write_prot_to_pdb(
         coords.detach().cpu().numpy(),
@@ -48,6 +55,7 @@ def run_confind(
     confind_bin: str = "confind",
     omp_threads: int = 1,
     renumber: bool = True,
+    timeout: Optional[int] = None,
 ) -> None:
     env = os.environ.copy()
     env["OMP_NUM_THREADS"] = str(omp_threads)
@@ -62,7 +70,14 @@ def run_confind(
     ]
     if renumber:
         cmd.append("--ren")
-    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    subprocess.run(
+        cmd,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        timeout=timeout,
+    )
 
 
 def parse_confind_contacts(
@@ -132,6 +147,7 @@ def confind_raw_contact_map(
     confind_bin: str = "confind",
     omp_threads: int = 1,
     renumber: bool = True,
+    timeout: Optional[int] = None,
 ) -> np.ndarray:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
@@ -145,6 +161,7 @@ def confind_raw_contact_map(
             confind_bin=confind_bin,
             omp_threads=omp_threads,
             renumber=renumber,
+            timeout=timeout,
         )
         return parse_confind_contacts(
             contact_path, expected_len=graph.coords.shape[0], renumbered=renumber

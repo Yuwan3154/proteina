@@ -12,7 +12,7 @@ import torch
 from openfold.np import protein
 from openfold.np import residue_constants as rc
 
-from proteinfoundation.utils.openfold_inference import OpenFoldDistogramOnlyInference
+from proteinfoundation.utils.openfold_inference import OpenFoldTemplateInference
 
 
 @dataclass(frozen=True)
@@ -268,7 +268,7 @@ def main() -> None:
         remark="GT from input PDB (filtered: drop X/UNK residues)",
     )
 
-    infer = OpenFoldDistogramOnlyInference(
+    infer = OpenFoldTemplateInference(
         model_name=args.model_name,
         jax_params_path=args.jax_params,
         device=device,
@@ -311,9 +311,13 @@ def main() -> None:
         kalign_binary_path=args.kalign_binary_path,
         mask_template_aatype=args.template_all_x,
     )
-    atom37_w_t = out["atom37"]
+    atom_pos = out["final_atom_positions"]
+    if atom_pos.dim() == 3:
+        atom37_w_t = atom_pos.unsqueeze(0)
+    else:
+        atom37_w_t = atom_pos
     if atom37_w_t.ndim != 4 or atom37_w_t.shape[0] != 1 or atom37_w_t.shape[2] != rc.atom_type_num or atom37_w_t.shape[3] != 3:
-        raise ValueError(f"Unexpected atom37 shape from template run: {tuple(atom37_w_t.shape)}")
+        raise ValueError(f"Unexpected final_atom_positions shape from template run: {tuple(atom37_w_t.shape)}")
 
     # Baseline: no template = feed uniform distogram
     uniform = torch.full_like(dist_probs, 1.0 / dist_probs.shape[-1])
@@ -324,9 +328,13 @@ def main() -> None:
         template_mode="distogram_only",
         mask_template_aatype=args.template_all_x,
     )
-    atom37_no_t = out0["atom37"]
+    atom_pos0 = out0["final_atom_positions"]
+    if atom_pos0.dim() == 3:
+        atom37_no_t = atom_pos0.unsqueeze(0)
+    else:
+        atom37_no_t = atom_pos0
     if atom37_no_t.ndim != 4 or atom37_no_t.shape[0] != 1 or atom37_no_t.shape[2] != rc.atom_type_num or atom37_no_t.shape[3] != 3:
-        raise ValueError(f"Unexpected atom37 shape from baseline run: {tuple(atom37_no_t.shape)}")
+        raise ValueError(f"Unexpected final_atom_positions shape from baseline run: {tuple(atom37_no_t.shape)}")
 
     print(f"n_res={parsed.ca_xyz.shape[0]}")
 
