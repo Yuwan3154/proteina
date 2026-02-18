@@ -1,5 +1,4 @@
 run_name_: ca_motif_seq_cond_beta-2.5-2.0_finetune-all_v1.6_default-fold_21-seq-S25_256-eff-bs_purge-test_warmup_cutoff-190828
-pretrain_ckpt_path: ~/proteina/data/weights/finetune-all_v1.6_default-fold_4-seq-S25_32-effective-batch_purge-7bny-7kww-7ad5-7b76_warmup_cutoff-190828_last.ckpt
 
 hardware:
   ncpus_per_task_train_: 16  # Number of CPUs per task during training

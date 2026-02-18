@@ -779,6 +779,12 @@ class FeatureFactory(torch.nn.Module):
         self.use_residue_type_emb = use_residue_type_emb
         self.use_cirpin_emb = use_cirpin_emb
 
+        # Disable sinusoidal positional embedding (res_seq_pdb_idx) when idx_emb_dim is 0 or not specified
+        if feats is not None and mode == "seq":
+            idx_emb_dim = kwargs.get("idx_emb_dim", 0)
+            if idx_emb_dim <= 0:
+                feats = [f for f in feats if f != "res_seq_pdb_idx"]
+
         self.ret_zero = True if (feats is None or len(feats) == 0) else False
         if self.ret_zero:
             logger.info("No features requested")
