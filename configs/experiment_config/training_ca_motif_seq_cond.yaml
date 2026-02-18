@@ -1,0 +1,110 @@
+run_name_: ca_motif_seq_cond_beta-2.5-2.0_finetune-all_v1.6_default-fold_4-seq-S25_64-eff-bs_purge-test_warmup_cutoff-190828
+pretrain_ckpt_path: ~/proteina/data/weights/proteina_v1.6_DFS_200M_notri_long_chain_generation.ckpt
+
+hardware:
+  ncpus_per_task_train_: 8  # Number of CPUs per task during training
+  ncpus_per_task_prepro_: 8  # Number of CPUs used for data preprocessing run
+  accelerator: gpu
+  ngpus_per_node_: 1  # Number of GPUs per node
+  nnodes_: 1  # Number of nodes
+
+# Below, for t_distribution, options are
+# - name: uniform. p2 is the maximum time that we can sample (<=1, p1 is ignored).
+# - name: logit-normal (normal + sigmoid). p1 is the mean of the normal, p2 the std (>0).
+# - name: beta. This is beta(p1, p2).
+loss:
+  t_distribution:
+    name: mix_up02_beta
+    p1: 2.5
+    p2: 2.0
+  loss_t_clamp: 0.9  # Used for loss stability in frameflow, 1. for no clamping
+  use_aux_loss: True  # Whether to use auxiliary loss
+  aux_loss_t_lim: 0.3  # Time limit to apply auxiliary loss
+  thres_aux_2d_loss: 0.6  # This is nm not Å
+  aux_loss_weight: 1.0
+  num_dist_buckets: 64  # Number of buckets to discretize the pairwise distance
+  max_dist_boundary: 1.0  # Given by nanometer
+  motif_aux_loss_weight: 5.0
+  scaffold_aux_loss_weight: 0
+
+
+defaults:
+  - model: caflow_motif_200M
+  - _self_
+
+model:
+  nn:
+    residue_type_emb_init_seq: True
+    residue_type_emb_cond_seq: True
+    residue_type_emb_init_pair: True
+    residue_type_emb_cond_pair: True
+    seq_emb_dim: 4
+
+
+# Dataset params
+dataset: pdb_train_S25_max384_purge-test_cutoff-190828
+dataset_config_subdir: pdb
+
+force_precision_f32: False  # If false will use bf16-mixed precision
+
+training:
+  motif_conditioning: True
+  motif_conditioning_sequence_rep: True
+  self_cond: True
+  seq_cond: True
+  fold_cond: True
+  mask_T_prob: 0.5
+  mask_A_prob: 0.5
+  mask_C_prob: 0.5
+  fold_label_sample_ratio: [0.5, 0.1, 0.15, 0.25]   # Training proportion for [None, C, CA, CAT]. If specified, will override mask_{C,A,T}_prob
+  mask_seq_proportion: 0.15
+  finetune_seq_cond_lora_only: False
+  self_cond_use_copy: True
+  self_cond_copy_update_every: 10  # Update every 10 optimizer steps
+
+
+lora:
+  use: False
+  lora_alpha: 32.0
+  lora_dropout: 0.0
+  r: 0
+  train_bias: "none"
+
+
+opt:
+  lr: 0.0001
+  max_epochs: 100
+  accumulate_grad_batches: 64  # effective batch size = 1*2*64 = 128
+  val_check_interval: 1000  # Number of training batches after which we check validation loss
+  skip_nan_grad: False  # Skip updates with nan gradient
+  grad_and_weight_analysis: False  # Log some statistics of gradients and weights
+  dist_strategy: ddp  # For multi GPU training, do not change
+  dist_backend: gloo  # For multi GPU training, applicable when using ddp strategy [nccl, gloo]
+  # Learning rate warmup scheduler
+  use_lr_warmup: True  # Enable learning rate warmup
+  warmup_steps: 3000  # Number of warmup steps (linear warmup from warmup_start_lr_ratio to 1.0)
+  warmup_start_lr_ratio: 0.0  # Starting LR as ratio of target LR (0.0 means start from 0)
+  lr_scheduler_type: "cosine"  # Scheduler after warmup: "constant", "linear_decay", or "cosine"
+  use_cueq: False  # Whether to use cuequivariance for triangle operations
+
+log:
+  wandb_project: protein_transformer_big_runs  # Leave this so we can compare runs easily
+  log_wandb: True  # whether to log to wandb
+  log_every_n_steps: 1  # How often to log metrics to wandb
+  log_structure_every_n_steps: 100  # How often to log structure/contact map visualizations (0 = disabled)
+  checkpoint: True  # whether to store checkpoints
+  checkpoint_every_n_steps: 2000  # How often we store a checkpoint, should be greater than val_check_interval above
+  last_ckpt_every_n_steps: 1000  # How often do we update our last ckpt, needed for requeuing without losing progress
+
+validation_sampling:
+  dt: 0.005
+  sampling_mode: sc
+  sc_scale_noise: 0.45
+
+seed: 42
+
+ema:
+  decay: 0.999  # 0 means no EMA, so all the EMA machinery is unused and no EMA checkpoints are stored
+  validate_original_weights: False  # Whether to run validation on regular or EMA weights
+  every_n_steps: 1  # Frequency of EMA updates
+  cpu_offload: False  # Whether to offload EMA weights to cpu
