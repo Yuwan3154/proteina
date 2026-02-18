@@ -12,14 +12,9 @@ datamodule:
     - _target_: "proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform"
     - _target_: "proteinfoundation.datasets.transforms.CATHLabelTransform" # activate for fold-conditional training
       root_dir: ${oc.env:DATA_PATH}/cathdata/ # Root directory for CATH labels
-    - _target_: "proteinfoundation.utils.cirpin_transform.CirpinEmbeddingTransformWithMapping" # Add CIRPIN embeddings
-      cirpin_emb_path: "/home/jupyter-chenxi/progres/progres/databases/v_0_2_1/pdb_max384.pt"
-      protein_id_field: "id"
-      mode: ${oc.env:CIRPIN_EMBEDDING_MODE,sample}  # Mode set by training script from training config
-      cath_data_dir: ${oc.env:DATA_PATH}/cathdata/ # Same as CATHLabelTransform root_dir
     - _target_: "proteinfoundation.datasets.transforms.PaddingTransform"
-      max_size: 320
-  batch_size: 1 # Batch size for dataloader
+      max_size: 256
+  batch_size: 4 # Batch size for dataloader
   num_workers: 8 # Number of workers for dataloader
   pin_memory: True # Pin memory for dataloader
   prefetch_factor: 2 # Prefetch factor for dataloader
@@ -31,7 +26,7 @@ datamodule:
     molecule_type: "protein" # Type of molecule for which to select
     experiment_types: ["diffraction", "EM"] # other options are "NMR" and "other"
     min_length: 50 # Exclude peptides of length smaller than 50
-    max_length: 320 # Exclude polypeptides greater than length 320
+    max_length: 256 # Exclude polypeptides greater than length 256
     oligomeric_min: null 
     oligomeric_max: null 
     best_resolution: 0.0  # Include only proteins with resolution >= 0.0
@@ -40,6 +35,9 @@ datamodule:
     remove_ligands: [] # Exclude specific ligands from any available protein-ligand complexes
     remove_non_standard_residues: True # Include only proteins containing standard amino acid residues
     remove_pdb_unavailable: True # Include only proteins that are available to download
+    # NEW FEATURE 1: Release date cutoff (format: YYYY-MM-DD)
+    max_deposition_date: "2019-08-28" # Only include structures deposited on or before this date
+    # NOTE: exclude_ids moved to datasplitter for cluster-aware exclusion
     exclude_ids: ["7ll9_C", "7ll9_D", "7ll9_G", "7ll9_H", "7bny_A", "7bny_B", "7bny_C", "7bny_D", "7kww_A", "7kww_B", "7ad5_A", "7b76_A"]   # IDs can be excluded here like ["9b57", "1crr"]
 
   datasplitter:
@@ -49,4 +47,8 @@ datamodule:
     split_type: "sequence_similarity" # Split sequences by sequence similarity clustering, other option is "random"
     split_sequence_similarity: 0.25 # Clustering at 25% sequence similarity (argument is ignored if split_type!="sequence_similarity")
     overwrite_sequence_clusters: False # Previous clusterings at same sequence similarity are reused and not overwritten (argument is ignored if split_type!="sequence_similarity")
-
+    # NEW FEATURE 2: Cluster-aware exclusion
+    # For sequence_similarity split: entire clusters containing these IDs will be excluded
+    # For random split: only the specified IDs will be excluded
+    exclude_ids: ["7ll9_C", "7ll9_D", "7ll9_G", "7ll9_H", "7bny_A", "7bny_B", "7bny_C", "7bny_D", "7kww_A", "7ad5_A", "7b76_A"]
+    exclude_ids_from_file: null # Optional: path to a text file with one ID per line

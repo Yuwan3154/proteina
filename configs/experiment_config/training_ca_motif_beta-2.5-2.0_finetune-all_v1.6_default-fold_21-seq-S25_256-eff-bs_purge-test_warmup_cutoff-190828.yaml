@@ -1,9 +1,9 @@
-run_name_: ca_motif_seq_cond_beta-2.5-2.0_finetune-all_v1.6_default-fold_4-seq-S25_64-eff-bs_purge-test_warmup_cutoff-190828
-pretrain_ckpt_path: ~/proteina/data/weights/proteina_v1.6_DFS_200M_notri_long_chain_generation.ckpt
+run_name_: ca_motif_seq_cond_beta-2.5-2.0_finetune-all_v1.6_default-fold_21-seq-S25_256-eff-bs_purge-test_warmup_cutoff-190828
+pretrain_ckpt_path: ~/proteina/data/weights/finetune-all_v1.6_default-fold_4-seq-S25_32-effective-batch_purge-7bny-7kww-7ad5-7b76_warmup_cutoff-190828_last.ckpt
 
 hardware:
-  ncpus_per_task_train_: 8  # Number of CPUs per task during training
-  ncpus_per_task_prepro_: 8  # Number of CPUs used for data preprocessing run
+  ncpus_per_task_train_: 16  # Number of CPUs per task during training
+  ncpus_per_task_prepro_: 16  # Number of CPUs used for data preprocessing run
   accelerator: gpu
   ngpus_per_node_: 1  # Number of GPUs per node
   nnodes_: 1  # Number of nodes
@@ -29,7 +29,8 @@ loss:
 
 
 defaults:
-  - model: caflow_motif_200M
+  - model: caflow_motif
+  - override model/nn: ca_af3_200M_no_tri_motif
   - _self_
 
 model:
@@ -38,11 +39,11 @@ model:
     residue_type_emb_cond_seq: True
     residue_type_emb_init_pair: True
     residue_type_emb_cond_pair: True
-    seq_emb_dim: 4
+    seq_emb_dim: 21
 
 
 # Dataset params
-dataset: pdb_train_S25_max384_purge-test_cutoff-190828
+dataset: pdb_train_S25_max256_purge-test_cutoff-190828
 dataset_config_subdir: pdb
 
 force_precision_f32: False  # If false will use bf16-mixed precision
@@ -74,7 +75,7 @@ lora:
 opt:
   lr: 0.0001
   max_epochs: 100
-  accumulate_grad_batches: 64  # effective batch size = 1*2*64 = 128
+  accumulate_grad_batches: 64  # effective batch size = 1(ngpus)*4(batch_size)*64(accumulate_grad_batches) = 256
   val_check_interval: 1000  # Number of training batches after which we check validation loss
   skip_nan_grad: False  # Skip updates with nan gradient
   grad_and_weight_analysis: False  # Log some statistics of gradients and weights
@@ -90,7 +91,7 @@ opt:
 log:
   wandb_project: protein_transformer_big_runs  # Leave this so we can compare runs easily
   log_wandb: True  # whether to log to wandb
-  log_every_n_steps: 1  # How often to log metrics to wandb
+  log_every_n_steps: 100  # How often to log metrics to wandb
   log_structure_every_n_steps: 100  # How often to log structure/contact map visualizations (0 = disabled)
   checkpoint: True  # whether to store checkpoints
   checkpoint_every_n_steps: 2000  # How often we store a checkpoint, should be greater than val_check_interval above

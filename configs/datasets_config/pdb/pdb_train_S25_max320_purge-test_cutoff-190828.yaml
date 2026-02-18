@@ -12,10 +12,6 @@ datamodule:
     - _target_: "proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform"
     - _target_: "proteinfoundation.datasets.transforms.CATHLabelTransform" # activate for fold-conditional training
       root_dir: ${oc.env:DATA_PATH}/cathdata/ # Root directory for CATH labels
-    - _target_: "proteinfoundation.datasets.transforms.ContactMapTransform"  # Required for contact_map_mode training
-      contact_method: confind  # Expects precomputed contact_map_confind in processed .pt files
-      confind_rotamer_lib: ${oc.env:DATA_PATH}/rotlibs
-      confind_contact_threshold: 0.01
     - _target_: "proteinfoundation.datasets.transforms.PaddingTransform"
       max_size: 320
   batch_size: 4 # Batch size for dataloader
@@ -31,8 +27,6 @@ datamodule:
     experiment_types: ["diffraction", "EM"] # other options are "NMR" and "other"
     min_length: 50 # Exclude peptides of length smaller than 50
     max_length: 320 # Exclude polypeptides greater than length 320
-    fraction: 1 # Fraction of dataset to use
-    molecule_type: "protein" # Type of molecule for which to select
     oligomeric_min: null 
     oligomeric_max: null 
     best_resolution: 0.0  # Include only proteins with resolution >= 0.0
@@ -44,7 +38,7 @@ datamodule:
     # NEW FEATURE 1: Release date cutoff (format: YYYY-MM-DD)
     max_deposition_date: "2019-08-28" # Only include structures deposited on or before this date
     # NOTE: exclude_ids moved to datasplitter for cluster-aware exclusion
-    exclude_ids: ["7ll9_C", "7ll9_D", "7ll9_G", "7ll9_H", "7bny_A", "7bny_B", "7bny_C", "7bny_D", "7kww_A", "7ad5_A", "7b76_A"] # Can still specify here, but will be passed to datasplitter automatically
+    exclude_ids: ["7ll9_C", "7ll9_D", "7ll9_G", "7ll9_H", "7bny_A", "7bny_B", "7bny_C", "7bny_D", "7kww_A", "7kww_B", "7ad5_A", "7b76_A"]   # IDs can be excluded here like ["9b57", "1crr"]
 
   datasplitter:
     _target_: "proteinfoundation.datasets.pdb_data.PDBDataSplitter"
