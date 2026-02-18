@@ -36,8 +36,8 @@ class OpenFoldTemplateInference(nn.Module):
         model_name: str = "model_1_ptm",
         jax_params_path: str = "/home/ubuntu/params/params_model_1_ptm.npz",
         device: Optional[torch.device] = None,
-        rm_template_sequence: bool = False,
-        template_sequence_all_x: Optional[bool] = None,
+        rm_template_sequence: Optional[bool] = False,
+        skip_template_alignment: bool = False,
         max_recycling_iters: Optional[int] = None,
     ):
         super().__init__()
@@ -63,9 +63,8 @@ class OpenFoldTemplateInference(nn.Module):
         self.device = device
         self.model = self.model.to(self.device)
         self.feature_pipeline = FeaturePipeline(self.cfg.data)
-        if template_sequence_all_x is not None:
-            rm_template_sequence = bool(template_sequence_all_x)
         self.rm_template_sequence = rm_template_sequence
+        self.skip_template_alignment = skip_template_alignment
         self._template_use_unit_vector_default = None
         if hasattr(self.model, "template_embedder") and hasattr(self.model.template_embedder, "config"):
             self._template_use_unit_vector_default = self.model.template_embedder.config.use_unit_vector
@@ -235,6 +234,8 @@ class OpenFoldTemplateInference(nn.Module):
                     pdb_id=pdb_id,
                     chain_id=template_chain_id,
                     kalign_binary_path=kalign_binary_path,
+                    rm_template_sequence=self.rm_template_sequence,
+                    skip_alignment=self.skip_template_alignment,
                 )
             else:
                 raw = self._make_template_stub_features(
@@ -258,6 +259,8 @@ class OpenFoldTemplateInference(nn.Module):
                 pdb_id=pdb_id,
                 chain_id=template_chain_id,
                 kalign_binary_path=kalign_binary_path,
+                rm_template_sequence=self.rm_template_sequence,
+                skip_alignment=self.skip_template_alignment,
             )
         else:
             raise ValueError(
