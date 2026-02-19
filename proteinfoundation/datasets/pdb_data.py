@@ -11,9 +11,8 @@
 import os
 import pathlib
 import time
-from typing import Callable, Dict, List, Literal, Optional, Tuple, Union
-import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Callable, Dict, List, Literal, Optional, Tuple, Union
 import functools
 
 import numpy as np
@@ -45,23 +44,6 @@ from proteinfoundation.graphein_utils.graphein_utils import (
     download_pdb_multiprocessing,
     get_obsolete_mapping,
 )
-
-
-def _check_one_length(path: pathlib.Path) -> Tuple[str, Optional[int]]:
-    """Worker for parallel length computation. Returns (stem, processed_length or None).
-    Must be module-level for ProcessPoolExecutor spawn pickling."""
-    stem = path.stem
-    if not path.exists():
-        return stem, None
-    add_safe_globals([tgd.Data])
-    try:
-        data = torch.load(str(path), map_location="cpu", weights_only=False)
-    except Exception:
-        return stem, None
-    if not hasattr(data, "coord_mask"):
-        return stem, None
-    nres = int(data.coord_mask.any(dim=-1).sum().item())
-    return stem, nres
 
 
 class PDBDataSelector:
@@ -731,22 +713,35 @@ class PDBLightningDataModule(BaseLightningDataModule):
         if self.dataselector:
             file_identifier = self._get_file_identifier(self.dataselector)
             df_data_name = f"{file_identifier}.csv"
-            if not self.overwrite and (self.data_dir / df_data_name).exists() and not self.regenerate_missing:
-                rank_zero_info(
-                    f"{df_data_name} already exists, skipping data selection and processing stage."
-                )
-            elif not self.overwrite and (self.data_dir / df_data_name).exists() and self.regenerate_missing:
+            csv_path = self.data_dir / df_data_name
+
+            if not self.overwrite and csv_path.exists() and not self.regenerate_missing:
+                df_check = pd.read_csv(csv_path, nrows=1)
+                has_processed_length = "processed_length" in df_check.columns
+                if self.min_length is None or has_processed_length:
+                    rank_zero_info(
+                        f"{df_data_name} already exists, skipping data selection and processing stage."
+                    )
+                else:
+                    rank_zero_info(
+                        f"{df_data_name} exists but missing processed_length column; adding it."
+                    )
+                    df_data = pd.read_csv(csv_path)
+                    df_data = self._filter_processed_by_length(df_data, id_col="id")
+                    df_data.to_csv(csv_path, index=False)
+
+            elif not self.overwrite and csv_path.exists() and self.regenerate_missing:
                 rank_zero_info(
                     f"{df_data_name} exists; regenerate_missing=True, regenerating missing .pt files."
                 )
-                df_data = pd.read_csv(self.data_dir / df_data_name)
+                df_data = pd.read_csv(csv_path)
                 self._download_structure_data(df_data["pdb"].tolist())
                 self._process_structure_data(
                     df_data["pdb"].tolist(), df_data["chain"].tolist()
                 )
-                rank_zero_info(f"Post-filtering processed files by minimum length {self.min_length}")
                 df_data = self._filter_processed_by_length(df_data, id_col="id")
-                df_data.to_csv(self.data_dir / df_data_name, index=False)
+                df_data.to_csv(csv_path, index=False)
+
             else:
                 rank_zero_info(f"{df_data_name} does not exist yet, creating dataset now.")
                 df_data = self.dataselector.create_dataset()
@@ -756,43 +751,51 @@ class PDBLightningDataModule(BaseLightningDataModule):
                 self._download_structure_data(df_data["pdb"].tolist())
                 has_processed = any(self.processed_dir.glob("*.pt"))
                 if self.overwrite or not has_processed or self.regenerate_missing:
-                    # process pdb files into seperate chains and save processed objects as .pt files
                     self._process_structure_data(
                         df_data["pdb"].tolist(), df_data["chain"].tolist()
                     )
                 else:
                     rank_zero_info("Detected existing processed files; skipping reprocessing and using existing .pt files only.")
 
-                rank_zero_info(f"Post-filtering processed files by minimum length {self.min_length}")
                 df_data = self._filter_processed_by_length(df_data, id_col="id")
-
-                # save df_data to disk for later use (in splitting, dataloading etc)
                 rank_zero_info(f"Saving dataset csv to {df_data_name}")
-                df_data.to_csv(self.data_dir / df_data_name, index=False)
+                df_data.to_csv(csv_path, index=False)
 
         else:  # user-provided dataset
             df_data_name = f"{self.data_dir.name}.csv"
-            if not self.overwrite and (self.data_dir / df_data_name).exists() and not self.regenerate_missing:
-                rank_zero_info(
-                    f"{df_data_name} already exists, skipping data selection and processing stage."
-                )
-            elif not self.overwrite and (self.data_dir / df_data_name).exists() and self.regenerate_missing:
+            csv_path = self.data_dir / df_data_name
+
+            if not self.overwrite and csv_path.exists() and not self.regenerate_missing:
+                df_check = pd.read_csv(csv_path, nrows=1)
+                has_processed_length = "processed_length" in df_check.columns
+                if self.min_length is None or has_processed_length:
+                    rank_zero_info(
+                        f"{df_data_name} already exists, skipping data selection and processing stage."
+                    )
+                else:
+                    rank_zero_info(
+                        f"{df_data_name} exists but missing processed_length column; adding it."
+                    )
+                    df_data = pd.read_csv(csv_path)
+                    df_data = self._filter_processed_by_length(df_data, id_col="id")
+                    df_data.to_csv(csv_path, index=False)
+
+            elif not self.overwrite and csv_path.exists() and self.regenerate_missing:
                 rank_zero_info(
                     f"{df_data_name} exists; regenerate_missing=True, regenerating missing .pt files."
                 )
-                df_data = pd.read_csv(self.data_dir / df_data_name)
+                df_data = pd.read_csv(csv_path)
                 self._process_structure_data(
                     pdb_codes=df_data["pdb"].tolist(),
                     chains=None,
                 )
                 df_data = self._filter_processed_by_length(df_data, id_col="id")
-                df_data.to_csv(self.data_dir / df_data_name, index=False)
+                df_data.to_csv(csv_path, index=False)
             else:
                 rank_zero_info(f"{df_data_name} does not exist yet, creating dataset now.")
                 df_data = self._load_pdb_folder_data(self.raw_dir)
                 has_processed = any(self.processed_dir.glob("*.pt"))
                 if self.overwrite or not has_processed or self.regenerate_missing:
-                    # process pdb files into seperate chains and save processed objects as .pt files
                     self._process_structure_data(
                         pdb_codes=df_data["pdb"].tolist(),
                         chains=None,
@@ -800,9 +803,8 @@ class PDBLightningDataModule(BaseLightningDataModule):
                 else:
                     rank_zero_info("Detected existing processed files; skipping reprocessing and using existing .pt files only.")
                 df_data = self._filter_processed_by_length(df_data, id_col="id")
-                # save df_data to disk for later use (in splitting, dataloading etc)
                 rank_zero_info(f"Saving dataset csv to {df_data_name}")
-                df_data.to_csv(self.data_dir / df_data_name, index=False)
+                df_data.to_csv(csv_path, index=False)
             
     def _load_pdb_folder_data(self, data_dir: pathlib.Path) -> pd.DataFrame:
         """
@@ -840,29 +842,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
             return df_data
 
         stems = df_data[id_col].astype(str).tolist()
-
-        # Compute processed_length by loading .pt files
-        add_safe_globals([tgd.Data])
-        parallel_threshold = 100
-        use_parallel = len(stems) >= parallel_threshold and self.num_workers > 1
-
-        if use_parallel:
-            try:
-                paths = [self.processed_dir / f"{s}.pt" for s in stems]
-                workers = min(self.num_workers, len(stems), (os.cpu_count() or 4) // 2)
-                workers = max(1, workers)
-                ctx = mp.get_context("spawn")
-                length_map = {}
-                with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as executor:
-                    futures = {executor.submit(_check_one_length, p): stems[i] for i, p in enumerate(paths)}
-                    for future in as_completed(futures):
-                        stem, nres = future.result()
-                        length_map[stem] = nres
-            except Exception as e:
-                rank_zero_info(f"Parallel length computation failed ({e}), falling back to sequential")
-                length_map = self._compute_processed_lengths(stems)
-        else:
-            length_map = self._compute_processed_lengths(stems)
+        length_map = self._compute_processed_lengths(stems)
 
         df_data = df_data.copy()
         df_data["processed_length"] = df_data[id_col].astype(str).map(length_map)

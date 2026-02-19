@@ -397,10 +397,6 @@ if __name__ == "__main__":
 
         _run_confind_precompute()
 
-    # Ensure all ranks wait for rank-zero data preparation before proceeding
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-
     if args.prepare_data_only:
         log_info("prepare_data_only set; exiting after dataset preparation.")
         sys.exit(0)
