@@ -25,7 +25,7 @@ feats_cond_seq: ["time_emb", "fold_emb"]
 # Parameters for the features we extract (both for sequence representatoin and conditioning vector)
 t_emb_dim: 256  # dimension of the time embedding
 dim_cond: 512  # dimension of conditioning vector
-idx_emb_dim: 128  # dimension of the sequence position [0, 1, 2, ...] (if contiguous residues) embeddings
+idx_emb_dim: 0  # dimension of the sequence position [0, 1, 2, ...] (if contiguous residues) embeddings
 fold_emb_dim: 256  # dimension of fold class embedding. This will be multiplied by three, as we have C, A, T embeddings.
 cath_code_dir: ${oc.env:DATA_PATH}/pdb_raw/    # This should be set as the path to your pdb_cath dataset directory
 multilabel_mode: "sample"

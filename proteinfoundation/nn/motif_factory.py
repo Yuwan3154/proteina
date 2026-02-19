@@ -330,15 +330,11 @@ class SingleMotifFactory:
     
     def create_batch_motif(self, batch, zeroes = False):
         result = {}
-        if "x_1" in batch:
-            x_1 = batch["x_1"]  # [b, n, 3]
-        else:
-            x_1 = batch["coords"][:,:,1,:]  # [b, n, 3]
         if "mask" in batch:
             mask = batch["mask"]
         else:
             mask = batch["mask_dict"]["coords"][..., 0, 0]  # [b, n] boolean
-        batch_size, num_residues =mask.shape
+        batch_size, num_residues = mask.shape
         if zeroes or random.random() > self.motif_prob:
             motif_sequence_mask = torch.zeros((batch_size, num_residues), dtype = torch.bool)
             motif_structure_mask = torch.zeros((batch_size, num_residues, num_residues), dtype = torch.bool)
@@ -347,6 +343,10 @@ class SingleMotifFactory:
             result['x_motif'] = torch.zeros((batch_size, num_residues, 3)).to(mask.device)
             return result
 
+        if "x_1" in batch:
+            x_1 = batch["x_1"]  # [b, n, 3]
+        else:
+            x_1 = batch["coords"][:,:,1,:]  # [b, n, 3]
         batch_num_residues = mask.sum(-1).cpu().numpy()
         
         motif_n_res_batch = (
@@ -373,21 +373,20 @@ class SingleMotifFactory:
             motif_seg_lens = indices[1:] - indices[:-1]
             motif_seg_lens_batch.append(motif_seg_lens)
         
-        motif_sequence_masks = []
-        # motif_structure_masks = []
-
+        # Build motif masks at batch padded length (num_residues) so shapes match x_1, mask.
+        # pad_sequence only pads to max(batch_num_residues), but the batch is padded to num_residues by the dataloader.
+        motif_sequence_masks = torch.zeros((batch_size, num_residues), dtype=torch.bool, device=mask.device)
         for i in range(len(motif_seg_lens_batch)):
             segs = [''.join(['1'] * l) for l in motif_seg_lens_batch[i]]
             segs.extend(['0'] * (batch_num_residues[i] - motif_n_res_batch[i]).astype(np.int64))
             random.shuffle(segs)
-            motif_sequence_mask = torch.tensor([int(elt) for elt in ''.join(segs)], dtype=torch.bool)
-            motif_sequence_masks.append(motif_sequence_mask)
-
-        
-        motif_sequence_masks = torch.nn.utils.rnn.pad_sequence(motif_sequence_masks, batch_first=True, padding_value=False)
+            motif_sequence_mask = torch.tensor(
+                [int(elt) for elt in ''.join(segs)], dtype=torch.bool, device=mask.device
+            )
+            motif_sequence_masks[i, :batch_num_residues[i]] = motif_sequence_mask
         motif_structure_masks = motif_sequence_masks[:, :, None] * motif_sequence_masks[:, None, :]
-        result['fixed_sequence_mask'] = motif_sequence_masks.to(mask.device)
-        result['fixed_structure_mask'] = motif_structure_masks.to(mask.device)
+        result['fixed_sequence_mask'] = motif_sequence_masks
+        result['fixed_structure_mask'] = motif_structure_masks
         result['x_motif'] = x_1.clone()
         #! Center the conditional Motif
         result['x_motif'] = (result['x_motif'] - mean_w_mask(result['x_motif'], result['fixed_sequence_mask'], keepdim=True)) * result['fixed_sequence_mask'][..., None]
