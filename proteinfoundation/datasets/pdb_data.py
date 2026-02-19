@@ -46,6 +46,24 @@ from proteinfoundation.graphein_utils.graphein_utils import (
     get_obsolete_mapping,
 )
 
+
+def _check_one_length(path: pathlib.Path) -> Tuple[str, Optional[int]]:
+    """Worker for parallel length computation. Returns (stem, processed_length or None).
+    Must be module-level for ProcessPoolExecutor spawn pickling."""
+    stem = path.stem
+    if not path.exists():
+        return stem, None
+    add_safe_globals([tgd.Data])
+    try:
+        data = torch.load(str(path), map_location="cpu", weights_only=False)
+    except Exception:
+        return stem, None
+    if not hasattr(data, "coord_mask"):
+        return stem, None
+    nres = int(data.coord_mask.any(dim=-1).sum().item())
+    return stem, nres
+
+
 class PDBDataSelector:
     def __init__(
         self,
@@ -727,11 +745,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
                     df_data["pdb"].tolist(), df_data["chain"].tolist()
                 )
                 rank_zero_info(f"Post-filtering processed files by minimum length {self.min_length}")
-                expected_files = [f"{p}_{c}" for p, c in zip(df_data["pdb"].tolist(), df_data["chain"].tolist())]
-                keep_files, drop_files = self._filter_processed_by_length(expected_files)
-                keep_set = set(keep_files)
-                rank_zero_info(f"Filtered dataset from {len(df_data)} to {len(keep_set)} samples")
-                df_data = df_data[df_data.apply(lambda r: f"{r.pdb}_{r.chain}" in keep_set, axis=1)]
+                df_data = self._filter_processed_by_length(df_data, id_col="id")
                 df_data.to_csv(self.data_dir / df_data_name, index=False)
             else:
                 rank_zero_info(f"{df_data_name} does not exist yet, creating dataset now.")
@@ -750,11 +764,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
                     rank_zero_info("Detected existing processed files; skipping reprocessing and using existing .pt files only.")
 
                 rank_zero_info(f"Post-filtering processed files by minimum length {self.min_length}")
-                expected_files = [f"{p}_{c}" for p, c in zip(df_data["pdb"].tolist(), df_data["chain"].tolist())]
-                keep_files, drop_files = self._filter_processed_by_length(expected_files)
-                keep_set = set(keep_files)
-                rank_zero_info(f"Filtered dataset from {len(df_data)} to {len(keep_set)} samples")
-                df_data = df_data[df_data.apply(lambda r: f"{r.pdb}_{r.chain}" in keep_set, axis=1)]
+                df_data = self._filter_processed_by_length(df_data, id_col="id")
 
                 # save df_data to disk for later use (in splitting, dataloading etc)
                 rank_zero_info(f"Saving dataset csv to {df_data_name}")
@@ -775,9 +785,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
                     pdb_codes=df_data["pdb"].tolist(),
                     chains=None,
                 )
-                keep_files, drop_files = self._filter_processed_by_length(df_data["pdb"].tolist())
-                keep_set = set(keep_files)
-                df_data = df_data[df_data["pdb"].apply(lambda x: x in keep_set)]
+                df_data = self._filter_processed_by_length(df_data, id_col="id")
                 df_data.to_csv(self.data_dir / df_data_name, index=False)
             else:
                 rank_zero_info(f"{df_data_name} does not exist yet, creating dataset now.")
@@ -791,9 +799,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
                     )
                 else:
                     rank_zero_info("Detected existing processed files; skipping reprocessing and using existing .pt files only.")
-                keep_files, drop_files = self._filter_processed_by_length(df_data["pdb"].tolist())
-                keep_set = set(keep_files)
-                df_data = df_data[df_data["pdb"].apply(lambda x: x in keep_set)]
+                df_data = self._filter_processed_by_length(df_data, id_col="id")
                 # save df_data to disk for later use (in splitting, dataloading etc)
                 rank_zero_info(f"Saving dataset csv to {df_data_name}")
                 df_data.to_csv(self.data_dir / df_data_name, index=False)
@@ -824,39 +830,98 @@ class PDBLightningDataModule(BaseLightningDataModule):
         
         return df_data
 
-    def _filter_processed_by_length(self, file_names: List[str]) -> Tuple[List[str], List[str]]:
-        """Post-filter processed .pt files by effective length (coord_mask.any)."""
+    def _filter_processed_by_length(
+        self, df_data: pd.DataFrame, id_col: str = "id"
+    ) -> pd.DataFrame:
+        """Post-filter by processed length (coord_mask.any). Adds processed_length column
+        to df_data, filters by min_length, unlinks too-short .pt files, and invalidates
+        cluster files so they are regenerated from the filtered dataset."""
         if self.min_length is None:
-            return file_names, []
+            return df_data
 
+        stems = df_data[id_col].astype(str).tolist()
+
+        # Compute processed_length by loading .pt files
         add_safe_globals([tgd.Data])
+        parallel_threshold = 100
+        use_parallel = len(stems) >= parallel_threshold and self.num_workers > 1
 
-        keep, drop = [], []
-        for fname in file_names:
-            stem = fname if not fname.endswith(".pt") else fname[:-3]
+        if use_parallel:
+            try:
+                paths = [self.processed_dir / f"{s}.pt" for s in stems]
+                workers = min(self.num_workers, len(stems), (os.cpu_count() or 4) // 2)
+                workers = max(1, workers)
+                ctx = mp.get_context("spawn")
+                length_map = {}
+                with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as executor:
+                    futures = {executor.submit(_check_one_length, p): stems[i] for i, p in enumerate(paths)}
+                    for future in as_completed(futures):
+                        stem, nres = future.result()
+                        length_map[stem] = nres
+            except Exception as e:
+                rank_zero_info(f"Parallel length computation failed ({e}), falling back to sequential")
+                length_map = self._compute_processed_lengths(stems)
+        else:
+            length_map = self._compute_processed_lengths(stems)
+
+        df_data = df_data.copy()
+        df_data["processed_length"] = df_data[id_col].astype(str).map(length_map)
+
+        # Drop rows with missing/invalid .pt or length < min_length
+        valid = df_data["processed_length"].notna() & (df_data["processed_length"] >= self.min_length)
+        df_filtered = df_data[valid].copy()
+        drop_stems = set(stems) - set(df_filtered[id_col].astype(str))
+
+        for stem in drop_stems:
             path = self.processed_dir / f"{stem}.pt"
-            if not path.exists():
-                drop.append(stem)
-                continue
-            data = torch.load(path, map_location="cpu", weights_only=False)
-            if not hasattr(data, "coord_mask"):
-                drop.append(stem)
-                path.unlink(missing_ok=True)
-                continue
-            nres = int(data.coord_mask.any(dim=-1).sum().item())
-            if nres < self.min_length:
-                drop.append(stem)
-                path.unlink(missing_ok=True)
-            else:
-                keep.append(stem)
+            if path.exists():
+                nres = length_map.get(stem)
+                if nres is None or nres < self.min_length:
+                    path.unlink(missing_ok=True)
 
-        if drop:
+        if drop_stems:
             auto_excluded = self.processed_dir.parent / "auto_excluded_too_short.txt"
             with open(auto_excluded, "a") as f:
-                for stem in drop:
+                for stem in sorted(drop_stems):
                     f.write(f"{stem}\n")
 
-        return keep, drop
+        rank_zero_info(f"Filtered dataset from {len(df_data)} to {len(df_filtered)} samples")
+        self._invalidate_cluster_files()
+        return df_filtered
+
+    def _compute_processed_lengths(self, stems: List[str]) -> Dict[str, Optional[int]]:
+        """Sequential fallback for computing processed_length from .pt files."""
+        add_safe_globals([tgd.Data])
+        length_map = {}
+        for stem in stems:
+            path = self.processed_dir / f"{stem}.pt"
+            if not path.exists():
+                length_map[stem] = None
+                continue
+            try:
+                data = torch.load(path, map_location="cpu", weights_only=False)
+            except Exception:
+                length_map[stem] = None
+                path.unlink(missing_ok=True)
+                continue
+            if not hasattr(data, "coord_mask"):
+                length_map[stem] = None
+                path.unlink(missing_ok=True)
+                continue
+            length_map[stem] = int(data.coord_mask.any(dim=-1).sum().item())
+        return length_map
+
+    def _invalidate_cluster_files(self) -> None:
+        """Remove cluster/seq files so they are regenerated from the filtered dataset."""
+        if not self.dataselector:
+            return
+        file_identifier = self._get_file_identifier(self.dataselector)
+        for f in self.data_dir.glob(f"seq_{file_identifier}.fasta"):
+            f.unlink(missing_ok=True)
+        for f in self.data_dir.glob(f"cluster_seqid_*_{file_identifier}.fasta"):
+            f.unlink(missing_ok=True)
+        for f in self.data_dir.glob(f"cluster_seqid_*_{file_identifier}.tsv"):
+            f.unlink(missing_ok=True)
 
     def _get_file_identifier(self, ds):
         file_identifier = (
