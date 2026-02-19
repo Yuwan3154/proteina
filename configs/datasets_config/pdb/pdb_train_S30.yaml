@@ -4,6 +4,7 @@ datamodule:
   in_memory: False
   format: "cif" # format for file download
   overwrite: False # Whether to overwrite existing dataset files and reprocess the raw data
+  regenerate_missing: True # When True, regenerate only missing .pt files (e.g. after purge_invalid_pt_files)
   # arguments for BaseLightningDataModule class
   batch_padding: True # whether we want a sparse PyG batch or a padded dense batch
   sampling_mode: "cluster-random" # sample randomly inside each sequence similarity cluster during training
