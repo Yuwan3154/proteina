@@ -4,6 +4,7 @@ datamodule:
   in_memory: False
   format: "cif" # format for file download
   overwrite: False # Whether to overwrite existing dataset files and reprocess the raw data
+  regenerate_missing: True # When True, regenerate only missing .pt files (e.g. after purge_invalid_pt_files)
   # arguments for BaseLightningDataModule class
   batch_padding: True # whether we want a sparse PyG batch or a padded dense batch
   sampling_mode: "cluster-random" # sample randomly inside each sequence similarity cluster during training
@@ -14,7 +15,7 @@ datamodule:
       root_dir: ${oc.env:DATA_PATH}/cathdata/ # Root directory for CATH labels
     - _target_: "proteinfoundation.datasets.transforms.PaddingTransform"
       max_size: 256
-  batch_size: 4 # Batch size for dataloader
+  batch_size: 8 # Batch size for dataloader
   num_workers: 8 # Number of workers for dataloader
   pin_memory: True # Pin memory for dataloader
   prefetch_factor: 2 # Prefetch factor for dataloader

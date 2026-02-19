@@ -58,10 +58,13 @@ from proteinfoundation.utils.training_analysis_utils import (
 )
 
 
-def _maybe_init_cuequivariance():
+def _maybe_init_cuequivariance(use_cueq: bool = False):
+    """Initialize cuequivariance Triton cache when use_cueq is True. Skip when disabled."""
+    if not use_cueq:
+        return False
     try:
         import cuequivariance_torch as cuet  # noqa: F401
-        from cueuivariance_ops_torch import init_triton_cache
+        from cuequivariance_ops_torch import init_triton_cache
         init_triton_cache()
         return True
     except Exception as exc:
@@ -281,6 +284,9 @@ if __name__ == "__main__":
     with hydra.initialize(config_path, version_base=hydra.__version__):
         cfg_data = hydra.compose(config_name=cfg_exp["dataset"])
         cfg_data.datamodule.num_workers = num_cpus  # Overwrite number of cpus
+        batch_size = cfg_exp.opt.get("batch_size")
+        if batch_size is not None:
+            cfg_data.datamodule.batch_size = batch_size
         if cfg_data.get("exclude_id_pkl_path") is not None:
             with open(cfg_data.exclude_id_pkl_path, "rb") as fin:
                 exclude_ids = pickle.load(fin)
@@ -395,7 +401,7 @@ if __name__ == "__main__":
         log_info("prepare_data_only set; exiting after dataset preparation.")
         sys.exit(0)
 
-    _maybe_init_cuequivariance()
+    _maybe_init_cuequivariance(cfg_exp.opt.get("use_cueq", False))
 
     # Set logger
     wandb_logger = None

@@ -615,6 +615,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
         in_memory: bool = False,
         format: Literal["mmtf", "pdb", "cif", "ent"] = "cif",
         overwrite: bool = False,
+        regenerate_missing: bool = False,
         store_het: bool = False,
         store_bfactor: bool = True,
         use_multiprocessing: bool = True,
@@ -647,6 +648,9 @@ class PDBLightningDataModule(BaseLightningDataModule):
                 "mmtf", "pdb", "cif" or "ent". Defaults to "cif".
             overwrite (bool, optional): Whether to overwrite existing processed
                 data. Defaults to False.
+            regenerate_missing (bool, optional): When True, regenerate .pt files that are
+                missing (e.g. after purge_invalid_pt_files). Uses existing CSV; only processes
+                files that do not exist. Defaults to False.
             store_het (bool, optional): Whether to store heteroatoms in the processed data.
                 Defaults to False.
             store_bfactor (bool, optional): Whether to store B factors in the processed data.
@@ -693,6 +697,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
         self.sampling_mode = sampling_mode
         self.format = format
         self.overwrite = overwrite
+        self.regenerate_missing = regenerate_missing
         self.in_memory = in_memory
         self.store_het = store_het
         self.store_bfactor = store_bfactor
@@ -708,10 +713,26 @@ class PDBLightningDataModule(BaseLightningDataModule):
         if self.dataselector:
             file_identifier = self._get_file_identifier(self.dataselector)
             df_data_name = f"{file_identifier}.csv"
-            if not self.overwrite and (self.data_dir / df_data_name).exists():
+            if not self.overwrite and (self.data_dir / df_data_name).exists() and not self.regenerate_missing:
                 rank_zero_info(
                     f"{df_data_name} already exists, skipping data selection and processing stage."
                 )
+            elif not self.overwrite and (self.data_dir / df_data_name).exists() and self.regenerate_missing:
+                rank_zero_info(
+                    f"{df_data_name} exists; regenerate_missing=True, regenerating missing .pt files."
+                )
+                df_data = pd.read_csv(self.data_dir / df_data_name)
+                self._download_structure_data(df_data["pdb"].tolist())
+                self._process_structure_data(
+                    df_data["pdb"].tolist(), df_data["chain"].tolist()
+                )
+                rank_zero_info(f"Post-filtering processed files by minimum length {self.min_length}")
+                expected_files = [f"{p}_{c}" for p, c in zip(df_data["pdb"].tolist(), df_data["chain"].tolist())]
+                keep_files, drop_files = self._filter_processed_by_length(expected_files)
+                keep_set = set(keep_files)
+                rank_zero_info(f"Filtered dataset from {len(df_data)} to {len(keep_set)} samples")
+                df_data = df_data[df_data.apply(lambda r: f"{r.pdb}_{r.chain}" in keep_set, axis=1)]
+                df_data.to_csv(self.data_dir / df_data_name, index=False)
             else:
                 rank_zero_info(f"{df_data_name} does not exist yet, creating dataset now.")
                 df_data = self.dataselector.create_dataset()
@@ -720,7 +741,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
                 )
                 self._download_structure_data(df_data["pdb"].tolist())
                 has_processed = any(self.processed_dir.glob("*.pt"))
-                if self.overwrite or not has_processed:
+                if self.overwrite or not has_processed or self.regenerate_missing:
                     # process pdb files into seperate chains and save processed objects as .pt files
                     self._process_structure_data(
                         df_data["pdb"].tolist(), df_data["chain"].tolist()
@@ -741,15 +762,28 @@ class PDBLightningDataModule(BaseLightningDataModule):
 
         else:  # user-provided dataset
             df_data_name = f"{self.data_dir.name}.csv"
-            if not self.overwrite and (self.data_dir / df_data_name).exists():
+            if not self.overwrite and (self.data_dir / df_data_name).exists() and not self.regenerate_missing:
                 rank_zero_info(
                     f"{df_data_name} already exists, skipping data selection and processing stage."
                 )
+            elif not self.overwrite and (self.data_dir / df_data_name).exists() and self.regenerate_missing:
+                rank_zero_info(
+                    f"{df_data_name} exists; regenerate_missing=True, regenerating missing .pt files."
+                )
+                df_data = pd.read_csv(self.data_dir / df_data_name)
+                self._process_structure_data(
+                    pdb_codes=df_data["pdb"].tolist(),
+                    chains=None,
+                )
+                keep_files, drop_files = self._filter_processed_by_length(df_data["pdb"].tolist())
+                keep_set = set(keep_files)
+                df_data = df_data[df_data["pdb"].apply(lambda x: x in keep_set)]
+                df_data.to_csv(self.data_dir / df_data_name, index=False)
             else:
                 rank_zero_info(f"{df_data_name} does not exist yet, creating dataset now.")
                 df_data = self._load_pdb_folder_data(self.raw_dir)
                 has_processed = any(self.processed_dir.glob("*.pt"))
-                if self.overwrite or not has_processed:
+                if self.overwrite or not has_processed or self.regenerate_missing:
                     # process pdb files into seperate chains and save processed objects as .pt files
                     self._process_structure_data(
                         pdb_codes=df_data["pdb"].tolist(),

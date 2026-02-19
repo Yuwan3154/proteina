@@ -482,8 +482,8 @@ class GenMD4DiscreteDiffusion(nn.Module):
         masked_integrand = (mask[..., None] * weighted).sum(
             dim=tuple(range(1, x.dim()))
         )
-        loss_diff = masked_integrand.sum(dim=-1)
-        return loss_diff
+        # masked_integrand is [b] (per-sample); return as-is for torch.mean by caller
+        return masked_integrand
 
     def reinforce_loss(
         self,
