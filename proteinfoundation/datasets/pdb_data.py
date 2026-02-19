@@ -332,19 +332,32 @@ class PDBDataSplitter:
                 )
             )
 
-            if not input_fasta_filepath.exists() or self.overwrite_sequence_clusters:
-                rank_zero_info("Retrieving sequences and writing them to fasta file...")
-                df_to_fasta(df=df_data, output_file=input_fasta_filepath)
+            # Only rank 0 creates cluster files; non-zero ranks wait to avoid race
+            is_rank_zero = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+            if is_rank_zero:
+                if not input_fasta_filepath.exists() or self.overwrite_sequence_clusters:
+                    rank_zero_info("Retrieving sequences and writing them to fasta file...")
+                    df_to_fasta(df=df_data, output_file=input_fasta_filepath)
 
-            if not cluster_fasta_filepath.exists() or self.overwrite_sequence_clusters:
-                rank_zero_info("Clustering sequences via mmseqs2...")
-                cluster_sequences(
-                    fasta_input_filepath=input_fasta_filepath,
-                    cluster_output_filepath=cluster_fasta_filepath,
-                    min_seq_id=self.split_sequence_similarity,
-                    overwrite=self.overwrite_sequence_clusters,
-                )
-            
+                if not cluster_fasta_filepath.exists() or self.overwrite_sequence_clusters:
+                    rank_zero_info("Clustering sequences via mmseqs2...")
+                    cluster_sequences(
+                        fasta_input_filepath=input_fasta_filepath,
+                        cluster_output_filepath=cluster_fasta_filepath,
+                        min_seq_id=self.split_sequence_similarity,
+                        overwrite=self.overwrite_sequence_clusters,
+                    )
+            else:
+                # Non-zero ranks wait for cluster files to exist
+                wait_sec = int(os.getenv("CLUSTER_WAIT_SEC", "3600"))
+                start = time.time()
+                while not (cluster_fasta_filepath.exists() and cluster_tsv_filepath.exists()):
+                    if time.time() - start > wait_sec:
+                        raise RuntimeError(
+                            f"Timed out waiting for cluster files {cluster_fasta_filepath}"
+                        )
+                    time.sleep(5)
+
             # construct cluster_dict to map from cluster representative to all sequence ids in cluster
             clusterid_to_seqid_mapping = read_cluster_tsv(cluster_tsv_filepath)
             
