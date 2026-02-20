@@ -313,19 +313,16 @@ if __name__ == "__main__":
     if use_ddp and hasattr(datamodule, "use_multiprocessing"):
         datamodule.use_multiprocessing = False
 
-    # Init distributed early so we can barrier before Trainer creation; prevents NCCL timeout
-    # while rank 0 runs prepare_data (e.g. filtering 244k files) and ranks 1-N race ahead
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if use_ddp and world_size > 1 and not torch.distributed.is_initialized():
-        backend = cfg_exp.opt.get("dist_backend", "nccl")
-        torch.distributed.init_process_group(backend=backend)
-
     # Ensure data preparation only happens on rank 0 to avoid duplicate processing
     if hasattr(datamodule, 'prepare_data'):
         datamodule.prepare_data = rank_zero_only(datamodule.prepare_data)
 
     # Run dataset preparation immediately to ensure CSV exists
+    rank = int(os.environ.get("RANK", 0))
+    done_file = os.path.join(root_run, ".prepare_data_done")
     if hasattr(datamodule, "prepare_data"):
+        if rank == 0:
+            Path(done_file).unlink(missing_ok=True)  # Clear stale signal before prepare_data
         slurm_task_id, slurm_task_count = _slurm_task_info()
         dataset_csv = _dataset_csv_path(datamodule)
         if slurm_task_count > 1 and slurm_task_id != 0:
@@ -414,9 +411,18 @@ if __name__ == "__main__":
 
         _run_confind_precompute()
 
-    # All ranks must wait for rank 0 to finish data prep before Trainer creation
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+    # Non-zero ranks wait for rank 0 to finish data prep (file-based sync, no early distributed init)
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size > 1 and rank != 0:
+        wait_sec = int(os.getenv("DATA_PREP_WAIT_SEC", "21600"))
+        start = time.time()
+        while not os.path.exists(done_file):
+            if time.time() - start > wait_sec:
+                raise RuntimeError(f"Timed out waiting for {done_file}")
+            time.sleep(5)
+    elif world_size > 1 and rank == 0:
+        Path(root_run).mkdir(parents=True, exist_ok=True)
+        Path(root_run, ".prepare_data_done").touch()
 
     if args.prepare_data_only:
         log_info("prepare_data_only set; exiting after dataset preparation.")
