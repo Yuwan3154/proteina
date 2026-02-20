@@ -1046,10 +1046,10 @@ class PDBLightningDataModule(BaseLightningDataModule):
         else:
             # Fall back to sequential processing for single files or single worker
             rank_zero_info(f"Processing {len(index_pdb_tuples)} structures sequentially...")
-        for tuple_ in tqdm(index_pdb_tuples, desc="Processing structures", unit="file"):
-            result = self._load_and_process_pdb(tuple_)
-            if result is not None:
-                file_names.append(result)
+            for tuple_ in tqdm(index_pdb_tuples, desc="Processing structures", unit="file"):
+                result = self._load_and_process_pdb(tuple_)
+                if result is not None:
+                    file_names.append(result)
         
         rank_zero_info(f"Completed processing. Successfully processed {len(file_names)} structures.")
         return file_names

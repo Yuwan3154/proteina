@@ -327,6 +327,8 @@ if __name__ == "__main__":
         else:
             log_info("Preparing dataset...")
             datamodule.prepare_data()
+            # Prevent Lightning from re-running prepare_data during fit (avoids duplicate processing)
+            datamodule.prepare_data = lambda: None
 
     # If confind contact maps are requested, precompute and cache them
     transforms_cfg = cfg_data.datamodule.get("transforms")
