@@ -942,33 +942,33 @@ class ProteinTransformerAF3(torch.nn.Module):
             contact_map_embed = self.linear_contact_embed(contact_map) * pair_mask[..., None] # [b, n, n, pair_repr_dim]
             pair_f_repr = self.pair_repr_builder(batch_nn)  # [b, n, n, pair_repr_dim]
             pair_rep = (contact_map_embed + pair_f_repr) * pair_mask[..., None]  # [b, n, n, pair_repr_dim]
-            if torch.isnan(contact_map_embed).any() or torch.isinf(contact_map_embed).any():
-                print(
-                    f"[pair_init_debug] contact_map_embed nan={torch.isnan(contact_map_embed).any().item()} "
-                    f"inf={torch.isinf(contact_map_embed).any().item()} "
-                    f"min={contact_map_embed.min().item()} max={contact_map_embed.max().item()}"
-                )
-            if torch.isnan(pair_f_repr).any() or torch.isinf(pair_f_repr).any():
-                print(
-                    f"[pair_init_debug] pair_f_repr nan={torch.isnan(pair_f_repr).any().item()} "
-                    f"inf={torch.isinf(pair_f_repr).any().item()} "
-                    f"min={pair_f_repr.min().item()} max={pair_f_repr.max().item()}"
-                )
-            if torch.isnan(pair_rep).any() or torch.isinf(pair_rep).any():
-                print(
-                    f"[pair_init_debug] pair_rep nan={torch.isnan(pair_rep).any().item()} "
-                    f"inf={torch.isinf(pair_rep).any().item()} "
-                    f"min={pair_rep.min().item()} max={pair_rep.max().item()}"
-                )
+            # if torch.isnan(contact_map_embed).any() or torch.isinf(contact_map_embed).any():
+            #     print(
+            #         f"[pair_init_debug] contact_map_embed nan={torch.isnan(contact_map_embed).any().item()} "
+            #         f"inf={torch.isinf(contact_map_embed).any().item()} "
+            #         f"min={contact_map_embed.min().item()} max={contact_map_embed.max().item()}"
+            #     )
+            # if torch.isnan(pair_f_repr).any() or torch.isinf(pair_f_repr).any():
+            #     print(
+            #         f"[pair_init_debug] pair_f_repr nan={torch.isnan(pair_f_repr).any().item()} "
+            #         f"inf={torch.isinf(pair_f_repr).any().item()} "
+            #         f"min={pair_f_repr.min().item()} max={pair_f_repr.max().item()}"
+            #     )
+            # if torch.isnan(pair_rep).any() or torch.isinf(pair_rep).any():
+            #     print(
+            #         f"[pair_init_debug] pair_rep nan={torch.isnan(pair_rep).any().item()} "
+            #         f"inf={torch.isinf(pair_rep).any().item()} "
+            #         f"min={pair_rep.min().item()} max={pair_rep.max().item()}"
+            #     )
 
             # Sequence representation
             seqs = self.init_repr_factory(batch_nn) * mask[..., None]  # [b, n, token_dim]
-            if torch.isnan(seqs).any() or torch.isinf(seqs).any():
-                print(
-                    f"[seqs_init_debug] nan={torch.isnan(seqs).any().item()} "
-                    f"inf={torch.isinf(seqs).any().item()} "
-                    f"min={seqs.min().item()} max={seqs.max().item()}"
-                )
+            # if torch.isnan(seqs).any() or torch.isinf(seqs).any():
+            #     print(
+            #         f"[seqs_init_debug] nan={torch.isnan(seqs).any().item()} "
+            #         f"inf={torch.isinf(seqs).any().item()} "
+            #         f"min={seqs.min().item()} max={seqs.max().item()}"
+            #     )
         else:
             coors_3d = batch_nn["x_t"] * mask[..., None]  # [b, n, 3]
             coors_embed = (
@@ -984,15 +984,15 @@ class ProteinTransformerAF3(torch.nn.Module):
 
         # Apply registers
         seqs, pair_rep, mask, c = self._extend_w_registers(seqs, pair_rep, mask, c)
-        if torch.isnan(seqs).any() or torch.isinf(seqs).any() or torch.isnan(pair_rep).any() or torch.isinf(pair_rep).any():
-            print(
-                f"[after_extend_debug] seqs_nan={torch.isnan(seqs).any().item()} "
-                f"seqs_inf={torch.isinf(seqs).any().item()} "
-                f"seqs_min={seqs.min().item()} seqs_max={seqs.max().item()} "
-                f"pair_nan={torch.isnan(pair_rep).any().item()} "
-                f"pair_inf={torch.isinf(pair_rep).any().item()} "
-                f"pair_min={pair_rep.min().item()} pair_max={pair_rep.max().item()}"
-            )
+        # if torch.isnan(seqs).any() or torch.isinf(seqs).any() or torch.isnan(pair_rep).any() or torch.isinf(pair_rep).any():
+        #     print(
+        #         f"[after_extend_debug] seqs_nan={torch.isnan(seqs).any().item()} "
+        #         f"seqs_inf={torch.isinf(seqs).any().item()} "
+        #         f"seqs_min={seqs.min().item()} seqs_max={seqs.max().item()} "
+        #         f"pair_nan={torch.isnan(pair_rep).any().item()} "
+        #         f"pair_inf={torch.isinf(pair_rep).any().item()} "
+        #         f"pair_min={pair_rep.min().item()} pair_max={pair_rep.max().item()}"
+        #     )
 
         # Run trunk
         for i in range(self.nlayers):
@@ -1006,27 +1006,27 @@ class ProteinTransformerAF3(torch.nn.Module):
                         pair_rep = self.pair_update_layers[i](
                             seqs, pair_rep, mask
                         )  # [b, n, n, pair_dim]
-                if torch.isnan(seqs).any() or torch.isinf(seqs).any() or torch.isnan(pair_rep).any() or torch.isinf(pair_rep).any():
-                    print(
-                        f"[trunk_debug_layer{i}] seqs_nan={torch.isnan(seqs).any().item()} "
-                        f"seqs_inf={torch.isinf(seqs).any().item()} "
-                        f"seqs_min={seqs.min().item()} seqs_max={seqs.max().item()} "
-                        f"pair_nan={torch.isnan(pair_rep).any().item()} "
-                        f"pair_inf={torch.isinf(pair_rep).any().item()} "
-                        f"pair_min={pair_rep.min().item()} pair_max={pair_rep.max().item()}"
-                    )
+                # if torch.isnan(seqs).any() or torch.isinf(seqs).any() or torch.isnan(pair_rep).any() or torch.isinf(pair_rep).any():
+                #     print(
+                #         f"[trunk_debug_layer{i}] seqs_nan={torch.isnan(seqs).any().item()} "
+                #         f"seqs_inf={torch.isinf(seqs).any().item()} "
+                #         f"seqs_min={seqs.min().item()} seqs_max={seqs.max().item()} "
+                #         f"pair_nan={torch.isnan(pair_rep).any().item()} "
+                #         f"pair_inf={torch.isinf(pair_rep).any().item()} "
+                #         f"pair_min={pair_rep.min().item()} pair_max={pair_rep.max().item()}"
+                #     )
 
         # Undo registers
         seqs, pair_rep, mask = self._undo_registers(seqs, pair_rep, mask)
         
         # Symmetrize pair representation
         pair_rep = (pair_rep + pair_rep.transpose(-2, -3)) / 2.0
-        if torch.isnan(pair_rep).any() or torch.isinf(pair_rep).any():
-            print(
-                f"[pair_rep_sym_debug] nan={torch.isnan(pair_rep).any().item()} "
-                f"inf={torch.isinf(pair_rep).any().item()} "
-                f"min={pair_rep.min().item()} max={pair_rep.max().item()}"
-            )
+        # if torch.isnan(pair_rep).any() or torch.isinf(pair_rep).any():
+        #     print(
+        #         f"[pair_rep_sym_debug] nan={torch.isnan(pair_rep).any().item()} "
+        #         f"inf={torch.isinf(pair_rep).any().item()} "
+        #         f"min={pair_rep.min().item()} max={pair_rep.max().item()}"
+        #     )
 
         nn_out = {}
         coords_pred = None
@@ -1041,15 +1041,15 @@ class ProteinTransformerAF3(torch.nn.Module):
                 raise ValueError(
                     "residue_type is required in batch for IPA coordinate prediction."
                 )
-            if torch.isnan(seqs).any() or torch.isinf(seqs).any() or torch.isnan(pair_rep).any() or torch.isinf(pair_rep).any():
-                print(
-                    f"[ipa_input_debug] seqs_nan={torch.isnan(seqs).any().item()} "
-                    f"seqs_inf={torch.isinf(seqs).any().item()} "
-                    f"seqs_min={seqs.min().item()} seqs_max={seqs.max().item()} "
-                    f"pair_nan={torch.isnan(pair_rep).any().item()} "
-                    f"pair_inf={torch.isinf(pair_rep).any().item()} "
-                    f"pair_min={pair_rep.min().item()} pair_max={pair_rep.max().item()}"
-                )
+            # if torch.isnan(seqs).any() or torch.isinf(seqs).any() or torch.isnan(pair_rep).any() or torch.isinf(pair_rep).any():
+            #     print(
+            #         f"[ipa_input_debug] seqs_nan={torch.isnan(seqs).any().item()} "
+            #         f"seqs_inf={torch.isinf(seqs).any().item()} "
+            #         f"seqs_min={seqs.min().item()} seqs_max={seqs.max().item()} "
+            #         f"pair_nan={torch.isnan(pair_rep).any().item()} "
+            #         f"pair_inf={torch.isinf(pair_rep).any().item()} "
+            #         f"pair_min={pair_rep.min().item()} pair_max={pair_rep.max().item()}"
+            #     )
             struct_out = self.coors_3d_decoder(
                 {"single": seqs, "pair": pair_rep},
                 aatype=aatype,
@@ -1064,12 +1064,12 @@ class ProteinTransformerAF3(torch.nn.Module):
                 else struct_out["frames"]
             )  # [b, n, 7]
             atom14 = struct_out["positions"][-1] if struct_out["positions"].dim() == 5 else struct_out["positions"]
-            if torch.isnan(atom14).any() or torch.isinf(atom14).any():
-                print(
-                    f"[ipa_pos_debug] nan={torch.isnan(atom14).any().item()} "
-                    f"inf={torch.isinf(atom14).any().item()} "
-                    f"min={atom14.min().item()} max={atom14.max().item()}"
-                )
+            # if torch.isnan(atom14).any() or torch.isinf(atom14).any():
+            #     print(
+            #         f"[ipa_pos_debug] nan={torch.isnan(atom14).any().item()} "
+            #         f"inf={torch.isinf(atom14).any().item()} "
+            #         f"min={atom14.min().item()} max={atom14.max().item()}"
+            #     )
             atom14 = atom14 * mask[..., None, None]
             # Convert atom14 -> atom37 safely via gather (scatter is unsafe because
             # rc.RESTYPE_ATOM14_TO_ATOM37 uses 0 as a dummy index for missing atoms,
@@ -1099,14 +1099,14 @@ class ProteinTransformerAF3(torch.nn.Module):
 
         if self.update_pair_repr and self.num_buckets_predict_pair is not None:
             pair_logits = self.pair_head_prediction(pair_rep)
-            if torch.isnan(pair_logits).any() or torch.isinf(pair_logits).any():
-                print(
-                    f"[pair_logits_debug] nan={torch.isnan(pair_logits).any().item()} "
-                    f"inf={torch.isinf(pair_logits).any().item()} "
-                    f"pair_rep_nan={torch.isnan(pair_rep).any().item()} "
-                    f"pair_rep_inf={torch.isinf(pair_rep).any().item()} "
-                    f"pair_rep_min={pair_rep.min().item()} pair_rep_max={pair_rep.max().item()}"
-                )
+            # if torch.isnan(pair_logits).any() or torch.isinf(pair_logits).any():
+            #     print(
+            #         f"[pair_logits_debug] nan={torch.isnan(pair_logits).any().item()} "
+            #         f"inf={torch.isinf(pair_logits).any().item()} "
+            #         f"pair_rep_nan={torch.isnan(pair_rep).any().item()} "
+            #         f"pair_rep_inf={torch.isinf(pair_rep).any().item()} "
+            #         f"pair_rep_min={pair_rep.min().item()} pair_rep_max={pair_rep.max().item()}"
+            #     )
             if coords_pred is not None:
                 coords_pred = coords_pred + torch.mean(pair_logits) * 0.0
                 coords_pred = coords_pred * (mask[..., None] if coords_pred.dim() == 3 else mask[..., None, None])

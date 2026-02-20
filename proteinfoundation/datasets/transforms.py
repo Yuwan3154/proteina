@@ -145,17 +145,11 @@ class PaddingTransform(T.BaseTransform):
         return graph
 
     def pad_tensor(self, tensor, max_size, dim, fill_value=0):
-        """Pads a single tensor to specified size.
-
-        Args:
-            tensor: Tensor to pad
-            max_size: Target size
-            dim: Dimension to pad
-            fill_value: Value to use for padding
-
-        Returns:
-            Padded tensor
-        """
+        """Pads a single tensor to specified size. Truncates if larger than max_size
+        to avoid OOM when .pt files from other configs exceed the current max_size."""
+        if tensor.size(dim) > max_size:
+            # Truncate to max_size to match dataset config (e.g. max_length 256)
+            tensor = tensor.narrow(dim, 0, max_size)
         if tensor.size(dim) >= max_size:
             return tensor
         pad_size = max_size - tensor.size(dim)

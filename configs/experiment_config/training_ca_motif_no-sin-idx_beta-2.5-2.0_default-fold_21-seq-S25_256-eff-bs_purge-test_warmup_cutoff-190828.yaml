@@ -1,4 +1,5 @@
 run_name_: ca_motif_no-sin-idx_beta-2.5-2.0_default-fold_21-seq-S25_256-eff-bs_purge-test_warmup_cutoff-190828
+pretrained_model_path: ~/proteina/data/weights/ca_motif_no-sin-idx_beta-2.5-2.0_default-fold_21-seq-S25_256-eff-bs_purge-test_warmup_cutoff-190828/checkpoints/last.ckpt
 
 hardware:
   ncpus_per_task_train_: 16  # Number of CPUs per task during training

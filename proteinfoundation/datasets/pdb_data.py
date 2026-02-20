@@ -708,6 +708,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
         self.clusterid_to_seqid_mappings = None
         self.file_names = None
         self.min_length = dataselector.min_length if dataselector else None
+        self.max_length = dataselector.max_length if dataselector else None
 
     def prepare_data(self):
         if self.dataselector:
@@ -836,9 +837,9 @@ class PDBLightningDataModule(BaseLightningDataModule):
         self, df_data: pd.DataFrame, id_col: str = "id"
     ) -> pd.DataFrame:
         """Post-filter by processed length (coord_mask.any). Adds processed_length column
-        to df_data, filters by min_length, unlinks too-short .pt files, and invalidates
-        cluster files so they are regenerated from the filtered dataset."""
-        if self.min_length is None:
+        to df_data, filters by min_length and max_length, unlinks too-short .pt files,
+        and invalidates cluster files so they are regenerated from the filtered dataset."""
+        if self.min_length is None and self.max_length is None:
             return df_data
 
         stems = df_data[id_col].astype(str).tolist()
@@ -847,8 +848,12 @@ class PDBLightningDataModule(BaseLightningDataModule):
         df_data = df_data.copy()
         df_data["processed_length"] = df_data[id_col].astype(str).map(length_map)
 
-        # Drop rows with missing/invalid .pt or length < min_length
-        valid = df_data["processed_length"].notna() & (df_data["processed_length"] >= self.min_length)
+        # Drop rows with missing/invalid .pt or length outside [min_length, max_length]
+        valid = df_data["processed_length"].notna()
+        if self.min_length is not None:
+            valid = valid & (df_data["processed_length"] >= self.min_length)
+        if self.max_length is not None:
+            valid = valid & (df_data["processed_length"] <= self.max_length)
         df_filtered = df_data[valid].copy()
         drop_stems = set(stems) - set(df_filtered[id_col].astype(str))
 
@@ -856,7 +861,12 @@ class PDBLightningDataModule(BaseLightningDataModule):
             path = self.processed_dir / f"{stem}.pt"
             if path.exists():
                 nres = length_map.get(stem)
-                if nres is None or nres < self.min_length:
+                drop = nres is None
+                if self.min_length is not None and nres is not None:
+                    drop = drop or nres < self.min_length
+                if self.max_length is not None and nres is not None:
+                    drop = drop or nres > self.max_length
+                if drop:
                     path.unlink(missing_ok=True)
 
         if drop_stems:
@@ -869,26 +879,58 @@ class PDBLightningDataModule(BaseLightningDataModule):
         self._invalidate_cluster_files()
         return df_filtered
 
-    def _compute_processed_lengths(self, stems: List[str]) -> Dict[str, Optional[int]]:
-        """Sequential fallback for computing processed_length from .pt files."""
+    @staticmethod
+    def _get_length_from_pt(stem: str, processed_dir: pathlib.Path) -> Tuple[str, Optional[int]]:
         add_safe_globals([tgd.Data])
-        length_map = {}
-        for stem in stems:
-            path = self.processed_dir / f"{stem}.pt"
-            if not path.exists():
-                length_map[stem] = None
-                continue
+        path = processed_dir / f"{stem}.pt"
+        if not path.exists():
+            return stem, None
+        try:
+            data = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception:
             try:
-                data = torch.load(path, map_location="cpu", weights_only=False)
-            except Exception:
-                length_map[stem] = None
                 path.unlink(missing_ok=True)
-                continue
-            if not hasattr(data, "coord_mask"):
-                length_map[stem] = None
+            except OSError:
+                pass
+            return stem, None
+        
+        if not hasattr(data, "coord_mask"):
+            try:
                 path.unlink(missing_ok=True)
-                continue
-            length_map[stem] = int(data.coord_mask.any(dim=-1).sum().item())
+            except OSError:
+                pass
+            return stem, None
+            
+        return stem, int(data.coord_mask.any(dim=-1).sum().item())
+
+    def _compute_processed_lengths(self, stems: List[str]) -> Dict[str, Optional[int]]:
+        """Compute processed_length from .pt files using multiprocessing if available."""
+        rank_zero_info(f"Computing lengths for {len(stems)} processed files...")
+        length_map = {}
+        
+        if self.use_multiprocessing and self.num_workers > 1:
+            process_func = functools.partial(
+                self._get_length_from_pt,
+                processed_dir=self.processed_dir,
+            )
+            # Use map with chunksize to reduce overhead of submitting many small tasks
+            chunksize = max(1, len(stems) // (self.num_workers * 4))
+            with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
+                results = list(tqdm(
+                    executor.map(process_func, stems, chunksize=chunksize),
+                    total=len(stems),
+                    desc="Checking file lengths",
+                    unit="file"
+                ))
+                for stem, length in results:
+                    length_map[stem] = length
+        else:
+            # Sequential fallback
+            add_safe_globals([tgd.Data])
+            for stem in tqdm(stems, desc="Checking file lengths", unit="file"):
+                stem_ret, length = self._get_length_from_pt(stem, self.processed_dir)
+                length_map[stem_ret] = length
+                
         return length_map
 
     def _invalidate_cluster_files(self) -> None:

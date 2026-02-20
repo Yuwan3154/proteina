@@ -12,15 +12,6 @@ import os
 import sys
 import time
 
-# # Set CUDA environment variables
-# os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-# os.environ["TORCH_USE_CUDA_DSA"] = "1"
-# # Disable CUDA graph capture
-# os.environ["CUDA_ENABLE_GRAPH_CAPTURE"] = "0"
-
-root = os.path.abspath(".")
-sys.path.append(root)  # Adds project's root directory
-
 import argparse
 import hashlib
 import json
@@ -33,7 +24,7 @@ import hydra
 import lightning as L
 import loralib as lora
 import torch
-torch._dynamo.config.optimize_ddp = False
+torch._dynamo.config.optimize_ddp = True
 import wandb
 from dotenv import load_dotenv
 from lightning.pytorch.loggers import WandbLogger

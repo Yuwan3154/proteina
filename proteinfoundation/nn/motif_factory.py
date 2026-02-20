@@ -374,8 +374,8 @@ class SingleMotifFactory:
             motif_seg_lens_batch.append(motif_seg_lens)
         
         # Build motif masks at batch padded length (num_residues) so shapes match x_1, mask.
-        # pad_sequence only pads to max(batch_num_residues), but the batch is padded to num_residues by the dataloader.
-        motif_sequence_masks = torch.zeros((batch_size, num_residues), dtype=torch.bool, device=mask.device)
+        # Avoid in-place operations for dynamo compatibility
+        motif_sequence_masks_list = []
         for i in range(len(motif_seg_lens_batch)):
             segs = [''.join(['1'] * l) for l in motif_seg_lens_batch[i]]
             segs.extend(['0'] * (batch_num_residues[i] - motif_n_res_batch[i]).astype(np.int64))
@@ -383,7 +383,13 @@ class SingleMotifFactory:
             motif_sequence_mask = torch.tensor(
                 [int(elt) for elt in ''.join(segs)], dtype=torch.bool, device=mask.device
             )
-            motif_sequence_masks[i, :batch_num_residues[i]] = motif_sequence_mask
+            # Pad to num_residues if necessary
+            padding_len = num_residues - motif_sequence_mask.shape[0]
+            if padding_len > 0:
+                motif_sequence_mask = torch.nn.functional.pad(motif_sequence_mask, (0, padding_len), value=False)
+            motif_sequence_masks_list.append(motif_sequence_mask)
+        
+        motif_sequence_masks = torch.stack(motif_sequence_masks_list)
         motif_structure_masks = motif_sequence_masks[:, :, None] * motif_sequence_masks[:, None, :]
         result['fixed_sequence_mask'] = motif_sequence_masks
         result['fixed_structure_mask'] = motif_structure_masks
