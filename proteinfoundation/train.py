@@ -313,6 +313,13 @@ if __name__ == "__main__":
     if use_ddp and hasattr(datamodule, "use_multiprocessing"):
         datamodule.use_multiprocessing = False
 
+    # Init distributed early so we can barrier before Trainer creation; prevents NCCL timeout
+    # while rank 0 runs prepare_data (e.g. filtering 244k files) and ranks 1-N race ahead
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if use_ddp and world_size > 1 and not torch.distributed.is_initialized():
+        backend = cfg_exp.opt.get("dist_backend", "nccl")
+        torch.distributed.init_process_group(backend=backend)
+
     # Ensure data preparation only happens on rank 0 to avoid duplicate processing
     if hasattr(datamodule, 'prepare_data'):
         datamodule.prepare_data = rank_zero_only(datamodule.prepare_data)
@@ -406,6 +413,10 @@ if __name__ == "__main__":
             run_precompute(**filtered_kwargs)
 
         _run_confind_precompute()
+
+    # All ranks must wait for rank 0 to finish data prep before Trainer creation
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
 
     if args.prepare_data_only:
         log_info("prepare_data_only set; exiting after dataset preparation.")
