@@ -283,15 +283,7 @@ if __name__ == "__main__":
         config_path = "../configs/datasets_config/"
     with hydra.initialize(config_path, version_base=hydra.__version__):
         cfg_data = hydra.compose(config_name=cfg_exp["dataset"])
-        # DDP + DataLoader num_workers>0 causes fork/CUDA deadlock; run all in main process
-        use_ddp = cfg_exp.opt.get("dist_strategy") == "ddp"
-        if use_ddp:
-            cfg_data.datamodule.num_workers = 0
-            if hasattr(cfg_data.datamodule, "use_multiprocessing"):
-                cfg_data.datamodule.use_multiprocessing = False
-            log_info("DDP mode: num_workers=0, use_multiprocessing=False to avoid fork deadlock")
-        else:
-            cfg_data.datamodule.num_workers = num_cpus
+        cfg_data.datamodule.num_workers = num_cpus  # Overwrite number of cpus
         batch_size = cfg_exp.opt.get("batch_size")
         if batch_size is not None:
             cfg_data.datamodule.batch_size = batch_size
@@ -310,19 +302,13 @@ if __name__ == "__main__":
 
     # create datamodule containing default train and val dataloader
     datamodule = hydra.utils.instantiate(cfg_data.datamodule)
-    if use_ddp and hasattr(datamodule, "use_multiprocessing"):
-        datamodule.use_multiprocessing = False
-
+    
     # Ensure data preparation only happens on rank 0 to avoid duplicate processing
     if hasattr(datamodule, 'prepare_data'):
         datamodule.prepare_data = rank_zero_only(datamodule.prepare_data)
 
     # Run dataset preparation immediately to ensure CSV exists
-    rank = int(os.environ.get("RANK", 0))
-    done_file = os.path.join(root_run, ".prepare_data_done")
     if hasattr(datamodule, "prepare_data"):
-        if rank == 0:
-            Path(done_file).unlink(missing_ok=True)  # Clear stale signal before prepare_data
         slurm_task_id, slurm_task_count = _slurm_task_info()
         dataset_csv = _dataset_csv_path(datamodule)
         if slurm_task_count > 1 and slurm_task_id != 0:
@@ -410,19 +396,6 @@ if __name__ == "__main__":
             run_precompute(**filtered_kwargs)
 
         _run_confind_precompute()
-
-    # Non-zero ranks wait for rank 0 to finish data prep (file-based sync, no early distributed init)
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if world_size > 1 and rank != 0:
-        wait_sec = int(os.getenv("DATA_PREP_WAIT_SEC", "21600"))
-        start = time.time()
-        while not os.path.exists(done_file):
-            if time.time() - start > wait_sec:
-                raise RuntimeError(f"Timed out waiting for {done_file}")
-            time.sleep(5)
-    elif world_size > 1 and rank == 0:
-        Path(root_run).mkdir(parents=True, exist_ok=True)
-        Path(root_run, ".prepare_data_done").touch()
 
     if args.prepare_data_only:
         log_info("prepare_data_only set; exiting after dataset preparation.")

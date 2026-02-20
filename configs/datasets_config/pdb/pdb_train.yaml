@@ -20,9 +20,9 @@ datamodule:
     - _target_: "proteinfoundation.datasets.transforms.PaddingTransform"
       max_size: 256
   batch_size: 4 # Batch size for dataloader
-  num_workers: 0 # Number of workers for dataloader
+  num_workers: 8 # Number of workers for dataloader
   pin_memory: True # Pin memory for dataloader
-  prefetch_factor: 0 # Prefetch factor for dataloader
+  prefetch_factor: 2 # Prefetch factor for dataloader
   # Overfit testing: filter dataset to specific PDB chains (e.g., ["1abc_A", "2xyz_B"])
   overfit_pdb_chains: null
 
