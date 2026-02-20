@@ -17,6 +17,7 @@ datamodule:
     # - _target_: "proteinfoundation.datasets.transforms.ContactMapTransform"
     #   contact_atom_type: "CB"  # "CA" for alpha-carbon, "CB" for beta-carbon (pseudo-CB for Glycine)
     #   contact_distance_cutoff: 8.0  # Distance threshold in Angstroms for defining contacts
+    - _target_: "proteinfoundation.datasets.transforms.PurgeConfindTransform"  # Remove contact_map_confind when not using confind
     - _target_: "proteinfoundation.datasets.transforms.PaddingTransform"
       max_size: 256
   batch_size: 4 # Batch size for dataloader

@@ -372,6 +372,21 @@ class CATHLabelTransform(T.BaseTransform):
         raise ValueError(f"Segment {segment} is not in the correct format")
 
 
+class PurgeConfindTransform(T.BaseTransform):
+    """Removes contact_map_confind from the graph when not using confind contact maps.
+
+    Use this transform in configs that do NOT include ContactMapTransform with
+    contact_method='confind'. Preprocessed .pt files may contain contact_map_confind;
+    this transform purges it so it does not reach the collator and cause KeyError
+    when batching samples with mixed attributes.
+    """
+
+    def forward(self, graph: Data) -> Data:
+        if hasattr(graph, "contact_map_confind"):
+            del graph["contact_map_confind"]
+        return graph
+
+
 class ContactMapTransform(T.BaseTransform):
     """Extracts contact map from ground-truth protein coordinates.
 
@@ -515,6 +530,9 @@ class ContactMapTransform(T.BaseTransform):
             contact_map = self._contact_map_from_distance(graph)
         elif self.contact_method == "confind":
             contact_map = self._contact_map_from_confind_precomputed(graph)
+            # Purge raw confind map after use so it is not passed to collation
+            if hasattr(graph, "contact_map_confind"):
+                del graph["contact_map_confind"]
         else:
             raise ValueError(f"Unknown contact_method: {self.contact_method}")
 

@@ -13,6 +13,7 @@ datamodule:
     - _target_: "proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform"
     - _target_: "proteinfoundation.datasets.transforms.CATHLabelTransform" # activate for fold-conditional training
       root_dir: ${oc.env:DATA_PATH}/cathdata/ # Root directory for CATH labels
+    - _target_: "proteinfoundation.datasets.transforms.PurgeConfindTransform"  # Remove contact_map_confind when not using confind
     - _target_: "proteinfoundation.datasets.transforms.PaddingTransform"
       max_size: 256
   batch_size: 8 # Batch size for dataloader
