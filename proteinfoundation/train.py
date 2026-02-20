@@ -41,6 +41,8 @@ from lightning.pytorch.utilities import rank_zero_only
 from lightning.pytorch.strategies import DDPStrategy
 from loguru import logger
 from omegaconf import OmegaConf
+from einops._torch_specific import allow_ops_in_compiled_graph
+allow_ops_in_compiled_graph()
 
 from proteinfoundation.utils.precompute_confind_maps import run_precompute
 from proteinfoundation.utils.ema_utils.ema_callback import EMA, EmaModelCheckpoint
@@ -57,19 +59,6 @@ from proteinfoundation.utils.training_analysis_utils import (
     SkipNanGradCallback,
 )
 
-
-def _maybe_init_cuequivariance(use_cueq: bool = False):
-    """Initialize cuequivariance Triton cache when use_cueq is True. Skip when disabled."""
-    if not use_cueq:
-        return False
-    try:
-        import cuequivariance_torch as cuet  # noqa: F401
-        from cuequivariance_ops_torch import init_triton_cache
-        init_triton_cache()
-        return True
-    except Exception as exc:
-        log_info(f"Skipping cuequivariance init: {exc}")
-        return False
 
 @rank_zero_only
 def wandb_login():
@@ -402,8 +391,6 @@ if __name__ == "__main__":
     if args.prepare_data_only:
         log_info("prepare_data_only set; exiting after dataset preparation.")
         sys.exit(0)
-
-    _maybe_init_cuequivariance(cfg_exp.opt.get("use_cueq", False))
 
     # Set logger
     wandb_logger = None

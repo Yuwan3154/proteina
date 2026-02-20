@@ -268,7 +268,12 @@ def dense_padded_collate(
     for out_store in out.stores:
         key = out_store._key
         stores = key_to_stores[key]
-        for attr in stores[0].keys():
+        # Only collate attributes present in ALL stores; skip optional attributes
+        # (e.g. contact_map_confind) that may exist in some samples but not others.
+        common_attrs = set(stores[0].keys())
+        for store in stores[1:]:
+            common_attrs &= set(store.keys())
+        for attr in common_attrs:
             if attr in exclude_keys:  # Do not include top-level attribute.
                 continue
 
