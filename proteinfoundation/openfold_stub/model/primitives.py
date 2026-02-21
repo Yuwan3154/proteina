@@ -210,7 +210,7 @@ def softmax(t: torch.Tensor, dim: int = -1) -> torch.Tensor:
     #     with torch.cuda.amp.autocast(enabled=False):
     #         s = torch.nn.functional.softmax(t, dim=dim)
     # else:
-    s = torch.nn.functional.softmax(t, dim=dim)
+    s = torch.nn.functional.softmax(t.contiguous(), dim=dim)
 
     return s
 
