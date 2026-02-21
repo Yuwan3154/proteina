@@ -346,8 +346,16 @@ class PDBDataSplitter:
                     )
 
             rank_zero_only(_create_cluster_files)()
-            if torch.distributed.is_initialized():
-                torch.distributed.barrier()
+
+            # Non-rank-0 processes wait for cluster files (avoids barrier/device warnings with torchrun)
+            _rank = int(os.environ.get("RANK", "0"))
+            if _rank != 0 and (not cluster_fasta_filepath.exists() or not cluster_tsv_filepath.exists()):
+                wait_sec = int(os.environ.get("CLUSTER_WAIT_SEC", "3600"))
+                start = time.time()
+                while (not cluster_fasta_filepath.exists() or not cluster_tsv_filepath.exists()) and (time.time() - start) < wait_sec:
+                    time.sleep(1.0)
+                if not cluster_fasta_filepath.exists():
+                    raise RuntimeError(f"Timed out waiting for cluster files from rank 0 after {wait_sec}s")
 
             # construct cluster_dict to map from cluster representative to all sequence ids in cluster
             clusterid_to_seqid_mapping = read_cluster_tsv(cluster_tsv_filepath)

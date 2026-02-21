@@ -186,6 +186,24 @@ if __name__ == "__main__":
             cfg_exp.run_name_ = cfg_exp.run_name_ + "_single"
         log_info(f"Exp config {cfg_exp}")
 
+    # Verify distributed setup when using torchrun / multi-GPU
+    _rank = int(os.environ.get("RANK", "-1"))
+    _world_size = int(os.environ.get("WORLD_SIZE", "-1"))
+    _local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
+    _expected_world = cfg_exp.hardware.ngpus_per_node_ * cfg_exp.hardware.nnodes_
+    if _expected_world > 1:
+        if _world_size == -1:
+            log_info(
+                f"Multi-GPU config (ngpus={cfg_exp.hardware.ngpus_per_node_}, nnodes={cfg_exp.hardware.nnodes_}) "
+                f"but RANK/WORLD_SIZE not set. Launch with: torchrun --nproc_per_node={cfg_exp.hardware.ngpus_per_node_} train.py ..."
+            )
+        elif _world_size != _expected_world:
+            raise RuntimeError(
+                f"Config expects {_expected_world} processes (ngpus={cfg_exp.hardware.ngpus_per_node_} * nnodes={cfg_exp.hardware.nnodes_}) "
+                f"but WORLD_SIZE={_world_size}. Check torchrun --nproc_per_node and num_nodes."
+            )
+        log_info(f"Distributed: rank={_rank} world_size={_world_size} local_rank={_local_rank}")
+
     # Set training precision
     precision = "32"
     if not cfg_exp.force_precision_f32:
