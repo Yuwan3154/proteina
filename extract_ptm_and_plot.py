@@ -102,7 +102,7 @@ def create_correlation_plot(tm_scores: List[float], ptm_scores: List[float],
     x_line = np.linspace(min(tm_scores), max(tm_scores), 100)
     y_line = slope * x_line + intercept
     plt.plot(x_line, y_line, 'r--', linewidth=2, 
-            #  label=f'Linear fit: y = {slope:.3f}x + {intercept:.3f}'
+             label=f'Linear fit: y = {slope:.3f}x + {intercept:.3f}'
              )
     
     # Labels and title
@@ -125,6 +125,8 @@ def create_correlation_plot(tm_scores: List[float], ptm_scores: List[float],
              fontsize=24, verticalalignment='bottom', horizontalalignment='right',
              bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
     
+    # Place the legend in the bottom right corner
+    plt.legend(fontsize=24, loc='lower right')
     # plt.grid(True, alpha=0.3)
     
     # Set equal aspect ratio if scores are in similar range
