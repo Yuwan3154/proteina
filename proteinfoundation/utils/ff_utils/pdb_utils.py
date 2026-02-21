@@ -390,16 +390,36 @@ def mask_seq(seq: Union[np.ndarray, torch.Tensor], mask: Union[np.ndarray, torch
         return seq
 
     if isinstance(seq, torch.Tensor):
-        # GPU-friendly implementation avoiding CPU sync
-        # Assume mask is also a tensor on the same device
-        seq_len = mask.sum()
-        num_mask = (seq_len.float() * mask_seq_proportion).long()
+        # GPU-friendly implementation avoiding CPU sync and loops
+        is_1d = seq.dim() == 1
+        if is_1d:
+            seq = seq.unsqueeze(0)
+            if isinstance(mask, torch.Tensor):
+                mask = mask.unsqueeze(0)
         
-        if num_mask > 0:
-            mask_idx = torch.randperm(seq_len, device=seq.device)[:num_mask]
-            
-            # Apply masking
-            seq[mask_idx] = 20
+        # Assume seq and mask are [B, N]
+        lengths = mask.sum(dim=1) # [B]
+        num_mask = (lengths.float() * mask_seq_proportion).long() # [B]
+
+        # Create noise for argsort
+        # We want to select 'num_mask' tokens with smallest noise values
+        noise = torch.rand_like(seq.float()) # [B, N]
+
+        # Ignore padded regions (where mask is 0) by setting noise to infinity
+        noise.masked_fill_(~mask.bool(), float('inf'))
+
+        # Get rank of each element
+        # argsort twice gives the rank (0-based index in sorted array)
+        ranks = torch.argsort(torch.argsort(noise, dim=1), dim=1)
+
+        # Select where rank < num_mask
+        mask_selection = ranks < num_mask.unsqueeze(1)
+
+        # Apply masking out-of-place
+        seq = torch.where(mask_selection, torch.tensor(20, device=seq.device, dtype=seq.dtype), seq)
+
+        if is_1d:
+            seq = seq.squeeze(0)
             
     else:
         # Numpy fallback

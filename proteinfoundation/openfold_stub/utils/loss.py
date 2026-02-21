@@ -1345,7 +1345,7 @@ def compute_violation_metrics_np(
     atom14_pred_positions: np.ndarray,
     violations: Dict[str, np.ndarray],
 ) -> Dict[str, np.ndarray]:
-    to_tensor = lambda x: torch.tensor(x)
+    to_tensor = lambda x: torch.as_tensor(x)
     batch = tree_map(to_tensor, batch, np.ndarray)
     atom14_pred_positions = to_tensor(atom14_pred_positions)
     violations = tree_map(to_tensor, violations, np.ndarray)
@@ -1568,10 +1568,10 @@ def compute_drmsd(structure_1, structure_2, mask=None):
 
 
 def compute_drmsd_np(structure_1, structure_2, mask=None):
-    structure_1 = torch.tensor(structure_1)
-    structure_2 = torch.tensor(structure_2)
+    structure_1 = torch.as_tensor(structure_1)
+    structure_2 = torch.as_tensor(structure_2)
     if(mask is not None):
-        mask = torch.tensor(mask)
+        mask = torch.as_tensor(mask)
 
     return compute_drmsd(structure_1, structure_2, mask)
 
