@@ -518,8 +518,11 @@ class IdxEmbeddingSeqFeat(Feature):
             self.assert_defaults_allowed(batch, "Residue index sequence")
             xt = batch["x_t"]  # [b, n, 3]
             b, n = xt.shape[0], xt.shape[1]
-            inds = torch.Tensor([[i + 1 for i in range(n)] for _ in range(b)]).to(
-                xt.device
+            inds = (
+                torch.arange(1, n + 1, device=xt.device)
+                .unsqueeze(0)
+                .expand(b, -1)
+                .float()
             )  # [b, n]
         return get_index_embedding(inds, edim=self.dim)  # [b, n, idx_embed_dim]
 
