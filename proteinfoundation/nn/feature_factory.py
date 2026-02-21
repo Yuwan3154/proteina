@@ -640,9 +640,7 @@ class SequenceSeparationPairFeat(Feature):
             self.assert_defaults_allowed(batch, "Relative sequence separation pair")
             xt = batch["x_t"]  # [b, n, 3]
             b, n = xt.shape[0], xt.shape[1]
-            inds = torch.Tensor([[i + 1 for i in range(n)] for _ in range(b)]).to(
-                xt.device
-            )  # [b, n]
+            inds = torch.arange(1, n + 1, device=xt.device, dtype=torch.float32).expand(b, -1)  # [b, n]
 
         seq_sep = inds[:, :, None] - inds[:, None, :]  # [b, n, n]
 
