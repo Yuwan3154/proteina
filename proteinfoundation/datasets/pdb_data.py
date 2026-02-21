@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 import torch
 from loguru import logger
-from lightning.pytorch.utilities.rank_zero import rank_zero_info
+from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 from torch.utils.data import Dataset, get_worker_info
 from torch_geometric.data import Data
 import torch_geometric.data.data as tgd
@@ -332,19 +332,23 @@ class PDBDataSplitter:
                 )
             )
 
-            if not input_fasta_filepath.exists() or self.overwrite_sequence_clusters:
-                rank_zero_info("Retrieving sequences and writing them to fasta file...")
-                df_to_fasta(df=df_data, output_file=input_fasta_filepath)
+            def _create_cluster_files():
+                if not input_fasta_filepath.exists() or self.overwrite_sequence_clusters:
+                    rank_zero_info("Retrieving sequences and writing them to fasta file...")
+                    df_to_fasta(df=df_data, output_file=input_fasta_filepath)
+                if not cluster_fasta_filepath.exists() or self.overwrite_sequence_clusters:
+                    rank_zero_info("Clustering sequences via mmseqs2...")
+                    cluster_sequences(
+                        fasta_input_filepath=input_fasta_filepath,
+                        cluster_output_filepath=cluster_fasta_filepath,
+                        min_seq_id=self.split_sequence_similarity,
+                        overwrite=self.overwrite_sequence_clusters,
+                    )
 
-            if not cluster_fasta_filepath.exists() or self.overwrite_sequence_clusters:
-                rank_zero_info("Clustering sequences via mmseqs2...")
-                cluster_sequences(
-                    fasta_input_filepath=input_fasta_filepath,
-                    cluster_output_filepath=cluster_fasta_filepath,
-                    min_seq_id=self.split_sequence_similarity,
-                    overwrite=self.overwrite_sequence_clusters,
-                )
-            
+            rank_zero_only(_create_cluster_files)()
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+
             # construct cluster_dict to map from cluster representative to all sequence ids in cluster
             clusterid_to_seqid_mapping = read_cluster_tsv(cluster_tsv_filepath)
             
@@ -904,9 +908,9 @@ class PDBLightningDataModule(BaseLightningDataModule):
             with open(auto_excluded, "a") as f:
                 for stem in sorted(drop_stems):
                     f.write(f"{stem}\n")
+            self._invalidate_cluster_files()
 
         rank_zero_info(f"Filtered dataset from {len(df_data)} to {len(df_filtered)} samples")
-        self._invalidate_cluster_files()
         return df_filtered
 
     @staticmethod

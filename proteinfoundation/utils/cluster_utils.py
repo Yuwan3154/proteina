@@ -292,19 +292,35 @@ def cluster_sequences(
                 "MMseqs2 not found. Please install it: conda install -c conda-forge -c bioconda mmseqs2"
             )
 
-        if (
-            efficient_linclust
-        ):  # use efficient linclust algorithm that cales linearly with input size
-            cmd = f"mmseqs easy-linclust {fasta_input_filepath} pdb_cluster tmp --min-seq-id {min_seq_id} -c {coverage} --cov-mode 1"
-        else:  # use standard cascaded clustering algorithm
-            cmd = f"mmseqs easy-cluster {fasta_input_filepath} pdb_cluster tmp --min-seq-id {min_seq_id} -c {coverage} --cov-mode 1"
-        if silence_mmseqs_output:
-            subprocess.run(cmd.split(), stdout=subprocess.DEVNULL)
+        # Run mmseqs from data_dir so tmp/ and output files are created there (avoids CWD/tmp
+        # permission issues on HPC/DDP where CWD may be unwritable)
+        work_dir = cluster_fasta_path.parent
+        fasta_abs = pathlib.Path(fasta_input_filepath).resolve()
+
+        if efficient_linclust:
+            cmd_parts = ["mmseqs", "easy-linclust", str(fasta_abs), "pdb_cluster", "tmp", "--min-seq-id", str(min_seq_id), "-c", str(coverage), "--cov-mode", "1"]
         else:
-            subprocess.run(cmd.split())
-        # Rename output file
-        shutil.move("pdb_cluster_rep_seq.fasta", cluster_fasta_path)
-        shutil.move("pdb_cluster_cluster.tsv", cluster_tsv_path)
+            cmd_parts = ["mmseqs", "easy-cluster", str(fasta_abs), "pdb_cluster", "tmp", "--min-seq-id", str(min_seq_id), "-c", str(coverage), "--cov-mode", "1"]
+        run_kw = {"cwd": str(work_dir), "stderr": subprocess.PIPE}
+        if silence_mmseqs_output:
+            run_kw["stdout"] = subprocess.DEVNULL
+        result = subprocess.run(cmd_parts, **run_kw)
+        if result.returncode != 0:
+            stderr = result.stderr.decode() if getattr(result, "stderr", None) else ""
+            raise RuntimeError(
+                f"mmseqs clustering failed (exit {result.returncode}). "
+                f"Ensure tmp and output can be written in {work_dir}. stderr: {stderr}"
+            )
+        # Move output files (created in work_dir) to final paths
+        rep_seq_src = work_dir / "pdb_cluster_rep_seq.fasta"
+        cluster_tsv_src = work_dir / "pdb_cluster_cluster.tsv"
+        if not rep_seq_src.exists():
+            raise RuntimeError(
+                f"mmseqs did not create pdb_cluster_rep_seq.fasta in {work_dir}. "
+                "Check mmseqs stderr for errors (run with silence_mmseqs_output=False)."
+            )
+        shutil.move(str(rep_seq_src), cluster_fasta_path)
+        shutil.move(str(cluster_tsv_src), cluster_tsv_path)
 
 
 def split_sequence_clusters(
