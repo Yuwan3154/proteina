@@ -38,10 +38,10 @@ def parse_fasta(filename,limit=-1, omit=[]):
 
 def _scores(S, log_probs, mask):
     """ Negative log probabilities """
-    criterion = torch.nn.NLLLoss(reduction='none')
-    loss = criterion(
+    loss = F.nll_loss(
         log_probs.contiguous().view(-1,log_probs.size(-1)),
-        S.contiguous().view(-1)
+        S.contiguous().view(-1),
+        reduction='none'
     ).view(S.size())
     scores = torch.sum(loss * mask, dim=-1) / torch.sum(mask, dim=-1)
     return scores
