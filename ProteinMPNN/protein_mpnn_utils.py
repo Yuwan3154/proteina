@@ -756,6 +756,8 @@ class CA_ProteinFeatures(nn.Module):
         self.edge_embedding = nn.Linear(edge_in, edge_features, bias=False)
         self.norm_nodes = nn.LayerNorm(node_features)
         self.norm_edges = nn.LayerNorm(edge_features)
+        self.register_buffer('D_mu', torch.linspace(2., 22., num_rbf).view([1,1,1,-1]))
+        self.register_buffer('D_sigma', torch.tensor((22. - 2.) / num_rbf))
 
 
     def _quaternions(self, R):
@@ -852,13 +854,8 @@ class CA_ProteinFeatures(nn.Module):
 
     def _rbf(self, D):
         # Distance radial basis function
-        device = D.device
-        D_min, D_max, D_count = 2., 22., self.num_rbf
-        D_mu = torch.linspace(D_min, D_max, D_count).to(device)
-        D_mu = D_mu.view([1,1,1,-1])
-        D_sigma = (D_max - D_min) / D_count
         D_expand = torch.unsqueeze(D, -1)
-        RBF = torch.exp(-((D_expand - D_mu) / D_sigma)**2)
+        RBF = torch.exp(-((D_expand - self.D_mu) / self.D_sigma)**2)
         return RBF
 
     def _get_rbf(self, A, B, E_idx):
@@ -933,6 +930,8 @@ class ProteinFeatures(nn.Module):
         node_in, edge_in = 6, num_positional_embeddings + num_rbf*25
         self.edge_embedding = nn.Linear(edge_in, edge_features, bias=False)
         self.norm_edges = nn.LayerNorm(edge_features)
+        self.register_buffer('D_mu', torch.linspace(2., 22., num_rbf).view([1,1,1,-1]))
+        self.register_buffer('D_sigma', torch.tensor((22. - 2.) / num_rbf))
 
     def _dist(self, X, mask, eps=1E-6):
         mask_2D = torch.unsqueeze(mask,1) * torch.unsqueeze(mask,2)
@@ -945,13 +944,8 @@ class ProteinFeatures(nn.Module):
         return D_neighbors, E_idx
 
     def _rbf(self, D):
-        device = D.device
-        D_min, D_max, D_count = 2., 22., self.num_rbf
-        D_mu = torch.linspace(D_min, D_max, D_count, device=device)
-        D_mu = D_mu.view([1,1,1,-1])
-        D_sigma = (D_max - D_min) / D_count
         D_expand = torch.unsqueeze(D, -1)
-        RBF = torch.exp(-((D_expand - D_mu) / D_sigma)**2)
+        RBF = torch.exp(-((D_expand - self.D_mu) / self.D_sigma)**2)
         return RBF
 
     def _get_rbf(self, A, B, E_idx):
