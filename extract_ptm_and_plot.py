@@ -22,8 +22,6 @@ import matplotlib.pyplot as plt
 import scipy.stats
 from pathlib import Path
 from typing import Dict, List, Tuple
-import warnings
-warnings.filterwarnings('ignore')
 
 def extract_ptm_from_json(json_path: Path) -> float:
     """Extract PTM value from summary_confidences.json file."""
@@ -127,8 +125,6 @@ def create_correlation_plot(tm_scores: List[float], ptm_scores: List[float],
              fontsize=24, verticalalignment='bottom', horizontalalignment='right',
              bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
     
-    # Place the legend in the bottom right corner
-    plt.legend(fontsize=24, loc='lower right')
     # plt.grid(True, alpha=0.3)
     
     # Set equal aspect ratio if scores are in similar range
