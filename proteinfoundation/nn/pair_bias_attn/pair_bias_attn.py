@@ -103,5 +103,5 @@ class PairBiasAttention(nn.Module):
         if exists(mask):
             mask = rearrange(mask, "b i j -> b () i j")
             sim = sim.masked_fill(~mask, max_neg_value(sim))
-        attn = torch.softmax(sim + b, dim=-1)
+        attn = torch.softmax((sim + b).contiguous(), dim=-1)
         return einsum("b h i j, b h j d -> b h i d", attn, v)
