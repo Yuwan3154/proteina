@@ -811,15 +811,16 @@ class ModelTrainerBase(L.LightningModule):
         if self.cfg_exp.training.seq_cond:
             # Get the sequence from the batch
             seq = batch["residue_type"]
-            seq[seq == -1] = 20
+            # Avoid in-place modification for better compilation support
+            seq = torch.where(seq == -1, torch.tensor(20, device=seq.device, dtype=seq.dtype), seq)
+
             # Preserve the unmasked sequence for logging / IPA geometry (do this before masking)
             if "residue_type_unmasked" not in batch:
                 residue_type_unmasked = seq.clone().detach()
                 batch["residue_type_unmasked"] = residue_type_unmasked
 
-            # Mask the sequence
-            for i in range(len(seq)):
-                seq[i] = mask_seq(seq[i], mask[i], self.cfg_exp.training.mask_seq_proportion)
+            # Mask the sequence (vectorized)
+            seq = mask_seq(seq, mask, self.cfg_exp.training.mask_seq_proportion)
             
             batch["residue_type"] = seq
 
