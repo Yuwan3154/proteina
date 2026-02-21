@@ -204,6 +204,20 @@ if __name__ == "__main__":
             )
         log_info(f"Distributed: rank={_rank} world_size={_world_size} local_rank={_local_rank}")
 
+        # Manually initialize process group to avoid warning about missing device_id with NCCL
+        if cfg_exp.opt.dist_strategy == "ddp" and cfg_exp.opt.get("dist_backend", "nccl") == "nccl":
+            if not torch.distributed.is_initialized():
+                if _local_rank != -1 and torch.cuda.is_available():
+                    torch.cuda.set_device(_local_rank)
+                    device = torch.device(f"cuda:{_local_rank}")
+                    try:
+                        torch.distributed.init_process_group(backend="nccl", device_id=device)
+                        log_info(f"Initialized NCCL process group with device_id={device}")
+                    except TypeError:
+                        # Fallback for older PyTorch versions that don't support device_id
+                        torch.distributed.init_process_group(backend="nccl")
+                        log_info("Initialized NCCL process group without device_id (not supported)")
+
     # Set training precision
     precision = "32"
     if not cfg_exp.force_precision_f32:
