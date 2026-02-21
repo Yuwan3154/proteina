@@ -22,8 +22,6 @@ import matplotlib.pyplot as plt
 import scipy.stats
 from pathlib import Path
 from typing import Dict, List, Tuple
-import warnings
-warnings.filterwarnings('ignore')
 
 def extract_ptm_from_json(json_path: Path) -> float:
     """Extract PTM value from summary_confidences.json file."""
@@ -104,7 +102,7 @@ def create_correlation_plot(tm_scores: List[float], ptm_scores: List[float],
     x_line = np.linspace(min(tm_scores), max(tm_scores), 100)
     y_line = slope * x_line + intercept
     plt.plot(x_line, y_line, 'r--', linewidth=2, 
-            #  label=f'Linear fit: y = {slope:.3f}x + {intercept:.3f}'
+             label=f'Linear fit: y = {slope:.3f}x + {intercept:.3f}'
              )
     
     # Labels and title
