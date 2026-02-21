@@ -264,6 +264,10 @@ if __name__ == "__main__":
     with hydra.initialize(config_path, version_base=hydra.__version__):
         cfg_data = hydra.compose(config_name=cfg_exp["dataset"])
         cfg_data.datamodule.num_workers = num_cpus  # Overwrite number of cpus
+        # Disable multiprocessing when using multiple GPUs (DDP) to avoid freeze/deadlock
+        ngpus = cfg_exp.hardware.ngpus_per_node_ * cfg_exp.hardware.nnodes_
+        if ngpus > 1:
+            cfg_data.datamodule.use_multiprocessing = False
         batch_size = cfg_exp.opt.get("batch_size")
         if batch_size is not None:
             cfg_data.datamodule.batch_size = batch_size
