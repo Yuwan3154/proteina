@@ -16,6 +16,7 @@ import random
 
 import biotite.structure.io as strucio
 from proteinfoundation.utils.align_utils.align_utils import mean_w_mask
+from proteinfoundation.utils.coors_utils import ang_to_nm
 
 import itertools
 
@@ -347,6 +348,9 @@ class SingleMotifFactory:
             x_1 = batch["x_1"]  # [b, n, 3]
         else:
             x_1 = batch["coords"][:,:,1,:]  # [b, n, 3]
+        # Coords from PDB/dataloader are in Å; convert to nm for pipeline consistency
+        # (extract_clean_sample, samples_to_atom37, and structure logging expect nm)
+        x_1 = ang_to_nm(x_1)
         batch_num_residues = mask.sum(-1).cpu().numpy()
         
         motif_n_res_batch = (
@@ -393,10 +397,10 @@ class SingleMotifFactory:
         motif_structure_masks = motif_sequence_masks[:, :, None] * motif_sequence_masks[:, None, :]
         result['fixed_sequence_mask'] = motif_sequence_masks
         result['fixed_structure_mask'] = motif_structure_masks
-        result['x_motif'] = x_1.clone()
+        result['x_motif'] = x_1.clone()  # x_1 already in nm
         #! Center the conditional Motif
         result['x_motif'] = (result['x_motif'] - mean_w_mask(result['x_motif'], result['fixed_sequence_mask'], keepdim=True)) * result['fixed_sequence_mask'][..., None]
-        #! Translate x_1 so that the motif is in the center
+        #! Translate x_1 so that the motif is in the center (x_1 in nm for pipeline consistency)
         batch["x_1"] = (x_1 - mean_w_mask(x_1, result['fixed_sequence_mask'], keepdim=True)) * mask[..., None]
         return result
         

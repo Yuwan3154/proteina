@@ -1216,9 +1216,11 @@ class ModelTrainerBase(L.LightningModule):
     ):
         """
         Logs predicted structure (as temporary PDB) and contact map visualizations.
+        Expects x_1_pred coordinates in nm (training pipeline convention); samples_to_atom37
+        converts nm -> Å for PDB output.
 
         Args:
-            x_1_pred: Predicted coordinates, shape [1, n, 3]
+            x_1_pred: Predicted coordinates in nm, shape [1, n, 3]
             contact_map_pred: Predicted contact map, shape [n, n] or None
             mask: Boolean mask, shape [n]
             residue_type: Residue type, shape [n]
