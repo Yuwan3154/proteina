@@ -337,7 +337,7 @@ class ModelTrainerBase(L.LightningModule):
         # We allow either logits or probs; if logits, convert to probs.
         use_full_openfold = self.cfg_exp.model.nn.get("openfold_distogram_only", True)
         if use_full_openfold:
-            distogram_probs = torch.softmax(pair_logits, dim=-1)
+            distogram_probs = torch.softmax(pair_logits.contiguous(), dim=-1)
 
             module = self._get_distogram_only_inference_module()
             module = module.to(self.device)
@@ -489,7 +489,7 @@ class ModelTrainerBase(L.LightningModule):
         # Include distogram if available
         if "pair_logits" in nn_out:
             # Store probabilities for OpenFold distogram-only template inference.
-            result["distogram"] = torch.softmax(nn_out["pair_logits"], dim=-1)
+            result["distogram"] = torch.softmax(nn_out["pair_logits"].contiguous(), dim=-1)
 
         return result
 

@@ -503,7 +503,7 @@ class GenMD4DiscreteDiffusion(nn.Module):
         t_ext = t_ext.clamp(min=1e-6, max=1.0)
         if self.position_bias_enabled and self.position_bias_mode == "sigmoid":
             d_pos = _distance_fraction(x.shape[-1], x.device, x.dtype)
-            k = torch.tensor(self.position_bias_k, device=x.device, dtype=x.dtype)
+            k = torch.as_tensor(self.position_bias_k, device=x.device, dtype=x.dtype)
             k_eff = k * w_x
             alpha_t_x, _ = _sigmoid_alpha(
                 t_ext, d_pos, k_eff, self.noise_schedule.eps
@@ -517,9 +517,7 @@ class GenMD4DiscreteDiffusion(nn.Module):
                 if w_pos is not None:
                     w_eff = w_eff * w_pos
             alpha_t_x = 1.0 - (1.0 - eps) * t_ext ** w_eff
-            log_q_mask = torch.log(
-                torch.tensor(1.0 - eps, device=x.device)
-            ) + w_eff * torch.log(t_ext)
+            log_q_mask = math.log(1.0 - eps) + w_eff * torch.log(t_ext)
             log_q_unmask = torch.log(alpha_t_x.clamp_min(1e-12))
 
         log_q1 = torch.where(zt_1 == self.mask_token, log_q_mask, log_q_unmask)
