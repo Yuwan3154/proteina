@@ -28,7 +28,7 @@ from proteinfoundation.nn.protein_transformer import ProteinTransformerAF3
 from proteinfoundation.proteinflow.model_trainer_base import ModelTrainerBase
 from proteinfoundation.utils.align_utils.align_utils import kabsch_align
 from proteinfoundation.utils.coors_utils import ang_to_nm, nm_to_ang, trans_nm_to_atom37
-from proteinfoundation.utils.ff_utils.pdb_utils import mask_cath_code_by_level, mask_seq
+from proteinfoundation.utils.ff_utils.pdb_utils import mask_seq
 from proteinfoundation.nn.motif_factory import SingleMotifFactory
 
 

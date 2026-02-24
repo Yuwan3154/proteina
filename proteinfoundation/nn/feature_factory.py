@@ -12,7 +12,6 @@
 import gzip
 import math
 import os
-import random
 from typing import Dict, List, Literal
 
 import torch
@@ -20,7 +19,6 @@ from loguru import logger
 from torch.nn import functional as F
 from torch_scatter import scatter_mean, scatter_sum
 
-from proteinfoundation.utils.ff_utils.pdb_utils import extract_cath_code_by_level
 from proteinfoundation.utils.ff_utils.idx_emb_utils import get_index_embedding, get_time_embedding
 
 
@@ -131,7 +129,12 @@ class ZeroFeat(Feature):
 
 
 class FoldEmbeddingSeqFeat(Feature):
-    """Computes fold class embedding and returns as sequence feature of shape [b, n, fold_emb_dim * 3]."""
+    """Computes fold class embedding from precomputed cath_code_indices.
+
+    Expects batch["cath_code_indices"] as tensor [b, 3] (sample) or
+    [b, max_labels, 3] (average/sum/transformer) with optional cath_code_indices_mask.
+    Indices are precomputed in the data pipeline; this module does embedding lookup only.
+    """
 
     def __init__(
         self,
@@ -144,16 +147,16 @@ class FoldEmbeddingSeqFeat(Feature):
     ):
         """
         multilabel_mode (["sample", "average", "sum", "transformer"]): Schemes to handle multiple fold labels
-            "sample": randomly sample one label
-            "average": average fold embeddings over all labels
-            "sum": sum fold embeddings over all labels
-            "transformer": pad labels together and feed into a transformer, take the average over the output
+            "sample": one label per sample, indices [b, 3]
+            "average": multiple labels, average embeddings over valid labels
+            "sum": multiple labels, sum embeddings over valid labels
+            "transformer": pad labels, run transformer, average output
         """
         super().__init__(dim=fold_emb_dim * 3)
         self.create_mapping(cath_code_dir)
         self.embedding_C = torch.nn.Embedding(
             self.num_classes_C + 1, fold_emb_dim
-        )  # The last class is left as null embedding
+        )  # The last class is null embedding
         self.embedding_A = torch.nn.Embedding(self.num_classes_A + 1, fold_emb_dim)
         self.embedding_T = torch.nn.Embedding(self.num_classes_T + 1, fold_emb_dim)
         self.register_buffer("_device_param", torch.tensor(0), persistent=False)
@@ -173,157 +176,71 @@ class FoldEmbeddingSeqFeat(Feature):
         return next(self.buffers()).device
 
     def create_mapping(self, cath_code_dir):
-        """Create cath label vocabulary for C, A, T levels."""
+        """Load cath label vocabulary for embedding sizes."""
         mapping_file = os.path.join(cath_code_dir, "cath_label_mapping.pt")
         if os.path.exists(mapping_file):
             class_mapping = torch.load(mapping_file, weights_only=False)
         else:
             raise IOError(f"{mapping_file} does not exist...")
 
-        self.class_mapping_C = class_mapping["C"]
-        self.class_mapping_A = class_mapping["A"]
-        self.class_mapping_T = class_mapping["T"]
-        self.num_classes_C = len(self.class_mapping_C)
-        self.num_classes_A = len(self.class_mapping_A)
-        self.num_classes_T = len(self.class_mapping_T)
-
-    def parse_label(self, cath_code_list):
-        """Parse cath_code into corresponding indices at C, A, T levels
-
-        Args:
-            cath_code_list (List[List[str]]): List of cath codes for each protein. Each protein can have no, one or multiple labels.
-
-        Return:
-            results: for each label of each protein, return its C, A, T label indices
-        """
-        results = []
-        for cath_codes in cath_code_list:
-            result = []
-            for cath_code in cath_codes:
-                result.append(
-                    [
-                        self.class_mapping_C.get(
-                            extract_cath_code_by_level(cath_code, "C"),
-                            self.num_classes_C,
-                        ),  # If unknown or masked, set as null
-                        self.class_mapping_A.get(
-                            extract_cath_code_by_level(cath_code, "A"),
-                            self.num_classes_A,
-                        ),
-                        self.class_mapping_T.get(
-                            extract_cath_code_by_level(cath_code, "T"),
-                            self.num_classes_T,
-                        ),
-                    ]
-                )
-            if len(cath_codes) == 0:
-                result = [
-                    [self.num_classes_C, self.num_classes_A, self.num_classes_T]
-                ]  # If no cath code is provided, return null
-            results.append(result)
-        return results  # [b, num_label, 3]
-
-    def sample(self, cath_code_list):
-        """Randomly sample one cath code"""
-        results = []
-        for cath_codes in cath_code_list:
-            idx = random.randint(0, len(cath_codes) - 1)
-            results.append(cath_codes[idx])
-        return results
-
-    def flatten(self, cath_code_list):
-        """Flatten variable lengths of cath codes into a long cath code tensor"""
-        results = []
-        batch_id = []
-        for i, cath_codes in enumerate(cath_code_list):
-            results += cath_codes
-            batch_id += [i] * len(cath_codes)
-        results = torch.as_tensor(results, device=self.device)
-        batch_id = torch.as_tensor(batch_id, device=self.device)
-        return results, batch_id
-
-    def pad(self, cath_code_list):
-        """Pad variable lengths of cath codes into a batched cath code tensor"""
-        results = []
-        max_num_label = 0
-        for cath_codes in cath_code_list:
-            results.append(cath_codes)
-            max_num_label = max(max_num_label, len(cath_codes))
-        mask = []
-        for i in range(len(results)):
-            mask_i = [False] * len(results[i])
-            if len(results[i]) < max_num_label:
-                mask_i += [True] * (max_num_label - len(results[i]))
-                results[i] += [
-                    [self.num_classes_C, self.num_classes_A, self.num_classes_T]
-                ] * (max_num_label - len(results[i]))
-            mask.append(mask_i)
-        results = torch.as_tensor(results, device=self.device)
-        mask = torch.as_tensor(mask, device=self.device)
-        return results, mask
+        self.num_classes_C = len(class_mapping["C"])
+        self.num_classes_A = len(class_mapping["A"])
+        self.num_classes_T = len(class_mapping["T"])
 
     def forward(self, batch):
         xt = batch["x_t"]  # [b, n, 3]
         bs = xt.shape[0]
         n = xt.shape[1]
-        if "cath_code" not in batch:
-            cath_code = [
-                ["x.x.x.x"]
-            ] * bs  # If no cath code provided, return null embeddings
+        idx = batch.get("cath_code_indices")
+        if idx is None:
+            # No CATH: use null embedding indices
+            idx = torch.full(
+                (bs, 3),
+                self.num_classes_C,
+                device=xt.device,
+                dtype=torch.long,
+            )
+            idx[:, 1] = self.num_classes_A
+            idx[:, 2] = self.num_classes_T
+        if idx.dim() == 2:
+            # [b, 3] - sample mode
+            fold_emb = torch.cat(
+                [
+                    self.embedding_C(idx[:, 0]),
+                    self.embedding_A(idx[:, 1]),
+                    self.embedding_T(idx[:, 2]),
+                ],
+                dim=-1,
+            )  # [b, fold_emb_dim * 3]
         else:
-            cath_code = batch["cath_code"]
-        cath_code_list = self.parse_label(cath_code)
-        if self.multilabel_mode == "sample":
-            cath_code_list = self.sample(
-                cath_code_list
-            )  # Random sample one label for each protein
-            cath_code = torch.as_tensor(cath_code_list, device=self.device)  # [b, 3]
+            # [b, max_labels, 3] - average/sum/transformer
+            mask = batch.get("cath_code_indices_mask")
+            if mask is None:
+                mask = torch.zeros(idx.shape[:2], dtype=torch.bool, device=idx.device)
             fold_emb = torch.cat(
                 [
-                    self.embedding_C(cath_code[:, 0]),
-                    self.embedding_A(cath_code[:, 1]),
-                    self.embedding_T(cath_code[:, 2]),
+                    self.embedding_C(idx[:, :, 0]),
+                    self.embedding_A(idx[:, :, 1]),
+                    self.embedding_T(idx[:, :, 2]),
                 ],
                 dim=-1,
-            )  # [b, fold_emb_dim * 3]
-        elif self.multilabel_mode == "average":
-            cath_code, batch_id = self.flatten(cath_code_list)
-            fold_emb = torch.cat(
-                [
-                    self.embedding_C(cath_code[:, 0]),
-                    self.embedding_A(cath_code[:, 1]),
-                    self.embedding_T(cath_code[:, 2]),
-                ],
-                dim=-1,
-            )  # [num_code, fold_emb_dim * 3]
-            fold_emb = scatter_mean(fold_emb, batch_id, dim=0, dim_size=bs)
-        elif self.multilabel_mode == "sum":
-            cath_code, batch_id = self.flatten(cath_code_list)
-            fold_emb = torch.cat(
-                [
-                    self.embedding_C(cath_code[:, 0]),
-                    self.embedding_A(cath_code[:, 1]),
-                    self.embedding_T(cath_code[:, 2]),
-                ],
-                dim=-1,
-            )  # [num_code, fold_emb_dim * 3]
-            fold_emb = scatter_sum(fold_emb, batch_id, dim=0, dim_size=bs)
-        elif self.multilabel_mode == "transformer":
-            cath_code, mask = self.pad(cath_code_list)
-            fold_emb = torch.cat(
-                [
-                    self.embedding_C(cath_code[:, :, 0]),
-                    self.embedding_A(cath_code[:, :, 1]),
-                    self.embedding_T(cath_code[:, :, 2]),
-                ],
-                dim=-1,
-            )  # [b, max_num_label, fold_emb_dim * 3]
-            fold_emb = self.transformer(
-                fold_emb, src_key_padding_mask=mask
-            )  # [b, max_num_label, fold_emb_dim * 3]
-            fold_emb = (fold_emb * (~mask[:, :, None]).float()).sum(dim=1) / (
-                (~mask[:, :, None]).float().sum(dim=1) + 1e-10
-            )  # [b, fold_emb_dim * 3]
+            )  # [b, max_labels, fold_emb_dim * 3]
+            if self.multilabel_mode == "transformer":
+                fold_emb = self.transformer(
+                    fold_emb, src_key_padding_mask=mask
+                )  # [b, max_labels, fold_emb_dim * 3]
+            # Aggregate over valid (non-masked) labels
+            valid = ~mask  # [b, max_labels]
+            if self.multilabel_mode == "transformer":
+                fold_emb = (fold_emb * valid[:, :, None].float()).sum(dim=1) / (
+                    valid.sum(dim=1, keepdim=True).float().clamp(min=1e-10)
+                )
+            elif self.multilabel_mode == "average":
+                fold_emb = (fold_emb * valid[:, :, None].float()).sum(dim=1) / (
+                    valid.sum(dim=1, keepdim=True).float().clamp(min=1e-10)
+                )
+            elif self.multilabel_mode == "sum":
+                fold_emb = (fold_emb * valid[:, :, None].float()).sum(dim=1)
         fold_emb = fold_emb[:, None, :]  # [b, 1, fold_emb_dim * 3]
         return fold_emb.expand(
             (fold_emb.shape[0], n, fold_emb.shape[2])

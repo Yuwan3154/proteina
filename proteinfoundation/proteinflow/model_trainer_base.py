@@ -36,8 +36,11 @@ from proteinfoundation.flow_matching.discrete_md4 import (
     MD4DiscreteDiffusion,
     _normalize_position_bias_mode,
 )
+from proteinfoundation.datasets.cath_utils import (
+    apply_fold_mask_to_indices,
+    load_cath_mapping,
+)
 from proteinfoundation.utils.ff_utils.pdb_utils import (
-    mask_cath_code_by_level,
     mask_seq,
     write_prot_to_pdb,
 )
@@ -416,10 +419,12 @@ class ModelTrainerBase(L.LightningModule):
             nn_out_uncond = None
             if autoguidance_ratio < 1.0:
                 assert (
-                    "cath_code" in batch
-                ), "Only support CFG when cath_code is provided"
+                    "cath_code" in batch or "cath_code_indices" in batch
+                ), "Only support CFG when cath_code or cath_code_indices is provided"
                 uncond_batch = batch.copy()
-                uncond_batch.pop("cath_code")
+                uncond_batch.pop("cath_code", None)
+                uncond_batch.pop("cath_code_indices", None)
+                uncond_batch.pop("cath_code_indices_mask", None)
                 nn_out_uncond = self.nn(uncond_batch)
                 x_pred_uncond = self._nn_out_to_x_clean(nn_out_uncond, uncond_batch) if x_pred is not None else None
                 c_pred_uncond = self._nn_out_to_c_clean(nn_out_uncond, uncond_batch) if c_pred is not None else None
@@ -778,34 +783,32 @@ class ModelTrainerBase(L.LightningModule):
         batch["mask"] = mask
         batch["x_t"] = x_t
 
-        # Fold conditional training
+        # Fold conditional training: apply progressive masking to cath_code_indices
         if self.cfg_exp.training.fold_cond:
-            bs = x_1.shape[0]
-            cath_code_list = batch.cath_code
-            for i in range(bs):
-                if cath_code_list[i] is None:
-                    cath_code_list[i] = ["x.x.x.x"]
-                    continue
-                # Progressively mask T, A, C levels
-                cath_code_list[i] = mask_cath_code_by_level(
-                    cath_code_list[i], level="H"
-                )
-                if random.random() < self.cfg_exp.training.mask_T_prob:
-                    cath_code_list[i] = mask_cath_code_by_level(
-                        cath_code_list[i], level="T"
-                    )
-                    if random.random() < self.cfg_exp.training.mask_A_prob:
-                        cath_code_list[i] = mask_cath_code_by_level(
-                            cath_code_list[i], level="A"
-                        )
-                        if random.random() < self.cfg_exp.training.mask_C_prob:
-                            cath_code_list[i] = mask_cath_code_by_level(
-                                cath_code_list[i], level="C"
-                            )
-            batch.cath_code = cath_code_list
+            idx = batch.get("cath_code_indices")
+            if idx is not None and isinstance(idx, torch.Tensor):
+                cath_code_dir = self.cfg_exp.model.nn.get("cath_code_dir")
+                if cath_code_dir:
+                    _, _, _, nC, nA, nT = load_cath_mapping(cath_code_dir)
+                    bs = idx.shape[0]
+                    result = idx.clone()
+                    for i in range(bs):
+                        mask_T = random.random() < self.cfg_exp.training.mask_T_prob
+                        mask_A = random.random() < self.cfg_exp.training.mask_A_prob
+                        mask_C = random.random() < self.cfg_exp.training.mask_C_prob
+                        result[i] = apply_fold_mask_to_indices(
+                            idx[i : i + 1],
+                            mask_T, mask_A, mask_C,
+                            nC, nA, nT,
+                        ).squeeze(0)
+                    batch.cath_code_indices = result
+            if "cath_code" in batch:
+                batch.pop("cath_code")
         else:
             if "cath_code" in batch:
                 batch.pop("cath_code")
+            if "cath_code_indices" in batch:
+                batch.pop("cath_code_indices")
 
         # Sequence conditional training
         if self.cfg_exp.training.seq_cond:
@@ -1575,10 +1578,16 @@ class ModelTrainerBase(L.LightningModule):
         if residue_type is not None:
             residue_type = residue_type[:nsamples].to(self.device)
         cath_code = batch.get("cath_code") if self.cfg_exp.training.get("fold_cond", False) else None
+        cath_code_indices = batch.get("cath_code_indices")
+        cath_code_indices_mask = batch.get("cath_code_indices_mask")
         if cath_code is not None and isinstance(cath_code, torch.Tensor):
             cath_code = cath_code[:nsamples]
         if cath_code is not None and isinstance(cath_code, (list, tuple)):
             cath_code = cath_code[:nsamples]
+        if cath_code_indices is not None:
+            cath_code_indices = cath_code_indices[:nsamples].to(self.device)
+        if cath_code_indices_mask is not None:
+            cath_code_indices_mask = cath_code_indices_mask[:nsamples].to(self.device)
 
         x_motif = batch.get("motif_structure", None)
         if x_motif is not None:
@@ -1603,6 +1612,8 @@ class ModelTrainerBase(L.LightningModule):
                 dt=dt,
                 self_cond=self.cfg_exp.training.self_cond,
                 cath_code=cath_code,
+                cath_code_indices=cath_code_indices,
+                cath_code_indices_mask=cath_code_indices_mask,
                 residue_type=residue_type,
                 guidance_weight=1.0,
                 autoguidance_ratio=0.0,
@@ -1703,9 +1714,21 @@ class ModelTrainerBase(L.LightningModule):
         force_compile = getattr(self, "_force_compile", False)
         sampling_args = self.inf_cfg.sampling_caflow
 
-        cath_code = (
-            _extract_cath_code(batch) if self.inf_cfg.get("fold_cond", False) else [["x.x.x.x"] for _ in range(batch["nsamples"])]
-        )  # When using unconditional model, don't use cath_code
+        cath_code_raw = (
+            _extract_cath_code(batch) if self.inf_cfg.get("fold_cond", False) else None
+        )
+        cath_code_indices = batch.get("cath_code_indices")
+        cath_code_indices_mask = batch.get("cath_code_indices_mask")
+        if cath_code_indices is None and cath_code_raw is not None:
+            cath_code_dir = self.cfg_exp.model.nn.get("cath_code_dir")
+            multilabel_mode = self.cfg_exp.model.nn.get("multilabel_mode", "sample")
+            if cath_code_dir:
+                from proteinfoundation.datasets.cath_utils import cath_code_strings_to_indices_for_model
+                cath_code_indices, cath_code_indices_mask = cath_code_strings_to_indices_for_model(
+                    cath_code_raw, cath_code_dir, multilabel_mode, device=self.device
+                )
+        if cath_code_indices is None:
+            cath_code_raw = cath_code_raw or [["x.x.x.x"] for _ in range(batch["nsamples"])]
         residue_type = batch["residue_type"] if self.inf_cfg.get("seq_cond", False) else None
         guidance_weight = self.inf_cfg.get("guidance_weight", 1.0)
         autoguidance_ratio = self.inf_cfg.get("autoguidance_ratio", 0.0)
@@ -1728,7 +1751,9 @@ class ModelTrainerBase(L.LightningModule):
             n=batch["nres"],
             dt=batch["dt"].to(dtype=torch.float32),
             self_cond=self.inf_cfg.self_cond,
-            cath_code=cath_code,
+            cath_code=cath_code_raw if cath_code_indices is None else None,
+            cath_code_indices=cath_code_indices,
+            cath_code_indices_mask=cath_code_indices_mask,
             residue_type=residue_type,
             guidance_weight=guidance_weight,
             autoguidance_ratio=autoguidance_ratio,
@@ -1749,7 +1774,8 @@ class ModelTrainerBase(L.LightningModule):
             return_trajectory=return_trajectory,
             trajectory_stride=trajectory_stride,
         )
-        cirpin_ids = batch.get("cirpin_ids", [None] * len(cath_code))
+        n_cath = len(cath_code_raw) if cath_code_raw else batch["nsamples"]
+        cirpin_ids = batch.get("cirpin_ids", [None] * n_cath)
         coords_atom37 = None
         if result.get("coords") is not None:
             coords_atom37 = self.samples_to_atom37(result["coords"])
@@ -1774,7 +1800,7 @@ class ModelTrainerBase(L.LightningModule):
             "coords_atom37": coords_atom37,
             "contact_map": result.get("contact_map"),
             "distogram": distogram,
-            "cath_code": cath_code,
+            "cath_code": cath_code_raw,
             "cirpin_ids": cirpin_ids,
             "trajectory_tokens": result.get("trajectory_tokens"),
         }
@@ -1785,8 +1811,10 @@ class ModelTrainerBase(L.LightningModule):
         n: int,
         dt: float,
         self_cond: bool,
-        cath_code: List[List[str]],
-        residue_type: List[List[int]],
+        cath_code: Optional[List[List[str]]] = None,
+        cath_code_indices: Optional[torch.Tensor] = None,
+        cath_code_indices_mask: Optional[torch.Tensor] = None,
+        residue_type: Optional[List[List[int]]] = None,
         guidance_weight: float = 1.0,
         autoguidance_ratio: float = 0.0,
         dtype: torch.dtype = None,
@@ -1855,7 +1883,11 @@ class ModelTrainerBase(L.LightningModule):
                     "t": t_tensor,
                     "mask": mask,
                 }
-                if cath_code is not None:
+                if cath_code_indices is not None:
+                    nn_in["cath_code_indices"] = cath_code_indices
+                    if cath_code_indices_mask is not None:
+                        nn_in["cath_code_indices_mask"] = cath_code_indices_mask
+                elif cath_code is not None:
                     nn_in["cath_code"] = cath_code
                 if residue_type is not None:
                     nn_in["residue_type"] = residue_type
@@ -1914,6 +1946,8 @@ class ModelTrainerBase(L.LightningModule):
             n=n,
             self_cond=self_cond,
             cath_code=cath_code,
+            cath_code_indices=cath_code_indices,
+            cath_code_indices_mask=cath_code_indices_mask,
             residue_type=residue_type,
             device=self.device,
             mask=mask,

@@ -422,20 +422,22 @@ class _CoordinateFlowMatcher:
         nsamples: int,
         n: int,
         self_cond: bool,
-        cath_code: List[List[str]],
-        residue_type: List[List[int]],
-        device: torch.device,
-        mask: Bool[Tensor, "* n"],
+        cath_code: Optional[List[List[str]]] = None,
+        cath_code_indices: Optional[Tensor] = None,
+        cath_code_indices_mask: Optional[Tensor] = None,
+        residue_type: Optional[List[List[int]]] = None,
+        device: torch.device = None,
+        mask: Bool[Tensor, "* n"] = None,
         schedule_mode: Literal[
             "uniform", "power", "cos_sch_v_snr", "loglinear", "edm", "log"
-        ],
-        schedule_p: float,
-        sampling_mode: str,
-        sc_scale_noise: float,
-        sc_scale_score: float,
-        gt_mode: Literal["us", "tan"],
-        gt_p: float,
-        gt_clamp_val: float,
+        ] = "uniform",
+        schedule_p: float = 1.0,
+        sampling_mode: str = "vf",
+        sc_scale_noise: float = 1.0,
+        sc_scale_score: float = 1.0,
+        gt_mode: Literal["us", "tan"] = "us",
+        gt_p: float = 1.0,
+        gt_clamp_val: Optional[float] = None,
         x_motif = None,
         fixed_sequence_mask = None,
         fixed_structure_mask = None,
@@ -530,7 +532,11 @@ class _CoordinateFlowMatcher:
                         "x_motif": x_motif
                     }
 
-                if cath_code is not None:
+                if cath_code_indices is not None:
+                    nn_in["cath_code_indices"] = cath_code_indices
+                    if cath_code_indices_mask is not None:
+                        nn_in["cath_code_indices_mask"] = cath_code_indices_mask
+                elif cath_code is not None:
                     nn_in["cath_code"] = cath_code
                 if step > 0 and self_cond:
                     nn_in["x_sc"] = x_1_pred  # Self-conditioning
@@ -952,19 +958,21 @@ class _ContactMapFlowMatcher:
         nsamples: int,
         n: int,
         self_cond: bool,
-        cath_code: Optional[List[List[str]]],
-        residue_type: Optional[List[List[int]]],
-        device: torch.device,
-        mask: Bool[Tensor, "* n"],
-        dtype: Optional[torch.dtype],
-        schedule_mode: Literal["uniform", "power", "cos_sch_v_snr", "loglinear", "edm", "log"],
-        schedule_p: float,
-        sampling_mode: str,
-        sc_scale_noise: float,
-        sc_scale_score: float,
-        gt_mode: Literal["us", "tan", "1/t"],
-        gt_p: float,
-        gt_clamp_val: Optional[float],
+        cath_code: Optional[List[List[str]]] = None,
+        cath_code_indices: Optional[Tensor] = None,
+        cath_code_indices_mask: Optional[Tensor] = None,
+        residue_type: Optional[List[List[int]]] = None,
+        device: torch.device = None,
+        mask: Bool[Tensor, "* n"] = None,
+        dtype: Optional[torch.dtype] = None,
+        schedule_mode: Literal["uniform", "power", "cos_sch_v_snr", "loglinear", "edm", "log"] = "uniform",
+        schedule_p: float = 1.0,
+        sampling_mode: str = "vf",
+        sc_scale_noise: float = 1.0,
+        sc_scale_score: float = 1.0,
+        gt_mode: Literal["us", "tan", "1/t"] = "us",
+        gt_p: float = 1.0,
+        gt_clamp_val: Optional[float] = None,
         x_motif = None,
         fixed_sequence_mask = None,
         fixed_structure_mask = None,
@@ -1032,7 +1040,11 @@ class _ContactMapFlowMatcher:
                     "mask": mask,
                 }
 
-                if cath_code is not None:
+                if cath_code_indices is not None:
+                    nn_in["cath_code_indices"] = cath_code_indices
+                    if cath_code_indices_mask is not None:
+                        nn_in["cath_code_indices_mask"] = cath_code_indices_mask
+                elif cath_code is not None:
                     nn_in["cath_code"] = cath_code
                 if residue_type is not None:
                     nn_in["residue_type"] = residue_type
@@ -1265,10 +1277,12 @@ class FlowMatcher:
         nsamples: int,
         n: int,
         self_cond: bool,
-        cath_code: Optional[List[List[str]]],
-        residue_type: Optional[List[List[int]]],
-        device: torch.device,
-        mask: Bool[Tensor, "* n"],
+        cath_code: Optional[List[List[str]]] = None,
+        cath_code_indices: Optional[Tensor] = None,
+        cath_code_indices_mask: Optional[Tensor] = None,
+        residue_type: Optional[List[List[int]]] = None,
+        device: torch.device = None,
+        mask: Bool[Tensor, "* n"] = None,
         dtype: Optional[torch.dtype] = None,
         schedule_mode: str = "uniform",
         schedule_p: float = 1.0,
@@ -1310,7 +1324,9 @@ class FlowMatcher:
             # Delegate to coordinate flow matcher
             x = self.coord_fm.full_simulation(
                 predict_clean_n_v, dt=dt, nsamples=nsamples, n=n, self_cond=self_cond,
-                cath_code=cath_code, residue_type=residue_type, device=device,
+                cath_code=cath_code, cath_code_indices=cath_code_indices,
+                cath_code_indices_mask=cath_code_indices_mask,
+                residue_type=residue_type, device=device,
                 mask=mask, dtype=dtype, schedule_mode=schedule_mode,
                 schedule_p=schedule_p, sampling_mode=sampling_mode,
                 sc_scale_noise=sc_scale_noise, sc_scale_score=sc_scale_score,
@@ -1323,7 +1339,9 @@ class FlowMatcher:
         # Delegate to contact map flow matcher
         return self.contact_fm.full_simulation(
             predict_clean_n_v, dt=dt, nsamples=nsamples, n=n, self_cond=self_cond,
-            cath_code=cath_code, residue_type=residue_type, device=device,
+            cath_code=cath_code, cath_code_indices=cath_code_indices,
+            cath_code_indices_mask=cath_code_indices_mask,
+            residue_type=residue_type, device=device,
             mask=mask, dtype=dtype, schedule_mode=schedule_mode,
             schedule_p=schedule_p, sampling_mode=sampling_mode,
             sc_scale_noise=sc_scale_noise, sc_scale_score=sc_scale_score,

@@ -37,6 +37,8 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         num_workers: int = 32,
         pin_memory: bool = False,
         prefetch_factor: int = 2,
+        cath_code_dir: Optional[str] = None,
+        multilabel_mode: Literal["sample", "average", "sum", "transformer"] = "sample",
     ):
         """Initialising the base data module class.
 
@@ -58,10 +60,16 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             num_workers (int, optional): Number of workers used for dataloading. Defaults to 32.
             pin_memory (bool, optional): Whether memory should be pinned. Defaults to False.
             prefetch_factor (int, optional): Number of batches to prefetch. Defaults to 2.
+            cath_code_dir (str, optional): Directory containing cath_label_mapping.pt for CATH
+                index conversion. When set with fold_cond, enables cath_code_indices in batches.
+            multilabel_mode (str, optional): How to aggregate multiple CATH labels per sample.
+                One of "sample", "average", "sum", "transformer". Defaults to "sample".
         """
         super().__init__()
         self.batch_padding = batch_padding
         self.sampling_mode = sampling_mode
+        self.cath_code_dir = cath_code_dir
+        self.multilabel_mode = multilabel_mode
         self.transform = (
             self._compose_transforms(transforms) if transforms is not None else None
         )
@@ -203,6 +211,11 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         if dataloader_class is DensePaddingDataLoader:
             kwargs["rank_for_logging"] = rank_for_logging
             kwargs["debug_data_loading"] = debug_data_loading
+            if getattr(self, "cath_code_dir", None) is not None:
+                kwargs["cath_code_dir"] = self.cath_code_dir
+                kwargs["multilabel_mode"] = getattr(
+                    self, "multilabel_mode", "sample"
+                )
 
         return dataloader_class(dataset, **kwargs)
 

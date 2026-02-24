@@ -26,6 +26,7 @@ from scipy.spatial.transform import Rotation as Scipy_Rotation
 from torch_geometric import transforms as T
 from torch_geometric.data import Data
 
+from proteinfoundation.datasets.cath_utils import load_cath_mapping, parse_cath_codes_to_indices
 from proteinfoundation.utils.dense_padding_data_loader import FLOAT_PADDING_VALUE
 
 
@@ -364,6 +365,55 @@ class CATHLabelTransform(T.BaseTransform):
         if match:
             return match.groups()
         raise ValueError(f"Segment {segment} is not in the correct format")
+
+
+class CATHToIndicesTransform(T.BaseTransform):
+    """Converts CATH code strings to numerical indices for use in the model.
+
+    Runs after CATHLabelTransform. Expects graph.cath_code (list of strings) and
+    adds graph.cath_code_indices (list of [C_idx, A_idx, T_idx] per label).
+    """
+
+    def __init__(self, cath_code_dir: str):
+        """Initialize with path to directory containing cath_label_mapping.pt.
+
+        Args:
+            cath_code_dir: Directory containing cath_label_mapping.pt
+        """
+        self.cath_code_dir = Path(cath_code_dir)
+        mapping_C, mapping_A, mapping_T, nC, nA, nT = load_cath_mapping(str(self.cath_code_dir))
+        self.class_mapping_C = mapping_C
+        self.class_mapping_A = mapping_A
+        self.class_mapping_T = mapping_T
+        self.num_classes_C = nC
+        self.num_classes_A = nA
+        self.num_classes_T = nT
+
+    def forward(self, graph: Data) -> Data:
+        """Convert graph.cath_code to graph.cath_code_indices.
+
+        Args:
+            graph: Data with cath_code (list of strings)
+
+        Returns:
+            Graph with cath_code_indices added (list of [C,A,T] int tuples)
+        """
+        cath_code = getattr(graph, "cath_code", None)
+        if cath_code is None or len(cath_code) == 0:
+            null_idx = [self.num_classes_C, self.num_classes_A, self.num_classes_T]
+            graph.cath_code_indices = [null_idx]
+        else:
+            result = parse_cath_codes_to_indices(
+                [cath_code],
+                self.class_mapping_C,
+                self.class_mapping_A,
+                self.class_mapping_T,
+                self.num_classes_C,
+                self.num_classes_A,
+                self.num_classes_T,
+            )
+            graph.cath_code_indices = result[0]
+        return graph
 
 
 class PurgeConfindTransform(T.BaseTransform):

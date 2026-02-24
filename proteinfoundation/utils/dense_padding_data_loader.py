@@ -8,12 +8,14 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+import random
 import time
 from collections import defaultdict
 from collections.abc import Mapping
-from typing import Any, List, Optional, Sequence, Tuple, Union
+from typing import Any, List, Literal, Optional, Sequence, Tuple, Union
 
 import numpy as np
+import torch
 import torch.utils.data
 from loguru import logger
 import torch_geometric
@@ -27,9 +29,78 @@ from torch_geometric.data.storage import BaseStorage
 from torch_geometric.typing import SparseTensor, TensorFrame, torch_frame
 from torch_geometric.utils import is_sparse, is_torch_sparse_tensor
 from torch_geometric.utils.sparse import cat
+from torch_scatter import scatter_mean, scatter_sum
 
 FLOAT_PADDING_VALUE = 1e-8
 NON_FLOAT_PADDING_VALUE = -1
+
+
+def _apply_cath_multilabel_to_batch(
+    batch: Batch,
+    cath_code_dir: str,
+    multilabel_mode: Literal["sample", "average", "sum", "transformer"],
+) -> None:
+    """Apply multilabel aggregation to batch.cath_code_indices and replace with tensor.
+
+    Expects batch.cath_code_indices as list of list of [C_idx, A_idx, T_idx] per sample.
+    Produces batch.cath_code_indices as tensor [b, 3] or [b, max_labels, 3] (transformer).
+    For transformer mode, also sets batch.cath_code_indices_mask [b, max_labels] (True=pad).
+    """
+    from proteinfoundation.datasets.cath_utils import load_cath_mapping
+
+    indices_list = getattr(batch, "cath_code_indices", None)
+    if indices_list is None:
+        return
+    if not isinstance(indices_list, (list, tuple)) or len(indices_list) == 0:
+        return
+
+    mapping_C, mapping_A, mapping_T, nC, nA, nT = load_cath_mapping(cath_code_dir)
+    null_idx = [nC, nA, nT]
+    bs = len(indices_list)
+
+    if multilabel_mode == "sample":
+        result = []
+        for sample_indices in indices_list:
+            if len(sample_indices) == 0:
+                result.append(null_idx)
+            else:
+                idx = random.randint(0, len(sample_indices) - 1)
+                result.append(sample_indices[idx])
+        batch.cath_code_indices = torch.tensor(result, dtype=torch.long)
+    elif multilabel_mode in ("average", "sum"):
+        # Output [b, max_labels, 3] + mask so model can scatter over embeddings.
+        # (We cannot pre-aggregate indices for sum; model does scatter on embeddings.)
+        max_num_label = max(max(len(s), 1) for s in indices_list)
+        padded = []
+        mask = []
+        for sample_indices in indices_list:
+            n = len(sample_indices)
+            if n == 0:
+                padded.append([null_idx] * max_num_label)
+                mask.append([True] * max_num_label)
+            else:
+                row = list(sample_indices) + [null_idx] * (max_num_label - n)
+                padded.append(row)
+                mask.append([False] * n + [True] * (max_num_label - n))
+        batch.cath_code_indices = torch.tensor(padded, dtype=torch.long)
+        batch.cath_code_indices_mask = torch.tensor(mask, dtype=torch.bool)
+    elif multilabel_mode == "transformer":
+        max_num_label = max(len(s) for s in indices_list)
+        padded = []
+        mask = []
+        for sample_indices in indices_list:
+            n = len(sample_indices)
+            if n == 0:
+                padded.append([null_idx] * max_num_label)
+                mask.append([True] * max_num_label)
+            else:
+                row = list(sample_indices) + [null_idx] * (max_num_label - n)
+                padded.append(row)
+                mask.append([False] * n + [True] * (max_num_label - n))
+        batch.cath_code_indices = torch.tensor(padded, dtype=torch.long)
+        batch.cath_code_indices_mask = torch.tensor(mask, dtype=torch.bool)
+    else:
+        raise ValueError(f"Unknown multilabel_mode: {multilabel_mode}")
 
 
 def _pad_tensor_list(values, padding_value):
@@ -377,12 +448,16 @@ class DensePaddingCollater:
         exclude_keys: Optional[List[str]] = None,
         rank_for_logging: int = -1,
         debug_data_loading: bool = False,
+        cath_code_dir: Optional[str] = None,
+        multilabel_mode: Literal["sample", "average", "sum", "transformer"] = "sample",
     ):
         self.dataset = dataset
         self.follow_batch = follow_batch
         self.exclude_keys = exclude_keys
         self._rank_for_logging = rank_for_logging
         self._debug_data_loading = debug_data_loading
+        self.cath_code_dir = cath_code_dir
+        self.multilabel_mode = multilabel_mode
 
     def __call__(self, batch: List[Any]) -> Any:
         """Collates a python list of data objects to the internal storage format of
@@ -413,6 +488,10 @@ class DensePaddingCollater:
                 follow_batch=self.follow_batch,
                 exclude_keys=self.exclude_keys,
             )
+            if self.cath_code_dir is not None and hasattr(out, "cath_code_indices"):
+                _apply_cath_multilabel_to_batch(
+                    out, self.cath_code_dir, self.multilabel_mode
+                )
             if debug:
                 elapsed = time.perf_counter() - t0
                 logger.info(
@@ -482,6 +561,8 @@ class DensePaddingDataLoader(torch.utils.data.DataLoader):
         exclude_keys: Optional[List[str]] = None,
         rank_for_logging: int = -1,
         debug_data_loading: bool = False,
+        cath_code_dir: Optional[str] = None,
+        multilabel_mode: Literal["sample", "average", "sum", "transformer"] = "sample",
         **kwargs,
     ):
         # Remove for PyTorch Lightning:
@@ -497,6 +578,8 @@ class DensePaddingDataLoader(torch.utils.data.DataLoader):
             exclude_keys,
             rank_for_logging=rank_for_logging,
             debug_data_loading=debug_data_loading,
+            cath_code_dir=cath_code_dir,
+            multilabel_mode=multilabel_mode,
         )
 
         if isinstance(dataset, OnDiskDataset):
