@@ -24,7 +24,7 @@ import hydra
 import lightning as L
 import loralib as lora
 import torch
-torch._dynamo.config.optimize_ddp = False
+torch._dynamo.config.optimize_ddp = True
 import wandb
 from dotenv import load_dotenv
 from lightning.pytorch.loggers import WandbLogger
