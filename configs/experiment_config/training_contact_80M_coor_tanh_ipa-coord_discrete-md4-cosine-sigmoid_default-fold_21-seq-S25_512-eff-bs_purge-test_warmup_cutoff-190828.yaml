@@ -5,7 +5,7 @@ hardware:
   ncpus_per_task_train_: 16  # Number of CPUs per task during training
   ncpus_per_task_prepro_: 16  # Number of CPUs used for data preprocessing run
   accelerator: gpu
-  ngpus_per_node_: 4  # Number of GPUs per node
+  ngpus_per_node_: 2  # Number of GPUs per node
   nnodes_: 1  # Number of nodes
 
 # Below, for t_distribution, options are
