@@ -32,6 +32,32 @@ FLOAT_PADDING_VALUE = 1e-8
 NON_FLOAT_PADDING_VALUE = -1
 
 
+def _pad_tensor_list(values, padding_value):
+    """Pads a list of tensors of arbitrary dimensions along all dimensions to the maximum size."""
+    if not values:
+        return []
+    
+    # Get the maximum size for each dimension
+    max_sizes = []
+    for dim in range(values[0].dim()):
+        max_sizes.append(max(v.shape[dim] for v in values))
+        
+    padded_values = []
+    for v in values:
+        # Calculate padding for each dimension
+        # padding format for F.pad is (pad_left, pad_right, pad_top, pad_bottom, ...)
+        # starting from the last dimension and moving backwards
+        pad_amounts = []
+        for dim in reversed(range(v.dim())):
+            pad_amounts.extend([0, max_sizes[dim] - v.shape[dim]])
+            
+        if any(p > 0 for p in pad_amounts):
+            padded_values.append(torch.nn.functional.pad(v, pad_amounts, value=padding_value))
+        else:
+            padded_values.append(v)
+            
+    return padded_values
+
 def _dense_pad_tensor(
     key,
     values,
@@ -70,17 +96,16 @@ def _dense_pad_tensor(
                 # NOTE: Here, we assume dimension `0` denotes the source and target node indices and dimension `1` denotes the number of edges.
                 values = [
                     value.permute(1, 0).unsqueeze(0)
-                    for value in torch.nn.utils.rnn.pad_sequence(
+                    for value in _pad_tensor_list(
                         [val.permute(1, 0) for val in values],
-                        batch_first=True,
                         padding_value=padding_value,
                     )
                 ]
             else:
                 values = [
                     value.unsqueeze(0)
-                    for value in torch.nn.utils.rnn.pad_sequence(
-                        values, batch_first=True, padding_value=padding_value
+                    for value in _pad_tensor_list(
+                        values, padding_value=padding_value
                     )
                 ]
             if dtype in [torch.uint8, torch.bool]:
@@ -94,8 +119,8 @@ def _dense_pad_tensor(
         else:
             values = [
                 value.unsqueeze(0)
-                for value in torch.nn.utils.rnn.pad_sequence(
-                    values, batch_first=True, padding_value=padding_value
+                for value in _pad_tensor_list(
+                    values, padding_value=padding_value
                 )
             ]
 
