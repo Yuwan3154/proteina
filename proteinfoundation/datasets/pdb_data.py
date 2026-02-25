@@ -1207,7 +1207,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
             fname = f"{pdb}.pt" if chains == "all" else f"{pdb}_{chains}.pt"
 
             graph.id = fname.split(".")[0]
-            graph.protein_id = graph.id  # Add protein_id for CIRPIN conditioning
+
             graph.coords = _to_float_tensor(graph.coords)
             if hasattr(graph, "bfactor"):
                 graph.bfactor = _to_float_tensor(graph.bfactor)

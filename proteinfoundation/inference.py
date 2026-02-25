@@ -32,7 +32,6 @@ from omegaconf import OmegaConf
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from proteinfoundation.utils.lora_utils import replace_lora_layers
-from proteinfoundation.utils.cirpin_utils import CirpinEmbeddingLoader
 
 
 from proteinfoundation.metrics.designability import scRMSD
@@ -104,75 +103,6 @@ class GenDataset(Dataset):
             result["cath_code"] = random.choices(
                 self.cath_codes_given_len_bucket[bucket_idx], k=self.nsamples[index]
             )
-        return result
-
-
-class GenDatasetWithSeqCathCirpin(Dataset):
-    """
-    Dataset for sequence + CATH + CIRPIN conditioning inference.
-    
-    This dataset generates samples for a single protein with CATH fold conditioning
-    and CIRPIN conditioning using embeddings from a CIRPIN embeddings file.
-    """
-    def __init__(self, pt, cath_codes=None, cirpin_emb_file=None, dt=0.005, nsamples_per_len=10, max_nsamples=10):
-        super(GenDatasetWithSeqCathCirpin, self).__init__()
-        self.pt = pt
-        self.dt = dt
-        self.nsamples_per_len = nsamples_per_len
-        self.max_nsamples = max_nsamples
-        self.cath_codes = cath_codes if cath_codes is not None else ["x.x.x.x"]
-        self.num_batches_per_cath = (nsamples_per_len + max_nsamples - 1) // max_nsamples # Equivalent to math.ceil
-
-        # Load CIRPIN embeddings if provided
-        self.cirpin_loader = None
-        if cirpin_emb_file is not None:
-            self.cirpin_loader = CirpinEmbeddingLoader(cirpin_emb_file)
-            self.cirpin_ids = self.cirpin_loader.get_all_protein_ids()
-            logger.info(f"Loaded CIRPIN embeddings for {len(self.cirpin_ids)} proteins")
-            if len(self.cath_codes) == 1:
-                self.cath_codes = self.cath_codes * len(self.cirpin_ids)
-
-    def __len__(self):
-        return len(self.cath_codes) * self.num_batches_per_cath
-        
-    def __getitem__(self, index):
-        cath_idx = index // self.num_batches_per_cath
-        batch_idx_for_cath = index % self.num_batches_per_cath
-        
-        current_cath_code = self.cath_codes[cath_idx]
-        current_id = self.cirpin_ids[cath_idx]
-
-        start_sample_idx = batch_idx_for_cath * self.max_nsamples
-        end_sample_idx = start_sample_idx + self.max_nsamples
-
-        if end_sample_idx > self.nsamples_per_len:
-            num_samples_for_batch = self.nsamples_per_len - start_sample_idx
-        else:
-            num_samples_for_batch = self.max_nsamples
-            
-        cath_code_batch = [[current_cath_code] for _ in range(num_samples_for_batch)]
-        residue_type = self.pt.residue_type
-        
-        result = {
-            "nres": residue_type.shape[-1],
-            "dt": self.dt,
-            "nsamples": num_samples_for_batch,
-            "cath_code": cath_code_batch,
-            "residue_type": residue_type,
-        }
-        
-        # Add CIRPIN embeddings if available
-        if self.cirpin_loader is not None:
-            # Get CIRPIN embedding for this protein
-            protein_ids = [current_id for _ in range(num_samples_for_batch)]
-            cirpin_emb = self.cirpin_loader.get_embeddings_by_ids(
-                protein_ids, 
-                fill_missing=True,  # Fill with zeros if not found
-                dtype=torch.float32
-            )
-            result["cirpin_emb"] = cirpin_emb
-            result["cirpin_ids"] = protein_ids
-        
         return result
 
 
@@ -462,24 +392,13 @@ if __name__ == "__main__":
         elif residue_type_tensor is not None:
             mask_tensor = torch.ones_like(residue_type_tensor, dtype=torch.float32)
 
-    # Choose the appropriate dataset class based on CIRPIN conditioning
-    if cfg.get("cirpin_cond", False):
-        dataset = GenDatasetWithSeqCathCirpin(
-            pt=pt,
-            cath_codes=cath_codes if cfg.fold_cond else ["x.x.x.x"],
-            cirpin_emb_file=cfg.cirpin.cirpin_emb_path,
-            dt=cfg.dt,
-            nsamples_per_len=cfg.nsamples_per_len,
-            max_nsamples=cfg.max_nsamples
-        )
-    else:
-        dataset = GenDatasetWithSeqCath(
-            pt=pt,
-            cath_codes=cath_codes if cfg.fold_cond else ["x.x.x.x"],
-            dt=cfg.dt,
-            nsamples_per_len=cfg.nsamples_per_len,
-            max_nsamples=cfg.max_nsamples
-        )
+    dataset = GenDatasetWithSeqCath(
+        pt=pt,
+        cath_codes=cath_codes if cfg.fold_cond else ["x.x.x.x"],
+        dt=cfg.dt,
+        nsamples_per_len=cfg.nsamples_per_len,
+        max_nsamples=cfg.max_nsamples
+    )
     # nlens_dict = parse_nlens_cfg(cfg)
     # lens_sample, nsamples = split_nlens(
     #     nlens_dict, max_nsamples=cfg.max_nsamples, n_replica=1
@@ -527,7 +446,6 @@ if __name__ == "__main__":
         # Unpack dictionary returned by predict_step
         coors_atom37 = pred["coords_atom37"]  # [b, n, 37, 3]
         cath_codes_batch = pred["cath_code"]
-        cirpin_ids_batch = pred["cirpin_ids"]
         contact_map = pred.get("contact_map")  # [b, n, n] or None
         distogram = pred.get("distogram")  # [b, n, n, num_buckets] or None
         trajectory_tokens = pred.get("trajectory_tokens")
@@ -539,10 +457,9 @@ if __name__ == "__main__":
         for i in range(batch_size):
             # Create directory where everything related to this sample will be stored
             current_cath_code = cath_codes_batch[i][0] # Get the actual CATH code string
-            current_cirpin_id = cirpin_ids_batch[i][0] if cirpin_ids_batch[i] is not None else "unknown"
 
             # Initialize counter for this pt and cath_code if not present
-            sample_key = (args.pt, current_cath_code, current_cirpin_id)
+            sample_key = (args.pt, current_cath_code)
             if sample_key not in samples_per_length:
                 samples_per_length[sample_key] = 0
             
@@ -552,8 +469,6 @@ if __name__ == "__main__":
             filename_parts = [args.pt]
             if cfg.fold_cond and current_cath_code != "x.x.x.x":
                 filename_parts.append(f"cath_{current_cath_code}")
-            if cfg.get("cirpin_cond", False) and current_cirpin_id != "unknown":
-                filename_parts.append(f"cirpin_{current_cirpin_id}")
             filename_parts.append(str(sample_idx))
             
             if coors_atom37 is not None or distogram is not None:

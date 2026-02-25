@@ -247,119 +247,6 @@ class FoldEmbeddingSeqFeat(Feature):
         )  # [b, n, fold_emb_dim * 3]
 
 
-class CirpinEmbeddingSeqFeat(Feature):
-    """Computes CIRPIN embedding and returns as sequence feature of shape [b, n, cirpin_emb_dim].
-    
-    Expects pre-loaded CIRPIN embeddings in batch["cirpin_emb"] of shape [b, 128].
-    """
-
-    def __init__(self, cirpin_emb_dim, **kwargs):
-        """
-        Args:
-            cirpin_emb_dim (int): Dimension of CIRPIN embeddings after projection
-        """
-        super().__init__(dim=cirpin_emb_dim)
-        self.cirpin_emb_dim = cirpin_emb_dim
-        
-        # Create a learnable projection layer to adapt CIRPIN embeddings if needed
-        self.projection = torch.nn.Linear(128, cirpin_emb_dim)  # Input size is always 128
-    
-    def forward(self, batch):
-        xt = batch["x_t"]  # [b, n, 3]
-        bs = xt.shape[0]
-        n = xt.shape[1]
-        
-        # Get CIRPIN embeddings from batch with fallback handling
-        if "cirpin_emb_fallback" not in batch:
-            # If no CIRPIN embeddings provided, use zero embeddings
-            logger.warning("No cirpin_emb_fallback found in batch for CIRPIN conditioning, using zero embeddings")
-            cirpin_emb = torch.zeros(bs, 128, dtype=xt.dtype, device=xt.device)
-        else:
-            cirpin_emb_raw = batch["cirpin_emb_fallback"]  # May be [b, 1, 128] or [b, seq_len, 128] after batching
-            
-            # Handle different possible shapes from batching
-            if cirpin_emb_raw.dim() == 3:
-                # Shape: [batch_size, seq_len, 128] - take first element of sequence
-                cirpin_emb = cirpin_emb_raw[:, 0, :]  # [batch_size, 128]
-            elif cirpin_emb_raw.dim() == 2 and cirpin_emb_raw.shape == (bs, 128):
-                # Shape: [batch_size, 128] - already correct
-                cirpin_emb = cirpin_emb_raw
-            else:
-                raise ValueError(f"Unexpected cirpin_emb_fallback shape: {cirpin_emb_raw.shape}, expected [bs, seq_len, 128] or [bs, 128]")
-            
-            # Ensure correct dtype to match model precision
-            cirpin_emb = cirpin_emb.to(dtype=xt.dtype, device=xt.device)
-            
-            if cirpin_emb.shape != (bs, 128):
-                raise ValueError(f"Expected final cirpin_emb shape [{bs}, 128], got {cirpin_emb.shape}")
-        
-        # Project to desired dimension (cast embedding to match model dtype)
-        cirpin_emb = self.projection(cirpin_emb)  # [b, cirpin_emb_dim]
-        
-        # Expand to all residues (per-residue conditioning)
-        cirpin_emb = cirpin_emb[:, None, :]  # [b, 1, cirpin_emb_dim]
-        return cirpin_emb.expand((bs, n, self.cirpin_emb_dim))  # [b, n, cirpin_emb_dim]
-
-
-class CirpinEmbeddingPairFeat(Feature):
-    """Computes CIRPIN embedding and returns as pair feature of shape [b, n, n, cirpin_emb_dim].
-    
-    Expects pre-loaded CIRPIN embeddings in batch["cirpin_emb"] of shape [b, 128].
-    """
-
-    def __init__(self, cirpin_emb_dim, **kwargs):
-        """
-        Args:
-            cirpin_emb_dim (int): Dimension of CIRPIN embeddings after projection
-        """
-        super().__init__(dim=cirpin_emb_dim)
-        self.cirpin_emb_dim = cirpin_emb_dim
-        
-        # Create learnable projection layers for pair features
-        self.projection_1 = torch.nn.Linear(128, cirpin_emb_dim)  # First embedding
-        self.projection_2 = torch.nn.Linear(128, cirpin_emb_dim)  # Second embedding
-    
-    def forward(self, batch):
-        xt = batch["x_t"]  # [b, n, 3]
-        bs = xt.shape[0]
-        n = xt.shape[1]
-        
-        # Get CIRPIN embeddings from batch with fallback handling
-        if "cirpin_emb_fallback" not in batch:
-            # If no CIRPIN embeddings provided, use zero embeddings
-            logger.warning("No cirpin_emb_fallback found in batch for CIRPIN conditioning, using zero embeddings")
-            cirpin_emb = torch.zeros(bs, 128, dtype=xt.dtype, device=xt.device)
-        else:
-            cirpin_emb_raw = batch["cirpin_emb_fallback"]  # May be [b, 1, 128] or [b, seq_len, 128] after batching
-            
-            # Handle different possible shapes from batching
-            if cirpin_emb_raw.dim() == 3:
-                # Shape: [batch_size, seq_len, 128] - take first element of sequence
-                cirpin_emb = cirpin_emb_raw[:, 0, :]  # [batch_size, 128]
-            elif cirpin_emb_raw.dim() == 2 and cirpin_emb_raw.shape == (bs, 128):
-                # Shape: [batch_size, 128] - already correct
-                cirpin_emb = cirpin_emb_raw
-            else:
-                raise ValueError(f"Unexpected cirpin_emb_fallback shape: {cirpin_emb_raw.shape}, expected [bs, seq_len, 128] or [bs, 128]")
-            
-            # Ensure correct dtype to match model precision
-            cirpin_emb = cirpin_emb.to(dtype=xt.dtype, device=xt.device)
-            
-            if cirpin_emb.shape != (bs, 128):
-                raise ValueError(f"Expected final cirpin_emb shape [{bs}, 128], got {cirpin_emb.shape}")
-        
-        # Project to desired dimension using two different projections (embedding already cast to model dtype)
-        cirpin_emb_1 = self.projection_1(cirpin_emb)  # [b, cirpin_emb_dim]
-        cirpin_emb_2 = self.projection_2(cirpin_emb)  # [b, cirpin_emb_dim]
-        
-        # Expand to sequence length first, then create pair representation
-        cirpin_emb_1 = cirpin_emb_1[:, None, :].expand(bs, n, self.cirpin_emb_dim)  # [b, n, cirpin_emb_dim]
-        cirpin_emb_2 = cirpin_emb_2[:, None, :].expand(bs, n, self.cirpin_emb_dim)  # [b, n, cirpin_emb_dim]
-        
-        # Create pair representation by outer product (similar to ResidueTypeEmbeddingPairFeat)
-        return cirpin_emb_1[:, :, None, :] * cirpin_emb_2[:, None, :, :]  # [b, n, n, cirpin_emb_dim]
-
-
 class TimeEmbeddingSeqFeat(Feature):
     """Computes time embedding and returns as sequence feature of shape [b, n, t_emb_dim]."""
 
@@ -675,7 +562,6 @@ class FeatureFactory(torch.nn.Module):
         use_ln_out: bool,
         mode: Literal["seq", "pair"],
         use_residue_type_emb: bool = False,
-        use_cirpin_emb: bool = False,
         **kwargs,
     ):
         """
@@ -695,7 +581,6 @@ class FeatureFactory(torch.nn.Module):
         super().__init__()
         self.mode = mode
         self.use_residue_type_emb = use_residue_type_emb
-        self.use_cirpin_emb = use_cirpin_emb
 
         # Disable sinusoidal positional embedding (res_seq_pdb_idx) when idx_emb_dim is 0 or not specified
         if feats is not None and mode == "seq":
@@ -723,11 +608,6 @@ class FeatureFactory(torch.nn.Module):
             self.residue_type_out = torch.nn.Linear(
                 self.residue_type_feat_creator.get_dim(), dim_feats_out, bias=False
             )
-        if self.use_cirpin_emb:
-            self.cirpin_feat_creator = self.get_creator("cirpin_emb", **kwargs)
-            self.cirpin_out = torch.nn.Linear(
-                self.cirpin_feat_creator.get_dim(), dim_feats_out, bias=False
-            )
     
     def get_creator(self, f, **kwargs):
         """Returns the right class for the requested feature f (a string)."""
@@ -749,8 +629,6 @@ class FeatureFactory(torch.nn.Module):
                 return MotifMaskSeqFeat(**kwargs)
             elif f == "residue_type_emb":
                 return ResidueTypeEmbeddingSeqFeat(**kwargs)
-            elif f == "cirpin_emb":
-                return CirpinEmbeddingSeqFeat(**kwargs)
             else:
                 raise IOError(f"Sequence feature {f} not implemented.")
 
@@ -769,8 +647,6 @@ class FeatureFactory(torch.nn.Module):
                 return MotifStructureMaskFeat(**kwargs)
             elif f == "residue_type_emb":
                 return ResidueTypeEmbeddingPairFeat(**kwargs)
-            elif f == "cirpin_emb":
-                return CirpinEmbeddingPairFeat(**kwargs)
             elif f == "contact_map_sc":
                 return ContactMapScPairFeat(**kwargs)
             else:
@@ -828,10 +704,6 @@ class FeatureFactory(torch.nn.Module):
         if self.use_residue_type_emb and "residue_type" in batch:
             features_out += self.residue_type_out(
                 self.residue_type_feat_creator(batch)
-                )
-        if self.use_cirpin_emb and "cirpin_emb_fallback" in batch:
-            features_out += self.cirpin_out(
-                self.cirpin_feat_creator(batch)
                 )
         features_proc = self.ln_out(
             features_out

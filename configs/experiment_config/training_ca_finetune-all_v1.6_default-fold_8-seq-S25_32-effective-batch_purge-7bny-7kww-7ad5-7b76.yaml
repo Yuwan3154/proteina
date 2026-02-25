@@ -38,12 +38,6 @@ model:
     residue_type_emb_init_pair: True
     residue_type_emb_cond_pair: True
     seq_emb_dim: 8
-    cirpin_emb_init_seq: False
-    cirpin_emb_cond_seq: False
-    cirpin_emb_init_pair: False
-    cirpin_emb_cond_pair: False
-    cirpin_emb_dim: 128
-    cirpin_emb_path: "~/progres/progres/databases/v_0_2_1/pdb_max384.pt"
 
 
 # Dataset params
@@ -56,7 +50,6 @@ training:
   self_cond: True
   seq_cond: True
   fold_cond: True
-  cirpin_cond: False
   mask_T_prob: 0.5
   mask_A_prob: 0.5
   mask_C_prob: 0.5
@@ -64,8 +57,6 @@ training:
   mask_seq_proportion: 0.1
   finetune_seq_cond_lora_only: False
 
-cirpin:
-  cirpin_emb_path: "~/progres/progres/databases/v_0_2_1/pdb_max384.pt"  # Path to CIRPIN embeddings .pt file
 
 
 lora:

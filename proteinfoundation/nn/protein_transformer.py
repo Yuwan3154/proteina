@@ -529,7 +529,6 @@ class PairReprBuilder(torch.nn.Module):
             use_ln_out=True,
             mode="pair",
             use_residue_type_emb=kwargs.get("residue_type_emb_init_pair", False),
-            use_cirpin_emb=kwargs.get("cirpin_emb_init_pair", False),
             **kwargs,
         )
 
@@ -542,7 +541,6 @@ class PairReprBuilder(torch.nn.Module):
                     use_ln_out=True,
                     mode="pair",
                     use_residue_type_emb=kwargs.get("residue_type_emb_cond_pair", False),
-                    use_cirpin_emb=kwargs.get("cirpin_emb_cond_pair", False),
                     **kwargs,
                 )
                 self.adaln = AdaptiveLayerNorm(
@@ -684,7 +682,6 @@ class ProteinTransformerAF3(torch.nn.Module):
             use_ln_out=False,
             mode="seq",
             use_residue_type_emb=kwargs.get("residue_type_emb_init_seq", False),
-            use_cirpin_emb=kwargs.get("cirpin_emb_init_seq", False),
             **kwargs,
         )
 
@@ -695,7 +692,6 @@ class ProteinTransformerAF3(torch.nn.Module):
             use_ln_out=False,
             mode="seq",
             use_residue_type_emb=kwargs.get("residue_type_emb_cond_seq", False),
-            use_cirpin_emb=kwargs.get("cirpin_emb_cond_seq", False),
             **kwargs,
         )
 

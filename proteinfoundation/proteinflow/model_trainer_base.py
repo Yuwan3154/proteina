@@ -836,34 +836,7 @@ class ModelTrainerBase(L.LightningModule):
             if "residue_type" in batch and not need_residue_type:
                 batch.pop("residue_type")
 
-        # CIRPIN conditional training
-        if self.cfg_exp.training.get("cirpin_cond", False):
-            # CIRPIN conditioning now expects cirpin_emb_fallback directly in the batch
-            # The dataset should have already loaded the embeddings
-            if "cirpin_emb_fallback" not in batch:
-                # If cirpin_emb_fallback is not available, create zero embeddings
-                logger.warning("cirpin_emb_fallback not found in batch for CIRPIN conditioning, using zero embeddings")
-                bs = x_1.shape[0]
-                batch["cirpin_emb_fallback"] = torch.zeros(bs, 1, 128, dtype=x_1.dtype, device=x_1.device)
-            else:
-                # Handle CIRPIN masking based on mask_cirpin_prob
-                cirpin_emb_raw = batch["cirpin_emb_fallback"]  # May be [batch_size, seq_len, 128]
-                
-                mask_cirpin_prob = self.cfg_exp.training.get("mask_cirpin_prob", 0.0)
-                if mask_cirpin_prob > 0.0:
-                    bs = x_1.shape[0]
-                    for i in range(bs):
-                        if random.random() < mask_cirpin_prob:
-                            # Mask CIRPIN by setting embedding to zero
-                            if cirpin_emb_raw.dim() == 3:  # [batch_size, seq_len, 128]
-                                cirpin_emb_raw[i, 0, :] = torch.zeros(128, dtype=cirpin_emb_raw.dtype, device=cirpin_emb_raw.device)
-                            elif cirpin_emb_raw.dim() == 2:  # [batch_size, 128]
-                                cirpin_emb_raw[i] = torch.zeros(128, dtype=cirpin_emb_raw.dtype, device=cirpin_emb_raw.device)
-                    batch["cirpin_emb_fallback"] = cirpin_emb_raw
-        else:
-            # Remove cirpin_emb_fallback from batch when cirpin_cond is False (optional cleanup)
-            if "cirpin_emb_fallback" in batch:
-                batch.pop("cirpin_emb_fallback")
+        
         
         # Prediction for self-conditioning
         if random.random() > 0.5 and self.cfg_exp.training.self_cond:
@@ -1709,7 +1682,6 @@ class ModelTrainerBase(L.LightningModule):
                 - "coords_atom37": Generated coordinates in atom37 format, shape [b, n, 37, 3]
                 - "contact_map": Generated contact map (if available), shape [b, n, n]
                 - "cath_code": CATH codes for each sample
-                - "cirpin_ids": CIRPIN IDs for each sample
         """
         force_compile = getattr(self, "_force_compile", False)
         sampling_args = self.inf_cfg.sampling_caflow
@@ -1774,8 +1746,6 @@ class ModelTrainerBase(L.LightningModule):
             return_trajectory=return_trajectory,
             trajectory_stride=trajectory_stride,
         )
-        n_cath = len(cath_code_raw) if cath_code_raw else batch["nsamples"]
-        cirpin_ids = batch.get("cirpin_ids", [None] * n_cath)
         coords_atom37 = None
         if result.get("coords") is not None:
             coords_atom37 = self.samples_to_atom37(result["coords"])
@@ -1801,7 +1771,6 @@ class ModelTrainerBase(L.LightningModule):
             "contact_map": result.get("contact_map"),
             "distogram": distogram,
             "cath_code": cath_code_raw,
-            "cirpin_ids": cirpin_ids,
             "trajectory_tokens": result.get("trajectory_tokens"),
         }
 

@@ -9,12 +9,9 @@ self_cond: True
 fold_cond: False
 cath_code_level: "T"  # Guidance level -- C, A, or T
 seq_cond: True
-cirpin_cond: False
 data_dir: ${oc.env:DATA_PATH}/pdb_train/ # Directory where the dataset is stored
 cath_code_file: cath_codes_train_df_pdb_f1_minl50_maxl384_mtprotein_etdiffractionEM_minoNone_maxoNone_minr0.0_maxr5.0_hl_rl_rnsrTrue_rpuTrue_l_rcuFalse_ex11.csv # test_cath_code.csv
 
-cirpin:
-  cirpin_emb_path: "~/data/cath_v4-4/by_fold/3.30.70/3.30.70.pt"  # Path to CIRPIN embeddings .pt file
 
 # Sampling
 dt: 0.005
