@@ -10,6 +10,7 @@
 
 import os
 import pathlib
+import random
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Callable, Dict, List, Literal, Optional, Tuple, Union
@@ -252,8 +253,14 @@ class PDBDataSplitter:
         overwrite_sequence_clusters: Optional[bool] = False,
         exclude_ids: List[str] = None,
         exclude_ids_from_file: str = None,
+        exclude_ids_val_from_file: str = None,
+        exclude_ids_test_from_file: str = None,
     ) -> None:
         """Initialise DataSplitter object for splitting data based on arguments into train, val and test set.
+
+        When exclude_ids_from_file is set, those IDs are excluded from training but distributed to
+        val and test according to train_val_test. Val/test IDs are read from {base}_val.txt and
+        {base}_test.txt (derived from exclude_ids_from_file path) unless explicitly provided.
 
         Args:
             df_data (pd.DataFrame, optional): DataFrame containing the sample IDs and metadata. Defaults to None.
@@ -270,7 +277,12 @@ class PDBDataSplitter:
                 or reused. Defaults to False (reuse).
             exclude_ids (List[str], optional): List of PDB IDs to be excluded. For sequence_similarity split,
                 entire clusters containing these IDs will be excluded. Defaults to None.
-            exclude_ids_from_file (str, optional): Path to a txt file containing IDs to be excluded. Defaults to None.
+            exclude_ids_from_file (str, optional): Path to a txt file containing IDs to be excluded from
+                training (and distributed to val/test). Defaults to None.
+            exclude_ids_val_from_file (str, optional): Path to txt file with IDs for val set. If None and
+                exclude_ids_from_file is set, derived as {exclude_ids_from_file base}_val.txt.
+            exclude_ids_test_from_file (str, optional): Path to txt file with IDs for test set. If None and
+                exclude_ids_from_file is set, derived as {exclude_ids_from_file base}_test.txt.
         """
 
         self.df_data = df_data
@@ -281,9 +293,26 @@ class PDBDataSplitter:
         self.overwrite_sequence_clusters = overwrite_sequence_clusters
         self.exclude_ids = exclude_ids
         self.exclude_ids_from_file = exclude_ids_from_file
+        self.exclude_ids_val_from_file = exclude_ids_val_from_file
+        self.exclude_ids_test_from_file = exclude_ids_test_from_file
         self.splits = ["train", "val", "test"]
         self.dfs_splits = None
         self.clusterid_to_seqid_mappings = None
+
+    def _load_ids_from_file(self, path: str) -> set:
+        """Load IDs from a text file (one per line)."""
+        with open(path, "r") as f:
+            return {line.strip() for line in f if line.strip()}
+
+    def _derive_val_test_paths(self, base_path: str) -> Tuple[Optional[str], Optional[str]]:
+        """Derive _val.txt and _test.txt paths from exclude_ids_from_file path."""
+        p = pathlib.Path(base_path)
+        if p.suffix != ".txt":
+            return None, None
+        base = p.parent / p.stem
+        val_path = str(base) + "_val.txt"
+        test_path = str(base) + "_test.txt"
+        return val_path, test_path
 
     def split_data(self, df_data: pd.DataFrame, file_identifier: str) -> Dict:
         """
@@ -295,26 +324,82 @@ class PDBDataSplitter:
         Returns:
             dfs_splits (Dict): dictionary containing the train/val/test splits of the dataframe.
         """
-        # Collect all exclude_ids from both sources
+        # Collect all exclude_ids from both sources (excluded from training)
         all_exclude_ids = set()
+        file_exclude_ids = set()
+        inline_exclude_ids = set()
         if self.exclude_ids:
-            all_exclude_ids.update(self.exclude_ids)
+            inline_exclude_ids.update(self.exclude_ids)
         if self.exclude_ids_from_file:
-            with open(self.exclude_ids_from_file, "r") as f:
-                file_ids = {line.strip() for line in f if line.strip()}
-            all_exclude_ids.update(file_ids)
-        
+            file_exclude_ids = self._load_ids_from_file(self.exclude_ids_from_file)
+            all_exclude_ids.update(file_exclude_ids)
+        all_exclude_ids.update(inline_exclude_ids)
+
+        # Load exclude_ids_val and exclude_ids_test (distributed to val/test, not train)
+        exclude_ids_val = set()
+        exclude_ids_test = set()
+        if all_exclude_ids:
+            # File-based: use _val.txt and _test.txt if available
+            val_path = self.exclude_ids_val_from_file
+            test_path = self.exclude_ids_test_from_file
+            if self.exclude_ids_from_file and (val_path is None or test_path is None):
+                derived_val, derived_test = self._derive_val_test_paths(self.exclude_ids_from_file)
+                if val_path is None:
+                    val_path = derived_val
+                if test_path is None:
+                    test_path = derived_test
+            if val_path and pathlib.Path(val_path).exists():
+                exclude_ids_val.update(self._load_ids_from_file(val_path))
+            if test_path and pathlib.Path(test_path).exists():
+                exclude_ids_test.update(self._load_ids_from_file(test_path))
+            # Inline exclude_ids: split according to train_val_test (val_frac of non-train)
+            if inline_exclude_ids:
+                val_ratio, test_ratio = self.train_val_test[1], self.train_val_test[2]
+                total = val_ratio + test_ratio
+                val_frac = val_ratio / total if total > 0 else 0.5
+                n_val = max(1, int(len(inline_exclude_ids) * val_frac))
+                shuffled = list(inline_exclude_ids)
+                random.seed(42)
+                random.shuffle(shuffled)
+                exclude_ids_val.update(shuffled[:n_val])
+                exclude_ids_test.update(shuffled[n_val:])
+            # Ensure no overlap and all file ids are in val or test
+            file_val = exclude_ids_val & file_exclude_ids
+            file_test = exclude_ids_test & file_exclude_ids
+            file_unassigned = file_exclude_ids - file_val - file_test
+            if file_unassigned:
+                val_ratio, test_ratio = self.train_val_test[1], self.train_val_test[2]
+                n_val = max(1, int(len(file_unassigned) * val_ratio / (val_ratio + test_ratio)))
+                shuffled = list(file_unassigned)
+                random.seed(42)
+                random.shuffle(shuffled)
+                exclude_ids_val.update(shuffled[:n_val])
+                exclude_ids_test.update(shuffled[n_val:])
+
+        df_data_full = df_data  # Keep full df for adding val/test rows
+
         if self.split_type == "random":
             rank_zero_info(
                 f"Splitting dataset via random split into {self.train_val_test}..."
             )
-            # For random split, apply simple exclusion
+            # Exclude from training pool only
             if all_exclude_ids:
-                rank_zero_info(f"Excluding {len(all_exclude_ids)} specified IDs...")
-                df_data = df_data[~df_data['id'].isin(all_exclude_ids)]
-                rank_zero_info(f"{len(df_data)} chains remaining after exclusion")
-            
-            self.dfs_splits = split_dataframe(df_data, self.splits, self.train_val_test)
+                rank_zero_info(f"Excluding {len(all_exclude_ids)} IDs from training (distributing to val/test)...")
+                df_for_split = df_data[~df_data["id"].isin(all_exclude_ids)]
+                rank_zero_info(f"{len(df_for_split)} chains in training pool")
+            else:
+                df_for_split = df_data
+
+            self.dfs_splits = split_dataframe(df_for_split, self.splits, self.train_val_test)
+            # Add excluded IDs to val and test
+            if exclude_ids_val:
+                val_add = df_data_full[df_data_full["id"].isin(exclude_ids_val)]
+                self.dfs_splits["val"] = pd.concat([self.dfs_splits["val"], val_add], ignore_index=True)
+                rank_zero_info(f"Added {len(val_add)} excluded IDs to val set")
+            if exclude_ids_test:
+                test_add = df_data_full[df_data_full["id"].isin(exclude_ids_test)]
+                self.dfs_splits["test"] = pd.concat([self.dfs_splits["test"], test_add], ignore_index=True)
+                rank_zero_info(f"Added {len(test_add)} excluded IDs to test set")
             self.clusterid_to_seqid_mappings = None
 
         elif self.split_type == "sequence_similarity":
@@ -383,9 +468,9 @@ class PDBDataSplitter:
                 }
                 
                 # Filter df_data to remove all sequences from excluded clusters
-                df_data = df_data[~df_data['id'].isin(excluded_seq_ids)]
+                df_data = df_data[~df_data["id"].isin(excluded_seq_ids)]
                 rank_zero_info(f"{len(df_data)} chains remaining after cluster-aware exclusion")
-            
+
             # read representative sequences in
             df_cluster_reps = fasta_to_df(cluster_fasta_filepath)
             seq_ids = df_cluster_reps["id"].to_numpy().tolist()
@@ -410,6 +495,16 @@ class PDBDataSplitter:
                     if len(clusterid_to_seqid_mappings_splits[split][clusterid]) == 0:
                         clusterid_to_seqid_mappings_splits[split].pop(clusterid)
             self.clusterid_to_seqid_mappings = clusterid_to_seqid_mappings_splits
+
+            # Add excluded IDs to val and test (from df_data_full, not filtered df_data)
+            if exclude_ids_val:
+                val_add = df_data_full[df_data_full["id"].isin(exclude_ids_val)]
+                self.dfs_splits["val"] = pd.concat([self.dfs_splits["val"], val_add], ignore_index=True)
+                rank_zero_info(f"Added {len(val_add)} excluded IDs to val set")
+            if exclude_ids_test:
+                test_add = df_data_full[df_data_full["id"].isin(exclude_ids_test)]
+                self.dfs_splits["test"] = pd.concat([self.dfs_splits["test"], test_add], ignore_index=True)
+                rank_zero_info(f"Added {len(test_add)} excluded IDs to test set")
         return (
             self.dfs_splits,
             self.clusterid_to_seqid_mappings,
@@ -1045,9 +1140,11 @@ class PDBLightningDataModule(BaseLightningDataModule):
             )
 
         # Pass exclude_ids from dataselector to datasplitter if not already set
-        if self.dataselector and not self.datasplitter.exclude_ids:
-            self.datasplitter.exclude_ids = self.dataselector.exclude_ids
-            self.datasplitter.exclude_ids_from_file = self.dataselector.exclude_ids_from_file
+        if self.dataselector:
+            if not self.datasplitter.exclude_ids:
+                self.datasplitter.exclude_ids = self.dataselector.exclude_ids
+            if not self.datasplitter.exclude_ids_from_file and self.dataselector.exclude_ids_from_file:
+                self.datasplitter.exclude_ids_from_file = self.dataselector.exclude_ids_from_file
         
         # split the dataset into train, val and test and set attributes that are used for dataset creation
         (self.dfs_splits, self.clusterid_to_seqid_mappings) = (
