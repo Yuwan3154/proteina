@@ -566,6 +566,50 @@ class ContactMapScPairFeat(Feature):
 ####################################
 
 
+def _get_feature_creator(f: str, mode: Literal["seq", "pair"], **kwargs) -> Feature:
+    """Returns the Feature instance for the requested feature name. Shared by FeatureFactory and IndividualFeatureFactory."""
+    if mode == "seq":
+        if f == "time_emb":
+            return TimeEmbeddingSeqFeat(**kwargs)
+        elif f == "res_seq_pdb_idx":
+            return IdxEmbeddingSeqFeat(**kwargs)
+        elif f == "chain_break_per_res":
+            return ChainBreakPerResidueSeqFeat(**kwargs)
+        elif f == "fold_emb":
+            return FoldEmbeddingSeqFeat(**kwargs)
+        elif f == "x_sc":
+            return XscSeqFeat(**kwargs)
+        elif f == "motif_x1":
+            return MotifX1SeqFeat(**kwargs)
+        elif f == "motif_sequence_mask":
+            return MotifMaskSeqFeat(**kwargs)
+        elif f == "residue_type_emb":
+            return ResidueTypeEmbeddingSeqFeat(**kwargs)
+        else:
+            raise IOError(f"Sequence feature {f} not implemented.")
+    elif mode == "pair":
+        if f == "xt_pair_dists":
+            return XtPairwiseDistancesPairFeat(**kwargs)
+        elif f == "x_sc_pair_dists":
+            return XscPairwiseDistancesPairFeat(**kwargs)
+        elif f == "rel_seq_sep":
+            return SequenceSeparationPairFeat(**kwargs)
+        elif f == "time_emb":
+            return TimeEmbeddingPairFeat(**kwargs)
+        elif f == "motif_x1_pair_dists":
+            return MotifX1PairwiseDistancesPairFeat(**kwargs)
+        elif f == "motif_structure_mask":
+            return MotifStructureMaskFeat(**kwargs)
+        elif f == "residue_type_emb":
+            return ResidueTypeEmbeddingPairFeat(**kwargs)
+        elif f == "contact_map_sc":
+            return ContactMapScPairFeat(**kwargs)
+        else:
+            raise IOError(f"Pair feature {f} not implemented.")
+    else:
+        raise IOError(f"Wrong feature mode: {mode}. Should be 'seq' or 'pair'.")
+
+
 class FeatureFactory(torch.nn.Module):
     def __init__(
         self,
@@ -574,6 +618,8 @@ class FeatureFactory(torch.nn.Module):
         use_ln_out: bool,
         mode: Literal["seq", "pair"],
         use_residue_type_emb: bool = False,
+        feature_embedding_mode: Literal["concat", "individual"] = "concat",
+        individual_feat_ln: bool = True,
         **kwargs,
     ):
         """
@@ -593,6 +639,21 @@ class FeatureFactory(torch.nn.Module):
         super().__init__()
         self.mode = mode
         self.use_residue_type_emb = use_residue_type_emb
+        self.feature_embedding_mode = kwargs.pop("feature_embedding_mode", feature_embedding_mode)
+        self._individual_feat_ln = kwargs.get("individual_feat_ln", individual_feat_ln)
+
+        if self.feature_embedding_mode == "individual":
+            _feat_kwargs = {k: v for k, v in kwargs.items() if k not in ("individual_feat_ln",)}
+            self._individual_factory = IndividualFeatureFactory(
+                feats=feats,
+                dim_feats_out=dim_feats_out,
+                use_ln_out=use_ln_out,
+                mode=mode,
+                use_residue_type_emb=use_residue_type_emb,
+                individual_feat_ln=self._individual_feat_ln,
+                **_feat_kwargs,
+            )
+            return
 
         # Disable sinusoidal positional embedding (res_seq_pdb_idx) when idx_emb_dim is 0 or not specified
         if feats is not None and mode == "seq":
@@ -607,7 +668,7 @@ class FeatureFactory(torch.nn.Module):
             return
 
         self.feat_creators = torch.nn.ModuleList(
-            [self.get_creator(f, **kwargs) for f in feats]
+            [_get_feature_creator(f, self.mode, **kwargs) for f in feats]
         )
         self.ln_out = (
             torch.nn.LayerNorm(dim_feats_out) if use_ln_out else torch.nn.Identity()
@@ -616,59 +677,11 @@ class FeatureFactory(torch.nn.Module):
             sum([c.get_dim() for c in self.feat_creators]), dim_feats_out, bias=False
         )
         if self.use_residue_type_emb:
-            self.residue_type_feat_creator = self.get_creator("residue_type_emb", **kwargs)
+            self.residue_type_feat_creator = _get_feature_creator("residue_type_emb", self.mode, **kwargs)
             self.residue_type_out = torch.nn.Linear(
                 self.residue_type_feat_creator.get_dim(), dim_feats_out, bias=False
             )
     
-    def get_creator(self, f, **kwargs):
-        """Returns the right class for the requested feature f (a string)."""
-
-        if self.mode == "seq":
-            if f == "time_emb":
-                return TimeEmbeddingSeqFeat(**kwargs)
-            elif f == "res_seq_pdb_idx":
-                return IdxEmbeddingSeqFeat(**kwargs)
-            elif f == "chain_break_per_res":
-                return ChainBreakPerResidueSeqFeat(**kwargs)
-            elif f == "fold_emb":
-                return FoldEmbeddingSeqFeat(**kwargs)
-            elif f == "x_sc":
-                return XscSeqFeat(**kwargs)
-            elif f == "motif_x1":
-                return MotifX1SeqFeat(**kwargs)
-            elif f == "motif_sequence_mask":
-                return MotifMaskSeqFeat(**kwargs)
-            elif f == "residue_type_emb":
-                return ResidueTypeEmbeddingSeqFeat(**kwargs)
-            else:
-                raise IOError(f"Sequence feature {f} not implemented.")
-
-        elif self.mode == "pair":
-            if f == "xt_pair_dists":
-                return XtPairwiseDistancesPairFeat(**kwargs)
-            elif f == "x_sc_pair_dists":
-                return XscPairwiseDistancesPairFeat(**kwargs)
-            elif f == "rel_seq_sep":
-                return SequenceSeparationPairFeat(**kwargs)
-            elif f == "time_emb":
-                return TimeEmbeddingPairFeat(**kwargs)
-            elif f == "motif_x1_pair_dists":
-                return MotifX1PairwiseDistancesPairFeat(**kwargs)
-            elif f == "motif_structure_mask":
-                return MotifStructureMaskFeat(**kwargs)
-            elif f == "residue_type_emb":
-                return ResidueTypeEmbeddingPairFeat(**kwargs)
-            elif f == "contact_map_sc":
-                return ContactMapScPairFeat(**kwargs)
-            else:
-                raise IOError(f"Pair feature {f} not implemented.")
-
-        else:
-            raise IOError(
-                f"Wrong feature mode (creator): {self.mode}. Should be 'seq' or 'pair'."
-            )
-
     def apply_padding_mask(self, feature_tensor, mask):
         """
         Applies mask to features.
@@ -692,6 +705,8 @@ class FeatureFactory(torch.nn.Module):
 
     def forward(self, batch):
         """Returns masked features, shape depends on mode, either 'seq' or 'pair'."""
+        if self.feature_embedding_mode == "individual":
+            return self._individual_factory(batch)
         # If no features requested just return the zero tensor of appropriate dimensions
         if self.ret_zero:
             return self.zero_creator(batch)
@@ -723,3 +738,106 @@ class FeatureFactory(torch.nn.Module):
         return self.apply_padding_mask(
             features_proc, batch["mask"]
         )  # [b, n, dim_f] or [b, n, n, dim_f]
+
+
+class IndividualFeatureFactory(torch.nn.Module):
+    """Projects each feature individually to dim_feats_out and sums them.
+    Mirrors residue_type_emb pattern: each modality gets its own Linear projection."""
+
+    def __init__(
+        self,
+        feats: List[str],
+        dim_feats_out: int,
+        use_ln_out: bool,
+        mode: Literal["seq", "pair"],
+        use_residue_type_emb: bool = False,
+        individual_feat_ln: bool = True,
+        **kwargs,
+    ):
+        super().__init__()
+        self.mode = mode
+        self.use_residue_type_emb = use_residue_type_emb
+        self.individual_feat_ln = individual_feat_ln
+        kwargs = {k: v for k, v in kwargs.items() if k not in ("feature_embedding_mode", "individual_feat_ln")}
+
+        # Disable sinusoidal positional embedding (res_seq_pdb_idx) when idx_emb_dim is 0 or not specified
+        if feats is not None and mode == "seq":
+            idx_emb_dim = kwargs.get("idx_emb_dim", 0)
+            if idx_emb_dim <= 0:
+                feats = [f for f in feats if f != "res_seq_pdb_idx"]
+
+        self.ret_zero = True if (feats is None or len(feats) == 0) else False
+        self.dim_feats_out = dim_feats_out
+        if self.ret_zero:
+            logger.info("No features requested (IndividualFeatureFactory)")
+            self.zero_creator = ZeroFeat(dim_feats_out=dim_feats_out, mode=mode)
+            return
+
+        self.feat_names = feats
+        self.feat_creators = torch.nn.ModuleList(
+            [_get_feature_creator(f, self.mode, **kwargs) for f in feats]
+        )
+        self.projections = torch.nn.ModuleDict(
+            {
+                name: torch.nn.Linear(creator.get_dim(), dim_feats_out, bias=False)
+                for name, creator in zip(feats, self.feat_creators)
+            }
+        )
+        if self.individual_feat_ln:
+            self.feat_layer_norms = torch.nn.ModuleDict(
+                {
+                    name: torch.nn.LayerNorm(dim_feats_out)
+                    for name in feats
+                }
+            )
+        else:
+            self.feat_layer_norms = None
+
+        if self.use_residue_type_emb:
+            self.residue_type_feat_creator = _get_feature_creator(
+                "residue_type_emb", self.mode, **kwargs
+            )
+            self.residue_type_out = torch.nn.Linear(
+                self.residue_type_feat_creator.get_dim(), dim_feats_out, bias=False
+            )
+
+        self.ln_out = (
+            torch.nn.LayerNorm(dim_feats_out) if use_ln_out else torch.nn.Identity()
+        )
+
+    def _apply_padding_mask(self, feature_tensor, mask):
+        if self.mode == "seq":
+            return feature_tensor * mask[..., None]
+        elif self.mode == "pair":
+            mask_pair = mask[:, None, :] * mask[:, :, None]
+            return feature_tensor * mask_pair[..., None]
+        else:
+            raise IOError(
+                f"Wrong feature mode (pad mask): {self.mode}. Should be 'seq' or 'pair'."
+            )
+
+    def forward(self, batch):
+        if self.ret_zero:
+            return self.zero_creator(batch)
+
+        xt = batch["x_t"]
+        b, n = xt.shape[0], xt.shape[1]
+        if self.mode == "seq":
+            output = torch.zeros((b, n, self.dim_feats_out), device=xt.device, dtype=xt.dtype)
+        else:
+            output = torch.zeros((b, n, n, self.dim_feats_out), device=xt.device, dtype=xt.dtype)
+
+        for name, creator in zip(self.feat_names, self.feat_creators):
+            raw = creator(batch)
+            proj = self.projections[name](raw)
+            if self.feat_layer_norms is not None:
+                proj = self.feat_layer_norms[name](proj)
+            output = output + proj
+
+        if self.use_residue_type_emb and "residue_type" in batch:
+            residue_feat = self.residue_type_feat_creator(batch)
+            output = output + self.residue_type_out(residue_feat)
+
+        output = self._apply_padding_mask(output, batch["mask"])
+        output = self.ln_out(output)
+        return self._apply_padding_mask(output, batch["mask"])

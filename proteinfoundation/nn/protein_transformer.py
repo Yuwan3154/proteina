@@ -522,6 +522,7 @@ class PairReprBuilder(torch.nn.Module):
 
     def __init__(self, feats_repr, feats_cond, dim_feats_out, dim_cond_pair, **kwargs):
         super().__init__()
+        _feat_kwargs = {k: v for k, v in kwargs.items() if k not in ("feature_embedding_mode", "individual_feat_ln")}
 
         self.init_repr_factory = FeatureFactory(
             feats=feats_repr,
@@ -529,7 +530,9 @@ class PairReprBuilder(torch.nn.Module):
             use_ln_out=True,
             mode="pair",
             use_residue_type_emb=kwargs.get("residue_type_emb_init_pair", False),
-            **kwargs,
+            feature_embedding_mode=kwargs.get("feature_embedding_mode", "concat"),
+            individual_feat_ln=kwargs.get("individual_feat_ln", True),
+            **_feat_kwargs,
         )
 
         self.cond_factory = None  # Build a pair feature for conditioning and use it for adaln the pair representation
@@ -541,7 +544,9 @@ class PairReprBuilder(torch.nn.Module):
                     use_ln_out=True,
                     mode="pair",
                     use_residue_type_emb=kwargs.get("residue_type_emb_cond_pair", False),
-                    **kwargs,
+                    feature_embedding_mode=kwargs.get("feature_embedding_mode", "concat"),
+                    individual_feat_ln=kwargs.get("individual_feat_ln", True),
+                    **_feat_kwargs,
                 )
                 self.adaln = AdaptiveLayerNorm(
                     dim=dim_feats_out, dim_cond=dim_cond_pair
@@ -676,13 +681,16 @@ class ProteinTransformerAF3(torch.nn.Module):
             self.linear_3d_embed = torch.nn.Linear(3, kwargs["token_dim"], bias=False)
 
         # To form initial representation
+        _feat_kwargs = {k: v for k, v in kwargs.items() if k not in ("feature_embedding_mode", "individual_feat_ln")}
         self.init_repr_factory = FeatureFactory(
             feats=kwargs["feats_init_seq"],
             dim_feats_out=kwargs["token_dim"],
             use_ln_out=False,
             mode="seq",
             use_residue_type_emb=kwargs.get("residue_type_emb_init_seq", False),
-            **kwargs,
+            feature_embedding_mode=kwargs.get("feature_embedding_mode", "concat"),
+            individual_feat_ln=kwargs.get("individual_feat_ln", True),
+            **_feat_kwargs,
         )
 
         # To get conditioning variables
@@ -692,7 +700,9 @@ class ProteinTransformerAF3(torch.nn.Module):
             use_ln_out=False,
             mode="seq",
             use_residue_type_emb=kwargs.get("residue_type_emb_cond_seq", False),
-            **kwargs,
+            feature_embedding_mode=kwargs.get("feature_embedding_mode", "concat"),
+            individual_feat_ln=kwargs.get("individual_feat_ln", True),
+            **_feat_kwargs,
         )
 
         self.transition_c_1 = Transition(kwargs["dim_cond"], expansion_factor=2)
