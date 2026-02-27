@@ -1563,12 +1563,24 @@ class ModelTrainerBase(L.LightningModule):
         if cath_code_indices_mask is not None:
             cath_code_indices_mask = cath_code_indices_mask[:nsamples].to(self.device)
 
-        x_motif = batch.get("motif_structure", None)
-        if x_motif is not None:
-            x_motif = x_motif[:nsamples].to(self.device)
-        fixed_sequence_mask = batch.get("motif_seq_mask", None)
-        if fixed_sequence_mask is not None:
-            fixed_sequence_mask = fixed_sequence_mask[:nsamples].to(self.device)
+        # Extract motif conditioning: support both (motif_structure, motif_seq_mask) from
+        # inference/GenMotifDataset and (x_motif, fixed_sequence_mask, fixed_structure_mask)
+        # from motif_factory during PDB training/validation.
+        x_motif = None
+        fixed_sequence_mask = None
+        fixed_structure_mask = None
+        if batch.get("motif_structure") is not None and batch.get("motif_seq_mask") is not None:
+            x_motif = batch["motif_structure"][:nsamples].to(self.device)
+            fixed_sequence_mask = batch["motif_seq_mask"][:nsamples].to(self.device)
+            fixed_structure_mask = fixed_sequence_mask[:, :, None] * fixed_sequence_mask[:, None, :]
+        elif batch.get("x_motif") is not None and batch.get("fixed_sequence_mask") is not None:
+            x_motif = batch["x_motif"][:nsamples].to(self.device)
+            fixed_sequence_mask = batch["fixed_sequence_mask"][:nsamples].to(self.device)
+            fs_mask = batch.get("fixed_structure_mask")
+            if fs_mask is not None:
+                fixed_structure_mask = fs_mask[:nsamples].to(self.device)
+            else:
+                fixed_structure_mask = fixed_sequence_mask[:, :, None] * fixed_sequence_mask[:, None, :]
 
         discrete_enabled = getattr(self, "contact_map_mode", False) and self._discrete_diffusion_enabled()
         prev_sampling_grid = None
@@ -1603,7 +1615,7 @@ class ModelTrainerBase(L.LightningModule):
                 mask=mask,
                 x_motif=x_motif,
                 fixed_sequence_mask=fixed_sequence_mask,
-                fixed_structure_mask=None,
+                fixed_structure_mask=fixed_structure_mask,
             )
         finally:
             if prev_sampling_grid is not None:
@@ -1707,13 +1719,22 @@ class ModelTrainerBase(L.LightningModule):
         autoguidance_ratio = self.inf_cfg.get("autoguidance_ratio", 0.0)
         
         mask = batch['mask'].squeeze(0) if 'mask' in batch else None
-        if 'motif_seq_mask' in batch:
-            fixed_sequence_mask = batch['motif_seq_mask'].squeeze(0).to(self.device)
+        # Extract motif: (motif_structure, motif_seq_mask) from GenMotifDataset or
+        # (x_motif, fixed_sequence_mask, fixed_structure_mask) from motif_factory.
+        if batch.get('motif_structure') is not None and batch.get('motif_seq_mask') is not None:
             x_motif = batch['motif_structure'].squeeze(0).to(self.device)
+            fixed_sequence_mask = batch['motif_seq_mask'].squeeze(0).to(self.device)
             fixed_structure_mask = fixed_sequence_mask[:, :, None] * fixed_sequence_mask[:, None, :]
+        elif batch.get('x_motif') is not None and batch.get('fixed_sequence_mask') is not None:
+            x_motif = batch['x_motif'].squeeze(0).to(self.device)
+            fixed_sequence_mask = batch['fixed_sequence_mask'].squeeze(0).to(self.device)
+            fs_mask = batch.get('fixed_structure_mask')
+            fixed_structure_mask = (
+                fs_mask.squeeze(0).to(self.device) if fs_mask is not None
+                else fixed_sequence_mask[:, :, None] * fixed_sequence_mask[:, None, :]
+            )
         else:
-            fixed_sequence_mask, x_motif, fixed_structure_mask = None, None, None
-            fixed_sequence_mask = None
+            x_motif = fixed_sequence_mask = fixed_structure_mask = None
 
         save_trajectory = bool(self.inf_cfg.get("save_trajectory", False))
         save_trajectory_gif = bool(self.inf_cfg.get("save_trajectory_gif", False))

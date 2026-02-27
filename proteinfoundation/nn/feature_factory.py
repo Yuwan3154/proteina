@@ -372,8 +372,10 @@ class MotifX1SeqFeat(Feature):
         super().__init__(dim=3)
 
     def forward(self, batch):
-        if "x_motif" in batch:
-            return batch["x_motif"]  # [b, n, 3]
+        # Support x_motif (motif_factory) and motif_structure (GenMotifDataset)
+        x_motif = batch.get("x_motif", batch.get("motif_structure"))
+        if x_motif is not None:
+            return x_motif  # [b, n, 3]
         else:
             # If no motif
             x = batch["x_t"]
@@ -389,7 +391,8 @@ class MotifMaskSeqFeat(Feature):
         super().__init__(dim=1)
 
     def forward(self, batch):
-        mask = batch.get("motif_mask", batch.get("fixed_sequence_mask"))
+        # Support motif_mask (flow), fixed_sequence_mask (motif_factory), motif_seq_mask (GenMotifDataset)
+        mask = batch.get("motif_mask", batch.get("fixed_sequence_mask", batch.get("motif_seq_mask")))
         if mask is not None:
             return mask.unsqueeze(-1)  # [b, n, 1]
         x = batch["x_t"]
@@ -406,10 +409,12 @@ class MotifStructureMaskFeat(Feature):
 
     def forward(self, batch):
         if "fixed_structure_mask" in batch:
-            # no need to force 1 since taking difference
-            mask = batch["fixed_structure_mask"].unsqueeze(-1)  # [b, n]
+            mask = batch["fixed_structure_mask"].unsqueeze(-1)  # [b, n, n, 1]
+        elif "motif_seq_mask" in batch:
+            m = batch["motif_seq_mask"]  # [b, n]
+            mask = (m[:, :, None] * m[:, None, :]).unsqueeze(-1)  # [b, n, n, 1]
         else:
-            raise ValueError("No fixed_structure_mask")
+            raise ValueError("No fixed_structure_mask or motif_seq_mask in batch")
         return mask
 
 
@@ -423,14 +428,22 @@ class MotifX1PairwiseDistancesPairFeat(Feature):
         self.max_dist = x_motif_pair_dist_max
         
     def forward(self, batch):
-        assert("x_motif" in batch)
-        assert("fixed_structure_mask" in batch)
+        # Support x_motif/motif_structure and fixed_structure_mask/motif_seq_mask
+        x_motif = batch.get("x_motif", batch.get("motif_structure"))
+        if x_motif is None:
+            raise ValueError("No x_motif or motif_structure in batch")
+        fs_mask = batch.get("fixed_structure_mask")
+        if fs_mask is None and "motif_seq_mask" in batch:
+            m = batch["motif_seq_mask"]
+            fs_mask = m[:, :, None] * m[:, None, :]
+        if fs_mask is None:
+            raise ValueError("No fixed_structure_mask or motif_seq_mask in batch")
         return bin_pairwise_distances(
-            x=batch["x_motif"],
+            x=x_motif,
             min_dist=self.min_dist,
             max_dist=self.max_dist,
             dim=self.dim,
-        ) * batch["fixed_structure_mask"].unsqueeze(-1)# [b, n, n, pair_dist_dim]
+        ) * fs_mask.unsqueeze(-1)  # [b, n, n, pair_dist_dim]
 
 
 class SequenceSeparationPairFeat(Feature):
