@@ -1547,7 +1547,8 @@ class ModelTrainerBase(L.LightningModule):
         nsamples = 1
         mask = batch["mask"][:nsamples].to(self.device)
         n = mask.shape[-1]
-        residue_type = batch.get("residue_type")
+        # Use unmasked sequence for validation sampling (training masks residue_type for seq_cond)
+        residue_type = batch.get("residue_type_unmasked", batch.get("residue_type"))
         if residue_type is not None:
             residue_type = residue_type[:nsamples].to(self.device)
         cath_code = batch.get("cath_code") if self.cfg_exp.training.get("fold_cond", False) else None
