@@ -154,9 +154,8 @@ class FoldEmbeddingSeqFeat(Feature):
         """
         super().__init__(dim=fold_emb_dim * 3)
         self.create_mapping(cath_code_dir)
-        self.embedding_C = torch.nn.Embedding(
-            self.num_classes_C + 1, fold_emb_dim
-        )  # The last class is null embedding
+        # The last class is null embedding
+        self.embedding_C = torch.nn.Embedding(self.num_classes_C + 1, fold_emb_dim)  
         self.embedding_A = torch.nn.Embedding(self.num_classes_A + 1, fold_emb_dim)
         self.embedding_T = torch.nn.Embedding(self.num_classes_T + 1, fold_emb_dim)
         self.register_buffer("_device_param", torch.tensor(0), persistent=False)
