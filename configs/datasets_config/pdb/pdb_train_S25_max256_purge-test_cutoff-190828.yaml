@@ -17,6 +17,7 @@ datamodule:
       root_dir: ${oc.env:DATA_PATH}/cathdata/ # Root directory for CATH labels
     - _target_: "proteinfoundation.datasets.transforms.CATHToIndicesTransform"  # Convert CATH strings to indices for model
       cath_code_dir: ${oc.env:DATA_PATH}/pdb_raw/
+    - _target_: "proteinfoundation.datasets.transforms.DSSPTargetTransform"  # 3-state secondary structure for DSSP aux loss
     - _target_: "proteinfoundation.datasets.transforms.PurgeConfindTransform"  # Remove contact_map_confind when not using confind
     - _target_: "proteinfoundation.datasets.transforms.PaddingTransform"
       max_size: 256

@@ -30,7 +30,6 @@ from proteinfoundation.proteinflow.model_trainer_base import ModelTrainerBase
 from proteinfoundation.utils.align_utils.align_utils import kabsch_align
 from proteinfoundation.utils.coors_utils import ang_to_nm, nm_to_ang, trans_nm_to_atom37
 from proteinfoundation.utils.ff_utils.pdb_utils import mask_seq
-from proteinfoundation.utils.dssp_utils import compute_dssp_target
 from proteinfoundation.nn.motif_factory import SingleMotifFactory
 
 
@@ -621,42 +620,40 @@ class Proteina(ModelTrainerBase):
                 rank_zero_only=True,
             )
 
-        # DSSP 3-state secondary structure auxiliary loss
+        # DSSP 3-state secondary structure auxiliary loss (target from DSSPTargetTransform)
         dssp_aux_loss_weight = self.cfg_exp.loss.get("dssp_aux_loss_weight", 0.0)
         if (
             getattr(self.nn, "predict_dssp", False)
             and dssp_aux_loss_weight > 0
             and batch is not None
-            and "coords" in batch
+            and "dssp_target" in batch
             and "dssp_logits" in nn_out
         ):
-            coords = batch["coords"]  # [b, n, atoms, 3] in Angstrom
-            dssp_target = compute_dssp_target(coords, mask, coord_mask=None)
-            if dssp_target is not None:
-                dssp_logits = nn_out["dssp_logits"]  # [b, n, 3]
-                ce_per_res = F.cross_entropy(
-                    dssp_logits.permute(0, 2, 1),
-                    dssp_target,
-                    ignore_index=-1,
-                    reduction="none",
-                )  # [b, n]
-                valid = dssp_target >= 0
-                n_valid_per_sample = valid.sum(dim=-1).clamp(min=1)
-                dssp_loss_per_sample = (ce_per_res * valid.float()).sum(dim=-1) / n_valid_per_sample  # [b]
-                dssp_loss = dssp_aux_loss_weight * dssp_loss_per_sample
-                auxiliary_loss = auxiliary_loss + dssp_loss
-                self.log(
-                    f"{log_prefix}/dssp_aux_loss",
-                    torch.mean(dssp_loss),
-                    on_step=True,
-                    on_epoch=True,
-                    prog_bar=False,
-                    logger=True,
-                    batch_size=mask.shape[0],
-                    sync_dist=True,
-                    add_dataloader_idx=False,
-                    rank_zero_only=True,
-                )
+            dssp_target = batch["dssp_target"]  # [b, n] from DSSPTargetTransform
+            dssp_logits = nn_out["dssp_logits"]  # [b, n, 3]
+            ce_per_res = F.cross_entropy(
+                dssp_logits.permute(0, 2, 1),
+                dssp_target,
+                ignore_index=-1,
+                reduction="none",
+            )  # [b, n]
+            valid = dssp_target >= 0
+            n_valid_per_sample = valid.sum(dim=-1).clamp(min=1)
+            dssp_loss_per_sample = (ce_per_res * valid.float()).sum(dim=-1) / n_valid_per_sample  # [b]
+            dssp_loss = dssp_aux_loss_weight * dssp_loss_per_sample
+            auxiliary_loss = auxiliary_loss + dssp_loss
+            self.log(
+                f"{log_prefix}/dssp_aux_loss",
+                torch.mean(dssp_loss),
+                on_step=True,
+                on_epoch=True,
+                prog_bar=False,
+                logger=True,
+                batch_size=mask.shape[0],
+                sync_dist=True,
+                add_dataloader_idx=False,
+                rank_zero_only=True,
+            )
 
         self.log(
             f"{log_prefix}/distogram_loss",

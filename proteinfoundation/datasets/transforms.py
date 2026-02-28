@@ -68,6 +68,50 @@ class CopyCoordinatesTransform(T.BaseTransform):
         return graph
 
 
+class DSSPTargetTransform(T.BaseTransform):
+    """Computes 3-state DSSP secondary structure targets from backbone coordinates.
+
+    Adds graph.dssp_target [L] with values 0=loop, 1=helix, 2=strand. Invalid residues
+    (missing N/CA/C/O or masked) are set to -1 (ignore_index for CE loss).
+    Skips if coords have fewer than 4 atoms (e.g. CA-only data).
+    """
+
+    def forward(self, graph: Data) -> Data:
+        """Computes DSSP targets and adds to graph.
+
+        Args:
+            graph: PyG Data with coords [L, atoms, 3], coord_mask [L, atoms]
+
+        Returns:
+            Graph with dssp_target [L] added (or unchanged if CA-only)
+        """
+        coords = getattr(graph, "coords", None)
+        coord_mask = getattr(graph, "coord_mask", None)
+        if coords is None or coords.shape[1] < 4:
+            return graph
+
+        import pydssp
+
+        # Extract N, CA, C, O (indices 0, 1, 2, 3)
+        ncao = coords[:, [0, 1, 2, 3], :]  # [L, 4, 3]
+        ncao_batch = ncao.unsqueeze(0)  # [1, L, 4, 3] for PyDSSP
+
+        dssp_out = pydssp.assign(ncao_batch, out_type="index")  # [1, L]
+        dssp_target = dssp_out[0].long().clone()  # [L]
+
+        # Mask invalid residues (missing backbone atoms)
+        if coord_mask is not None and coord_mask.shape[1] >= 4:
+            ncao_valid = (
+                coord_mask[:, 0] & coord_mask[:, 1] & coord_mask[:, 2] & coord_mask[:, 3]
+            )
+            dssp_target = torch.where(
+                ncao_valid, dssp_target, torch.full_like(dssp_target, -1)
+            )
+
+        graph.dssp_target = dssp_target
+        return graph
+
+
 class ChainBreakPerResidueTransform(T.BaseTransform):
     """Identifies chain breaks in protein structures.
 
@@ -136,6 +180,8 @@ class PaddingTransform(T.BaseTransform):
                 if value.dim() >= 1:
                     # For 2D tensors like contact_map [n, n], pad both dimensions
                     fill_value = FLOAT_PADDING_VALUE if torch.is_floating_point(value) else self.fill_value
+                    if key == "dssp_target":
+                        fill_value = -1  # ignore_index for CE loss
                     if "contact_map" in key and value.dim() == 2:
                         # Pad dimension 0 first, then dimension 1
                         value = self.pad_tensor(value, self.max_size, dim=0, fill_value=fill_value)

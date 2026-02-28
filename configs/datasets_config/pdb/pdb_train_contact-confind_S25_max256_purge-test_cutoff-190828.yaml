@@ -17,6 +17,7 @@ datamodule:
       root_dir: ${oc.env:DATA_PATH}/cathdata/ # Root directory for CATH labels
     - _target_: "proteinfoundation.datasets.transforms.CATHToIndicesTransform"  # Convert CATH strings to indices for model
       cath_code_dir: ${oc.env:DATA_PATH}/pdb_raw/
+    - _target_: "proteinfoundation.datasets.transforms.DSSPTargetTransform"  # 3-state secondary structure for DSSP aux loss
     - _target_: "proteinfoundation.datasets.transforms.ContactMapTransform"  # Required for contact_map_mode training
       contact_method: confind  # Expects precomputed contact_map_confind in processed .pt files
       confind_rotamer_lib: ${oc.env:DATA_PATH}/rotlibs
