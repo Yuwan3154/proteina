@@ -827,8 +827,11 @@ class IndividualFeatureFactory(torch.nn.Module):
         else:
             output = torch.zeros((b, n, n, self.dim_feats_out), device=xt.device, dtype=xt.dtype)
 
+        target_dtype = xt.dtype
         for name, creator in zip(self.feat_names, self.feat_creators):
             raw = creator(batch)
+            if raw.dtype != target_dtype:
+                raw = raw.to(target_dtype)
             proj = self.projections[name](raw)
             if self.feat_layer_norms is not None:
                 proj = self.feat_layer_norms[name](proj)
@@ -836,6 +839,8 @@ class IndividualFeatureFactory(torch.nn.Module):
 
         if self.use_residue_type_emb and "residue_type" in batch:
             residue_feat = self.residue_type_feat_creator(batch)
+            if residue_feat.dtype != target_dtype:
+                residue_feat = residue_feat.to(target_dtype)
             output = output + self.residue_type_out(residue_feat)
 
         output = self._apply_padding_mask(output, batch["mask"])
