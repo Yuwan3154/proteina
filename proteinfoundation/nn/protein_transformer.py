@@ -825,6 +825,15 @@ class ProteinTransformerAF3(torch.nn.Module):
                 torch.nn.Linear(kwargs["token_dim"], 9, bias=False),
             )
 
+        self.predict_dssp = kwargs.get("predict_dssp", False)
+        if self.predict_dssp:
+            self.dssp_head = torch.nn.Sequential(
+                torch.nn.LayerNorm(kwargs["token_dim"]),
+                torch.nn.Linear(kwargs["token_dim"], 3, bias=True),  # 3-state: loop, helix, strand
+            )
+        else:
+            self.dssp_head = None
+
     def _extend_w_registers(self, seqs, pair, mask, cond_seq):
         """
         Extends the sequence representation, pair representation, mask and indices with registers.
@@ -1128,5 +1137,10 @@ class ProteinTransformerAF3(torch.nn.Module):
                 nn_out["contact_map_pred"] = torch.tanh(contact_map_logits)
             else:
                 nn_out["contact_map_pred"] = torch.sigmoid(contact_map_logits)
+
+        # DSSP 3-state secondary structure prediction (auxiliary head)
+        if self.predict_dssp and self.dssp_head is not None:
+            dssp_logits = self.dssp_head(seqs) * mask[..., None]  # [b, n, 3]
+            nn_out["dssp_logits"] = dssp_logits
 
         return nn_out
