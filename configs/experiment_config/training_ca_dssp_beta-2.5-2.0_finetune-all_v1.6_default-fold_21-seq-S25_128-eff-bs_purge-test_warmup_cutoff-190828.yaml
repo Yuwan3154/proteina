@@ -22,6 +22,7 @@ loss:
   aux_loss_t_lim: 0.3  # Time limit to apply auxiliary loss
   thres_aux_2d_loss: 0.6  # This is nm not Å
   aux_loss_weight: 1.0
+  dssp_aux_loss_weight: 1.0
   num_dist_buckets: 64  # Number of buckets to discretize the pairwise distance
   max_dist_boundary: 1.0  # Given by nanometer
 
@@ -29,7 +30,6 @@ loss:
 defaults:
   - model: caflow  # caflow or frameflow
   - override model/nn: ca_af3_200M_no_tri
-  - override model/nn/predict_dssp: true
   - _self_
 
 model:
@@ -39,6 +39,7 @@ model:
     residue_type_emb_init_pair: True
     residue_type_emb_cond_pair: True
     seq_emb_dim: 21
+    predict_dssp: true
 
 
 # Dataset params
