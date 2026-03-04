@@ -1083,6 +1083,8 @@ class PDBLightningDataModule(BaseLightningDataModule):
             f.unlink(missing_ok=True)
 
     def _get_file_identifier(self, ds):
+        """File identifier for CSV and cluster files. Excludes exclude_ids so that
+        exclude_ids_from_file can change without invalidating cached dataset files."""
         file_identifier = (
             f"df_pdb_f{ds.fraction}_minl{ds.min_length}_maxl{ds.max_length}_mt{ds.molecule_type}"
             f"_et{''.join(ds.experiment_types) if ds.experiment_types else ''}"
@@ -1093,7 +1095,6 @@ class PDBLightningDataModule(BaseLightningDataModule):
             f"_rnsr{ds.remove_non_standard_residues}_rpu{ds.remove_pdb_unavailable}"
             f"_l{''.join(ds.labels) if ds.labels else ''}"
             f"_rcu{ds.remove_cath_unavailable}"
-            f"_ex{len(ds.exclude_ids) if ds.exclude_ids else 0}"
         )
         return file_identifier
 

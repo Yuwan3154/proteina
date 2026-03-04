@@ -19,7 +19,7 @@ import os
 # Without this, JAX grabs ALL available GPU memory by default!
 # For parallel processing on 4 GPUs with 49GB each, allocate conservatively
 # to allow multiple processes per GPU if needed
-os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.9'
+os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.3'
 
 import sys
 import glob

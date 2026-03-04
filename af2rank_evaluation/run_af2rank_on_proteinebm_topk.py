@@ -40,9 +40,9 @@ def _load_dataset_map(dataset_file: str, id_column: str, tms_column: str) -> Dic
     return out
 
 
-def _find_proteinebm_scores(inference_dir: str) -> List[Path]:
+def _find_proteinebm_scores(inference_dir: str, analysis_subdir: str = "proteinebm_v2_cathmd_analysis") -> List[Path]:
     base = Path(inference_dir)
-    return sorted(base.glob("*/proteinebm_analysis/proteinebm_scores_*.csv"))
+    return sorted(base.glob(f"*/{analysis_subdir}/proteinebm_scores_*.csv"))
 
 
 def _read_proteinebm_summary(summary_path: Path) -> Dict[str, str]:
@@ -156,7 +156,11 @@ if len(to_score) > 0:
 
 all_scores = existing_scores + new_scores
 save_af2rank_scores(all_scores, output_dir, protein_id)
-plot_af2rank_results(all_scores, output_dir, protein_id)
+# Plots reflect only the currently staged top_k templates, not the full
+# accumulated history in the CSV.
+staged_filenames = set(os.path.basename(p) for p in pdb_files)
+plot_scores = [s for s in all_scores if s.get("structure_file") in staged_filenames]
+plot_af2rank_results(plot_scores, output_dir, protein_id)
 """
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -215,15 +219,38 @@ def _process_one_protein(
 
     topk_df = _select_topk_templates(scores_csv_path, top_k)
     staged_dir = protein_out_dir / "staged_topk_templates"
-    _stage_templates_as_dir(topk_df, staged_dir)
 
+    # Check filter_existing BEFORE staging to avoid unnecessary symlink rebuilds.
     if filter_existing and af2rank_scores_csv.exists():
         existing_df = pd.read_csv(af2rank_scores_csv)
         if "structure_file" in existing_df.columns:
             processed = set(existing_df["structure_file"].dropna().astype(str).tolist())
             desired = set([Path(str(p)).name for p in topk_df["structure_path"].tolist()])
             if desired.issubset(processed):
-                return {}
+                # All top-k templates already scored — return existing summary metrics
+                # so the calling loop can still collect cross-protein data.
+                af2_df = existing_df.dropna(subset=["structure_file", "ptm"]) if "ptm" in existing_df.columns else existing_df.iloc[0:0]
+                topk_df2 = topk_df.copy()
+                topk_df2["structure_file"] = topk_df2["structure_path"].apply(lambda p: Path(str(p)).name)
+                if "ptm" in af2_df.columns:
+                    joined = topk_df2.merge(af2_df[["structure_file", "ptm"]], on="structure_file", how="left")
+                    max_ptm = float(pd.to_numeric(joined["ptm"], errors="coerce").dropna().max())
+                else:
+                    max_ptm = float("nan")
+                return {
+                    "protein_id": protein_id,
+                    "reference_tm": float(dataset_ref["reference_tm"]),
+                    "in_train": bool(dataset_ref["in_train"]),
+                    "length": float(dataset_ref["length"]),
+                    "top_k": int(top_k),
+                    "min_energy_topk": float(topk_df["energy"].min()),
+                    "max_ptm_topk": max_ptm,
+                    "proteinebm_scores_csv": str(scores_csv_path),
+                    "af2rank_scores_csv": str(af2rank_scores_csv),
+                }
+
+    # Stage templates (always rebuilds fresh to match current top_k).
+    _stage_templates_as_dir(topk_df, staged_dir)
 
     max_ptm = float("nan")
     af2rank_scores_csv_str = ""
@@ -278,6 +305,7 @@ def main() -> None:
     parser.add_argument("--filter_existing", action=argparse.BooleanOptionalAction, default=True, help="Skip proteins whose per-protein AF2Rank-topk output already exists")
     parser.add_argument("--cuda_visible_devices", default="", help="Comma-separated GPU ids to use (e.g. '0,1,2'). If empty, uses 0..num_gpus-1.")
     parser.add_argument("--dry_run", action="store_true", help="Validate top-k selection and dataset joins without running AF2Rank (no pTM plot)")
+    parser.add_argument("--proteinebm_analysis_subdir", default="proteinebm_v2_cathmd_analysis", help="Per-protein subdir containing ProteinEBM scores (default: proteinebm_v2_cathmd_analysis)")
     args = parser.parse_args()
 
     if args.top_k <= 0:
@@ -294,7 +322,7 @@ def main() -> None:
     if len(gpu_ids) == 0:
         raise ValueError("No GPU ids provided/derived for AF2Rank subprocesses")
 
-    score_csvs = _find_proteinebm_scores(args.inference_dir)
+    score_csvs = _find_proteinebm_scores(args.inference_dir, args.proteinebm_analysis_subdir)
     if len(score_csvs) == 0:
         raise FileNotFoundError(f"No proteinebm_scores_*.csv found under {args.inference_dir}")
 
@@ -399,7 +427,9 @@ def main() -> None:
                     rows.append(row)
 
     if len(rows) == 0:
-        raise ValueError("No proteins processed (check dataset id_column/tms_column and inference_dir contents).")
+        print("WARNING: No protein rows collected (all skipped by filter_existing or dry_run). "
+              "Cross-protein plots may be generated from pre-existing data by generate_cross_protein_plots.py.")
+        return
 
     summary_df = pd.DataFrame(rows)
     summary_csv = out_dir_path / f"af2rank_on_proteinebm_top_{int(args.top_k)}_summary.csv"

@@ -19,6 +19,7 @@ import subprocess
 import logging
 import time
 import shutil
+from pathlib import Path
 
 # Setup logging
 logging.basicConfig(
@@ -154,7 +155,7 @@ def run_af2rank_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpu
     # Run in colabdesign environment using shell script wrapper
     return run_with_conda_env('colabdesign', cmd)
 
-def run_proteinebm_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpus, proteinebm_config, proteinebm_checkpoint, proteinebm_template_self_condition=True):
+def run_proteinebm_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpus, proteinebm_config, proteinebm_checkpoint, proteinebm_template_self_condition=True, proteinebm_analysis_subdir='proteinebm_v2_cathmd_analysis', proteinebm_t=0.05):
     """Run the ProteinEBM scoring pipeline."""
     logger.info("💸 Starting ProteinEBM scoring pipeline...")
     
@@ -168,6 +169,8 @@ def run_proteinebm_scoring(csv_file, csv_column, cif_dir, inference_config, num_
         '--filter_existing',  # Always filter to only score proteins needing ProteinEBM
         '--proteinebm_config', proteinebm_config,
         '--proteinebm_checkpoint', proteinebm_checkpoint,
+        '--proteinebm_analysis_subdir', proteinebm_analysis_subdir,
+        '--proteinebm_t', str(proteinebm_t),
     ]
     
     if not proteinebm_template_self_condition:
@@ -185,6 +188,7 @@ def run_cross_protein_plots(
     tms_column: str,
     af2rank_top_k: int,
     proteinebm_plot_mode: str = "tm",
+    proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
 ) -> bool:
     """Run generate_cross_protein_plots.py for the requested scorer."""
     cmd = [
@@ -202,6 +206,8 @@ def run_cross_protein_plots(
         id_column,
         "--tms_column",
         tms_column,
+        "--proteinebm_analysis_subdir",
+        proteinebm_analysis_subdir,
     ]
 
     if scorer == "proteinebm":
@@ -222,6 +228,7 @@ def run_af2rank_on_proteinebm_topk(
     recycles: int,
     num_gpus: int,
     filter_existing: bool = True,
+    proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
 ) -> bool:
     """Run AF2Rank scoring on the ProteinEBM top-k templates per protein."""
     logger.info("🧪 Starting AF2Rank-on-ProteinEBM-topk step...")
@@ -241,6 +248,8 @@ def run_af2rank_on_proteinebm_topk(
         str(int(recycles)),
         "--num_gpus",
         str(int(num_gpus)),
+        "--proteinebm_analysis_subdir",
+        proteinebm_analysis_subdir,
     ]
 
     if dataset_file:
@@ -325,6 +334,10 @@ def main():
                        help='Path to ProteinEBM base_pretrain.yaml config')
     parser.add_argument('--proteinebm_template_self_condition', action=argparse.BooleanOptionalAction, default=True,
                        help='Use template coordinates for self-conditioning (matches ProteinEBM --template_self_condition)')
+    parser.add_argument('--proteinebm_analysis_subdir', default='proteinebm_v2_cathmd_analysis',
+                       help='Per-protein subdir for ProteinEBM outputs (default: proteinebm_v2_cathmd_analysis; use proteinebm_analysis for legacy)')
+    parser.add_argument('--proteinebm_t', type=float, default=0.05,
+                       help='Diffusion time t for ProteinEBM scoring (default: 0.05)')
     
     args = parser.parse_args()
     
@@ -411,12 +424,14 @@ def main():
             scoring_success = run_proteinebm_scoring(
                 csv_file=args.dataset_file,
                 csv_column=args.id_column,
-                   cif_dir=args.cif_dir,
+                cif_dir=args.cif_dir,
                 inference_config=args.inference_config,
                 num_gpus=args.num_gpus,
                 proteinebm_config=args.proteinebm_config,
                 proteinebm_checkpoint=args.proteinebm_checkpoint,
-                proteinebm_template_self_condition=args.proteinebm_template_self_condition
+                proteinebm_template_self_condition=args.proteinebm_template_self_condition,
+                proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
+                proteinebm_t=args.proteinebm_t,
             )
         
         if scoring_success:
@@ -443,6 +458,7 @@ def main():
             recycles=int(args.recycles),
             num_gpus=int(args.num_gpus),
             filter_existing=bool(args.af2rank_topk_filter_existing),
+            proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
         )
 
         if topk_success:
@@ -472,6 +488,7 @@ def main():
             tms_column=args.tms_column,
             af2rank_top_k=int(args.af2rank_top_k),
             proteinebm_plot_mode=str(args.proteinebm_cross_protein_plot_mode),
+            proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
         )
         if not plot_success:
             logger.error("❌ Cross-protein plotting failed")
@@ -487,6 +504,7 @@ def main():
                 tms_column=args.tms_column,
                 af2rank_top_k=int(args.af2rank_top_k),
                 proteinebm_plot_mode=str(args.proteinebm_cross_protein_plot_mode),
+                proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
             )
             if not plot_success_2:
                 # This commonly occurs if AF2Rank-on-ProteinEBM-top-k hasn't been run yet

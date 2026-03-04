@@ -117,7 +117,7 @@ def get_protein_names(csv_file: str, csv_column: str):
     return proteins
 
 
-def find_proteins_needing_proteinebm(csv_file: str, csv_column: str, inference_config: str):
+def find_proteins_needing_proteinebm(csv_file: str, csv_column: str, inference_config: str, analysis_subdir: str = "proteinebm_v2_cathmd_analysis"):
     csv_proteins = get_protein_names(csv_file, csv_column)
     inference_base_dir = os.path.join(PROTEINA_BASE_DIR, "inference", inference_config)
     if not os.path.exists(inference_base_dir):
@@ -133,7 +133,7 @@ def find_proteins_needing_proteinebm(csv_file: str, csv_column: str, inference_c
         if not pdb_files:
             continue
 
-        scores_csv = protein_dir / "proteinebm_analysis" / f"proteinebm_scores_{protein_name}.csv"
+        scores_csv = protein_dir / analysis_subdir / f"proteinebm_scores_{protein_name}.csv"
         if not scores_csv.exists():
             proteins_needing_work.append(protein_name)
         else:
@@ -155,11 +155,12 @@ def run_proteinebm_scoring_subprocess(
     proteinebm_config: str,
     proteinebm_checkpoint: str,
     template_self_condition: bool,
-    t: float = 0.1,
+    analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
+    t: float = 0.05,
 ):
     wrapper_script = os.path.join(PROTEINA_BASE_DIR, "af2rank_evaluation", "run_with_proteinebm_env.sh")
     scorer_script = os.path.join(PROTEINA_BASE_DIR, "af2rank_evaluation", "proteinebm_scorer.py")
-    output_dir = os.path.join(inference_output_dir, "proteinebm_analysis")
+    output_dir = os.path.join(inference_output_dir, analysis_subdir)
 
     cmd = [
         wrapper_script,
@@ -188,7 +189,7 @@ def run_proteinebm_scoring_subprocess(
 
 
 def process_single_protein_proteinebm(args):
-    protein_name, cif_dir, inference_config, gpu_id, proteinebm_config, proteinebm_checkpoint, template_self_condition = args
+    protein_name, cif_dir, inference_config, gpu_id, proteinebm_config, proteinebm_checkpoint, template_self_condition, analysis_subdir, proteinebm_t = args
 
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     logger.info(f"[GPU {gpu_id}] Starting ProteinEBM scoring for {protein_name}")
@@ -211,13 +212,14 @@ def process_single_protein_proteinebm(args):
         proteinebm_config=proteinebm_config,
         proteinebm_checkpoint=proteinebm_checkpoint,
         template_self_condition=template_self_condition,
-        t=0.1,
+        analysis_subdir=analysis_subdir,
+        t=proteinebm_t,
     )
 
     if result.returncode != 0:
         raise Exception(f"ProteinEBM scoring failed with returncode {result.returncode}")
 
-    analysis_dir = os.path.join(inference_output_dir, "proteinebm_analysis")
+    analysis_dir = os.path.join(inference_output_dir, analysis_subdir)
     summary_file = os.path.join(analysis_dir, f"proteinebm_summary_{protein_name}.json")
     summary_info = {}
     if os.path.exists(summary_file):
@@ -248,9 +250,9 @@ def worker_init_proteinebm(counter, lock, num_gpus):
 
 
 def process_single_protein_proteinebm_wrapper(args_tuple):
-    protein_name, cif_dir, inference_config, proteinebm_config, proteinebm_checkpoint, template_self_condition = args_tuple
+    protein_name, cif_dir, inference_config, proteinebm_config, proteinebm_checkpoint, template_self_condition, analysis_subdir, proteinebm_t = args_tuple
     gpu_id = getattr(builtins, "_worker_gpu_id", 0)
-    full_args = (protein_name, cif_dir, inference_config, gpu_id, proteinebm_config, proteinebm_checkpoint, template_self_condition)
+    full_args = (protein_name, cif_dir, inference_config, gpu_id, proteinebm_config, proteinebm_checkpoint, template_self_condition, analysis_subdir, proteinebm_t)
     return process_single_protein_proteinebm(full_args)
 
 
@@ -274,11 +276,22 @@ def main():
         default=True,
         help="Use template coordinates for self-conditioning input (default: True)",
     )
+    parser.add_argument(
+        "--proteinebm_analysis_subdir",
+        default="proteinebm_v2_cathmd_analysis",
+        help="Per-protein subdir for ProteinEBM outputs (default: proteinebm_v2_cathmd_analysis)",
+    )
+    parser.add_argument(
+        "--proteinebm_t",
+        type=float,
+        default=0.05,
+        help="Diffusion time t for ProteinEBM scoring (default: 0.05)",
+    )
 
     args = parser.parse_args()
 
     if args.filter_existing:
-        protein_names = find_proteins_needing_proteinebm(args.csv_file, args.csv_column, args.inference_config)
+        protein_names = find_proteins_needing_proteinebm(args.csv_file, args.csv_column, args.inference_config, args.proteinebm_analysis_subdir)
         logger.info(f"Found {len(protein_names)} proteins needing ProteinEBM scoring (from CSV file)")
     else:
         protein_names = get_protein_names(args.csv_file, args.csv_column)
@@ -305,7 +318,7 @@ def main():
 
     try:
         work_items = [
-            (protein_name, args.cif_dir, args.inference_config, args.proteinebm_config, args.proteinebm_checkpoint, args.proteinebm_template_self_condition)
+            (protein_name, args.cif_dir, args.inference_config, args.proteinebm_config, args.proteinebm_checkpoint, args.proteinebm_template_self_condition, args.proteinebm_analysis_subdir, args.proteinebm_t)
             for protein_name in protein_names
         ]
 

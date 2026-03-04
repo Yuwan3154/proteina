@@ -44,27 +44,28 @@ def find_af2rank_summaries(inference_base_dir: str) -> List[str]:
     return summary_files
 
 
-def find_proteinebm_score_files(inference_base_dir: str) -> List[str]:
+def find_proteinebm_score_files(inference_base_dir: str, analysis_subdir: str = "proteinebm_v2_cathmd_analysis") -> List[str]:
     """
     Find all ProteinEBM per-protein score CSVs in the inference directory structure.
 
     Args:
         inference_base_dir: Base inference directory
+        analysis_subdir: Per-protein subdir containing ProteinEBM outputs (e.g. proteinebm_analysis or proteinebm_v2_cathmd_analysis)
 
     Returns:
         List of paths to ProteinEBM score CSV files
     """
-    pattern = os.path.join(inference_base_dir, "*", "proteinebm_analysis", "proteinebm_scores_*.csv")
+    pattern = os.path.join(inference_base_dir, "*", analysis_subdir, "proteinebm_scores_*.csv")
     score_files = glob.glob(pattern)
     logger.info(f"Found {len(score_files)} ProteinEBM score files")
     return score_files
 
 
-def find_proteinebm_summaries(inference_base_dir: str) -> List[str]:
+def find_proteinebm_summaries(inference_base_dir: str, analysis_subdir: str = "proteinebm_v2_cathmd_analysis") -> List[str]:
     """
     Find all ProteinEBM per-protein summary JSON files in the inference directory structure.
     """
-    pattern = os.path.join(inference_base_dir, "*", "proteinebm_analysis", "proteinebm_summary_*.json")
+    pattern = os.path.join(inference_base_dir, "*", analysis_subdir, "proteinebm_summary_*.json")
     summary_files = glob.glob(pattern)
     logger.info(f"Found {len(summary_files)} ProteinEBM summary files")
     return summary_files
@@ -1062,6 +1063,11 @@ def main():
         default='tm',
         help='When --scorer=proteinebm, choose whether to plot TM-based (summary) metrics or energy-based diagnostics',
     )
+    parser.add_argument(
+        '--proteinebm_analysis_subdir',
+        default='proteinebm_v2_cathmd_analysis',
+        help='Per-protein subdir containing ProteinEBM outputs (default: proteinebm_v2_cathmd_analysis)',
+    )
     parser.add_argument('--dataset_file', required=True,
                        help='Name of the dataset file to analyze')
     parser.add_argument('--id_column', default='natives_rcsb',
@@ -1120,13 +1126,13 @@ def main():
         )
     else:
         if args.proteinebm_plot_mode == "tm":
-            summary_files = find_proteinebm_summaries(args.inference_dir)
+            summary_files = find_proteinebm_summaries(args.inference_dir, args.proteinebm_analysis_subdir)
             if not summary_files:
                 logger.error("No ProteinEBM summary files found")
                 sys.exit(1)
             df = load_proteinebm_summary_data(summary_files, args.dataset_file, args.id_column, args.tms_column)
         else:
-            score_files = find_proteinebm_score_files(args.inference_dir)
+            score_files = find_proteinebm_score_files(args.inference_dir, args.proteinebm_analysis_subdir)
             if not score_files:
                 logger.error("No ProteinEBM score files found")
                 sys.exit(1)
