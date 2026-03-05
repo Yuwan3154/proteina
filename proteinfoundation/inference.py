@@ -283,7 +283,13 @@ if __name__ == "__main__":
         default=True,
         help="Use cuequivariance triangle updates when available.",
     )
-    
+    parser.add_argument(
+        "--max_nsamples",
+        type=int,
+        default=None,
+        help="Override max_nsamples (GPU batch size) from config.",
+    )
+
     args = parser.parse_args()
     logger.info(" ".join(sys.argv))
 
@@ -310,6 +316,9 @@ if __name__ == "__main__":
         else:
             config_name = args.config_name
         cfg = hydra.compose(config_name=config_name)
+        if args.max_nsamples is not None:
+            cfg = OmegaConf.merge(cfg, {"max_nsamples": args.max_nsamples})
+            logger.info(f"Overriding max_nsamples to {args.max_nsamples}")
         logger.info(f"Inference config {cfg}")
         run_name = cfg.run_name_
 
@@ -322,6 +331,11 @@ if __name__ == "__main__":
     if cfg.seq_cond:
         root_path = os.path.join(root_path, args.pt)
     if os.path.exists(root_path):
+        # Skip cleanup if all samples already exist
+        existing_pdbs = [f for f in os.listdir(root_path) if f.endswith('.pdb')]
+        if len(existing_pdbs) >= cfg.nsamples_per_len:
+            logger.info(f"Output already complete ({len(existing_pdbs)} PDB files found), skipping inference")
+            sys.exit(0)
         shutil.rmtree(root_path)
     os.makedirs(root_path, exist_ok=True)
 

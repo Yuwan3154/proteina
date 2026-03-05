@@ -20,6 +20,7 @@ import signal
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import tempfile
 import shutil
+import torch
 
 def _terminate_process_group(signum: int) -> None:
     """
@@ -138,11 +139,12 @@ def run_cif_to_pt_conversion(csv_file, csv_column, cif_dir):
             stderr = str(e)
         return MockResult()
 
-def run_proteina_inference(protein_name, inference_config, force_compile: bool = False):
+def run_proteina_inference(protein_name, inference_config, force_compile: bool = False,
+                           max_nsamples: int = None):
     """
     Run Proteina inference directly.
     Only uses subprocess for calling proteinfoundation/inference.py.
-    
+
     Note: No timeout - inference can take hours for long proteins.
     Environment activation is handled by the caller (shell script wrapper).
     """
@@ -153,11 +155,13 @@ def run_proteina_inference(protein_name, inference_config, force_compile: bool =
     ]
     if force_compile:
         cmd.append('--force_compile')
-    
+    if max_nsamples is not None:
+        cmd.extend(['--max_nsamples', str(max_nsamples)])
+
     result = subprocess.run(
-        cmd, 
+        cmd,
         cwd=PROTEINA_BASE_DIR,
-        capture_output=True, 
+        capture_output=True,
         text=True
     )
     return result
@@ -201,35 +205,50 @@ def process_single_protein(args):
         
         logger.info(f"[GPU {gpu_id}] ✅ CIF to PT conversion completed for {protein_name}")
         
-        # Step 2: Proteina inference
-        logger.info(f"[GPU {gpu_id}] Step 2: Running Proteina inference for {protein_name}")
-        result = run_proteina_inference(protein_name, inference_config, force_compile=force_compile)
-        
-        if result.returncode != 0:
+        # Step 2: Proteina inference with adaptive batch size on OOM
+        # Read persisted max_nsamples from prior OOM in this worker (if any)
+        current_max_nsamples = getattr(builtins, '_worker_max_nsamples', None)
+
+        while True:
+            bs_info = f" (max_nsamples={current_max_nsamples})" if current_max_nsamples else ""
+            logger.info(f"[GPU {gpu_id}] Step 2: Running Proteina inference for {protein_name}{bs_info}")
+            result = run_proteina_inference(protein_name, inference_config,
+                                            force_compile=force_compile,
+                                            max_nsamples=current_max_nsamples)
+
+            if result.returncode == 0:
+                break  # success
+
             error_msg = result.stderr
-            
-            # Check for specific GPU memory errors
+
             if "CUDA out of memory" in error_msg or "OutOfMemoryError" in error_msg:
-                logger.error(f"[GPU {gpu_id}] 🔴 GPU OUT OF MEMORY for {protein_name}")
-                logger.error(f"[GPU {gpu_id}] This protein likely has a very long sequence")
-                error_type = "GPU_OOM"
+                if current_max_nsamples is None:
+                    current_max_nsamples = 16  # start from config default
+                if current_max_nsamples <= 1:
+                    logger.error(f"[GPU {gpu_id}] OOM with max_nsamples=1 for {protein_name}, giving up")
+                    return {
+                        'protein': protein_name, 'gpu': gpu_id, 'status': 'failed',
+                        'error_type': 'GPU_OOM', 'error': error_msg,
+                        'output_dir': protein_output_dir
+                    }
+                current_max_nsamples = current_max_nsamples // 2
+                logger.warning(f"[GPU {gpu_id}] OOM for {protein_name}, "
+                               f"retrying with max_nsamples={current_max_nsamples}")
+                # Persist reduced batch size for all future proteins on this worker
+                builtins._worker_max_nsamples = current_max_nsamples
+                continue
             else:
+                # Non-OOM failure
                 logger.error(f"[GPU {gpu_id}] Proteina inference failed for {protein_name}")
-                error_type = "INFERENCE_ERROR"
-            
-            logger.error(f"[GPU {gpu_id}] STDOUT: {result.stdout}")
-            logger.error(f"[GPU {gpu_id}] STDERR: {error_msg}")
-            
-            return {
-                'protein': protein_name, 
-                'gpu': gpu_id, 
-                'status': 'failed',
-                'error_type': error_type,
-                'error': error_msg,
-                'output_dir': protein_output_dir
-            }
-        
-        logger.info(f"[GPU {gpu_id}] ✅ Proteina inference completed for {protein_name}")
+                logger.error(f"[GPU {gpu_id}] STDOUT: {result.stdout}")
+                logger.error(f"[GPU {gpu_id}] STDERR: {error_msg}")
+                return {
+                    'protein': protein_name, 'gpu': gpu_id, 'status': 'failed',
+                    'error_type': 'INFERENCE_ERROR', 'error': error_msg,
+                    'output_dir': protein_output_dir
+                }
+
+        logger.info(f"[GPU {gpu_id}] Proteina inference completed for {protein_name}")
         
         # Note: USalign evaluation is not implemented - would be handled separately if needed
         
@@ -313,6 +332,38 @@ def get_protein_names(csv_file, csv_column):
     proteins = df[csv_column].dropna().unique().tolist()
     return [p for p in proteins if p.strip()]
 
+def get_protein_lengths(protein_names):
+    """Load PT files to get protein lengths for workload balancing."""
+    data_dir = os.path.join(
+        os.environ.get('DATA_PATH', os.path.join(PROTEINA_BASE_DIR, 'data')),
+        'pdb_train', 'processed'
+    )
+    lengths = {}
+    for name in protein_names:
+        pt_path = os.path.join(data_dir, f"{name}.pt")
+        if os.path.exists(pt_path):
+            pt = torch.load(pt_path, weights_only=False, map_location='cpu')
+            lengths[name] = len(pt.residue_type)
+        else:
+            lengths[name] = 0  # unknown -> treated as shortest
+    return lengths
+
+
+def shard_proteins_by_length(protein_names, shard_index, num_shards):
+    """
+    Sort proteins by length (ascending) and distribute via round-robin
+    to balance total workload across shards.
+    """
+    lengths = get_protein_lengths(protein_names)
+    sorted_names = sorted(protein_names, key=lambda p: lengths.get(p, 0))
+    # Round-robin (deal cards): shard 0 gets indices 0, num_shards, 2*num_shards, ...
+    shard_names = sorted_names[shard_index::num_shards]
+    total_residues = sum(lengths.get(p, 0) for p in shard_names)
+    logger.info(f"Shard {shard_index}/{num_shards}: {len(shard_names)} proteins, "
+                f"~{total_residues} total residues")
+    return shard_names
+
+
 def find_proteins_needing_inference(csv_file, csv_column, inference_config):
     """Find proteins from CSV that need inference (no PDB files generated yet)."""
     # Get proteins from CSV file
@@ -355,7 +406,15 @@ def main():
         action='store_true',
         help='Force torch.compile during inference (default: off).',
     )
-    
+    parser.add_argument(
+        '--shard_index', type=int, default=None,
+        help='Shard index (0-based). Auto-detected from SLURM_ARRAY_TASK_ID if not set.',
+    )
+    parser.add_argument(
+        '--num_shards', type=int, default=None,
+        help='Total number of shards. Auto-detected from SLURM_ARRAY_TASK_COUNT if not set.',
+    )
+
     args = parser.parse_args()
     
     # Validate inputs
@@ -377,7 +436,20 @@ def main():
     
     # Note: Multi-character chain IDs are now supported in AF2Rank via chain extraction
     # Proteina PT conversion also handles them correctly
-    
+
+    # --- Sharding: distribute proteins across SLURM array tasks ---
+    shard_index = args.shard_index
+    num_shards = args.num_shards
+    if shard_index is None and 'SLURM_ARRAY_TASK_ID' in os.environ:
+        shard_index = int(os.environ['SLURM_ARRAY_TASK_ID'])
+    if num_shards is None and 'SLURM_ARRAY_TASK_COUNT' in os.environ:
+        num_shards = int(os.environ['SLURM_ARRAY_TASK_COUNT'])
+
+    if shard_index is not None and num_shards is not None:
+        logger.info(f"Sharding enabled: shard {shard_index} of {num_shards}")
+        protein_names = shard_proteins_by_length(protein_names, shard_index, num_shards)
+    # ---
+
     logger.info(f"Proteins: {protein_names}")
     
     # Check available GPUs
