@@ -41,7 +41,7 @@ from proteinfoundation.metrics.metric_factory import (
 )
 from proteinfoundation.proteinflow.proteina import Proteina
 from proteinfoundation.utils.ff_utils.pdb_utils import mask_cath_code_by_level, write_prot_to_pdb
-from proteinfoundation.utils.openfold_inference import OpenFoldDistogramOnlyInference
+from proteinfoundation.utils.openfold_inference import OpenFoldTemplateInference
 
 
 # Length dataloader for validation and inference
