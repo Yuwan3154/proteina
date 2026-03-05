@@ -440,10 +440,17 @@ def main():
     # --- Sharding: distribute proteins across SLURM array tasks ---
     shard_index = args.shard_index
     num_shards = args.num_shards
-    if shard_index is None and 'SLURM_ARRAY_TASK_ID' in os.environ:
-        shard_index = int(os.environ['SLURM_ARRAY_TASK_ID'])
-    if num_shards is None and 'SLURM_ARRAY_TASK_COUNT' in os.environ:
-        num_shards = int(os.environ['SLURM_ARRAY_TASK_COUNT'])
+    # Auto-detect from SLURM array env vars, or MIT SuperCloud LLsub env vars
+    if shard_index is None:
+        for var in ('SLURM_ARRAY_TASK_ID', 'LLSUB_RANK'):
+            if var in os.environ:
+                shard_index = int(os.environ[var])
+                break
+    if num_shards is None:
+        for var in ('SLURM_ARRAY_TASK_COUNT', 'LLSUB_SIZE'):
+            if var in os.environ:
+                num_shards = int(os.environ[var])
+                break
 
     if shard_index is not None and num_shards is not None:
         logger.info(f"Sharding enabled: shard {shard_index} of {num_shards}")

@@ -69,6 +69,48 @@ def _select_topk_templates(scores_csv: Path, top_k: int) -> pd.DataFrame:
     return df
 
 
+def _extract_top1_top5_metrics(
+    af2_df: pd.DataFrame, staged_filenames: set
+) -> Dict[str, float]:
+    """Extract top-1 (by pTM) and top-5 (best tm_ref_pred among top-5 by pTM) metrics.
+    Returns dict with ptm, tm_ref_pred, composite, plddt for top_1 and top_5."""
+    nan = float("nan")
+    out = {
+        "top_1_ptm": nan, "top_1_tm_ref_pred": nan, "top_1_composite": nan, "top_1_plddt": nan,
+        "top_5_ptm": nan, "top_5_tm_ref_pred": nan, "top_5_composite": nan, "top_5_plddt": nan,
+    }
+    needed = {"structure_file", "ptm", "tm_ref_pred"}
+    if not needed.issubset(af2_df.columns):
+        return out
+    df = af2_df[af2_df["structure_file"].astype(str).isin(staged_filenames)].copy()
+    df = df.dropna(subset=["ptm", "tm_ref_pred"])
+    if len(df) == 0:
+        return out
+    df["ptm"] = pd.to_numeric(df["ptm"], errors="coerce")
+    df["tm_ref_pred"] = pd.to_numeric(df["tm_ref_pred"], errors="coerce")
+    if "composite" in df.columns:
+        df["composite"] = pd.to_numeric(df["composite"], errors="coerce")
+    if "plddt" in df.columns:
+        df["plddt"] = pd.to_numeric(df["plddt"], errors="coerce")
+    df = df.dropna(subset=["ptm", "tm_ref_pred"])
+    if len(df) == 0:
+        return out
+    df = df.sort_values("ptm", ascending=False).reset_index(drop=True)
+    r1 = df.iloc[0]
+    out["top_1_ptm"] = float(r1["ptm"])
+    out["top_1_tm_ref_pred"] = float(r1["tm_ref_pred"])
+    out["top_1_composite"] = float(r1["composite"]) if "composite" in r1 and pd.notna(r1.get("composite")) else nan
+    out["top_1_plddt"] = float(r1["plddt"]) if "plddt" in r1 and pd.notna(r1.get("plddt")) else nan
+    top5 = df.head(5)
+    best_idx = int(top5["tm_ref_pred"].argmax()) if len(top5) > 0 else 0
+    r5 = top5.iloc[best_idx]
+    out["top_5_ptm"] = float(r5["ptm"])
+    out["top_5_tm_ref_pred"] = float(r5["tm_ref_pred"])
+    out["top_5_composite"] = float(r5["composite"]) if "composite" in r5 and pd.notna(r5.get("composite")) else nan
+    out["top_5_plddt"] = float(r5["plddt"]) if "plddt" in r5 and pd.notna(r5.get("plddt")) else nan
+    return out
+
+
 def _stage_templates_as_dir(topk_df: pd.DataFrame, staged_dir: Path) -> None:
     if staged_dir.exists():
         shutil.rmtree(staged_dir)
@@ -237,6 +279,7 @@ def _process_one_protein(
                     max_ptm = float(pd.to_numeric(joined["ptm"], errors="coerce").dropna().max())
                 else:
                     max_ptm = float("nan")
+                m = _extract_top1_top5_metrics(existing_df, desired)
                 return {
                     "protein_id": protein_id,
                     "reference_tm": float(dataset_ref["reference_tm"]),
@@ -245,6 +288,7 @@ def _process_one_protein(
                     "top_k": int(top_k),
                     "min_energy_topk": float(topk_df["energy"].min()),
                     "max_ptm_topk": max_ptm,
+                    **m,
                     "proteinebm_scores_csv": str(scores_csv_path),
                     "af2rank_scores_csv": str(af2rank_scores_csv),
                 }
@@ -254,6 +298,12 @@ def _process_one_protein(
 
     max_ptm = float("nan")
     af2rank_scores_csv_str = ""
+    metrics: Dict[str, float] = {
+        "top_1_ptm": float("nan"), "top_1_tm_ref_pred": float("nan"),
+        "top_1_composite": float("nan"), "top_1_plddt": float("nan"),
+        "top_5_ptm": float("nan"), "top_5_tm_ref_pred": float("nan"),
+        "top_5_composite": float("nan"), "top_5_plddt": float("nan"),
+    }
 
     if not dry_run:
         _run_af2rank_subprocess(
@@ -276,6 +326,8 @@ def _process_one_protein(
         joined = topk_df.merge(af2_df[["structure_file", "ptm"]], on="structure_file", how="left")
         max_ptm = float(pd.to_numeric(joined["ptm"], errors="coerce").dropna().max())
         af2rank_scores_csv_str = str(af2rank_scores_csv)
+        staged_filenames = set(topk_df["structure_file"].astype(str).tolist())
+        metrics = _extract_top1_top5_metrics(af2_df, staged_filenames)
 
     min_energy = float(topk_df["energy"].min())
     return {
@@ -286,6 +338,7 @@ def _process_one_protein(
         "top_k": int(top_k),
         "min_energy_topk": min_energy,
         "max_ptm_topk": max_ptm,
+        **metrics,
         "proteinebm_scores_csv": str(scores_csv_path),
         "af2rank_scores_csv": af2rank_scores_csv_str,
     }
@@ -455,6 +508,70 @@ def main() -> None:
             ylabel="AF2Rank pTM (higher is better)",
             out_path=out_dir_path / f"ref_tm_vs_af2rank_ptm_topk{int(args.top_k)}.png",
         )
+
+        # TM_ref_pred vs pTM: does AF2 confidence correlate with prediction quality?
+        if "top_1_ptm" in summary_df.columns and "top_1_tm_ref_pred" in summary_df.columns:
+            _plot_scatter(
+                summary_df,
+                x_col="top_1_ptm",
+                y_col="top_1_tm_ref_pred",
+                title=f"Top-1 by pTM: Prediction TM (tm_ref_pred) vs AF2 pTM",
+                xlabel="AF2 pTM (confidence)",
+                ylabel="TM(ref vs pred)",
+                out_path=out_dir_path / f"tm_ref_pred_vs_ptm_top1_topk{int(args.top_k)}.png",
+            )
+        if "top_5_ptm" in summary_df.columns and "top_5_tm_ref_pred" in summary_df.columns:
+            _plot_scatter(
+                summary_df,
+                x_col="top_5_ptm",
+                y_col="top_5_tm_ref_pred",
+                title=f"Top-5 by pTM (best tm_ref_pred): Prediction TM vs AF2 pTM",
+                xlabel="AF2 pTM (confidence)",
+                ylabel="TM(ref vs pred)",
+                out_path=out_dir_path / f"tm_ref_pred_vs_ptm_top5_topk{int(args.top_k)}.png",
+            )
+
+        if "top_1_composite" in summary_df.columns and "top_1_tm_ref_pred" in summary_df.columns:
+            _plot_scatter(
+                summary_df,
+                x_col="top_1_composite",
+                y_col="top_1_tm_ref_pred",
+                title=f"Top-1 by pTM: Prediction TM vs composite score",
+                xlabel="Composite score",
+                ylabel="TM(ref vs pred)",
+                out_path=out_dir_path / f"tm_ref_pred_vs_composite_top1_topk{int(args.top_k)}.png",
+            )
+        if "top_5_composite" in summary_df.columns and "top_5_tm_ref_pred" in summary_df.columns:
+            _plot_scatter(
+                summary_df,
+                x_col="top_5_composite",
+                y_col="top_5_tm_ref_pred",
+                title=f"Top-5 by pTM (best tm_ref_pred): Prediction TM vs composite score",
+                xlabel="Composite score",
+                ylabel="TM(ref vs pred)",
+                out_path=out_dir_path / f"tm_ref_pred_vs_composite_top5_topk{int(args.top_k)}.png",
+            )
+
+        if "top_1_plddt" in summary_df.columns and "top_1_tm_ref_pred" in summary_df.columns:
+            _plot_scatter(
+                summary_df,
+                x_col="top_1_plddt",
+                y_col="top_1_tm_ref_pred",
+                title=f"Top-1 by pTM: Prediction TM vs pLDDT",
+                xlabel="pLDDT",
+                ylabel="TM(ref vs pred)",
+                out_path=out_dir_path / f"tm_ref_pred_vs_plddt_top1_topk{int(args.top_k)}.png",
+            )
+        if "top_5_plddt" in summary_df.columns and "top_5_tm_ref_pred" in summary_df.columns:
+            _plot_scatter(
+                summary_df,
+                x_col="top_5_plddt",
+                y_col="top_5_tm_ref_pred",
+                title=f"Top-5 by pTM (best tm_ref_pred): Prediction TM vs pLDDT",
+                xlabel="pLDDT",
+                ylabel="TM(ref vs pred)",
+                out_path=out_dir_path / f"tm_ref_pred_vs_plddt_top5_topk{int(args.top_k)}.png",
+            )
 
 
 if __name__ == "__main__":
