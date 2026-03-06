@@ -115,106 +115,122 @@ def load_af2rank_on_proteinebm_topk_data(
     dataset_proteins = set(dataset_df[id_column].tolist())
     logger.info(f"Dataset contains {len(dataset_proteins)} proteins")
 
+    def _extract_metrics(df: pd.DataFrame, staged_names: set, top_k: int) -> dict:
+        needed = {"ptm", "tm_ref_pred", "tm_ref_template", "structure_file"}
+        if not needed.issubset(df.columns):
+            return {}
+        d = df[df["structure_file"].astype(str).isin(staged_names)].copy()
+        d = d.dropna(subset=["ptm", "tm_ref_pred", "tm_ref_template"])
+        if len(d) == 0:
+            return {}
+        for c in ["ptm", "tm_ref_pred", "tm_ref_template", "composite", "plddt"]:
+            if c in d.columns:
+                d[c] = pd.to_numeric(d[c], errors="coerce")
+        d = d.dropna(subset=["ptm", "tm_ref_pred"]).sort_values("ptm", ascending=False).reset_index(drop=True)
+        if len(d) == 0:
+            return {}
+        k_eff = min(top_k, len(d))
+        d = d.iloc[:k_eff]
+        r1 = d.iloc[0]
+        k5 = min(5, len(d))
+        d5 = d.iloc[:k5]
+        best_idx = int(np.argmax(d5["tm_ref_pred"].to_numpy()))
+        r5 = d5.iloc[best_idx]
+        return {
+            "top_1_ptm": float(r1["ptm"]),
+            "top_1_tm_ref_pred": float(r1["tm_ref_pred"]),
+            "top_1_tm_ref_template": float(r1["tm_ref_template"]),
+            "top_1_composite": float(r1["composite"]) if "composite" in r1 and pd.notna(r1.get("composite")) else float("nan"),
+            "top_1_plddt": float(r1["plddt"]) if "plddt" in r1 and pd.notna(r1.get("plddt")) else float("nan"),
+            "top_5_ptm": float(r5["ptm"]),
+            "top_5_tm_ref_pred": float(r5["tm_ref_pred"]),
+            "top_5_tm_ref_template": float(r5["tm_ref_template"]),
+            "top_5_composite": float(r5["composite"]) if "composite" in r5 and pd.notna(r5.get("composite")) else float("nan"),
+            "top_5_plddt": float(r5["plddt"]) if "plddt" in r5 and pd.notna(r5.get("plddt")) else float("nan"),
+        }
+
+    def _merge_min(m1_df: pd.DataFrame, m2_df: pd.DataFrame, staged_names: set) -> pd.DataFrame:
+        needed = {"structure_file", "ptm", "tm_ref_pred"}
+        if not needed.issubset(m1_df.columns) or not needed.issubset(m2_df.columns):
+            return pd.DataFrame()
+        for c in ["composite", "plddt"]:
+            if c not in m1_df.columns:
+                m1_df = m1_df.copy()
+                m1_df[c] = float("nan")
+            if c not in m2_df.columns:
+                m2_df = m2_df.copy()
+                m2_df[c] = float("nan")
+        m1 = m1_df[m1_df["structure_file"].astype(str).isin(staged_names)].copy()
+        m2 = m2_df[m2_df["structure_file"].astype(str).isin(staged_names)].copy()
+        merged = m1.merge(m2, on="structure_file", how="inner", suffixes=("_m1", "_m2"))
+        merged["ptm"] = merged[["ptm_m1", "ptm_m2"]].min(axis=1)
+        merged["tm_ref_pred"] = merged[["tm_ref_pred_m1", "tm_ref_pred_m2"]].min(axis=1)
+        merged["composite"] = merged[["composite_m1", "composite_m2"]].min(axis=1)
+        merged["plddt"] = merged[["plddt_m1", "plddt_m2"]].min(axis=1)
+        merged["tm_ref_template"] = merged[["tm_ref_template_m1", "tm_ref_template_m2"]].min(axis=1)
+        return merged[["structure_file", "ptm", "tm_ref_pred", "tm_ref_template", "composite", "plddt"]]
+
     for score_file in score_files:
         protein_id = Path(score_file).parent.parent.parent.name
         if protein_id not in dataset_proteins:
             continue
 
-        df = pd.read_csv(score_file)
+        m1_df = pd.read_csv(score_file)
         needed = {"ptm", "tm_ref_pred", "tm_ref_template", "structure_file"}
-        missing = sorted([c for c in needed if c not in df.columns])
+        missing = sorted([c for c in needed if c not in m1_df.columns])
         if missing:
-            raise KeyError(f"Missing columns {missing} in {score_file}. Columns: {df.columns.tolist()}")
+            raise KeyError(f"Missing columns {missing} in {score_file}. Columns: {m1_df.columns.tolist()}")
 
-        # Restrict to currently staged templates (top-k by ProteinEBM energy)
         staged_dir = Path(score_file).parent.parent / "staged_topk_templates"
-        if staged_dir.exists():
-            staged_names = set(f.name for f in staged_dir.iterdir() if f.is_file() or f.is_symlink())
-            df = df[df["structure_file"].astype(str).isin(staged_names)].copy()
-        if len(df) == 0:
+        staged_names = set(f.name for f in staged_dir.iterdir() if f.is_file() or f.is_symlink()) if staged_dir.exists() else set()
+        if not staged_names:
+            staged_names = set(m1_df["structure_file"].astype(str).tolist())
+        if len(staged_names) == 0:
             continue
 
-        df = df.dropna(subset=["ptm", "tm_ref_pred", "tm_ref_template"]).copy()
-        if len(df) == 0:
+        m1_metrics = _extract_metrics(m1_df, staged_names, top_k)
+        if not m1_metrics:
             continue
 
-        df["ptm"] = pd.to_numeric(df["ptm"], errors="coerce")
-        df["tm_ref_pred"] = pd.to_numeric(df["tm_ref_pred"], errors="coerce")
-        df["tm_ref_template"] = pd.to_numeric(df["tm_ref_template"], errors="coerce")
-        if "composite" in df.columns:
-            df["composite"] = pd.to_numeric(df["composite"], errors="coerce")
-        if "plddt" in df.columns:
-            df["plddt"] = pd.to_numeric(df["plddt"], errors="coerce")
-        df = (
-            df.dropna(subset=["ptm", "tm_ref_pred", "tm_ref_template"])
-            .sort_values("ptm", ascending=False)
-            .reset_index(drop=True)
-        )
-        if len(df) == 0:
-            continue
-
-        k_eff_total = int(min(int(top_k), int(len(df))))
-        if k_eff_total <= 0:
-            continue
-        df = df.iloc[:k_eff_total].reset_index(drop=True)
-
-        n_scored = int(len(df))
-        r1 = df.iloc[0]
-        top_1_tm_ref_pred = float(r1["tm_ref_pred"])
-        top_1_tm_ref_template = float(r1["tm_ref_template"])
-        top_1_ptm = float(r1["ptm"])
-        top_1_composite = float(r1["composite"]) if "composite" in r1 and pd.notna(r1.get("composite")) else float("nan")
-        top_1_plddt = float(r1["plddt"]) if "plddt" in r1 and pd.notna(r1.get("plddt")) else float("nan")
-        k_eff_5 = int(min(5, n_scored))
-        df_top5 = df.iloc[:k_eff_5].reset_index(drop=True)
-        best_idx = int(np.argmax(df_top5["tm_ref_pred"].to_numpy()))
-        r5 = df_top5.iloc[best_idx]
-        top_5_tm_ref_pred = float(r5["tm_ref_pred"])
-        top_5_tm_ref_template = float(r5["tm_ref_template"])
-        top_5_ptm = float(r5["ptm"])
-        top_5_composite = float(r5["composite"]) if "composite" in r5 and pd.notna(r5.get("composite")) else float("nan")
-        top_5_plddt = float(r5["plddt"]) if "plddt" in r5 and pd.notna(r5.get("plddt")) else float("nan")
-
-        data.append(
-            {
-                "protein_id": protein_id,
-                "n_scored": n_scored,
-                "top_1_tm_ref_pred": top_1_tm_ref_pred,
-                "top_5_tm_ref_pred": top_5_tm_ref_pred,
-                "top_1_tm_ref_template": top_1_tm_ref_template,
-                "top_5_tm_ref_template": top_5_tm_ref_template,
-                "top_1_ptm": top_1_ptm,
-                "top_5_ptm": top_5_ptm,
-                "top_1_composite": top_1_composite,
-                "top_5_composite": top_5_composite,
-                "top_1_plddt": top_1_plddt,
-                "top_5_plddt": top_5_plddt,
-                "scores_csv": str(score_file),
-            }
-        )
+        m2_path = Path(score_file).parent.parent / "af2rank_analysis_model_2_ptm" / Path(score_file).name
+        row = {
+            "protein_id": protein_id,
+            "n_scored": len(m1_df[m1_df["structure_file"].astype(str).isin(staged_names)]),
+            "top_1_tm_ref_pred": m1_metrics["top_1_tm_ref_pred"],
+            "top_5_tm_ref_pred": m1_metrics["top_5_tm_ref_pred"],
+            "top_1_tm_ref_template": m1_metrics["top_1_tm_ref_template"],
+            "top_5_tm_ref_template": m1_metrics["top_5_tm_ref_template"],
+            "top_1_ptm": m1_metrics["top_1_ptm"],
+            "top_5_ptm": m1_metrics["top_5_ptm"],
+            "top_1_composite": m1_metrics["top_1_composite"],
+            "top_5_composite": m1_metrics["top_5_composite"],
+            "top_1_plddt": m1_metrics["top_1_plddt"],
+            "top_5_plddt": m1_metrics["top_5_plddt"],
+            "scores_csv": str(score_file),
+        }
+        if m2_path.exists():
+            m2_df = pd.read_csv(m2_path)
+            if needed.issubset(m2_df.columns):
+                m2_metrics = _extract_metrics(m2_df, staged_names, top_k)
+                min_df = _merge_min(m1_df, m2_df, staged_names)
+                min_metrics = _extract_metrics(min_df, staged_names, top_k) if len(min_df) > 0 else {}
+                for prefix, metrics in [("m2", m2_metrics), ("min", min_metrics)]:
+                    if metrics:
+                        for k, v in metrics.items():
+                            row[f"{prefix}_{k}"] = v
+        data.append(row)
 
     if len(data) == 0:
-        # Return an empty frame with the expected schema so callers can handle it cleanly.
-        return pd.DataFrame(
-            columns=[
-                "protein_id",
-                "n_scored",
-                "top_1_tm_ref_pred",
-                "top_5_tm_ref_pred",
-                "top_1_tm_ref_template",
-                "top_5_tm_ref_template",
-                "top_1_ptm",
-                "top_5_ptm",
-                "top_1_composite",
-                "top_5_composite",
-                "top_1_plddt",
-                "top_5_plddt",
-                "scores_csv",
-                tms_column,
-                "in_train",
-                "length",
-            ]
-        )
+        base_cols = [
+            "protein_id", "n_scored",
+            "top_1_tm_ref_pred", "top_5_tm_ref_pred", "top_1_tm_ref_template", "top_5_tm_ref_template",
+            "top_1_ptm", "top_5_ptm", "top_1_composite", "top_5_composite", "top_1_plddt", "top_5_plddt",
+            "scores_csv", tms_column, "in_train", "length",
+        ]
+        for prefix in ["m2", "min"]:
+            for k in ["top_1_ptm", "top_5_ptm", "top_1_tm_ref_pred", "top_5_tm_ref_pred", "top_1_composite", "top_5_composite", "top_1_plddt", "top_5_plddt"]:
+                base_cols.append(f"{prefix}_{k}")
+        return pd.DataFrame(columns=base_cols)
 
     out = pd.DataFrame(data)
     logger.info(f"Loaded {len(out)} proteins from AF2Rank-on-ProteinEBM-topk results (filtered by dataset)")
@@ -454,6 +470,47 @@ def create_af2rank_on_proteinebm_topk_plots(df: pd.DataFrame, output_dir: str, t
         plt.savefig(out_path5, dpi=900, bbox_inches="tight")
         logger.info(f"Saved AF2Rank-on-ProteinEBM-topk plot: {out_path5}")
         plt.close()
+
+    def _plot_variant(df_plot: pd.DataFrame, prefix: str, label: str, xlabel_override: dict = None) -> None:
+        xlabel_override = xlabel_override or {}
+        for suffix, x, y, top_num in [
+            ("ptm", f"{prefix}_top_1_ptm", f"{prefix}_top_1_tm_ref_pred", "1"),
+            ("ptm", f"{prefix}_top_5_ptm", f"{prefix}_top_5_tm_ref_pred", "5"),
+            ("composite", f"{prefix}_top_1_composite", f"{prefix}_top_1_tm_ref_pred", "1"),
+            ("composite", f"{prefix}_top_5_composite", f"{prefix}_top_5_tm_ref_pred", "5"),
+            ("plddt", f"{prefix}_top_1_plddt", f"{prefix}_top_1_tm_ref_pred", "1"),
+            ("plddt", f"{prefix}_top_5_plddt", f"{prefix}_top_5_tm_ref_pred", "5"),
+        ]:
+            if x not in df_plot.columns or y not in df_plot.columns:
+                continue
+            valid = df_plot.dropna(subset=[x, y, "in_train", "length"])
+            if len(valid) == 0:
+                continue
+            xlab = xlabel_override.get(suffix) or ("AF2 pTM" if suffix == "ptm" else "Composite score" if suffix == "composite" else "pLDDT")
+            fig, ax = plt.subplots(figsize=(10, 8))
+            ax.scatter(
+                valid[x],
+                valid[y],
+                alpha=0.3,
+                c=valid["in_train"].map({True: "blue", False: "red"}),
+                s=valid["length"] / 1.5,
+            )
+            ax.set_xlabel(xlab, fontsize=12)
+            ax.set_ylabel("TM(ref vs pred)", fontsize=12)
+            ax.set_title(f"Top-{top_num} by pTM ({label}): TM vs {suffix}\n(AF2Rank on ProteinEBM top-{int(top_k)} templates)", fontsize=13)
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            out_path = os.path.join(
+                output_dir, f"cross_protein_af2rank_on_proteinebm_top_k_tm_ref_pred_vs_{suffix}_top{top_num}_top{int(top_k)}_{label.replace(' ', '_')}.png"
+            )
+            plt.savefig(out_path, dpi=900, bbox_inches="tight")
+            logger.info(f"Saved AF2Rank-on-ProteinEBM-topk plot: {out_path}")
+            plt.close()
+
+    if "m2_top_1_ptm" in df.columns:
+        _plot_variant(df, "m2", "model_2_ptm")
+    if "min_top_1_ptm" in df.columns:
+        _plot_variant(df, "min", "min", {"ptm": "min(pTM)", "composite": "min(composite)", "plddt": "min(pLDDT)"})
 
 
 def load_summary_data(summary_files: List[str], dataset_file: str, id_column: str, tms_column: str) -> pd.DataFrame:

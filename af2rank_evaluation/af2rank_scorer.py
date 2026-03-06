@@ -384,7 +384,7 @@ def tmscore(x, y, tmscore_exe="USalign"):
 class ModernAF2Rank:
     """Modern AF2Rank implementation following predict.ipynb approach exactly."""
     
-    def __init__(self, reference_pdb, chain=None, model_type="auto", debug=False):
+    def __init__(self, reference_pdb, chain=None, model_type="auto", model_name="model_1_ptm", debug=False):
         """Initialize AF2Rank with reference structure."""
         self.reference_pdb = reference_pdb
         if chain is None:
@@ -393,6 +393,7 @@ class ModernAF2Rank:
             self.chain = chain
         self.debug = debug
         self.model_type = model_type
+        self.model_name = model_name
         
         # Get reference sequence using proper ColabDesign approach
         self.reference_sequence = get_sequence_from_pdb(reference_pdb, chain)
@@ -443,7 +444,7 @@ class ModernAF2Rank:
         model_opts = self.model_opts.copy()
         model_opts['data_dir'] = params_path
         
-        self.af = mk_af_model(use_mlm=False, model_names=['model_1_ptm'], **model_opts)
+        self.af = mk_af_model(use_mlm=False, model_names=[self.model_name], **model_opts)
         
         # Prepare inputs exactly like predict.ipynb
         self.af.prep_inputs(self.reference_lengths, copies=1, seed=0)
@@ -649,9 +650,9 @@ class ModernAF2Rank:
         if verbose:
             logger.debug("Starting AF2 prediction...")
         
-        # CRITICAL: Use model_1_ptm which supports templates
+        # CRITICAL: Use model_1_ptm or model_2_ptm which support templates
         # Only model_1_ptm and model_2_ptm support templates in monomer mode
-        self.af.predict(models=["model_1_ptm"], verbose=verbose)
+        self.af.predict(models=[self.model_name], verbose=verbose)
         
         if verbose:
             logger.debug("AF2 prediction completed successfully")
