@@ -14,6 +14,7 @@ import sys
 import glob
 import json
 import tempfile
+import subprocess
 from pathlib import Path
 from typing import List, Dict, Optional
 import numpy as np
@@ -84,6 +85,127 @@ def tmscore(x, y, tmscore_exe="USalign"):
     os.unlink(f1.name)
     os.unlink(f2.name)
     return o
+
+
+def _is_ca_only_pdb(pdb_file):
+    """Check if a PDB file contains only CA atoms."""
+    atom_names = set()
+    with open(pdb_file) as f:
+        for line in f:
+            if line.startswith("ATOM") or line.startswith("HETATM"):
+                atom_names.add(line[12:16].strip())
+                if len(atom_names) > 1:
+                    return False
+    return atom_names == {"CA"} or len(atom_names) == 0
+
+
+class CG2AllReconstructor:
+    """Reconstruct full all-atom PDBs from CA-only PDBs using cg2all (GPU-batched)."""
+
+    def __init__(self, device="cuda"):
+        import dgl
+        import cg2all.lib.libcg
+        import cg2all.lib.libmodel
+        from cg2all.lib.libconfig import MODEL_HOME
+        from cg2all.lib.libdata import PredictionData, create_trajectory_from_batch
+        from cg2all.lib.libter import patch_termini
+
+        self.dgl = dgl
+        self.PredictionData = PredictionData
+        self.create_trajectory_from_batch = create_trajectory_from_batch
+        self.patch_termini = patch_termini
+
+        self.device = torch.device(device)
+        ckpt_path = MODEL_HOME / "CalphaBasedModel.ckpt"
+        ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+        config = ckpt["hyper_parameters"]
+        self.cg_model = cg2all.lib.libcg.CalphaBasedModel
+        config = cg2all.lib.libmodel.set_model_config(config, self.cg_model, flattened=False)
+        self.config = config
+        model = cg2all.lib.libmodel.Model(config, self.cg_model, compute_loss=False)
+        state_dict = ckpt["state_dict"]
+        for key in list(state_dict):
+            state_dict[".".join(key.split(".")[1:])] = state_dict.pop(key)
+        model.load_state_dict(state_dict)
+        model = model.to(self.device)
+        model.set_constant_tensors(self.device)
+        model.eval()
+        self.model = model
+        logger.info(f"cg2all CalphaBasedModel loaded on {device}")
+
+    def reconstruct_single(self, pdb_file):
+        """Reconstruct a single CA-only PDB to all-atom. Returns temp PDB path."""
+        ds = self.PredictionData(pdb_file, self.cg_model, radius=self.config.globals.radius)
+        loader = self.dgl.dataloading.GraphDataLoader(ds, batch_size=1, num_workers=0, shuffle=False)
+        batch = next(iter(loader)).to(self.device)
+        with torch.no_grad():
+            R = self.model.forward(batch)[0]["R"]
+        traj_s, _ = self.create_trajectory_from_batch(batch, R)
+        output = self.patch_termini(traj_s[0])
+        fd, out_path = tempfile.mkstemp(suffix=".pdb", prefix="cg2all_")
+        os.close(fd)
+        output.save(out_path)
+        return out_path
+
+    def reconstruct_batch(self, pdb_files):
+        """Reconstruct multiple CA-only PDBs in a single GPU forward pass.
+
+        Returns dict mapping input path -> temp all-atom PDB path.
+        """
+        graphs = []
+        valid_indices = []
+        for i, pdb_file in enumerate(pdb_files):
+            try:
+                ds = self.PredictionData(pdb_file, self.cg_model, radius=self.config.globals.radius)
+                g = ds[0]
+                graphs.append(g)
+                valid_indices.append(i)
+            except Exception as e:
+                logger.warning(f"cg2all failed to load {pdb_file}: {e}")
+
+        if not graphs:
+            return {}
+
+        batched = self.dgl.batch(graphs).to(self.device)
+        with torch.no_grad():
+            R = self.model.forward(batched)[0]["R"]
+        traj_s, _ = self.create_trajectory_from_batch(batched, R)
+
+        result = {}
+        for idx, traj in zip(valid_indices, traj_s):
+            output = self.patch_termini(traj)
+            fd, out_path = tempfile.mkstemp(suffix=".pdb", prefix="cg2all_")
+            os.close(fd)
+            output.save(out_path)
+            result[pdb_files[idx]] = out_path
+        return result
+
+
+# Module-level singleton (lazy-loaded)
+_cg2all_reconstructor = None
+
+
+def _get_cg2all_reconstructor():
+    global _cg2all_reconstructor
+    if _cg2all_reconstructor is None:
+        _cg2all_reconstructor = CG2AllReconstructor(device="cuda")
+    return _cg2all_reconstructor
+
+
+def reconstruct_all_atom(pdb_file):
+    """Reconstruct full all-atom PDB from CA-only PDB using cg2all (GPU).
+
+    Returns path to a temporary all-atom PDB file (caller must delete).
+    If the input already has all atoms, returns None (no reconstruction needed).
+    """
+    if not _is_ca_only_pdb(pdb_file):
+        return None
+    try:
+        reconstructor = _get_cg2all_reconstructor()
+        return reconstructor.reconstruct_single(pdb_file)
+    except Exception as e:
+        logger.warning(f"cg2all reconstruction failed for {pdb_file}: {e}")
+        return None
 
 
 def convert_pdb_to_cif(pdb_file, chain_id=None):
@@ -394,6 +516,7 @@ class OpenFoldAF2Rank:
         model_name: str = "model_1_ptm",
         recycles: int = 3,
         debug: bool = False,
+        chunk_size: Optional[int] = None,
     ):
         if chain is None:
             chain = "A"
@@ -436,6 +559,12 @@ class OpenFoldAF2Rank:
             skip_template_alignment=True,  # No alignment needed (sequences match)
             max_recycling_iters=recycles,
         )
+
+        # Set chunk_size if specified (0 or 1 disables chunking)
+        if chunk_size is not None:
+            self.model.cfg.globals.chunk_size = chunk_size if chunk_size > 0 else None
+            logger.info(f"Set chunk_size to {chunk_size}")
+
         logger.info("OpenFold model loaded successfully")
 
     def score_structure(
@@ -449,23 +578,45 @@ class OpenFoldAF2Rank:
         seed: int = 0,
         output_pdb: Optional[str] = None,
         verbose: bool = False,
+        _original_pdb: Optional[str] = None,
     ) -> Dict:
-        """Score a single decoy structure using AF2Rank protocol via OpenFold."""
+        """Score a single decoy structure using AF2Rank protocol via OpenFold.
+
+        Args:
+            _original_pdb: If provided, use this for TMscore CA extraction instead
+                of decoy_pdb (useful when decoy_pdb is already a cg2all-reconstructed
+                all-atom PDB and we want TMscore against the original CA trace).
+        """
         if decoy_chain is None:
             decoy_chain = "A"
 
         if verbose:
             logger.debug(f"Scoring {decoy_pdb} with OpenFold AF2Rank")
 
-        # Get template coordinates for TMscore calculations
-        template_coords = get_ca_coords_from_structure(decoy_pdb, decoy_chain)
+        # Get template coordinates for TMscore calculations (from original PDB)
+        ca_source = _original_pdb if _original_pdb else decoy_pdb
+        template_coords = get_ca_coords_from_structure(ca_source, decoy_chain)
+
+        # If decoy is already all-atom, use directly; otherwise reconstruct
+        if _is_ca_only_pdb(decoy_pdb):
+            allatom_pdb = reconstruct_all_atom(decoy_pdb)
+            pdb_for_template = allatom_pdb if allatom_pdb else decoy_pdb
+        else:
+            allatom_pdb = None
+            pdb_for_template = decoy_pdb
 
         # Convert PDB to temporary mmCIF for OpenFold template pipeline
-        temp_cif = convert_pdb_to_cif(decoy_pdb, chain_id=decoy_chain)
+        temp_cif = convert_pdb_to_cif(pdb_for_template, chain_id=decoy_chain)
 
         try:
             # Detect chain ID in the temporary CIF (may differ from PDB)
             cif_chain = _detect_chain_in_cif(temp_cif)
+
+            # Set seeds for reproducibility before batch construction and inference
+            # (FeaturePipeline uses numpy random for bert_mask/msa_feat processing)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed(seed)
 
             # Build batch using OpenFoldTemplateInference
             batch = self.model.build_batch(
@@ -481,10 +632,6 @@ class OpenFoldAF2Rank:
                 zero_template_torsion_angles=rm_sc,
             )
 
-            # Set seed for reproducibility (matches ColabDesign's set_seed)
-            torch.manual_seed(seed)
-            torch.cuda.manual_seed(seed)
-
             # Run forward pass
             with torch.no_grad():
                 out = self.model.model(batch)
@@ -493,9 +640,11 @@ class OpenFoldAF2Rank:
             scores = self._extract_scores(out, template_coords)
 
         finally:
-            # Clean up temp CIF
+            # Clean up temp files
             if os.path.exists(temp_cif):
                 os.unlink(temp_cif)
+            if allatom_pdb and os.path.exists(allatom_pdb):
+                os.unlink(allatom_pdb)
 
         # Memory cleanup
         gc.collect()
@@ -583,6 +732,18 @@ def score_proteina_structures_openfold(
 
     logger.info(f"Starting OpenFold AF2Rank scoring for {len(pdb_files)} structures of {protein_id}")
 
+    # Batch-reconstruct all CA-only structures via cg2all (single GPU forward pass)
+    ca_only_pdbs = [p for p in pdb_files if _is_ca_only_pdb(p)]
+    allatom_map = {}  # original_pdb -> reconstructed_pdb
+    if ca_only_pdbs:
+        logger.info(f"Reconstructing {len(ca_only_pdbs)} CA-only structures with cg2all...")
+        try:
+            reconstructor = _get_cg2all_reconstructor()
+            allatom_map = reconstructor.reconstruct_batch(ca_only_pdbs)
+            logger.info(f"Reconstructed {len(allatom_map)} structures")
+        except Exception as e:
+            logger.warning(f"Batch cg2all failed, falling back to per-structure: {e}")
+
     scorer = OpenFoldAF2Rank(
         reference_cif, chain=chain, model_name=model_name, recycles=recycles,
     )
@@ -591,8 +752,11 @@ def score_proteina_structures_openfold(
     for pdb_path in tqdm(pdb_files, desc=f"AF2Rank-OpenFold scoring {protein_id}"):
         pdb_filename = os.path.basename(pdb_path)
         try:
+            # Use pre-reconstructed all-atom PDB if available
+            pdb_for_scoring = allatom_map.get(pdb_path, pdb_path)
             structure_scores = scorer.score_structure(
-                pdb_path, decoy_chain="A", recycles=recycles, verbose=verbose,
+                pdb_for_scoring, decoy_chain="A", recycles=recycles, verbose=verbose,
+                _original_pdb=pdb_path,
             )
             structure_scores.update({
                 "protein_id": protein_id,
@@ -610,6 +774,11 @@ def score_proteina_structures_openfold(
                 "structure_path": pdb_path,
                 "error": str(e),
             })
+
+    # Clean up batch-reconstructed temp files
+    for temp_path in allatom_map.values():
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
 
     logger.info(f"Completed OpenFold AF2Rank scoring for {protein_id}")
     return scores
