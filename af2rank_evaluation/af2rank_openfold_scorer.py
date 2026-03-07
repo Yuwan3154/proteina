@@ -1,0 +1,786 @@
+#!/usr/bin/env python3
+"""
+AF2Rank Scorer Module - OpenFold (PyTorch) Backend
+
+Provides the same AF2Rank scoring functionality as af2rank_scorer.py but using
+OpenFold (PyTorch) instead of ColabDesign (JAX). Both backends load the same
+AlphaFold weights and should produce roughly equivalent results (pTM diff < 0.01).
+
+Supports model_1_ptm and model_2_ptm for the AF2Rank-on-ProteinEBM top-k protocol.
+"""
+
+import os
+import sys
+import glob
+import json
+import tempfile
+from pathlib import Path
+from typing import List, Dict, Optional
+import numpy as np
+import pandas as pd
+from Bio.PDB import MMCIFParser, PDBParser, PDBIO, Select
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from loguru import logger
+import gc
+
+import torch
+
+# Add proteina root to path for openfold imports
+PROTEINA_BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+if PROTEINA_BASE_DIR not in sys.path:
+    sys.path.insert(0, PROTEINA_BASE_DIR)
+
+from proteinfoundation.utils.openfold_inference import OpenFoldTemplateInference
+import openfold.np.residue_constants as rc
+
+
+KALIGN_BINARY_PATH = "/usr/bin/kalign"
+DEFAULT_PARAMS_DIR = os.path.expanduser("~/params")
+
+
+# ---------------------------------------------------------------------------
+# Utility functions (self-contained, no ColabDesign/JAX dependency)
+# ---------------------------------------------------------------------------
+
+def tmscore(x, y, tmscore_exe="USalign"):
+    """Calculate TMscore between two coordinate arrays (CA atoms)."""
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False) as f1, \
+         tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False) as f2:
+        for f, z in zip([f1, f2], [x, y]):
+            coords = z if isinstance(z, np.ndarray) else z.detach().cpu().numpy()
+            for k, c in enumerate(coords):
+                f.write("ATOM  %5d  %-2s  %3s %s%4d    %8.3f%8.3f%8.3f  %4.2f  %4.2f\n"
+                        % (k + 1, "CA", "ALA", "A", k + 1, c[0], c[1], c[2], 1, 0))
+            f.flush()
+
+    for exe in [tmscore_exe, "./TMscore", "TMscore", "/usr/local/bin/TMscore"]:
+        if os.path.exists(exe) or os.system(f"which {exe} > /dev/null 2>&1") == 0:
+            cmd = f'{exe} {f1.name} {f2.name}'
+            if exe == "USalign":
+                cmd += " -TMscore 1"
+            output = os.popen(cmd).readlines()
+            break
+    else:
+        # Fallback: simple RMSD
+        x_np = x if isinstance(x, np.ndarray) else x.detach().cpu().numpy()
+        y_np = y if isinstance(y, np.ndarray) else y.detach().cpu().numpy()
+        rmsd = np.sqrt(np.mean(np.sum((x_np - y_np) ** 2, axis=-1)))
+        os.unlink(f1.name)
+        os.unlink(f2.name)
+        return {"rms": float(rmsd), "tms": 0.0, "gdt": 0.0}
+
+    parse_float = lambda x: float(x.split("=")[1].split()[0])
+    o = {"rms": 0.0, "tms": 0.0, "gdt": 0.0}
+    for line in output:
+        line = line.rstrip()
+        if line.startswith("RMSD"):
+            o["rms"] = parse_float(line)
+        elif line.startswith("TM-score"):
+            o["tms"] = parse_float(line)
+        elif line.startswith("GDT-TS-score"):
+            o["gdt"] = parse_float(line)
+
+    os.unlink(f1.name)
+    os.unlink(f2.name)
+    return o
+
+
+def convert_pdb_to_cif(pdb_file, chain_id=None):
+    """Convert a PDB file to a temporary mmCIF file using OpenFold's protein module.
+
+    Uses openfold.np.protein.to_modelcif() which produces CIF files that are
+    compatible with OpenFold's mmcif_parsing (unlike BioPython's MMCIFIO which
+    misses required fields like _entry.id).
+    """
+    from openfold.np import protein
+
+    with open(pdb_file) as f:
+        pdb_str = f.read()
+    prot = protein.from_pdb_string(pdb_str, chain_id=chain_id)
+    # to_modelcif expects 1-indexed residue_index (ihm convention),
+    # but from_pdb_string produces 0-indexed. Fix by adding 1.
+    prot = protein.Protein(
+        atom_positions=prot.atom_positions,
+        atom_mask=prot.atom_mask,
+        aatype=prot.aatype,
+        residue_index=prot.residue_index + 1,
+        chain_index=prot.chain_index,
+        b_factors=prot.b_factors,
+    )
+    cif_str = protein.to_modelcif(prot)
+
+    temp_cif = tempfile.NamedTemporaryFile(mode='w', suffix='.cif', delete=False)
+    temp_cif.write(cif_str)
+    temp_cif.close()
+    return temp_cif.name
+
+
+def get_sequence_from_structure(pdb_file, chain=None):
+    """Extract amino acid sequence from PDB/CIF file using BioPython."""
+    is_cif = pdb_file.lower().endswith('.cif')
+    if is_cif:
+        parser = MMCIFParser(QUIET=True)
+    else:
+        parser = PDBParser(QUIET=True)
+
+    structure = parser.get_structure('protein', pdb_file)
+
+    three_to_one = {
+        'ALA': 'A', 'CYS': 'C', 'ASP': 'D', 'GLU': 'E', 'PHE': 'F',
+        'GLY': 'G', 'HIS': 'H', 'ILE': 'I', 'LYS': 'K', 'LEU': 'L',
+        'MET': 'M', 'ASN': 'N', 'PRO': 'P', 'GLN': 'Q', 'ARG': 'R',
+        'SER': 'S', 'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y',
+    }
+
+    # Find the target chain
+    target_chain = None
+    for model in structure:
+        for c in model:
+            if chain is None or c.id == chain:
+                target_chain = c
+                break
+        if target_chain is not None:
+            break
+
+    if target_chain is None:
+        # Fallback: use first chain
+        for model in structure:
+            for c in model:
+                target_chain = c
+                break
+            break
+
+    sequence = []
+    for residue in target_chain:
+        resname = residue.get_resname().strip()
+        if resname in three_to_one:
+            sequence.append(three_to_one[resname])
+        elif residue.id[0] == ' ':  # Standard residue but unknown
+            sequence.append('X')
+    return "".join(sequence)
+
+
+def get_ca_coords_from_structure(pdb_file, chain=None):
+    """Extract CA coordinates from PDB/CIF file using BioPython."""
+    is_cif = pdb_file.lower().endswith('.cif')
+    if is_cif:
+        parser = MMCIFParser(QUIET=True)
+    else:
+        parser = PDBParser(QUIET=True)
+
+    structure = parser.get_structure('protein', pdb_file)
+
+    target_chain = None
+    for model in structure:
+        for c in model:
+            if chain is None or c.id == chain:
+                target_chain = c
+                break
+        if target_chain is not None:
+            break
+
+    if target_chain is None:
+        for model in structure:
+            for c in model:
+                target_chain = c
+                break
+            break
+
+    three_to_one = {
+        'ALA': 'A', 'CYS': 'C', 'ASP': 'D', 'GLU': 'E', 'PHE': 'F',
+        'GLY': 'G', 'HIS': 'H', 'ILE': 'I', 'LYS': 'K', 'LEU': 'L',
+        'MET': 'M', 'ASN': 'N', 'PRO': 'P', 'GLN': 'Q', 'ARG': 'R',
+        'SER': 'S', 'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y',
+    }
+
+    coords = []
+    for residue in target_chain:
+        resname = residue.get_resname().strip()
+        if resname not in three_to_one and residue.id[0] != ' ':
+            continue
+        if 'CA' in residue:
+            coords.append(residue['CA'].get_vector().get_array())
+    return np.array(coords, dtype=np.float32)
+
+
+def rescale(a, amin=None, amax=None):
+    """Rescale array values to [0,1] range."""
+    a = np.copy(a)
+    if amin is None:
+        amin = a.min()
+    if amax is None:
+        amax = a.max()
+    if amax == amin:
+        return np.ones_like(a) * 0.5
+    a[a < amin] = amin
+    a[a > amax] = amax
+    return (a - amin) / (amax - amin)
+
+
+def plot_metric(scores, x="ptm", y="composite",
+                title=None, diag=False, scale_axis=True,
+                save_path=None, **kwargs):
+    """Create AF2Rank analysis plot."""
+    plt.figure(figsize=(8, 6), dpi=100)
+    if title is not None:
+        plt.title(title)
+
+    x_vals = np.array([k.get(x, 0.0) for k in scores if "error" not in k])
+    y_vals = np.array([k.get(y, 0.0) for k in scores if "error" not in k])
+    c = rescale(np.array([k.get("plddt", 0.7) for k in scores if "error" not in k]), 0.5, 0.9)
+
+    if len(x_vals) == 0:
+        plt.text(0.5, 0.5, 'No valid data to plot', transform=plt.gca().transAxes,
+                 ha='center', va='center', fontsize=12)
+        correlation = 0.0
+    else:
+        plt.scatter(x_vals, y_vals, c=c * 0.75, s=20, vmin=0, vmax=1,
+                    cmap="gist_rainbow", **kwargs)
+
+        if diag and len(x_vals) > 0:
+            lims = [min(x_vals.min(), y_vals.min()), max(x_vals.max(), y_vals.max())]
+            plt.plot(lims, lims, color="black", linestyle="--", alpha=0.5)
+
+        valid_mask = (~np.isnan(x_vals)) & (~np.isnan(y_vals))
+        if valid_mask.sum() > 1:
+            from scipy.stats import spearmanr
+            correlation = spearmanr(x_vals[valid_mask], y_vals[valid_mask]).correlation
+            if not np.isnan(correlation):
+                plt.text(0.05, 0.95, f'Spearman R: {correlation:.3f}',
+                         transform=plt.gca().transAxes, fontsize=10,
+                         bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+            else:
+                correlation = 0.0
+        else:
+            correlation = 0.0
+
+    labels = {
+        "ptm": "Predicted TM-score (pTM)",
+        "plddt": "Predicted LDDT (pLDDT)",
+        "composite": "AF2Rank Score (pTM x pLDDT)",
+        "pae_mean": "Predicted Aligned Error",
+        "tm_ref_template": "TM-score (Reference vs Template)",
+        "tm_ref_pred": "TM-score (Reference vs Prediction)",
+        "tm_template_pred": "TM-score (Template vs Prediction)",
+        "rmsd_ref_template": "RMSD (Reference vs Template)",
+        "rmsd_ref_pred": "RMSD (Reference vs Prediction)",
+        "rmsd_template_pred": "RMSD (Template vs Prediction)",
+        "gdt_ref_template": "GDT-TS (Reference vs Template)",
+        "gdt_ref_pred": "GDT-TS (Reference vs Prediction)",
+        "gdt_template_pred": "GDT-TS (Template vs Prediction)",
+    }
+
+    plt.xlabel(labels.get(x, x.replace('_', ' ').title()))
+    plt.ylabel(labels.get(y, y.replace('_', ' ').title()))
+
+    if scale_axis and x in ["ptm", "plddt", "composite"] and y in ["ptm", "plddt", "composite"]:
+        plt.xlim(-0.05, 1.05)
+        plt.ylim(-0.05, 1.05)
+
+    if len(x_vals) > 0:
+        cbar = plt.colorbar()
+        cbar.set_label('pLDDT (scaled)')
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        logger.info(f"Saved plot: {save_path}")
+
+    plt.close()
+    return correlation
+
+
+def plot_af2rank_results(scores: List[Dict], output_dir: str, protein_id: str):
+    """Generate comprehensive AF2Rank analysis plots."""
+    plot_configs = [
+        {"x": "tm_ref_template", "y": "composite",
+         "title": "AF2Rank Analysis: Template Quality vs AF2 Confidence",
+         "filename": f"af2rank_{protein_id}_template_quality_vs_composite.png"},
+        {"x": "tm_ref_pred", "y": "ptm",
+         "title": "AF2Rank Analysis: Prediction Quality vs pTM",
+         "filename": f"af2rank_{protein_id}_prediction_quality_vs_ptm.png"},
+        {"x": "tm_ref_template", "y": "tm_ref_pred", "diag": True,
+         "title": "AF2Rank Analysis: Template vs Prediction Quality",
+         "filename": f"af2rank_{protein_id}_template_vs_prediction_quality.png"},
+        {"x": "composite", "y": "tm_ref_pred",
+         "title": "AF2Rank Analysis: AF2 Composite Score vs True Quality",
+         "filename": f"af2rank_{protein_id}_composite_vs_true_quality.png"},
+        {"x": "ptm", "y": "composite",
+         "title": "AF2Rank Analysis: pTM vs Composite Score",
+         "filename": f"af2rank_{protein_id}_ptm_vs_composite.png"},
+        {"x": "plddt", "y": "composite",
+         "title": "AF2Rank Analysis: pLDDT vs Composite Score",
+         "filename": f"af2rank_{protein_id}_plddt_vs_composite.png"},
+        {"x": "ptm", "y": "plddt",
+         "title": "AF2 Internal: pTM vs pLDDT correlation",
+         "filename": f"af2rank_{protein_id}_ptm_vs_plddt.png"},
+        {"x": "pae_mean", "y": "composite",
+         "title": "AF2Rank Analysis: PAE vs Composite Score",
+         "filename": f"af2rank_{protein_id}_pae_mean_vs_composite.png"},
+    ]
+
+    correlations = {}
+    for plot_config in plot_configs:
+        filename = plot_config.pop("filename")
+        save_path = os.path.join(output_dir, filename)
+        correlation = plot_metric(scores, save_path=save_path, **plot_config)
+        correlations[filename] = correlation
+
+    return correlations
+
+
+def save_af2rank_scores(scores: List[Dict], output_dir: str, protein_id: str) -> str:
+    """Save AF2Rank scores to CSV file."""
+    os.makedirs(output_dir, exist_ok=True)
+    df = pd.DataFrame(scores)
+    csv_path = os.path.join(output_dir, f"af2rank_scores_{protein_id}.csv")
+    df.to_csv(csv_path, index=False)
+    logger.info(f"Saved {len(scores)} AF2Rank scores to: {csv_path}")
+    return csv_path
+
+
+def load_af2rank_scores_from_csv(csv_path: str) -> List[Dict]:
+    """Load AF2Rank scores from CSV file."""
+    df = pd.read_csv(csv_path)
+    scores = df.to_dict('records')
+    logger.info(f"Loaded {len(scores)} scores from: {csv_path}")
+    return scores
+
+
+def _detect_chain_in_cif(cif_file, chain_hint=None):
+    """Detect the correct chain ID in a CIF file, with fallback mapping."""
+    parser = MMCIFParser(QUIET=True)
+    structure = parser.get_structure('protein', cif_file)
+    available_chains = []
+    for model in structure:
+        for chain in model:
+            available_chains.append(chain.id)
+        break
+
+    if chain_hint is not None and chain_hint in available_chains:
+        return chain_hint
+
+    if chain_hint is not None:
+        chain_mappings = {
+            'A': ['E', 'N', 'X', '1', 'a'],
+            'B': ['F', 'O', 'Y', '2', 'b'],
+            'C': ['G', 'P', 'Z', '3', 'c'],
+        }
+        if chain_hint in chain_mappings:
+            for alt in chain_mappings[chain_hint]:
+                if alt in available_chains:
+                    return alt
+
+    return available_chains[0] if available_chains else 'A'
+
+
+# ---------------------------------------------------------------------------
+# OpenFold AF2Rank Scorer
+# ---------------------------------------------------------------------------
+
+class OpenFoldAF2Rank:
+    """AF2Rank implementation using OpenFold (PyTorch) backend.
+
+    Drop-in replacement for ModernAF2Rank from af2rank_scorer.py.
+    Produces identical output keys so downstream analysis/plotting works unchanged.
+    """
+
+    def __init__(
+        self,
+        reference_pdb: str,
+        chain: Optional[str] = None,
+        model_name: str = "model_1_ptm",
+        recycles: int = 3,
+        debug: bool = False,
+    ):
+        if chain is None:
+            chain = "A"
+        self.chain = chain
+        self.model_name = model_name
+        self.debug = debug
+        self.recycles = recycles
+
+        # Detect correct chain in reference CIF
+        is_cif = reference_pdb.lower().endswith('.cif')
+        if is_cif:
+            detected_chain = _detect_chain_in_cif(reference_pdb, chain)
+        else:
+            detected_chain = chain
+
+        # Extract reference sequence and coordinates
+        self.reference_sequence = get_sequence_from_structure(reference_pdb, detected_chain)
+        self.reference_coords = get_ca_coords_from_structure(reference_pdb, detected_chain)
+
+        logger.info(f"Reference sequence length: {len(self.reference_sequence)}")
+        logger.info(f"Reference coords shape: {self.reference_coords.shape}")
+
+        # Build residue_type tensor from reference sequence
+        self._residue_type = torch.tensor(
+            [[rc.restype_order.get(aa, rc.restype_num) for aa in self.reference_sequence]],
+            dtype=torch.long,
+        )
+        self._mask = torch.ones((1, len(self.reference_sequence)), dtype=torch.float32)
+
+        # Load OpenFold model
+        jax_params_path = os.path.join(DEFAULT_PARAMS_DIR, f"params_{model_name}.npz")
+        if not os.path.exists(jax_params_path):
+            raise FileNotFoundError(f"Weight file not found: {jax_params_path}")
+
+        logger.info(f"Loading OpenFold model {model_name} from {jax_params_path}...")
+        self.model = OpenFoldTemplateInference(
+            model_name=model_name,
+            jax_params_path=jax_params_path,
+            rm_template_sequence=True,  # AF2Rank protocol: remove template sequence
+            skip_template_alignment=True,  # No alignment needed (sequences match)
+            max_recycling_iters=recycles,
+        )
+        logger.info("OpenFold model loaded successfully")
+
+    def score_structure(
+        self,
+        decoy_pdb: str,
+        decoy_chain: Optional[str] = None,
+        rm_seq: bool = True,
+        rm_sc: bool = True,
+        rm_ic: bool = False,
+        recycles: int = 3,
+        seed: int = 0,
+        output_pdb: Optional[str] = None,
+        verbose: bool = False,
+    ) -> Dict:
+        """Score a single decoy structure using AF2Rank protocol via OpenFold."""
+        if decoy_chain is None:
+            decoy_chain = "A"
+
+        if verbose:
+            logger.debug(f"Scoring {decoy_pdb} with OpenFold AF2Rank")
+
+        # Get template coordinates for TMscore calculations
+        template_coords = get_ca_coords_from_structure(decoy_pdb, decoy_chain)
+
+        # Convert PDB to temporary mmCIF for OpenFold template pipeline
+        temp_cif = convert_pdb_to_cif(decoy_pdb, chain_id=decoy_chain)
+
+        try:
+            # Detect chain ID in the temporary CIF (may differ from PDB)
+            cif_chain = _detect_chain_in_cif(temp_cif)
+
+            # Build batch using OpenFoldTemplateInference
+            batch = self.model.build_batch(
+                distogram_probs=None,
+                residue_type=self._residue_type,
+                mask=self._mask,
+                template_mode="full_template",
+                template_mmcif_path=temp_cif,
+                template_chain_id=cif_chain,
+                kalign_binary_path=KALIGN_BINARY_PATH,
+                mask_template_aatype=rm_seq,
+                zero_template_unit_vector=rm_sc,
+                zero_template_torsion_angles=rm_sc,
+            )
+
+            # Set seed for reproducibility (matches ColabDesign's set_seed)
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed(seed)
+
+            # Run forward pass
+            with torch.no_grad():
+                out = self.model.model(batch)
+
+            # Extract scores
+            scores = self._extract_scores(out, template_coords)
+
+        finally:
+            # Clean up temp CIF
+            if os.path.exists(temp_cif):
+                os.unlink(temp_cif)
+
+        # Memory cleanup
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        if verbose:
+            logger.debug(
+                f"OpenFold AF2Rank scores - pLDDT: {scores['plddt']:.3f}, "
+                f"pTM: {scores['ptm']:.3f}, Composite: {scores['composite']:.3f}"
+            )
+
+        return scores
+
+    def _extract_scores(self, out: dict, template_coords: np.ndarray) -> Dict:
+        """Extract AF2Rank scoring metrics from OpenFold output."""
+        scores = {}
+
+        # pTM score (0-1)
+        scores["ptm"] = float(out["ptm_score"].item()) if "ptm_score" in out else 0.0
+
+        # pLDDT (OpenFold returns 0-100, normalize to 0-1 to match ColabDesign)
+        if "plddt" in out:
+            plddt_per_res = out["plddt"]  # [N_res] in 0-100
+            scores["plddt"] = float(plddt_per_res.mean().item()) / 100.0
+        else:
+            scores["plddt"] = 0.0
+
+        # Predicted Aligned Error (mean, in Angstroms)
+        if "predicted_aligned_error" in out:
+            scores["pae_mean"] = float(out["predicted_aligned_error"].mean().item())
+        else:
+            scores["pae_mean"] = 0.0
+
+        # Predicted coordinates (CA atoms from atom37)
+        # final_atom_positions: [N_res, 37, 3]
+        if "final_atom_positions" in out:
+            ca_idx = rc.atom_order["CA"]  # Should be 1
+            pred_coords = out["final_atom_positions"][:, ca_idx, :].detach().cpu().numpy()
+        else:
+            pred_coords = np.zeros((len(self.reference_sequence), 3), dtype=np.float32)
+
+        # TMscore calculations
+        if self.reference_coords is not None:
+            tm_ref_pred = tmscore(self.reference_coords, pred_coords)
+            scores["tm_ref_pred"] = tm_ref_pred["tms"]
+            scores["rmsd_ref_pred"] = tm_ref_pred["rms"]
+            scores["gdt_ref_pred"] = tm_ref_pred.get("gdt", 0.0)
+
+        if template_coords is not None:
+            if self.reference_coords is not None:
+                tm_ref_template = tmscore(self.reference_coords, template_coords)
+                scores["tm_ref_template"] = tm_ref_template["tms"]
+                scores["rmsd_ref_template"] = tm_ref_template["rms"]
+                scores["gdt_ref_template"] = tm_ref_template.get("gdt", 0.0)
+
+            tm_template_pred = tmscore(template_coords, pred_coords)
+            scores["tm_template_pred"] = tm_template_pred["tms"]
+            scores["rmsd_template_pred"] = tm_template_pred["rms"]
+            scores["gdt_template_pred"] = tm_template_pred.get("gdt", 0.0)
+
+        # Composite score
+        scores["composite"] = scores["ptm"] * scores["plddt"]
+
+        # Store coordinates for external analysis
+        scores["pred_coords"] = pred_coords
+
+        return scores
+
+
+def score_proteina_structures_openfold(
+    protein_id: str,
+    reference_cif: str,
+    inference_output_dir: str,
+    chain: str = "A",
+    recycles: int = 3,
+    model_name: str = "model_1_ptm",
+    verbose: bool = False,
+) -> List[Dict]:
+    """Score all Proteina-generated structures using AF2Rank with OpenFold backend."""
+    pdb_files = sorted(glob.glob(os.path.join(inference_output_dir, "*.pdb")))
+
+    if not pdb_files:
+        logger.warning(f"No PDB files found in {inference_output_dir}")
+        return []
+
+    logger.info(f"Starting OpenFold AF2Rank scoring for {len(pdb_files)} structures of {protein_id}")
+
+    scorer = OpenFoldAF2Rank(
+        reference_cif, chain=chain, model_name=model_name, recycles=recycles,
+    )
+
+    scores = []
+    for pdb_path in tqdm(pdb_files, desc=f"AF2Rank-OpenFold scoring {protein_id}"):
+        pdb_filename = os.path.basename(pdb_path)
+        try:
+            structure_scores = scorer.score_structure(
+                pdb_path, decoy_chain="A", recycles=recycles, verbose=verbose,
+            )
+            structure_scores.update({
+                "protein_id": protein_id,
+                "structure_file": pdb_filename,
+                "structure_path": pdb_path,
+            })
+            if "pred_coords" in structure_scores:
+                del structure_scores["pred_coords"]
+            scores.append(structure_scores)
+        except Exception as e:
+            logger.error(f"Failed to score {pdb_filename}: {e}")
+            scores.append({
+                "protein_id": protein_id,
+                "structure_file": pdb_filename,
+                "structure_path": pdb_path,
+                "error": str(e),
+            })
+
+    logger.info(f"Completed OpenFold AF2Rank scoring for {protein_id}")
+    return scores
+
+
+def run_af2rank_analysis_openfold(
+    protein_id: str,
+    reference_cif: str,
+    inference_output_dir: str,
+    output_dir: str,
+    chain: str = "A",
+    recycles: int = 3,
+    model_name: str = "model_1_ptm",
+    verbose: bool = False,
+    regenerate_summary: bool = False,
+) -> str:
+    """Run complete AF2Rank analysis using OpenFold backend."""
+    os.makedirs(output_dir, exist_ok=True)
+
+    scores_csv_path = os.path.join(output_dir, f"af2rank_scores_{protein_id}.csv")
+
+    if os.path.exists(scores_csv_path) and not regenerate_summary:
+        logger.info(f"Loading existing scores for {protein_id}")
+        scores = load_af2rank_scores_from_csv(scores_csv_path)
+    else:
+        logger.info(f"Generating new scores for {protein_id}")
+        scores = score_proteina_structures_openfold(
+            protein_id=protein_id,
+            reference_cif=reference_cif,
+            inference_output_dir=inference_output_dir,
+            chain=chain,
+            recycles=recycles,
+            model_name=model_name,
+            verbose=verbose,
+        )
+        if not scores:
+            logger.warning(f"No scores generated for {protein_id}")
+            return None
+        scores_csv_path = save_af2rank_scores(scores, output_dir, protein_id)
+
+    # Generate plots
+    if regenerate_summary or not os.path.exists(
+        os.path.join(output_dir, f"af2rank_{protein_id}_template_quality_vs_composite.png")
+    ):
+        plot_af2rank_results(scores, output_dir, protein_id)
+
+    # Calculate summary metrics
+    successful_scores = [s for s in scores if "error" not in s]
+
+    spearman_rho_composite = None
+    spearman_rho_ptm = None
+    max_tm_ref_template = None
+    max_tm_ref_pred = None
+    tm_ref_template_at_max_composite = None
+    tm_ref_pred_at_max_composite = None
+    tm_ref_pred_at_max_ptm = None
+    top_1_tm_ref_template = None
+    top_5_tm_ref_template = None
+    top_1_tm_ref_pred = None
+    top_5_tm_ref_pred = None
+
+    if len(successful_scores) > 1:
+        tm_ref_template_scores = []
+        tm_ref_pred_scores = []
+        composite_scores = []
+        ptm_scores = []
+
+        for score in successful_scores:
+            if all(k in score for k in ('tm_ref_template', 'composite', 'tm_ref_pred', 'ptm')):
+                tm_ref_template_scores.append(score['tm_ref_template'])
+                tm_ref_pred_scores.append(score['tm_ref_pred'])
+                composite_scores.append(score['composite'])
+                ptm_scores.append(score['ptm'])
+
+        if len(tm_ref_template_scores) > 1:
+            from scipy.stats import spearmanr
+
+            correlation_result = spearmanr(tm_ref_template_scores, composite_scores)
+            spearman_rho_composite = correlation_result.correlation
+
+            correlation_result_ptm = spearmanr(tm_ref_pred_scores, ptm_scores)
+            spearman_rho_ptm = correlation_result_ptm.correlation
+
+            max_tm_ref_template = max(tm_ref_template_scores)
+            max_tm_ref_pred = max(tm_ref_pred_scores)
+
+            max_composite_idx = composite_scores.index(max(composite_scores))
+            tm_ref_template_at_max_composite = tm_ref_template_scores[max_composite_idx]
+            tm_ref_pred_at_max_composite = tm_ref_pred_scores[max_composite_idx]
+
+            max_ptm_idx = ptm_scores.index(max(ptm_scores))
+            tm_ref_pred_at_max_ptm = tm_ref_pred_scores[max_ptm_idx]
+
+            top_1_tm_ref_template = tm_ref_template_scores[np.argmax(composite_scores)]
+            top_5_tm_ref_template = max(
+                [tm_ref_template_scores[i] for i in np.argsort(-np.array(composite_scores))[:5]]
+            )
+            top_1_tm_ref_pred = tm_ref_pred_scores[np.argmax(ptm_scores)]
+            top_5_tm_ref_pred = max(
+                [tm_ref_pred_scores[i] for i in np.argsort(-np.array(ptm_scores))[:5]]
+            )
+
+    summary = {
+        "protein_id": protein_id,
+        "total_structures": len(scores),
+        "successful_scores": len(successful_scores),
+        "failed_scores": len([s for s in scores if "error" in s]),
+        "reference_structure": reference_cif,
+        "inference_directory": inference_output_dir,
+        "output_directory": output_dir,
+        "af2rank_directory": output_dir,
+        "chain": chain,
+        "recycles": recycles,
+        "spearman_correlation_rho_composite": spearman_rho_composite,
+        "spearman_correlation_rho_ptm": spearman_rho_ptm,
+        "max_tm_ref_template": max_tm_ref_template,
+        "max_tm_ref_pred": max_tm_ref_pred,
+        "tm_ref_template_at_max_composite": tm_ref_template_at_max_composite,
+        "tm_ref_pred_at_max_composite": tm_ref_pred_at_max_composite,
+        "tm_ref_pred_at_max_ptm": tm_ref_pred_at_max_ptm,
+        "scores_csv": scores_csv_path,
+        "top_1_tm_ref_template": top_1_tm_ref_template,
+        "top_5_tm_ref_template": top_5_tm_ref_template,
+        "top_1_tm_ref_pred": top_1_tm_ref_pred,
+        "top_5_tm_ref_pred": top_5_tm_ref_pred,
+    }
+
+    summary_path = os.path.join(output_dir, f"af2rank_summary_{protein_id}.json")
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=2)
+
+    return scores_csv_path
+
+
+def run_af2rank_plot_only_openfold(
+    protein_id: str,
+    reference_cif: str,
+    inference_output_dir: str,
+    output_dir: str,
+    chain: str = "A",
+    recycles: int = 3,
+    regenerate_summary: bool = True,
+) -> str:
+    """Generate only AF2Rank plots from existing CSV data (no scoring)."""
+    scores_csv_path = os.path.join(output_dir, f"af2rank_scores_{protein_id}.csv")
+    if not os.path.exists(scores_csv_path):
+        logger.error(f"No existing scores found for {protein_id} at {scores_csv_path}")
+        return None
+
+    scores = load_af2rank_scores_from_csv(scores_csv_path)
+    logger.info(f"Loaded {len(scores)} scores for {protein_id}")
+    plot_af2rank_results(scores, output_dir, protein_id)
+
+    if regenerate_summary:
+        # Recompute summary (same logic as run_af2rank_analysis_openfold)
+        return run_af2rank_analysis_openfold(
+            protein_id=protein_id,
+            reference_cif=reference_cif,
+            inference_output_dir=inference_output_dir,
+            output_dir=output_dir,
+            chain=chain,
+            recycles=recycles,
+            regenerate_summary=False,  # scores already loaded
+        )
+
+    return scores_csv_path
+
+
+if __name__ == "__main__":
+    print("AF2Rank OpenFold scorer module loaded successfully!")
+    print(f"PyTorch version: {torch.__version__}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA device: {torch.cuda.get_device_name(0)}")

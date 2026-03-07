@@ -161,15 +161,76 @@ def _run_af2rank_subprocess(
     recycles: int,
     cuda_visible_devices: str,
     model_name: str = "model_1_ptm",
+    backend: str = "colabdesign",
 ) -> None:
-    wrapper_script = "/home/ubuntu/proteina/af2rank_evaluation/run_with_colabdesign_env.sh"
-
     # Ensure each subprocess is pinned to a single GPU when requested.
     cuda_line = ""
     if cuda_visible_devices.strip():
         cuda_line = f"os.environ['CUDA_VISIBLE_DEVICES'] = {cuda_visible_devices!r}\n"
 
-    py = f"""
+    if backend == "openfold":
+        wrapper_script = "/home/ubuntu/proteina/af2rank_evaluation/run_with_proteina_env.sh"
+        py = f"""
+import os
+import sys
+import glob
+sys.path.append('/home/ubuntu/proteina/af2rank_evaluation')
+
+import pandas as pd
+
+from af2rank_openfold_scorer import OpenFoldAF2Rank, plot_af2rank_results, save_af2rank_scores, load_af2rank_scores_from_csv
+
+{cuda_line}
+
+protein_id = {protein_id!r}
+reference_cif = {reference_cif!r}
+chain = {chain!r}
+inference_output_dir = {str(staged_templates_dir)!r}
+output_dir = {str(output_dir)!r}
+
+scores_csv_path = os.path.join(output_dir, f"af2rank_scores_{{protein_id}}.csv")
+
+existing_scores = []
+processed_files = set()
+if os.path.exists(scores_csv_path):
+  existing_scores = load_af2rank_scores_from_csv(scores_csv_path)
+  for s in existing_scores:
+    sf = s.get("structure_file")
+    if sf:
+      processed_files.add(str(sf))
+
+pdb_files = sorted(glob.glob(os.path.join(inference_output_dir, "*.pdb")))
+to_score = [p for p in pdb_files if os.path.basename(p) not in processed_files]
+
+new_scores = []
+if len(to_score) > 0:
+  scorer = OpenFoldAF2Rank(reference_cif, chain=chain, model_name={model_name!r}, recycles={int(recycles)})
+  for pdb_path in to_score:
+    pdb_filename = os.path.basename(pdb_path)
+    structure_scores = scorer.score_structure(
+      pdb_path,
+      decoy_chain="A",
+      recycles={int(recycles)},
+      verbose=False,
+    )
+    structure_scores.update({{
+      "protein_id": protein_id,
+      "structure_file": pdb_filename,
+      "structure_path": pdb_path,
+    }})
+    if "pred_coords" in structure_scores:
+      del structure_scores["pred_coords"]
+    new_scores.append(structure_scores)
+
+all_scores = existing_scores + new_scores
+save_af2rank_scores(all_scores, output_dir, protein_id)
+staged_filenames = set(os.path.basename(p) for p in pdb_files)
+plot_scores = [s for s in all_scores if s.get("structure_file") in staged_filenames]
+plot_af2rank_results(plot_scores, output_dir, protein_id)
+"""
+    else:
+        wrapper_script = "/home/ubuntu/proteina/af2rank_evaluation/run_with_colabdesign_env.sh"
+        py = f"""
 import os
 import sys
 import glob
@@ -227,8 +288,6 @@ if len(to_score) > 0:
 
 all_scores = existing_scores + new_scores
 save_af2rank_scores(all_scores, output_dir, protein_id)
-# Plots reflect only the currently staged top_k templates, not the full
-# accumulated history in the CSV.
 staged_filenames = set(os.path.basename(p) for p in pdb_files)
 plot_scores = [s for s in all_scores if s.get("structure_file") in staged_filenames]
 plot_af2rank_results(plot_scores, output_dir, protein_id)
@@ -275,6 +334,7 @@ def _process_one_protein(
     gpu_id: str,
     filter_existing: bool,
     dry_run: bool,
+    backend: str = "colabdesign",
 ) -> Dict[str, object]:
     scores_csv_path = Path(scores_csv)
     protein_dir = scores_csv_path.parent.parent
@@ -381,6 +441,7 @@ def _process_one_protein(
             recycles=recycles,
             cuda_visible_devices=gpu_id,
             model_name="model_1_ptm",
+            backend=backend,
         )
         _run_af2rank_subprocess(
             protein_id=protein_id,
@@ -391,6 +452,7 @@ def _process_one_protein(
             recycles=recycles,
             cuda_visible_devices=gpu_id,
             model_name="model_2_ptm",
+            backend=backend,
         )
 
         m1_df = pd.read_csv(af2rank_scores_csv_m1)
@@ -457,6 +519,8 @@ def main() -> None:
     parser.add_argument("--cuda_visible_devices", default="", help="Comma-separated GPU ids to use (e.g. '0,1,2'). If empty, uses 0..num_gpus-1.")
     parser.add_argument("--dry_run", action="store_true", help="Validate top-k selection and dataset joins without running AF2Rank (no pTM plot)")
     parser.add_argument("--proteinebm_analysis_subdir", default="proteinebm_v2_cathmd_analysis", help="Per-protein subdir containing ProteinEBM scores (default: proteinebm_v2_cathmd_analysis)")
+    parser.add_argument("--backend", choices=["colabdesign", "openfold"], default="colabdesign",
+                       help="AF2Rank backend: colabdesign (JAX) or openfold (PyTorch)")
     args = parser.parse_args()
 
     if args.top_k <= 0:
@@ -518,6 +582,7 @@ def main() -> None:
                     gpu_id=gpu_id,
                     filter_existing=bool(args.filter_existing),
                     dry_run=bool(args.dry_run),
+                    backend=args.backend,
                 )
         else:
             with ProcessPoolExecutor(max_workers=int(args.num_gpus)) as ex:
@@ -534,6 +599,7 @@ def main() -> None:
                             gpu_id,
                             bool(args.filter_existing),
                             bool(args.dry_run),
+                            args.backend,
                         )
                     )
                 for fut in futs:
@@ -552,6 +618,7 @@ def main() -> None:
                 gpu_id=gpu_id,
                 filter_existing=bool(args.filter_existing),
                 dry_run=bool(args.dry_run),
+                backend=args.backend,
             )
             if row:
                 rows.append(row)
@@ -570,6 +637,7 @@ def main() -> None:
                         gpu_id,
                         bool(args.filter_existing),
                         bool(args.dry_run),
+                        args.backend,
                     )
                 )
             for fut in futs:
