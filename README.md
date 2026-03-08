@@ -129,6 +129,41 @@ bash script_utils/download_afdb_data.sh $DATA_PATH/d_FS/d_FS_index.txt $DATA_PAT
 
 This will download the specified PDB files from the AFDB to the specified folder, and in this folder all your PDB files are stored in a folder called `raw`. The dataloaders will process your pdb files into fast-to-load pkl files, split the data according to the config file and allow sampling from them. You can follow similar instructions as described above for the PDB dataloaders to create the dataloaders themselves, but use the config file `d_FS.yaml` for example and inside it adjust your `data_dir` to where you saved the data as well as the different dataloading and splitting options you prefer.
 
+### AFDB datasets (`d_FS`, `d_21M`) and shared CATH mapping
+
+The AFDB-based datasets use the same feature stack as PDB training. The relevant config files are `configs/datasets_config/afdb/d_FS.yaml` and `configs/datasets_config/afdb/d_21M.yaml`.
+
+**Shared CATH/TED vocabulary.** All dataset configs (PDB and AFDB) point to a single shared CATH label mapping at `${DATA_PATH}/cath_shared/cath_label_mapping.pt`. This ensures that the same CATH code → integer index mapping is used for both PDB training and AFDB/TED fold-conditional training, and that checkpoint compatibility is preserved when new TED codes are added (they are appended, never reindexed). To build or extend the shared mapping, use:
+
+```
+python script_utils/build_shared_cath_mapping.py \
+    --pdb-mapping ${DATA_PATH}/pdb_raw/cath_label_mapping.pt \
+    --ted-tsv ${DATA_PATH}/d_FS/ted_365m.domain_summary.cath.globularity.taxid.tsv \
+    --output ${DATA_PATH}/cath_shared/cath_label_mapping.pt
+```
+
+**TED fold labels.** To enable fold-conditional training on AFDB data, download `ted_365m.domain_summary.cath.globularity.taxid.tsv` from [Zenodo record 13908086](https://zenodo.org/records/13908086) and place it at `${DATA_PATH}/d_FS/`. Then uncomment the `TEDLabelTransform` and `CATHToIndicesTransform` blocks in the AFDB config. Note: the boundary file `ted_365m_domain_boundaries_consensus_level.tsv` (also on Zenodo) does **not** contain CATH labels and cannot be used with `TEDLabelTransform`; the transform will raise an error if given the wrong file.
+
+### `ext_lig` per-residue feature
+
+`ext_lig` is a per-residue sequence-level feature indicating whether non-self-chain, non-water atoms are present within 8 Å of each residue's CA atom:
+
+- `0` = **absent** — no external atoms within 8 Å
+- `1` = **present** — at least one non-water atom from a different chain is within 8 Å
+- `2` = **unknown** — CA coordinate is missing, or the structure is from AFDB (predicted monomer)
+
+`ext_lig` is computed and cached in each `.pt` file during dataset preprocessing. For AFDB structures, all residues are assigned `unknown`. For existing cached PDB `.pt` files that predate this feature, use `python script_utils/backfill_ext_lig.py` to add `ext_lig` without reprocessing from scratch.
+
+To embed `ext_lig` in the model, set `ext_lig_emb_init_seq: true` and `ext_lig_emb_dim: <dim>` in the NN config. If `ext_lig` is absent from the batch at training time the model falls back to all-unknown, so the feature is backward compatible with existing checkpoints loaded via `strict=False`.
+
+**Inference default.** When running inference, `ext_lig` is never in the sampling batch. The value used for all residues is controlled by the inference config field:
+
+```yaml
+ext_lig_default: "unknown"   # or "absent"
+```
+
+`"unknown"` is the default and is appropriate for unconditional generation or when generating sequences without explicit ligand context. `"absent"` can be used to generate apo-form / ligand-free structures.
+
 ## Model training
 
 ### Unconditional training

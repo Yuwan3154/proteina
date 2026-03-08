@@ -34,6 +34,11 @@ schedule:
   schedule_mode: log
   schedule_p: 2.0
 
+# ext_lig inference default: fill value when ext_lig is not provided in the inference batch.
+# "unknown" (2) is appropriate for unconditional / AFDB-style generation.
+# "absent" (0) is appropriate when generating apo / ligand-free structures explicitly.
+ext_lig_default: "unknown"
+
 # Fold conditioning
 fold_cond: False   # If true, turn on fold conditioning; if false, use unconditional model
 cath_code_level: "T"    # Guidance level
