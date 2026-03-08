@@ -182,6 +182,8 @@ class PaddingTransform(T.BaseTransform):
                     fill_value = FLOAT_PADDING_VALUE if torch.is_floating_point(value) else self.fill_value
                     if key == "dssp_target":
                         fill_value = -1  # ignore_index for CE loss
+                    elif key == "ext_lig":
+                        fill_value = 2  # unknown class for padded residues
                     if "contact_map" in key and value.dim() == 2:
                         # Pad dimension 0 first, then dimension 1
                         value = self.pad_tensor(value, self.max_size, dim=0, fill_value=fill_value)
@@ -642,10 +644,17 @@ class ContactMapTransform(T.BaseTransform):
 class TEDLabelTransform(T.BaseTransform):
     """Adds CATH labels if available to the AFDB protein.
 
-    Download ted_365m.domain_summary.cath.globularity.taxid.tsv.gz
-    from https://zenodo.org/records/13908086
-    and point to it via the file_path attribute.
+    Requires the TED domain summary TSV with CATH labels (21 tab-separated columns,
+    column 14 / index 13 contains the CATH code). Download
+    ``ted_365m.domain_summary.cath.globularity.taxid.tsv.gz`` from
+    https://zenodo.org/records/13908086 and point to it via the ``file_path`` attribute.
+
+    The boundary-only file ``ted_365m_domain_boundaries_consensus_level.tsv`` has only
+    3 columns and does **not** contain CATH labels; using it here will raise an error.
     """
+
+    _MIN_COLUMNS_FOR_CATH = 14  # column index 13 must exist
+    _CATH_CODE_RE = re.compile(r"^\d+\.\d+\.\d+\.\d+$")
 
     def __init__(
         self,
@@ -657,9 +666,9 @@ class TEDLabelTransform(T.BaseTransform):
 
         Args:
             file_path (str): Path to the TED domain summary file containing CATH labels.
-                Set it to something like "<your-path>/ted_365m.domain_summary.cath.globularity.taxid.tsv".
+                Supports plain ``.tsv`` and gzip-compressed ``.tsv.gz``.
             pkl_path (str): Base path for storing chunked pickle files of processed data.
-                Set it to something like "<your-path>/afdb_to_cath_ted.pkl".
+                These are auto-generated caches; they do not need to be downloaded.
             chunk_size (int): Maximum number of samples to store in each pickle chunk.
                 Defaults to 50000000.
         """
@@ -669,12 +678,45 @@ class TEDLabelTransform(T.BaseTransform):
         self.sample_to_cath = {}
         self._process_file()
 
+    def _open_tsv(self):
+        """Return a line iterator for the TSV file, supporting .gz transparently."""
+        if str(self.file_path).endswith(".gz"):
+            return gzip.open(self.file_path, "rt")
+        return open(self.file_path)
+
+    def _validate_schema(self):
+        """Read the first non-empty line and verify it has the expected CATH-label schema."""
+        with self._open_tsv() as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split("\t")
+                if len(parts) < self._MIN_COLUMNS_FOR_CATH:
+                    raise ValueError(
+                        f"TEDLabelTransform: the file '{self.file_path}' has only "
+                        f"{len(parts)} columns (expected >= {self._MIN_COLUMNS_FOR_CATH}). "
+                        f"This looks like the boundary-only TSV "
+                        f"(ted_365m_domain_boundaries_consensus_level.tsv) which does NOT "
+                        f"contain CATH labels. Please use the domain summary file "
+                        f"'ted_365m.domain_summary.cath.globularity.taxid.tsv[.gz]' instead."
+                    )
+                cath_field = parts[13]
+                if cath_field != "-" and not self._CATH_CODE_RE.match(cath_field.split(",")[0]):
+                    rank_zero_warn(
+                        f"TEDLabelTransform: column 14 of '{self.file_path}' contains "
+                        f"'{cath_field}' which does not look like a CATH code (X.X.X.X). "
+                        f"Proceeding, but double-check the file format."
+                    )
+                return
+
     def _process_file(self):
         if self._pickle_exists():
             logger.info("AFDB CATH data already processed, loading now")
             self._load_pickles()
         else:
             logger.info("AFDB CATH data not processed yet, processing now")
+            self._validate_schema()
             self._create_pickles()
             self._load_pickles()
 
@@ -682,30 +724,15 @@ class TEDLabelTransform(T.BaseTransform):
         return os.path.exists(f"{self.pkl_path}.0")
 
     def _create_pickles(self):
-        """Process input file and create chunked pickle files mapping sample IDs to CATH codes.
-
-        Reads the input file line by line, extracting sample IDs and their associated CATH codes.
-        Creates multiple pickle files when the number of processed samples reaches chunk_size.
-        Each pickle file contains a dictionary mapping sample IDs to lists of CATH codes.
-
-        The function:
-        - Processes the input file line by line
-        - Extracts sample ID and CATH codes from each line
-        - Groups CATH codes by sample ID in chunks
-        - Saves each chunk to a separate pickle file when chunk_size is reached
-        - Saves any remaining data in the final chunk
-
-        Note:
-        Uses self.file_path as input file path
-        Uses self.chunk_size to determine when to create new pickle files
-        Calls self._save_pickle() to save each chunk
-        """
+        """Process input file and create chunked pickle files mapping sample IDs to CATH codes."""
         sample_to_cath = {}
         counter = 0
         chunk_counter = 0
-        with open(self.file_path) as file:
+        with self._open_tsv() as file:
             for line in file:
                 parts = line.strip().split("\t")
+                if len(parts) < self._MIN_COLUMNS_FOR_CATH:
+                    continue
                 full_sample_id = parts[0]
                 cath_codes = parts[13].split(",") if parts[13] != "-" else []
                 sample_id = "_".join(full_sample_id.split("_")[:-1])

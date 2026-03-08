@@ -1,25 +1,35 @@
 datamodule:
   _target_: "proteinfoundation.datasets.pdb_data.PDBLightningDataModule"
-  data_dir: ${oc.env:DATA_PATH}/d_21M/ # Directory where the dataset is stored
+  data_dir: ${oc.env:DATA_PATH}/d_21M/
   in_memory: False
-  format: "pdb" # Format of your data files
-  overwrite: True # Whether to overwrite existing dataset files and reprocess the raw data
-  # arguments for BaseLightningDataModule class
-  batch_padding: True # whether we want a sparse PyG batch or a padded dense batch
-  sampling_mode: "cluster-random" # sample randomly inside each sequence similarity cluster during training
-  transforms: 
-    - _target_: "proteinfoundation.datasets.transforms.GlobalRotationTransform" # Transforms to apply to dataset examples
-    # - _target_: "proteinfoundation.datasets.transforms.TEDLabelTransform" # activate for fold-conditional training
-    #   file_path: "<your-path>/ted_365m_domain_boundaries_consensus_level.tsv"
-    #   pkl_path: "<your-path>/afdb_to_cath_ted.pkl"
-  batch_size: 8 # Batch size for dataloader
-  num_workers: 32 # Number of workers for dataloader
-  pin_memory: True # Pin memory for dataloader
-  
+  format: "pdb"
+  overwrite: False
+  regenerate_missing: True
+  cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/
+  multilabel_mode: "sample"
+  batch_padding: True
+  sampling_mode: "cluster-random"
+  transforms:
+    - _target_: "proteinfoundation.datasets.transforms.GlobalRotationTransform"
+    - _target_: "proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform"
+    # Fold conditioning via TED CATH labels (uncomment both TEDLabelTransform and CATHToIndicesTransform)
+    # - _target_: "proteinfoundation.datasets.transforms.TEDLabelTransform"
+    #   file_path: ${oc.env:DATA_PATH}/d_FS/ted_365m.domain_summary.cath.globularity.taxid.tsv
+    #   pkl_path: ${oc.env:DATA_PATH}/d_FS/afdb_to_cath_ted.pkl
+    # - _target_: "proteinfoundation.datasets.transforms.CATHToIndicesTransform"
+    #   cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/
+    - _target_: "proteinfoundation.datasets.transforms.DSSPTargetTransform"
+    - _target_: "proteinfoundation.datasets.transforms.PaddingTransform"
+      max_size: 384
+  batch_size: 8
+  num_workers: 32
+  pin_memory: True
+  prefetch_factor: 2
+
   datasplitter:
     _target_: "proteinfoundation.datasets.pdb_data.PDBDataSplitter"
-    data_dir: ${oc.env:DATA_PATH}/d_21M/ # Directory where the dataset is stored
-    train_val_test: [0.98, 0.019, 0.001] # Cross-validation ratios to use for train, val, and test splits
-    split_type: "sequence_similarity" # Split sequences randomly, other options are "sequence_similarity"
-    split_sequence_similarity: 0.5 # Clustering at 30% sequence similarity (argument is ignored if split_type!="sequence_similarity")
-    overwrite_sequence_clusters: False # Previous clusterings at same sequence similarity are reused and not overwritten (argument is ignored if split_type!="sequence_similarity")
+    data_dir: ${oc.env:DATA_PATH}/d_21M/
+    train_val_test: [0.98, 0.019, 0.001]
+    split_type: "sequence_similarity"
+    split_sequence_similarity: 0.5
+    overwrite_sequence_clusters: False

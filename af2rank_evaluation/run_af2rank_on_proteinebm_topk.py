@@ -152,6 +152,49 @@ def _stage_templates_as_dir(topk_df: pd.DataFrame, staged_dir: Path) -> None:
         os.symlink(str(src), str(dst))
 
 
+def _batch_reconstruct_ca_only(staged_dir: Path) -> Dict[str, str]:
+    """Reconstruct all CA-only PDBs in staged_dir via cg2all (single model load).
+    Returns mapping {original_path: reconstructed_path}. Empty dict if none are CA-only."""
+    import tempfile
+    pdb_files = sorted(staged_dir.glob("*.pdb"))
+    if not pdb_files:
+        return {}
+
+    # Quick CA-only check: any file where all ATOM records are CA
+    def _is_ca_only(path: Path) -> bool:
+        has_non_ca = False
+        has_atom = False
+        with open(path) as f:
+            for line in f:
+                if line.startswith("ATOM"):
+                    has_atom = True
+                    if line[12:16].strip() != "CA":
+                        has_non_ca = True
+                        break
+        return has_atom and not has_non_ca
+
+    ca_only = [str(p) for p in pdb_files if _is_ca_only(p)]
+    if not ca_only:
+        return {}
+
+    tmp_dir = tempfile.mkdtemp(prefix="cg2all_topk_")
+    inputs_json = os.path.join(tmp_dir, "inputs.json")
+    output_map_json = os.path.join(tmp_dir, "output_map.json")
+    with open(inputs_json, "w") as f:
+        json.dump(ca_only, f)
+
+    cue_python = "/home/ubuntu/miniforge3/envs/cue_openfold/bin/python"
+    script = str(Path(__file__).parent / "cg2all_reconstruct.py")
+    subprocess.run(
+        [cue_python, script, "--inputs", inputs_json, "--output_dir", tmp_dir, "--output_map", output_map_json],
+        check=True,
+        timeout=600,
+    )
+    with open(output_map_json) as f:
+        mapping = json.load(f)
+    return mapping
+
+
 def _run_af2rank_subprocess(
     protein_id: str,
     reference_cif: str,
@@ -162,6 +205,7 @@ def _run_af2rank_subprocess(
     cuda_visible_devices: str,
     model_name: str = "model_1_ptm",
     backend: str = "colabdesign",
+    allatom_map: Optional[Dict[str, str]] = None,
 ) -> None:
     # Ensure each subprocess is pinned to a single GPU when requested.
     cuda_line = ""
@@ -169,7 +213,7 @@ def _run_af2rank_subprocess(
         cuda_line = f"os.environ['CUDA_VISIBLE_DEVICES'] = {cuda_visible_devices!r}\n"
 
     if backend == "openfold":
-        wrapper_script = "/home/ubuntu/proteina/af2rank_evaluation/run_with_proteina_env.sh"
+        python_exe = "/home/ubuntu/miniforge3/envs/cue_openfold/bin/python"
         py = f"""
 import os
 import sys
@@ -229,7 +273,8 @@ plot_scores = [s for s in all_scores if s.get("structure_file") in staged_filena
 plot_af2rank_results(plot_scores, output_dir, protein_id)
 """
     else:
-        wrapper_script = "/home/ubuntu/proteina/af2rank_evaluation/run_with_colabdesign_env.sh"
+        python_exe = "/home/ubuntu/miniforge3/envs/colabdesign/bin/python"
+        allatom_map_repr = repr(allatom_map or {})
         py = f"""
 import os
 import sys
@@ -249,6 +294,8 @@ reference_cif = {reference_cif!r}
 chain = {chain!r}
 inference_output_dir = {str(staged_templates_dir)!r}
 output_dir = {str(output_dir)!r}
+# Pre-built cg2all reconstruction map (original_path -> allatom_path)
+allatom_map = {allatom_map_repr}
 
 scores_csv_path = os.path.join(output_dir, f"af2rank_scores_{{protein_id}}.csv")
 
@@ -276,6 +323,7 @@ if len(to_score) > 0:
         decoy_chain="A",
         recycles={int(recycles)},
         verbose=False,
+        _allatom_pdb=allatom_map.get(pdb_path),
       )
     structure_scores.update({{
       "protein_id": protein_id,
@@ -294,7 +342,7 @@ plot_af2rank_results(plot_scores, output_dir, protein_id)
 """
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    cmd = [wrapper_script, "python", "-c", py]
+    cmd = [python_exe, "-c", py]
     subprocess.run(cmd, cwd="/home/ubuntu/proteina/af2rank_evaluation", check=True)
 
 
@@ -432,28 +480,40 @@ def _process_one_protein(
     )
 
     if not dry_run:
-        _run_af2rank_subprocess(
-            protein_id=protein_id,
-            reference_cif=reference_cif,
-            chain=chain,
-            staged_templates_dir=staged_dir,
-            output_dir=af2rank_out_dir_m1,
-            recycles=recycles,
-            cuda_visible_devices=gpu_id,
-            model_name="model_1_ptm",
-            backend=backend,
-        )
-        _run_af2rank_subprocess(
-            protein_id=protein_id,
-            reference_cif=reference_cif,
-            chain=chain,
-            staged_templates_dir=staged_dir,
-            output_dir=af2rank_out_dir_m2,
-            recycles=recycles,
-            cuda_visible_devices=gpu_id,
-            model_name="model_2_ptm",
-            backend=backend,
-        )
+        # Batch-reconstruct all CA-only templates once upfront, reuse for both models
+        allatom_map: Dict[str, str] = {}
+        if backend == "colabdesign":
+            allatom_map = _batch_reconstruct_ca_only(staged_dir)
+        try:
+            _run_af2rank_subprocess(
+                protein_id=protein_id,
+                reference_cif=reference_cif,
+                chain=chain,
+                staged_templates_dir=staged_dir,
+                output_dir=af2rank_out_dir_m1,
+                recycles=recycles,
+                cuda_visible_devices=gpu_id,
+                model_name="model_1_ptm",
+                backend=backend,
+                allatom_map=allatom_map,
+            )
+            _run_af2rank_subprocess(
+                protein_id=protein_id,
+                reference_cif=reference_cif,
+                chain=chain,
+                staged_templates_dir=staged_dir,
+                output_dir=af2rank_out_dir_m2,
+                recycles=recycles,
+                cuda_visible_devices=gpu_id,
+                model_name="model_2_ptm",
+                backend=backend,
+                allatom_map=allatom_map,
+            )
+        finally:
+            # Delete reconstructed all-atom temp files after both models are done
+            for tmp_path in allatom_map.values():
+                if tmp_path and os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
 
         m1_df = pd.read_csv(af2rank_scores_csv_m1)
         m2_df = pd.read_csv(af2rank_scores_csv_m2)

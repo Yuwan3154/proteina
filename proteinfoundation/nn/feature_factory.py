@@ -306,6 +306,24 @@ class ResidueTypeEmbeddingPairFeat(Feature):
         return seq_emb_1[:, :, None, :] * seq_emb_2[:, None, :, :]  # [b, n, n, seq_emb_dim]
 
 
+class ExtLigEmbeddingSeqFeat(Feature):
+    """Embeds ext_lig per-residue labels (0=absent, 1=present, 2=unknown) as [b, n, ext_lig_emb_dim]."""
+
+    def __init__(self, ext_lig_emb_dim, **kwargs):
+        super().__init__(dim=ext_lig_emb_dim)
+        self.embedding = torch.nn.Embedding(3, ext_lig_emb_dim)
+
+    def forward(self, batch):
+        if "ext_lig" in batch:
+            return self.embedding(batch["ext_lig"])  # [b, n, ext_lig_emb_dim]
+        xt = batch["x_t"]  # [b, n, 3]
+        # Default to all unknown (index 2) when ext_lig is missing
+        unknown = torch.full(
+            (xt.shape[0], xt.shape[1]), 2, dtype=torch.long, device=xt.device
+        )
+        return self.embedding(unknown)
+
+
 class IdxEmbeddingSeqFeat(Feature):
     """Computes index embedding and returns sequence feature of shape [b, n, idx_emb]."""
 
@@ -585,6 +603,8 @@ def _get_feature_creator(f: str, mode: Literal["seq", "pair"], **kwargs) -> Feat
             return MotifMaskSeqFeat(**kwargs)
         elif f == "residue_type_emb":
             return ResidueTypeEmbeddingSeqFeat(**kwargs)
+        elif f == "ext_lig_emb":
+            return ExtLigEmbeddingSeqFeat(**kwargs)
         else:
             raise IOError(f"Sequence feature {f} not implemented.")
     elif mode == "pair":
@@ -618,6 +638,7 @@ class FeatureFactory(torch.nn.Module):
         use_ln_out: bool,
         mode: Literal["seq", "pair"],
         use_residue_type_emb: bool = False,
+        use_ext_lig_emb: bool = False,
         feature_embedding_mode: Literal["concat", "individual"] = "concat",
         individual_feat_ln: bool = True,
         **kwargs,
@@ -639,6 +660,7 @@ class FeatureFactory(torch.nn.Module):
         super().__init__()
         self.mode = mode
         self.use_residue_type_emb = use_residue_type_emb
+        self.use_ext_lig_emb = use_ext_lig_emb and mode == "seq"
         self.feature_embedding_mode = kwargs.pop("feature_embedding_mode", feature_embedding_mode)
         self._individual_feat_ln = kwargs.get("individual_feat_ln", individual_feat_ln)
 
@@ -650,6 +672,7 @@ class FeatureFactory(torch.nn.Module):
                 use_ln_out=use_ln_out,
                 mode=mode,
                 use_residue_type_emb=use_residue_type_emb,
+                use_ext_lig_emb=self.use_ext_lig_emb,
                 individual_feat_ln=self._individual_feat_ln,
                 **_feat_kwargs,
             )
@@ -680,6 +703,11 @@ class FeatureFactory(torch.nn.Module):
             self.residue_type_feat_creator = _get_feature_creator("residue_type_emb", self.mode, **kwargs)
             self.residue_type_out = torch.nn.Linear(
                 self.residue_type_feat_creator.get_dim(), dim_feats_out, bias=False
+            )
+        if self.use_ext_lig_emb:
+            self.ext_lig_feat_creator = _get_feature_creator("ext_lig_emb", "seq", **kwargs)
+            self.ext_lig_out = torch.nn.Linear(
+                self.ext_lig_feat_creator.get_dim(), dim_feats_out, bias=False
             )
     
     def apply_padding_mask(self, feature_tensor, mask):
@@ -732,6 +760,10 @@ class FeatureFactory(torch.nn.Module):
             features_out += self.residue_type_out(
                 self.residue_type_feat_creator(batch)
                 )
+        if self.use_ext_lig_emb:
+            features_out = features_out + self.ext_lig_out(
+                self.ext_lig_feat_creator(batch)
+            )
         features_proc = self.ln_out(
             features_out
         )  # [b, n, dim_f] or [b, n, n, dim_f]
@@ -751,12 +783,14 @@ class IndividualFeatureFactory(torch.nn.Module):
         use_ln_out: bool,
         mode: Literal["seq", "pair"],
         use_residue_type_emb: bool = False,
+        use_ext_lig_emb: bool = False,
         individual_feat_ln: bool = True,
         **kwargs,
     ):
         super().__init__()
         self.mode = mode
         self.use_residue_type_emb = use_residue_type_emb
+        self.use_ext_lig_emb = use_ext_lig_emb and mode == "seq"
         self.individual_feat_ln = individual_feat_ln
         kwargs = {k: v for k, v in kwargs.items() if k not in ("feature_embedding_mode", "individual_feat_ln")}
 
@@ -800,6 +834,13 @@ class IndividualFeatureFactory(torch.nn.Module):
             self.residue_type_out = torch.nn.Linear(
                 self.residue_type_feat_creator.get_dim(), dim_feats_out, bias=False
             )
+        if self.use_ext_lig_emb:
+            self.ext_lig_feat_creator = _get_feature_creator(
+                "ext_lig_emb", "seq", **kwargs
+            )
+            self.ext_lig_out = torch.nn.Linear(
+                self.ext_lig_feat_creator.get_dim(), dim_feats_out, bias=False
+            )
 
         self.ln_out = (
             torch.nn.LayerNorm(dim_feats_out) if use_ln_out else torch.nn.Identity()
@@ -842,6 +883,12 @@ class IndividualFeatureFactory(torch.nn.Module):
             if residue_feat.dtype != target_dtype:
                 residue_feat = residue_feat.to(target_dtype)
             output = output + self.residue_type_out(residue_feat)
+
+        if self.use_ext_lig_emb:
+            ext_lig_feat = self.ext_lig_feat_creator(batch)
+            if ext_lig_feat.dtype != target_dtype:
+                ext_lig_feat = ext_lig_feat.to(target_dtype)
+            output = output + self.ext_lig_out(ext_lig_feat)
 
         output = self._apply_padding_mask(output, batch["mask"])
         output = self.ln_out(output)

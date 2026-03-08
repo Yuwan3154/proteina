@@ -40,10 +40,15 @@ from proteinfoundation.utils.cluster_utils import (
 )
 from proteinfoundation.utils.constants import PDB_TO_OPENFOLD_INDEX_TENSOR
 from proteinfoundation.graphein_utils.graphein_utils import (
-    protein_to_pyg, 
+    protein_to_pyg,
+    read_pdb_to_dataframe,
     PDBManager,     
     download_pdb_multiprocessing,
     get_obsolete_mapping,
+)
+from proteinfoundation.datasets.ext_lig_utils import (
+    compute_ext_lig_from_df,
+    make_unknown_ext_lig,
 )
 
 
@@ -1187,6 +1192,9 @@ class PDBLightningDataModule(BaseLightningDataModule):
             rank_zero_info("No structures to process - all files already exist.")
             return []
 
+        # Determine database tag: "pdb" when dataselector is set, "afdb" for custom-folder datasets
+        database_tag = "pdb" if self.dataselector else "afdb"
+
         file_names = []
         
         # Use multiprocessing if enabled, there are multiple files to process and multiple workers
@@ -1203,6 +1211,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
                 store_bfactor=self.store_bfactor,
                 pre_transform=self.pre_transform,
                 pre_filter=self.pre_filter,
+                database_tag=database_tag,
             )
             
             # Use ProcessPoolExecutor for multiprocessing
@@ -1246,6 +1255,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
         store_bfactor: bool,
         pre_transform: Optional[Callable] = None,
         pre_filter: Optional[Callable] = None,
+        database_tag: str = "pdb",
     ) -> Optional[str]:
         """
         Static method for processing a single PDB file - suitable for multiprocessing.
@@ -1259,6 +1269,8 @@ class PDBLightningDataModule(BaseLightningDataModule):
             store_bfactor: Whether to store B factors
             pre_transform: Optional pre-transform function
             pre_filter: Optional pre-filter function
+            database_tag: Source database ("pdb" or "afdb"). Controls ext_lig computation:
+                "pdb" computes from full deposit; "afdb" sets all to unknown.
             
         Returns:
             Optional[str]: The filename of the saved processed graph, or None if processing failed.
@@ -1293,7 +1305,12 @@ class PDBLightningDataModule(BaseLightningDataModule):
                 return torch.as_tensor(np.asarray(arr, dtype=np.float32))
 
             fill_value_coords = 1e-5
+
+            # Read full deposit df once for ext_lig and protein_to_pyg
+            full_df = read_pdb_to_dataframe(path=path)
+
             graph = protein_to_pyg(
+                df=full_df.copy(),
                 path=path,
                 chain_selection=chains,
                 keep_insertions=True,
@@ -1314,7 +1331,19 @@ class PDBLightningDataModule(BaseLightningDataModule):
             graph.residue_type = torch.tensor(
                 [resname_to_idx[residue] for residue in graph.residues]
             ).long()
-            graph.database = "pdb"
+            graph.database = database_tag
+
+            # Compute ext_lig: for AFDB set all unknown, for PDB compute from full deposit
+            if database_tag == "afdb":
+                graph.ext_lig = make_unknown_ext_lig(graph.coords.shape[0])
+            else:
+                graph.ext_lig = compute_ext_lig_from_df(
+                    full_df=full_df,
+                    self_chains=chains,
+                    graph_residue_ids=list(graph.residue_id),
+                    fill_value_coords=fill_value_coords,
+                )
+
             graph.bfactor_avg = torch.mean(graph.bfactor, dim=-1)
             graph.residue_pdb_idx = torch.tensor(
                 [int(s.split(":")[2]) for s in graph.residue_id], dtype=torch.long
@@ -1336,10 +1365,8 @@ class PDBLightningDataModule(BaseLightningDataModule):
             chain_id = chains if 'chains' in locals() else 'all'
             protein_id = f"{pdb}_{chain_id}" if chain_id != 'all' else pdb
             
-            # Check if this is a non-canonical residue issue
             if any(keyword in error_msg.lower() for keyword in ['residue', 'resname', 'non-standard', 'unknown']):
                 logger.warning(f"Auto-excluding {protein_id} due to potential non-canonical residues: {e}")
-                # Write to auto-exclude tracking file
                 auto_exclude_file = processed_dir.parent / "auto_excluded_non_canonical.txt"
                 try:
                     with open(auto_exclude_file, "a") as f:
@@ -1357,21 +1384,14 @@ class PDBLightningDataModule(BaseLightningDataModule):
         """
         Load and process a PDB file, converting it to a PyTorch Geometric graph.
 
-        This function takes a tuple containing an index and a PDB code (and optionally a chain),
-        loads the corresponding PDB file, processes it into a graph, and saves the result.
-
         Args:
-            index_pdb_tuple (Union[Tuple[int, str], Tuple[int, str, str]]): A tuple containing:
-                - index (int): The index of the PDB file in the list.
-                - pdb (str): The PDB code.
-                - chains (str, optional): The chains to process. If not provided, all chains are processed.
+            index_pdb_tuple: Tuple of (index, pdb_code) or (index, pdb_code, chain).
 
         Returns:
-            Optional[str]: The filename of the saved processed graph, or None if processing failed.
-
-        Raises:
-            FileNotFoundError: If the PDB file is not found in the raw directory.
+            The filename of the saved processed graph, or None if processing failed.
         """
+        database_tag = "pdb" if self.dataselector else "afdb"
+
         try:
             if len(index_pdb_tuple) == 3:
                 i, pdb, chains = index_pdb_tuple
@@ -1402,7 +1422,11 @@ class PDBLightningDataModule(BaseLightningDataModule):
                 return torch.as_tensor(np.asarray(arr, dtype=np.float32))
 
             fill_value_coords = 1e-5
+
+            full_df = read_pdb_to_dataframe(path=path)
+
             graph = protein_to_pyg(
+                df=full_df.copy(),
                 path=path,
                 chain_selection=chains,
                 keep_insertions=True,
@@ -1416,10 +1440,8 @@ class PDBLightningDataModule(BaseLightningDataModule):
             chain_id = chains if 'chains' in locals() else 'all'
             protein_id = f"{pdb}_{chain_id}" if chain_id != 'all' else pdb
             
-            # Check if this is a non-canonical residue issue
             if any(keyword in error_msg.lower() for keyword in ['residue', 'resname', 'non-standard', 'unknown']):
                 logger.warning(f"Auto-excluding {protein_id} due to potential non-canonical residues: {e}")
-                # Write to auto-exclude tracking file
                 auto_exclude_file = self.data_dir / "auto_excluded_non_canonical.txt"
                 try:
                     with open(auto_exclude_file, "a") as f:
@@ -1441,7 +1463,18 @@ class PDBLightningDataModule(BaseLightningDataModule):
         graph.residue_type = torch.tensor(
             [resname_to_idx[residue] for residue in graph.residues]
         ).long()
-        graph.database = "pdb"
+        graph.database = database_tag
+
+        if database_tag == "afdb":
+            graph.ext_lig = make_unknown_ext_lig(graph.coords.shape[0])
+        else:
+            graph.ext_lig = compute_ext_lig_from_df(
+                full_df=full_df,
+                self_chains=chains,
+                graph_residue_ids=list(graph.residue_id),
+                fill_value_coords=fill_value_coords,
+            )
+
         graph.bfactor_avg = torch.mean(graph.bfactor, dim=-1)
         graph.residue_pdb_idx = torch.tensor(
             [int(s.split(":")[2]) for s in graph.residue_id], dtype=torch.long

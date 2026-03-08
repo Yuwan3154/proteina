@@ -187,23 +187,31 @@ def run_do_not_align(query_sequence, target_sequence, **kwargs):
     return [query_sequence, target_sequence], [0, 0]
 
 
+class _FirstAltlocSelect(Select):
+    """BioPython Select filter: keep only atoms with altloc ' ' or 'A' (first conformation)."""
+    def accept_atom(self, atom):
+        return atom.get_altloc() in (' ', 'A')
+
+
 def convert_cif_to_pdb_for_colabdesign(cif_file, chain_id=None):
     """
     Convert CIF file to PDB format that ColabDesign can handle.
     For multi-character chain IDs, extract the specific chain and rename to 'A'.
+    Only keeps first alternate conformation to avoid duplicate atoms.
     """
-    try:        
+    try:
         # Parse CIF file
         parser = MMCIFParser(QUIET=True)
         structure = parser.get_structure('protein', cif_file)
-        
+
         # Create a temporary PDB file
         temp_pdb = tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False)
         temp_pdb.close()
-        
-        # Write to PDB format
+
+        # Write to PDB format, filtering to first altloc only
         io = PDBIO()
-        
+        select = _FirstAltlocSelect()
+
         if chain_id:
             # Extract the specific chain and rename it to 'A' for PDB compatibility
             found_chain = None
@@ -214,29 +222,29 @@ def convert_cif_to_pdb_for_colabdesign(cif_file, chain_id=None):
                         break
                 if found_chain:
                     break
-            
+
             if not found_chain:
                 raise Exception(f"Chain '{chain_id}' not found in CIF file")
-            
+
             # Create new structure with only this chain, renamed to 'A'
             new_structure = Structure.Structure('protein')
             new_model = Model.Model(0)
             new_structure.add(new_model)
-            
+
             # Detach chain from old structure and change ID to 'A'
             old_chain_id = found_chain.id
             found_chain.detach_parent()
             found_chain.id = 'A'
             new_model.add(found_chain)
-            
+
             io.set_structure(new_structure)
-            io.save(temp_pdb.name)
-            
+            io.save(temp_pdb.name, select=select)
+
             logger.debug(f"Converted CIF chain '{old_chain_id}' to PDB chain 'A'")
         else:
             io.set_structure(structure)
-            io.save(temp_pdb.name)
-        
+            io.save(temp_pdb.name, select=select)
+
         return temp_pdb.name
     except Exception as e:
         raise ValueError(f"Failed to convert CIF to PDB: {e}")
@@ -472,9 +480,12 @@ def _reconstruct_ca_only_pdbs(pdb_files):
         with open(input_json, 'w') as f:
             json.dump(pdb_files, f)
 
+        # conda run is unreliable across env boundaries; use direct python path
+        cue_python = "/home/ubuntu/miniforge3/envs/cue_openfold/bin/python"
+        if not os.path.exists(cue_python):
+            cue_python = "python"  # fallback to current env
         cmd = [
-            "conda", "run", "--no-capture-output", "-n", "cue_openfold",
-            "python", reconstruct_script,
+            cue_python, reconstruct_script,
             "--inputs", input_json,
             "--output_dir", tmp_dir,
             "--output_map", output_map_json,
@@ -715,6 +726,14 @@ class ModernAF2Rank:
         # Set random seed for reproducibility
         self.af.set_seed(seed)
 
+        # Auto-reconstruct CA-only decoys with cg2all for proper CB coverage in template features
+        _tmp_allatom = None
+        if _allatom_pdb is None and _is_ca_only_pdb(decoy_pdb):
+            recon = _reconstruct_ca_only_pdbs([decoy_pdb])
+            if recon:
+                _tmp_allatom = recon[decoy_pdb]
+                _allatom_pdb = _tmp_allatom
+
         # Determine which PDB to use for template features
         template_pdb = _allatom_pdb if _allatom_pdb else decoy_pdb
 
@@ -791,13 +810,17 @@ class ModernAF2Rank:
         # Save output PDB if requested
         if output_pdb:
             self.af.save_pdb(output_pdb)
-        
+
+        # Clean up auto-reconstructed all-atom temp file
+        if _tmp_allatom and os.path.exists(_tmp_allatom):
+            os.unlink(_tmp_allatom)
+
         # Safe cleanup to prevent memory accumulation
         gc.collect()
-        
+
         if verbose:
             logger.debug(f"AF2Rank scores - pLDDT: {scores['plddt']:.3f}, pTM: {scores['ptm']:.3f}, Composite: {scores['composite']:.3f}")
-                
+
         return scores
     
     def _calculate_scores(self, template_coords=None):
