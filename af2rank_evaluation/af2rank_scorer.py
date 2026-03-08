@@ -25,6 +25,7 @@ import sys
 import glob
 import json
 import tempfile
+import subprocess
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import numpy as np
@@ -381,6 +382,119 @@ def tmscore(x, y, tmscore_exe="USalign"):
     return o
 
 
+_AF2RANK_EVAL_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _is_ca_only_pdb(pdb_file):
+    """Return True if PDB contains only CA atoms."""
+    atom_names = set()
+    with open(pdb_file) as f:
+        for line in f:
+            if line.startswith("ATOM") or line.startswith("HETATM"):
+                atom_names.add(line[12:16].strip())
+                if len(atom_names) > 1:
+                    return False
+    return atom_names == {"CA"} or len(atom_names) == 0
+
+
+def _reconstruct_ca_only_pdbs(pdb_files):
+    """Batch-reconstruct CA-only PDBs to all-atom using cg2all.
+
+    Tries direct import first (if cg2all is in the current env), then falls back
+    to a subprocess call into the cue_openfold conda environment.
+
+    Returns dict mapping input_path -> reconstructed_all_atom_path.
+    Entries missing from the dict means reconstruction failed for that file.
+    """
+    if not pdb_files:
+        return {}
+
+    # Try direct import (works if cg2all is installed in current environment)
+    try:
+        import torch
+        import dgl
+        import cg2all.lib.libcg
+        import cg2all.lib.libmodel
+        from cg2all.lib.libconfig import MODEL_HOME
+        from cg2all.lib.libdata import PredictionData, create_trajectory_from_batch
+        from cg2all.lib.libter import patch_termini
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        ckpt_path = MODEL_HOME / "CalphaBasedModel.ckpt"
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        config = ckpt["hyper_parameters"]
+        cg_model = cg2all.lib.libcg.CalphaBasedModel
+        config = cg2all.lib.libmodel.set_model_config(config, cg_model, flattened=False)
+        model = cg2all.lib.libmodel.Model(config, cg_model, compute_loss=False)
+        state_dict = ckpt["state_dict"]
+        for key in list(state_dict):
+            state_dict[".".join(key.split(".")[1:])] = state_dict.pop(key)
+        model.load_state_dict(state_dict)
+        model = model.to(device)
+        model.set_constant_tensors(device)
+        model.eval()
+
+        graphs = []
+        valid_indices = []
+        for i, pdb_file in enumerate(pdb_files):
+            try:
+                ds = PredictionData(pdb_file, cg_model, radius=config.globals.radius)
+                graphs.append(ds[0])
+                valid_indices.append(i)
+            except Exception as e:
+                logger.warning(f"cg2all failed to load {pdb_file}: {e}")
+
+        result = {}
+        if graphs:
+            batched = dgl.batch(graphs).to(device)
+            with torch.no_grad():
+                R = model.forward(batched)[0]["R"]
+            traj_s, _ = create_trajectory_from_batch(batched, R)
+            for idx, traj in zip(valid_indices, traj_s):
+                output = patch_termini(traj)
+                fd, out_path = tempfile.mkstemp(suffix=".pdb", prefix="cg2all_")
+                os.close(fd)
+                output.save(out_path)
+                result[pdb_files[idx]] = out_path
+        logger.info(f"cg2all (direct): reconstructed {len(result)}/{len(pdb_files)} structures")
+        return result
+
+    except ImportError:
+        pass  # Fall through to subprocess approach
+
+    # Subprocess fallback: call cg2all_reconstruct.py in the cue_openfold environment
+    try:
+        tmp_dir = tempfile.mkdtemp(prefix="cg2all_")
+        input_json = os.path.join(tmp_dir, "inputs.json")
+        output_map_json = os.path.join(tmp_dir, "output_map.json")
+        reconstruct_script = os.path.join(_AF2RANK_EVAL_DIR, "cg2all_reconstruct.py")
+
+        with open(input_json, 'w') as f:
+            json.dump(pdb_files, f)
+
+        cmd = [
+            "conda", "run", "--no-capture-output", "-n", "cue_openfold",
+            "python", reconstruct_script,
+            "--inputs", input_json,
+            "--output_dir", tmp_dir,
+            "--output_map", output_map_json,
+        ]
+        subprocess.run(cmd, check=True, timeout=600)
+
+        with open(output_map_json) as f:
+            result = json.load(f)
+
+        # Clean up temp json files (keep reconstructed PDBs; callers clean those up)
+        os.unlink(input_json)
+        os.unlink(output_map_json)
+        logger.info(f"cg2all (subprocess): reconstructed {len(result)}/{len(pdb_files)} structures")
+        return result
+
+    except Exception as e:
+        logger.warning(f"cg2all reconstruction failed (subprocess): {e}. Using CA-only templates.")
+        return {}
+
+
 class ModernAF2Rank:
     """Modern AF2Rank implementation following predict.ipynb approach exactly."""
     
@@ -581,19 +695,30 @@ class ModernAF2Rank:
                 if os.path.exists(temp_pdb_file):
                     os.unlink(temp_pdb_file)
         
-    def score_structure(self, decoy_pdb, decoy_chain=None, 
+    def score_structure(self, decoy_pdb, decoy_chain=None,
                 rm_seq=True, rm_sc=True, rm_ic=False,
-                      recycles=3, seed=0, 
-                      output_pdb=None, verbose=False):
-        """Score a single structure using AF2Rank protocol following predict.ipynb exactly."""
-        
+                      recycles=3, seed=0,
+                      output_pdb=None, verbose=False,
+                      _allatom_pdb=None, _original_pdb=None):
+        """Score a single structure using AF2Rank protocol following predict.ipynb exactly.
+
+        Args:
+            _allatom_pdb: If provided, use this all-atom PDB for template features
+                instead of decoy_pdb (e.g. cg2all-reconstructed version).
+            _original_pdb: If provided, use this for CA coordinate extraction for
+                TMscore calculations (useful when decoy_pdb is the reconstructed file).
+        """
+
         if verbose:
             logger.debug(f"Starting AF2Rank scoring for {decoy_pdb}")
 
         # Set random seed for reproducibility
         self.af.set_seed(seed)
-        
-        # Handle chain specification properly 
+
+        # Determine which PDB to use for template features
+        template_pdb = _allatom_pdb if _allatom_pdb else decoy_pdb
+
+        # Handle chain specification properly
         if decoy_chain is None:
             with open(decoy_pdb, 'r') as f:
                 for line in f:
@@ -602,13 +727,13 @@ class ModernAF2Rank:
                         break
             if decoy_chain is None:
                 decoy_chain = "A"  # Default fallback
-        
+
         # Create template batch using robust get_template_feats to handle model number issues
         if verbose:
-            logger.debug(f"Creating template batch for {decoy_pdb}")
-            
+            logger.debug(f"Creating template batch for {template_pdb}")
+
         batch = robust_get_template_feats(
-            pdbs=[decoy_pdb],
+            pdbs=[template_pdb],
             chains=[decoy_chain],  # Always pass a valid chain identifier
             query_seq=self.reference_sequence,
             query_a3m=None,  # No MSA for AF2Rank
@@ -641,10 +766,11 @@ class ModernAF2Rank:
         if verbose:
             logger.debug(f"Recycles set to {recycles}")
         
-        # Get template coordinates for TMscore analysis
+        # Get template coordinates for TMscore analysis (use original CA-only PDB if provided)
         if verbose:
             logger.debug("Getting template coordinates")
-        template_coords = self._get_coords_from_pdb(decoy_pdb, decoy_chain)
+        ca_source = _original_pdb if _original_pdb else decoy_pdb
+        template_coords = self._get_coords_from_pdb(ca_source, decoy_chain)
         
         # Run prediction exactly like predict.ipynb
         if verbose:
@@ -735,51 +861,70 @@ def score_proteina_structures(protein_id: str, reference_cif: str, inference_out
         List of score dictionaries
     """
     # Find all PDB files in the inference directory
-    pdb_files = glob.glob(os.path.join(inference_output_dir, "*.pdb"))
-    
+    pdb_files = sorted(glob.glob(os.path.join(inference_output_dir, "*.pdb")))
+
     if not pdb_files:
         logger.warning(f"No PDB files found in {inference_output_dir}")
         return []
-    
+
     logger.info(f"Starting AF2Rank scoring for {len(pdb_files)} structures of {protein_id}")
-    
+
+    # Batch-reconstruct all CA-only structures to all-atom via cg2all before scoring.
+    # This ensures ColabDesign's template embedder receives full backbone+sidechain
+    # coordinates (including CB), rather than the heavily-masked CA-only templates.
+    ca_only_pdbs = [p for p in pdb_files if _is_ca_only_pdb(p)]
+    allatom_map = {}  # original_pdb -> reconstructed_all_atom_pdb
+    if ca_only_pdbs:
+        logger.info(f"Reconstructing {len(ca_only_pdbs)} CA-only structures with cg2all...")
+        allatom_map = _reconstruct_ca_only_pdbs(ca_only_pdbs)
+        logger.info(f"cg2all reconstructed {len(allatom_map)}/{len(ca_only_pdbs)} structures")
+
     # Initialize AF2Rank scorer (suppress noisy ColabDesign stdout)
     try:
         with suppress_stdout():
             scorer = ModernAF2Rank(reference_cif, chain=chain)
     except Exception as e:
         logger.error(f"Failed to initialize AF2Rank scorer: {e}")
+        # Clean up any reconstructed temp files
+        for tmp in allatom_map.values():
+            if os.path.exists(tmp):
+                os.unlink(tmp)
         return []
-    
+
     scores = []
-    
+
     # Score each structure (suppress noisy ColabDesign stdout)
     for pdb_path in tqdm(pdb_files, desc=f"AF2Rank scoring {protein_id}"):
         pdb_filename = os.path.basename(pdb_path)
-        
+
         try:
+            # Use pre-reconstructed all-atom PDB for template if available
+            allatom_pdb = allatom_map.get(pdb_path)
+
             # Score the structure (suppress ColabDesign's verbose alignment output)
             with suppress_stdout():
                 structure_scores = scorer.score_structure(
                     pdb_path,
                     decoy_chain="A",  # Force chain A since Proteina generates chain A
                     recycles=recycles,
-                    verbose=verbose
+                    verbose=verbose,
+                    _allatom_pdb=allatom_pdb,
+                    _original_pdb=pdb_path if allatom_pdb else None,
                 )
-            
+
             # Add metadata
             structure_scores.update({
                 "protein_id": protein_id,
                 "structure_file": pdb_filename,
                 "structure_path": pdb_path
             })
-            
+
             # Remove coordinates from output (too large for CSV)
             if "pred_coords" in structure_scores:
                 del structure_scores["pred_coords"]
-            
+
             scores.append(structure_scores)
-            
+
         except Exception as e:
             logger.error(f"Failed to score {pdb_filename}: {e}")
             scores.append({
@@ -788,7 +933,12 @@ def score_proteina_structures(protein_id: str, reference_cif: str, inference_out
                 "structure_path": pdb_path,
                 "error": str(e)
             })
-    
+
+    # Clean up batch-reconstructed temp files
+    for tmp in allatom_map.values():
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
     logger.info(f"Completed AF2Rank scoring for {protein_id}")
     return scores
 
