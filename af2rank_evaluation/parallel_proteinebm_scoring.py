@@ -151,7 +151,7 @@ def find_proteins_needing_proteinebm(csv_file: str, csv_column: str, inference_c
 def run_proteinebm_scoring_subprocess(
     protein_name: str,
     inference_output_dir: str,
-    reference_cif: str,
+    reference_cif: str | None,
     proteinebm_config: str,
     proteinebm_checkpoint: str,
     template_self_condition: bool,
@@ -168,8 +168,6 @@ def run_proteinebm_scoring_subprocess(
         scorer_script,
         "--protein_id",
         protein_name,
-        "--reference_cif",
-        reference_cif,
         "--inference_output_dir",
         inference_output_dir,
         "--output_dir",
@@ -181,6 +179,9 @@ def run_proteinebm_scoring_subprocess(
         "--t",
         str(t),
     ]
+
+    if reference_cif is not None:
+        cmd.extend(["--reference_cif", reference_cif])
 
     if not template_self_condition:
         cmd.append("--no-proteinebm_template_self_condition")
@@ -202,8 +203,12 @@ def process_single_protein_proteinebm(args):
     if not pdb_files:
         raise FileNotFoundError(f"No PDB files found in {inference_output_dir}")
 
-    reference_cif = find_reference_cif(protein_name, cif_dir)
-    logger.info(f"[GPU {gpu_id}] Found reference CIF: {reference_cif}")
+    reference_cif = None
+    if cif_dir is not None:
+        reference_cif = find_reference_cif(protein_name, cif_dir)
+        logger.info(f"[GPU {gpu_id}] Found reference CIF: {reference_cif}")
+    else:
+        logger.info(f"[GPU {gpu_id}] No CIF dir provided, skipping TM-score computation")
 
     result = run_proteinebm_scoring_subprocess(
         protein_name=protein_name,
@@ -260,7 +265,7 @@ def main():
     parser = argparse.ArgumentParser(description="Parallel ProteinEBM scoring pipeline")
     parser.add_argument("--csv_file", required=True, help="Path to CSV file with protein data")
     parser.add_argument("--csv_column", required=True, help="Column name in CSV file to use for protein selection")
-    parser.add_argument("--cif_dir", required=True, help="Directory containing reference CIF files (for TMscore ground-truth)")
+    parser.add_argument("--cif_dir", default=None, help="Directory containing reference CIF files (for TMscore ground-truth). Optional; if omitted, TM-score metrics are skipped.")
     parser.add_argument("--inference_config", required=True, help="Inference configuration name")
     parser.add_argument("--num_gpus", type=int, default=1, help="Number of GPUs to use")
     parser.add_argument(

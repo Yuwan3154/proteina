@@ -171,7 +171,7 @@ def process_single_protein(args):
     Process a single protein through the entire Proteina pipeline.
     Includes proper error handling and GPU memory cleanup.
     """
-    protein_name, csv_file, csv_column, cif_dir, inference_config, usalign_path, gpu_id, force_compile = args
+    protein_name, csv_file, csv_column, cif_dir, inference_config, usalign_path, gpu_id, force_compile, skip_pt_conversion = args
     
     try:
         # Set GPU for this process
@@ -188,22 +188,25 @@ def process_single_protein(args):
         logger.info(f"[GPU {gpu_id}] Creating single_protein.csv for {protein_name}")
         single_csv_path = create_single_protein_csv(csv_file, csv_column, protein_name, protein_output_dir)
         
-        # Step 1: CIF to PT conversion
-        logger.info(f"[GPU {gpu_id}] Step 1: CIF to PT conversion for {protein_name}")
-        result = run_cif_to_pt_conversion(single_csv_path, csv_column, cif_dir)
-        
-        if result.returncode != 0:
-            logger.error(f"[GPU {gpu_id}] CIF to PT conversion failed for {protein_name}")
-            logger.error(f"[GPU {gpu_id}] STDERR: {result.stderr}")
-            return {
-                'protein': protein_name, 
-                'gpu': gpu_id, 
-                'status': 'failed', 
-                'error': f"CIF to PT conversion failed: {result.stderr}",
-                'output_dir': protein_output_dir
-            }
-        
-        logger.info(f"[GPU {gpu_id}] ✅ CIF to PT conversion completed for {protein_name}")
+        # Step 1: CIF to PT conversion (skip if PT files already exist)
+        if skip_pt_conversion:
+            logger.info(f"[GPU {gpu_id}] Skipping CIF to PT conversion for {protein_name} (--skip_pt_conversion)")
+        else:
+            logger.info(f"[GPU {gpu_id}] Step 1: CIF to PT conversion for {protein_name}")
+            result = run_cif_to_pt_conversion(single_csv_path, csv_column, cif_dir)
+
+            if result.returncode != 0:
+                logger.error(f"[GPU {gpu_id}] CIF to PT conversion failed for {protein_name}")
+                logger.error(f"[GPU {gpu_id}] STDERR: {result.stderr}")
+                return {
+                    'protein': protein_name,
+                    'gpu': gpu_id,
+                    'status': 'failed',
+                    'error': f"CIF to PT conversion failed: {result.stderr}",
+                    'output_dir': protein_output_dir
+                }
+
+            logger.info(f"[GPU {gpu_id}] ✅ CIF to PT conversion completed for {protein_name}")
         
         # Step 2: Proteina inference with adaptive batch size on OOM
         # Read persisted max_nsamples from prior OOM in this worker (if any)
@@ -300,13 +303,13 @@ def worker_init_proteina(counter, lock, num_gpus):
 # Wrapper function (must be at module level for pickling)
 def process_single_protein_wrapper(args_tuple):
     """Wrapper that uses the GPU assigned during worker init."""
-    protein_name, csv_file, csv_column, cif_dir, inference_config, usalign_path, force_compile = args_tuple
-    
+    protein_name, csv_file, csv_column, cif_dir, inference_config, usalign_path, force_compile, skip_pt_conversion = args_tuple
+
     # Get GPU ID from process-local variable set by worker_init
     gpu_id = getattr(builtins, '_worker_gpu_id', 0)
-    
+
     # Call the actual processing function
-    full_args = (protein_name, csv_file, csv_column, cif_dir, inference_config, usalign_path, gpu_id, force_compile)
+    full_args = (protein_name, csv_file, csv_column, cif_dir, inference_config, usalign_path, gpu_id, force_compile, skip_pt_conversion)
     return process_single_protein(full_args)
 
 def has_multi_char_chain_id(protein_name):
@@ -395,7 +398,7 @@ def main():
     parser = argparse.ArgumentParser(description='Parallel Proteina Inference Pipeline')
     parser.add_argument('--csv_file', required=True, help='Path to CSV file with protein data')
     parser.add_argument('--csv_column', required=True, help='Column name in CSV file to use for protein selection')
-    parser.add_argument('--cif_dir', required=True, help='Directory containing CIF files')
+    parser.add_argument('--cif_dir', default=None, help='Directory containing CIF files (not required when --skip_pt_conversion is set)')
     parser.add_argument('--inference_config', required=True, help='Inference configuration name')
     parser.add_argument('--num_gpus', type=int, default=1, help='Number of GPUs to use')
     parser.add_argument('--usalign_path', help='Path to USalign executable')
@@ -405,6 +408,11 @@ def main():
         '--force_compile',
         action='store_true',
         help='Force torch.compile during inference (default: off).',
+    )
+    parser.add_argument(
+        '--skip_pt_conversion',
+        action='store_true',
+        help='Skip CIF-to-PT conversion (use when PT files already exist, e.g. created from sequences).',
     )
     parser.add_argument(
         '--shard_index', type=int, default=None,
@@ -422,9 +430,13 @@ def main():
         logger.error(f"CSV file not found: {args.csv_file}")
         sys.exit(1)
     
-    if not os.path.exists(args.cif_dir):
-        logger.error(f"CIF directory not found: {args.cif_dir}")
-        sys.exit(1)
+    if not args.skip_pt_conversion:
+        if not args.cif_dir:
+            logger.error("--cif_dir is required when --skip_pt_conversion is not set")
+            sys.exit(1)
+        if not os.path.exists(args.cif_dir):
+            logger.error(f"CIF directory not found: {args.cif_dir}")
+            sys.exit(1)
     
     # Get protein names
     if args.skip_existing:
@@ -488,7 +500,7 @@ def main():
     
     try:
         # Submit all jobs (GPU assignment happens via worker init)
-        work_items = [(protein_name, args.csv_file, args.csv_column, args.cif_dir, args.inference_config, args.usalign_path, args.force_compile) 
+        work_items = [(protein_name, args.csv_file, args.csv_column, args.cif_dir, args.inference_config, args.usalign_path, args.force_compile, args.skip_pt_conversion)
                       for protein_name in protein_names]
         future_to_protein = {executor.submit(process_single_protein_wrapper, item): work_items[i][0] 
                             for i, item in enumerate(work_items)}

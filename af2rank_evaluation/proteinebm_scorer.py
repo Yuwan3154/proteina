@@ -342,7 +342,7 @@ def run_proteinebm_scoring_for_protein(
     protein_id: str,
     inference_output_dir: str,
     output_dir: str,
-    reference_cif: str,
+    reference_cif: str | None,
     reference_chain: str | None,
     proteinebm_config: str,
     proteinebm_checkpoint: str,
@@ -366,7 +366,9 @@ def run_proteinebm_scoring_for_protein(
     scores_csv_path = os.path.join(output_dir, f"proteinebm_scores_{protein_id}.csv")
     summary_path = os.path.join(output_dir, f"proteinebm_summary_{protein_id}.json")
 
-    ref_coords = _extract_ca_coords(reference_cif, chain_id=reference_chain)
+    ref_coords = None
+    if reference_cif is not None:
+        ref_coords = _extract_ca_coords(reference_cif, chain_id=reference_chain)
 
     start_time = time.time()
     results: List[Dict[str, object]] = []
@@ -379,8 +381,16 @@ def run_proteinebm_scoring_for_protein(
             template_self_condition=template_self_condition,
             device=device,
         )
-        decoy_coords = _extract_ca_coords(str(pdb_path), chain_id=None)
-        tm_out = tmscore_ca_coords(ref_coords, decoy_coords)
+        if ref_coords is not None:
+            decoy_coords = _extract_ca_coords(str(pdb_path), chain_id=None)
+            tm_out = tmscore_ca_coords(ref_coords, decoy_coords)
+            tm_ref = tm_out["tms"]
+            rmsd_ref = tm_out["rms"]
+            gdt_ref = tm_out["gdt"]
+        else:
+            tm_ref = float("nan")
+            rmsd_ref = float("nan")
+            gdt_ref = float("nan")
         results.append(
             {
                 "protein_id": protein_id,
@@ -388,9 +398,9 @@ def run_proteinebm_scoring_for_protein(
                 "structure_path": str(pdb_path),
                 "t": t,
                 "energy": energy,
-                "tm_ref_template": tm_out["tms"],
-                "rmsd_ref_template": tm_out["rms"],
-                "gdt_ref_template": tm_out["gdt"],
+                "tm_ref_template": tm_ref,
+                "rmsd_ref_template": rmsd_ref,
+                "gdt_ref_template": gdt_ref,
             }
         )
 
@@ -420,7 +430,7 @@ def run_proteinebm_scoring_for_protein(
     top_1_tm_ref_template = None
     top_5_tm_ref_template = None
 
-    if len(successful) > 1:
+    if ref_coords is not None and len(successful) > 1:
         tm_vals = [float(r["tm_ref_template"]) for r in successful]
         score_vals = [-float(r["energy"]) for r in successful]  # higher is better
 
@@ -443,7 +453,7 @@ def run_proteinebm_scoring_for_protein(
         "successful_scores": len(results),
         "runtime_seconds": runtime_s,
         "t": t,
-        "reference_structure": os.path.abspath(os.path.expanduser(reference_cif)),
+        "reference_structure": os.path.abspath(os.path.expanduser(reference_cif)) if reference_cif else None,
         "chain": reference_chain,
         "proteinebm_config": os.path.abspath(os.path.expanduser(proteinebm_config)),
         "proteinebm_checkpoint": os.path.abspath(os.path.expanduser(proteinebm_checkpoint)),
@@ -470,7 +480,7 @@ def run_proteinebm_scoring_for_protein(
 def main():
     parser = argparse.ArgumentParser(description="ProteinEBM scoring for Proteina decoys (single-pass energy)")
     parser.add_argument("--protein_id", required=True, help="Protein identifier (e.g. 1a2y_C)")
-    parser.add_argument("--reference_cif", required=True, help="Path to native/reference CIF (for TMscore ground-truth)")
+    parser.add_argument("--reference_cif", default=None, help="Path to native/reference CIF (for TMscore ground-truth). Optional; if omitted, TM-score metrics are skipped.")
     parser.add_argument("--chain", default=None, help="Chain ID in reference CIF (default: taken from protein_id if possible)")
     parser.add_argument("--inference_output_dir", required=True, help="Directory containing decoy PDB files")
     parser.add_argument("--output_dir", required=True, help="Directory to write proteinebm_analysis outputs")

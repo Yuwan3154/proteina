@@ -45,14 +45,15 @@ def _find_proteinebm_scores(inference_dir: str, analysis_subdir: str = "proteine
     return sorted(base.glob(f"*/{analysis_subdir}/proteinebm_scores_*.csv"))
 
 
-def _read_proteinebm_summary(summary_path: Path) -> Dict[str, str]:
+def _read_proteinebm_summary(summary_path: Path) -> Dict[str, str | None]:
     with summary_path.open("r") as f:
         summary = json.load(f)
     ref = summary.get("reference_structure")
     chain = summary.get("chain")
-    if not ref or not chain:
-        raise ValueError(f"Missing reference_structure/chain in {summary_path}")
-    return {"reference_structure": str(ref), "chain": str(chain)}
+    return {
+        "reference_structure": str(ref) if ref else None,
+        "chain": str(chain) if chain else None,
+    }
 
 
 def _select_topk_templates(scores_csv: Path, top_k: int) -> pd.DataFrame:
@@ -399,6 +400,11 @@ def _process_one_protein(
     chain = meta["chain"]
 
     topk_df = _select_topk_templates(scores_csv_path, top_k)
+
+    # If no ground-truth reference, use best-energy template as reference (for sequence extraction only)
+    if reference_cif is None or not os.path.exists(str(reference_cif)):
+        reference_cif = str(topk_df.iloc[0]["structure_path"])
+        chain = "A"
     staged_dir = protein_out_dir / "staged_topk_templates"
     desired = set([Path(str(p)).name for p in topk_df["structure_path"].tolist()])
     staged_filenames = desired
