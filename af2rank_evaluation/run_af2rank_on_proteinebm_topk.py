@@ -184,10 +184,10 @@ def _batch_reconstruct_ca_only(staged_dir: Path) -> Dict[str, str]:
     with open(inputs_json, "w") as f:
         json.dump(ca_only, f)
 
-    cue_python = "/home/ubuntu/miniforge3/envs/cue_openfold/bin/python"
+    wrapper_script = str(Path(__file__).parent / "run_with_proteina_env.sh")
     script = str(Path(__file__).parent / "cg2all_reconstruct.py")
     subprocess.run(
-        [cue_python, script, "--inputs", inputs_json, "--output_dir", tmp_dir, "--output_map", output_map_json],
+        [wrapper_script, "python", script, "--inputs", inputs_json, "--output_dir", tmp_dir, "--output_map", output_map_json],
         check=True,
         timeout=600,
     )
@@ -213,8 +213,9 @@ def _run_af2rank_subprocess(
     if cuda_visible_devices.strip():
         cuda_line = f"os.environ['CUDA_VISIBLE_DEVICES'] = {cuda_visible_devices!r}\n"
 
+    wrapper_dir = str(Path(__file__).parent)
     if backend == "openfold":
-        python_exe = "/home/ubuntu/miniforge3/envs/cue_openfold/bin/python"
+        wrapper_script = os.path.join(wrapper_dir, "run_with_proteina_env.sh")
         py = f"""
 import os
 import sys
@@ -274,7 +275,7 @@ plot_scores = [s for s in all_scores if s.get("structure_file") in staged_filena
 plot_af2rank_results(plot_scores, output_dir, protein_id)
 """
     else:
-        python_exe = "/home/ubuntu/miniforge3/envs/colabdesign/bin/python"
+        wrapper_script = os.path.join(wrapper_dir, "run_with_colabdesign_env.sh")
         allatom_map_repr = repr(allatom_map or {})
         py = f"""
 import os
@@ -343,8 +344,8 @@ plot_af2rank_results(plot_scores, output_dir, protein_id)
 """
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    cmd = [python_exe, "-c", py]
-    subprocess.run(cmd, cwd="/home/ubuntu/proteina/af2rank_evaluation", check=True)
+    cmd = [wrapper_script, "python", "-c", py]
+    subprocess.run(cmd, cwd=wrapper_dir, check=True)
 
 
 def _plot_scatter(

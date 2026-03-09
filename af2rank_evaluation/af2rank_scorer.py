@@ -480,12 +480,9 @@ def _reconstruct_ca_only_pdbs(pdb_files):
         with open(input_json, 'w') as f:
             json.dump(pdb_files, f)
 
-        # conda run is unreliable across env boundaries; use direct python path
-        cue_python = "/home/ubuntu/miniforge3/envs/cue_openfold/bin/python"
-        if not os.path.exists(cue_python):
-            cue_python = "python"  # fallback to current env
+        wrapper_script = os.path.join(_AF2RANK_EVAL_DIR, "run_with_proteina_env.sh")
         cmd = [
-            cue_python, reconstruct_script,
+            wrapper_script, "python", reconstruct_script,
             "--inputs", input_json,
             "--output_dir", tmp_dir,
             "--output_map", output_map_json,

@@ -1,7 +1,7 @@
-#!/home/ubuntu/miniforge3/envs/cue_openfold/bin/python
+#!/usr/bin/env python3
 """
 Parity test: Compare OpenFold vs ColabDesign AF2Rank scoring on the same decoys.
-Run with: /home/ubuntu/miniforge3/envs/cue_openfold/bin/python test_parity.py
+Run with: ./run_with_proteina_env.sh python test_parity.py
 
 This script:
 1. Scores 3 decoys with OpenFold (model_1_ptm and model_2_ptm)
@@ -103,11 +103,10 @@ print(json.dumps(results))
     print(f"ColabDesign scoring ({model_name}) - {len(decoy_pdbs)} decoys")
     print(f"{'='*60}")
 
-    wrapper = "/home/ubuntu/proteina/af2rank_evaluation/run_with_colabdesign_env.sh"
-    colabdesign_python = "/home/ubuntu/miniforge3/envs/colabdesign/bin/python"
+    wrapper = os.path.join(os.path.dirname(__file__), "run_with_colabdesign_env.sh")
     result = subprocess.run(
-        [wrapper, colabdesign_python, "-c", py_code],
-        cwd="/home/ubuntu/proteina/af2rank_evaluation",
+        [wrapper, "python", "-c", py_code],
+        cwd=os.path.dirname(__file__),
         capture_output=True, text=True, timeout=600,
     )
 

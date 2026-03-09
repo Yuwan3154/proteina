@@ -1,4 +1,4 @@
-#!/home/ubuntu/miniforge3/envs/colabdesign/bin/python
+#!/usr/bin/env python3
 """
 Diagnostic script to inspect ColabDesign template features for CA-only vs all-atom PDBs.
 
@@ -46,10 +46,9 @@ def reconstruct_via_cg2all(pdb_file):
     output_map = os.path.join(tmp_dir, "output_map.json")
     with open(input_json, 'w') as f:
         json.dump([pdb_file], f)
-    # Use direct python path - conda run is unreliable across env boundaries
-    cue_python = "/home/ubuntu/miniforge3/envs/cue_openfold/bin/python"
+    wrapper_script = os.path.join(SCRIPT_DIR, "run_with_proteina_env.sh")
     cmd = [
-        cue_python, os.path.join(SCRIPT_DIR, "cg2all_reconstruct.py"),
+        wrapper_script, "python", os.path.join(SCRIPT_DIR, "cg2all_reconstruct.py"),
         "--inputs", input_json,
         "--output_dir", tmp_dir,
         "--output_map", output_map,

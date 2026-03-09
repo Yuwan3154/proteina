@@ -1,0 +1,50 @@
+# Mixed PDB + d_FS dataset config with ext_lig and TED fold labels.
+#
+# NOTE: Full PDB+d_FS mixed training with combined sequence-similarity clustering
+# requires the multi-source datamodule (planned). This config uses d_FS as the
+# primary dataset with TED CATH labels and ext_lig. PDB and d_FS .pt files both
+# include ext_lig (PDB: computed from full deposit; d_FS: all unknown).
+#
+# To add PDB data: ensure PDB .pt files have ext_lig (run backfill_ext_lig.py
+# if needed), then use a combined data_dir or the multi-source datamodule when
+# available.
+#
+# Prerequisites:
+# - d_FS data: bash script_utils/download_afdb_data.sh $DATA_PATH/d_FS/d_FS_index.txt $DATA_PATH/d_FS
+# - TED domain summary: ted_365m.domain_summary.cath.globularity.taxid.tsv at $DATA_PATH/d_FS/
+# - Shared CATH mapping: $DATA_PATH/cath_shared/cath_label_mapping.pt (build via build_shared_cath_mapping.py)
+
+datamodule:
+  _target_: "proteinfoundation.datasets.pdb_data.PDBLightningDataModule"
+  data_dir: ${oc.env:DATA_PATH}/d_FS/
+  in_memory: False
+  format: "pdb"
+  overwrite: False
+  regenerate_missing: True
+  cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/
+  multilabel_mode: "sample"
+  batch_padding: True
+  sampling_mode: "cluster-random"
+  transforms:
+    - _target_: "proteinfoundation.datasets.transforms.GlobalRotationTransform"
+    - _target_: "proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform"
+    - _target_: "proteinfoundation.datasets.transforms.TEDLabelTransform"
+      file_path: ${oc.env:DATA_PATH}/d_FS/ted_365m.domain_summary.cath.globularity.taxid.tsv
+      pkl_path: ${oc.env:DATA_PATH}/d_FS/afdb_to_cath_ted.pkl
+    - _target_: "proteinfoundation.datasets.transforms.CATHToIndicesTransform"
+      cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/
+    - _target_: "proteinfoundation.datasets.transforms.DSSPTargetTransform"
+    - _target_: "proteinfoundation.datasets.transforms.PaddingTransform"
+      max_size: 256
+  batch_size: 8
+  num_workers: 32
+  pin_memory: True
+  prefetch_factor: 2
+
+  datasplitter:
+    _target_: "proteinfoundation.datasets.pdb_data.PDBDataSplitter"
+    data_dir: ${oc.env:DATA_PATH}/d_FS/
+    train_val_test: [0.98, 0.019, 0.001]
+    split_type: "sequence_similarity"
+    split_sequence_similarity: 0.25
+    overwrite_sequence_clusters: False

@@ -111,11 +111,10 @@ print(json.dumps(results))
     print(f"ColabDesign scoring ({model_name}) - {len(decoy_pdbs)} decoys")
     print(f"{'='*70}")
 
-    wrapper = "/home/ubuntu/proteina/af2rank_evaluation/run_with_colabdesign_env.sh"
-    colabdesign_python = "/home/ubuntu/miniforge3/envs/colabdesign/bin/python"
+    wrapper = os.path.join(os.path.dirname(__file__), "run_with_colabdesign_env.sh")
     result = subprocess.run(
-        [wrapper, colabdesign_python, "-c", py_code],
-        cwd="/home/ubuntu/proteina/af2rank_evaluation",
+        [wrapper, "python", "-c", py_code],
+        cwd=os.path.dirname(__file__),
         capture_output=True, text=True, timeout=600,
     )
 
