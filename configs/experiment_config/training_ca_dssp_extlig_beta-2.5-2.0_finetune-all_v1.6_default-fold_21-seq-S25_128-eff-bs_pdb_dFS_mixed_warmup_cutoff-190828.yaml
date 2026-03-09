@@ -42,7 +42,7 @@ model:
     # ext_lig: per-residue external-ligand-context embedding (0=absent, 1=present, 2=unknown)
     ext_lig_emb_init_seq: True
     ext_lig_emb_cond_seq: True
-    ext_lig_emb_dim: 16
+    ext_lig_emb_dim: 3
 
 # Dataset: mixed PDB+d_FS (d_FS with TED + ext_lig; see dataset config for full mixed setup)
 dataset: pdb_dFS_mixed_S25_max256
