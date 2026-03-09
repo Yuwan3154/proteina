@@ -1,13 +1,13 @@
 # Inference config: seq-conditioned sampling for mixed PDB+d_FS ext_lig model.
-# Checkpoint from training_ca_dssp_beta-2.5-2.0_finetune-all_v1.6_default-fold_21-seq-S25_128-eff-bs_pdb_dFS_mixed_extlig_warmup_cutoff-190828.
+# Checkpoint from training_ca_dssp_extlig_beta-2.5-2.0_finetune-all_v1.6_default-fold_21-seq-S25_128-eff-bs_pdb_dFS_mixed_warmup_cutoff-190828.
 # ext_lig_default: "unknown" for unconditional-style generation; "absent" for apo/ligand-free.
 
 defaults:
   - inference_base
   - _self_
 
-run_name_: seq_cond_pdb_dFS_mixed_extlig
-ckpt_name: ca_dssp_beta-2.5-2.0_finetune-all_v1.6_default-fold_21-seq-S25_128-eff-bs_pdb_dFS_mixed_extlig_warmup_cutoff-190828_last.ckpt
+run_name_: seq_cond_pdb_dFS_mixed
+ckpt_name: ca_dssp_extlig_beta-2.5-2.0_finetune-all_v1.6_default-fold_21-seq-S25_128-eff-bs_pdb_dFS_mixed_warmup_cutoff-190828_last.ckpt
 
 self_cond: True
 fold_cond: False

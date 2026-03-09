@@ -1,8 +1,8 @@
 # Training config: mixed PDB+d_FS dataset with ext_lig feature and DSSP aux loss.
-# Uses pdb_dFS_mixed_S25_max256_extlig dataset (d_FS with TED CATH + ext_lig).
+# Uses pdb_dFS_mixed_S25_max256 dataset (d_FS with TED CATH + ext_lig).
 # Model includes ext_lig embedding for ligand-context conditioning.
 
-run_name_: ca_dssp_beta-2.5-2.0_finetune-all_v1.6_default-fold_21-seq-S25_128-eff-bs_pdb_dFS_mixed_extlig_warmup_cutoff-190828
+run_name_: ca_dssp_extlig_beta-2.5-2.0_finetune-all_v1.6_default-fold_21-seq-S25_128-eff-bs_pdb_dFS_mixed_warmup_cutoff-190828
 pretrain_ckpt_path: ~/proteina/data/weights/proteina_v1.6_DFS_200M_notri_long_chain_generation.ckpt
 
 hardware:
@@ -45,7 +45,7 @@ model:
     ext_lig_emb_dim: 16
 
 # Dataset: mixed PDB+d_FS (d_FS with TED + ext_lig; see dataset config for full mixed setup)
-dataset: pdb_dFS_mixed_S25_max256_extlig
+dataset: pdb_dFS_mixed_S25_max256
 dataset_config_subdir: mixed
 
 force_precision_f32: False
