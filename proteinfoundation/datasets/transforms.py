@@ -651,6 +651,12 @@ class TEDLabelTransform(T.BaseTransform):
 
     The boundary-only file ``ted_365m_domain_boundaries_consensus_level.tsv`` has only
     3 columns and does **not** contain CATH labels; using it here will raise an error.
+
+    Cache strategy: on first run the full TSV (or existing chunked pickles) is filtered
+    down to only the sample IDs present in ``processed/`` next to ``pkl_path``, and saved
+    as a single small ``<pkl_path>.subset`` file.  Subsequent startups load only that file,
+    which is orders of magnitude faster and smaller than the original chunked pickles.
+    The old chunked ``<pkl_path>.N`` files are removed after a successful subset build.
     """
 
     _MIN_COLUMNS_FOR_CATH = 14  # column index 13 must exist
@@ -667,16 +673,48 @@ class TEDLabelTransform(T.BaseTransform):
         Args:
             file_path (str): Path to the TED domain summary file containing CATH labels.
                 Supports plain ``.tsv`` and gzip-compressed ``.tsv.gz``.
-            pkl_path (str): Base path for storing chunked pickle files of processed data.
-                These are auto-generated caches; they do not need to be downloaded.
-            chunk_size (int): Maximum number of samples to store in each pickle chunk.
-                Defaults to 50000000.
+            pkl_path (str): Base path (legacy chunked-pickle path).  A ``<pkl_path>.subset``
+                file is used as the fast single-file cache.
+            chunk_size (int): Unused; kept for backward-compatible configs.
         """
         self.file_path = file_path
-        self.pkl_path = pkl_path
+        self.pkl_path = str(pkl_path)
         self.chunk_size = chunk_size
         self.sample_to_cath = {}
         self._process_file()
+
+    # ------------------------------------------------------------------
+    # Path helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def _subset_path(self):
+        return f"{self.pkl_path}.subset"
+
+    def _chunked_pkl_exists(self):
+        return os.path.exists(f"{self.pkl_path}.0")
+
+    def _subset_exists(self):
+        return os.path.exists(self._subset_path)
+
+    # ------------------------------------------------------------------
+    # Dataset ID discovery
+    # ------------------------------------------------------------------
+
+    def _get_dataset_ids(self):
+        """Return the set of sample IDs present in processed/ next to pkl_path.
+
+        Returns None when the directory does not exist (fall back to full cache).
+        """
+        processed_dir = Path(self.pkl_path).parent / "processed"
+        if not processed_dir.exists():
+            return None
+        ids = {p.stem for p in processed_dir.glob("*.pt")}
+        return ids if ids else None
+
+    # ------------------------------------------------------------------
+    # TSV helpers
+    # ------------------------------------------------------------------
 
     def _open_tsv(self):
         """Return a line iterator for the TSV file, supporting .gz transparently."""
@@ -710,73 +748,109 @@ class TEDLabelTransform(T.BaseTransform):
                     )
                 return
 
+    # ------------------------------------------------------------------
+    # Cache build / load
+    # ------------------------------------------------------------------
+
     def _process_file(self):
-        if self._pickle_exists():
-            logger.info("AFDB CATH data already processed, loading now")
-            self._load_pickles()
+        if self._subset_exists():
+            logger.info(f"Loading AFDB CATH subset cache from {self._subset_path}")
+            with open(self._subset_path, "rb") as f:
+                self.sample_to_cath = pickle.load(f)
+            logger.info(f"Loaded {len(self.sample_to_cath)} entries from subset cache.")
+
+        elif self._chunked_pkl_exists():
+            dataset_ids = self._get_dataset_ids()
+            if dataset_ids is None:
+                # processed/ is empty — data hasn't been processed yet.
+                # Don't load 8+ GB of pickles against an empty whitelist; CATH labels
+                # will simply be absent this run (same as missing label).  The subset
+                # cache will be built on the next run once processed/ has .pt files.
+                logger.info(
+                    "AFDB CATH: no processed .pt files found yet — skipping pickle load. "
+                    "CATH labels will be empty this run; subset cache will be built next run."
+                )
+                return
+            logger.info(
+                f"Migrating chunked AFDB CATH pickles → subset cache "
+                f"(keeping {len(dataset_ids)} dataset entries)."
+            )
+            self._load_chunked_pickles(filter_ids=dataset_ids)
+            self._save_subset()
+            self._delete_chunked_pickles()
+
         else:
-            logger.info("AFDB CATH data not processed yet, processing now")
+            dataset_ids = self._get_dataset_ids()
+            if dataset_ids is None:
+                logger.info(
+                    "AFDB CATH: no processed .pt files and no cache — skipping. "
+                    "CATH labels will be empty this run; cache will be built next run."
+                )
+                return
+            logger.info(
+                f"Building AFDB CATH subset cache from TSV "
+                f"(keeping {len(dataset_ids)} dataset entries)."
+            )
             self._validate_schema()
-            self._create_pickles()
-            self._load_pickles()
+            self._build_from_tsv(filter_ids=dataset_ids)
+            self._save_subset()
 
-    def _pickle_exists(self):
-        return os.path.exists(f"{self.pkl_path}.0")
-
-    def _create_pickles(self):
-        """Process input file and create chunked pickle files mapping sample IDs to CATH codes."""
-        sample_to_cath = {}
-        counter = 0
+    def _load_chunked_pickles(self, filter_ids=None):
         chunk_counter = 0
-        with self._open_tsv() as file:
-            for line in file:
+        while os.path.exists(f"{self.pkl_path}.{chunk_counter}"):
+            logger.info(f"  Loading chunk {chunk_counter}…")
+            with open(f"{self.pkl_path}.{chunk_counter}", "rb") as f:
+                chunk = pickle.load(f)
+            if filter_ids is not None:
+                chunk = {k: v for k, v in chunk.items() if k in filter_ids}
+            self.sample_to_cath.update(chunk)
+            chunk_counter += 1
+
+    def _build_from_tsv(self, filter_ids=None):
+        counter = 0
+        with self._open_tsv() as fh:
+            for line in fh:
                 parts = line.strip().split("\t")
                 if len(parts) < self._MIN_COLUMNS_FOR_CATH:
                     continue
                 full_sample_id = parts[0]
-                cath_codes = parts[13].split(",") if parts[13] != "-" else []
+                cath_codes_str = parts[13]
+                if cath_codes_str == "-":
+                    continue
                 sample_id = "_".join(full_sample_id.split("_")[:-1])
-                if cath_codes:
-                    if sample_id not in sample_to_cath:
-                        sample_to_cath[sample_id] = []
-                        counter += 1
-                        if counter % 1000000 == 0:
-                            logger.info(f"Processed {counter} samples.")
-                    sample_to_cath[sample_id].extend(cath_codes)
-                if counter == self.chunk_size:
-                    self._save_pickle(sample_to_cath, chunk_counter)
-                    chunk_counter += 1
-                    counter = 0
-                    sample_to_cath = {}
-        if sample_to_cath:
-            self._save_pickle(sample_to_cath, chunk_counter)
+                if filter_ids is not None and sample_id not in filter_ids:
+                    continue
+                cath_codes = cath_codes_str.split(",")
+                if sample_id not in self.sample_to_cath:
+                    self.sample_to_cath[sample_id] = []
+                    counter += 1
+                    if counter % 100000 == 0:
+                        logger.info(f"  Collected {counter} matching entries…")
+                self.sample_to_cath[sample_id].extend(cath_codes)
 
-    def _save_pickle(self, sample_to_cath, chunk_counter):
-        """Save data to a pickle file with chunk number suffix.
+    def _save_subset(self):
+        with open(self._subset_path, "wb") as f:
+            pickle.dump(self.sample_to_cath, f, protocol=pickle.HIGHEST_PROTOCOL)
+        size_mb = os.path.getsize(self._subset_path) / 1e6
+        logger.info(
+            f"Saved AFDB CATH subset cache: {len(self.sample_to_cath)} entries, "
+            f"{size_mb:.1f} MB → {self._subset_path}"
+        )
 
-        Args:
-            sample_to_cath (dict): The data to be saved in pickle format.
-            chunk_counter (int): Counter used to create unique file names for chunks.
-
-        Returns:
-            None
-
-        Note:
-            The function creates a pickle file with name pattern {self.pkl_path}.{chunk_counter}
-            where chunk_counter is appended to the base pickle path.
-        """
-        pkl_path = f"{self.pkl_path}.{chunk_counter}"
-        with open(pkl_path, "wb") as pkl_file:
-            pickle.dump(sample_to_cath, pkl_file)
-
-    def _load_pickles(self):
-        """Load pickles from disk and merge them into one dictionary."""
+    def _delete_chunked_pickles(self):
         chunk_counter = 0
+        deleted = []
         while os.path.exists(f"{self.pkl_path}.{chunk_counter}"):
-            with open(f"{self.pkl_path}.{chunk_counter}", "rb") as pkl_file:
-                chunk_data = pickle.load(pkl_file)
-                self.sample_to_cath.update(chunk_data)
+            path = f"{self.pkl_path}.{chunk_counter}"
+            os.remove(path)
+            deleted.append(path)
             chunk_counter += 1
+        if deleted:
+            logger.info(f"Deleted {len(deleted)} legacy chunked pickle file(s).")
+
+    # ------------------------------------------------------------------
+    # Transform
+    # ------------------------------------------------------------------
 
     def forward(self, graph: Data) -> Data:
         """Call transform on sample.

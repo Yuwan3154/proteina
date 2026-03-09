@@ -21,6 +21,7 @@ datamodule:
   format: "pdb"
   overwrite: False
   regenerate_missing: True
+  max_samples: 128  # Limit for testing; set to null for full dataset
   cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/
   multilabel_mode: "sample"
   batch_padding: True

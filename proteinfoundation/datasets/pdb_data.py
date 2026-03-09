@@ -27,7 +27,10 @@ import torch_geometric.data.data as tgd
 from torch.serialization import add_safe_globals
 from tqdm import tqdm
 
-from proteinfoundation.openfold_stub.np.residue_constants import resname_to_idx
+from proteinfoundation.openfold_stub.np.residue_constants import resname_to_idx, restypes
+
+# One-letter codes for residue_type indices (0-19 standard, 20=UNK)
+_RESIDUE_TYPE_TO_ONE_LETTER = restypes + ["X"]
 from proteinfoundation.datasets.base_data import BaseLightningDataModule
 from proteinfoundation.utils.cluster_utils import (
     cluster_sequences,
@@ -743,6 +746,8 @@ class PDBLightningDataModule(BaseLightningDataModule):
         prefetch_factor: int = 2,
         # Overfit testing: filter dataset to specific PDB chains
         overfit_pdb_chains: Optional[List[str]] = None,
+        # Limit samples for testing (custom folder only; avoids processing full dataset)
+        max_samples: Optional[int] = None,
         **kwargs,
     ):
         """Initializes the PDBLightningDataModule.
@@ -815,6 +820,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
         self.store_bfactor = store_bfactor
         self.use_multiprocessing = use_multiprocessing
         self.overfit_pdb_chains = overfit_pdb_chains
+        self.max_samples = max_samples
         self.df_data = None
         self.dfs_splits = None
         self.clusterid_to_seqid_mappings = None
@@ -895,7 +901,11 @@ class PDBLightningDataModule(BaseLightningDataModule):
                         f"{df_data_name} exists but missing processed_length column; adding it."
                     )
                     df_data = pd.read_csv(csv_path)
+                    if self.max_samples is not None:
+                        df_data = df_data.head(self.max_samples)
+                        rank_zero_info(f"Limiting to {len(df_data)} samples (max_samples={self.max_samples})")
                     df_data = self._filter_processed_by_length(df_data, id_col="id")
+                    df_data = self._add_sequence_from_processed(df_data, id_col="id")
                     df_data.to_csv(csv_path, index=False)
 
             elif not self.overwrite and csv_path.exists() and self.regenerate_missing:
@@ -903,16 +913,23 @@ class PDBLightningDataModule(BaseLightningDataModule):
                     f"{df_data_name} exists; regenerate_missing=True, regenerating missing .pt files."
                 )
                 df_data = pd.read_csv(csv_path)
+                if self.max_samples is not None:
+                    df_data = df_data.head(self.max_samples)
+                    rank_zero_info(f"Limiting to {len(df_data)} samples (max_samples={self.max_samples})")
                 newly_processed = self._process_structure_data(
                     pdb_codes=df_data["pdb"].tolist(),
                     chains=None,
                 )
                 stems_to_recompute = [f.replace(".pt", "") for f in newly_processed] if newly_processed else None
                 df_data = self._filter_processed_by_length(df_data, id_col="id", stems_to_recompute=stems_to_recompute)
+                df_data = self._add_sequence_from_processed(df_data, id_col="id")
                 df_data.to_csv(csv_path, index=False)
             else:
                 rank_zero_info(f"{df_data_name} does not exist yet, creating dataset now.")
                 df_data = self._load_pdb_folder_data(self.raw_dir)
+                if self.max_samples is not None:
+                    df_data = df_data.head(self.max_samples)
+                    rank_zero_info(f"Limiting to {len(df_data)} samples (max_samples={self.max_samples})")
                 has_processed = any(self.processed_dir.glob("*.pt"))
                 newly_processed = []
                 if self.overwrite or not has_processed or self.regenerate_missing:
@@ -924,6 +941,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
                     rank_zero_info("Detected existing processed files; skipping reprocessing and using existing .pt files only.")
                 stems_to_recompute = [f.replace(".pt", "") for f in newly_processed] if newly_processed else None
                 df_data = self._filter_processed_by_length(df_data, id_col="id", stems_to_recompute=stems_to_recompute)
+                df_data = self._add_sequence_from_processed(df_data, id_col="id")
                 rank_zero_info(f"Saving dataset csv to {df_data_name}")
                 df_data.to_csv(csv_path, index=False)
             
@@ -1020,6 +1038,36 @@ class PDBLightningDataModule(BaseLightningDataModule):
 
         rank_zero_info(f"Filtered dataset from {len(df_data)} to {len(df_filtered)} samples")
         return df_filtered
+
+    def _add_sequence_from_processed(
+        self, df_data: pd.DataFrame, id_col: str = "id"
+    ) -> pd.DataFrame:
+        """Add 'sequence' column from processed .pt files (residue_type -> one-letter codes).
+        Required for sequence_similarity split on custom-folder datasets."""
+        add_safe_globals([tgd.Data])
+        sequences = []
+        for sid in df_data[id_col].astype(str):
+            path = self.processed_dir / f"{sid}.pt"
+            if not path.exists():
+                sequences.append("")
+                continue
+            try:
+                data = torch.load(path, map_location="cpu", weights_only=False)
+                rt = getattr(data, "residue_type", None)
+                if rt is None:
+                    sequences.append("")
+                    continue
+                idx = rt.tolist() if hasattr(rt, "tolist") else list(rt)
+                seq = "".join(
+                    _RESIDUE_TYPE_TO_ONE_LETTER[i] if i < len(_RESIDUE_TYPE_TO_ONE_LETTER) else "X"
+                    for i in idx
+                )
+                sequences.append(seq)
+            except Exception:
+                sequences.append("")
+        df_data = df_data.copy()
+        df_data["sequence"] = sequences
+        return df_data
 
     @staticmethod
     def _get_length_from_pt(stem: str, processed_dir: pathlib.Path) -> Tuple[str, Optional[int]]:
@@ -1119,6 +1167,21 @@ class PDBLightningDataModule(BaseLightningDataModule):
             df_data_name = f"{file_identifier}.csv"
             rank_zero_info(f"Loading dataset csv from {df_data_name}")
             self.df_data = pd.read_csv(self.data_dir / df_data_name)
+
+        # Apply max_samples for custom folder (e.g. testing on limited disk)
+        if not self.dataselector and self.max_samples is not None:
+            self.df_data = self.df_data.head(self.max_samples)
+            rank_zero_info(f"Limiting to {len(self.df_data)} samples (max_samples={self.max_samples})")
+
+        # Custom-folder datasets need 'sequence' for sequence_similarity split; add from .pt if missing
+        if not self.dataselector and "sequence" not in self.df_data.columns:
+            rank_zero_info("Adding 'sequence' column from processed .pt files for clustering.")
+            self.df_data = self._add_sequence_from_processed(self.df_data, id_col="id")
+            # Drop rows with empty sequence (failed to load)
+            before = len(self.df_data)
+            self.df_data = self.df_data[self.df_data["sequence"].str.len() > 0]
+            if len(self.df_data) < before:
+                rank_zero_info(f"Dropped {before - len(self.df_data)} rows with empty sequence.")
 
         # Apply overfit_pdb_chains filter BEFORE splitting to avoid issues with samples
         # ending up in different splits. This ensures all splits contain the same samples.
