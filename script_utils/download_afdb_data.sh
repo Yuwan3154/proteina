@@ -33,10 +33,7 @@ command_exists() {
 if command_exists aria2c; then
     temp_input=$(mktemp)
     while read -r filename; do
-        # EBI retired model_v4; serve the same entry under its latest version URL
-        # but keep the local filename matching the index ID for consistency.
-        url_filename="${filename/model_v4/model_v6}"
-        echo "https://alphafold.ebi.ac.uk/files/${url_filename}.pdb"
+        echo "https://alphafold.ebi.ac.uk/files/${filename}.pdb"
         echo "  out=raw/${filename}.pdb"
     done < "$index_file" > "$temp_input"
 
@@ -67,11 +64,9 @@ else
 
     while read -r filename; do
         output_file="raw/${filename}.pdb"
-        # EBI retired model_v4; serve the same entry under its latest version URL
-        url_filename="${filename/model_v4/model_v6}"
         if [ ! -f "$output_file" ]; then
             echo "Downloading: $filename"
-            $download_cmd "$output_file" "https://alphafold.ebi.ac.uk/files/${url_filename}.pdb"
+            $download_cmd "$output_file" "https://alphafold.ebi.ac.uk/files/${filename}.pdb"
         fi
     done < "$index_file"
 fi
