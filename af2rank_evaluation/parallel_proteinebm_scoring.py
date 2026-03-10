@@ -11,18 +11,17 @@ Outputs (per protein):
 """
 
 import argparse
-import builtins
 import csv
 import json
 import logging
-import multiprocessing as mp
 import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+from typing import Dict, List
 
 
 def _terminate_process_group(signum: int) -> None:
@@ -148,117 +147,99 @@ def find_proteins_needing_proteinebm(csv_file: str, csv_column: str, inference_c
     return proteins_needing_work
 
 
-def run_proteinebm_scoring_subprocess(
-    protein_name: str,
-    inference_output_dir: str,
-    reference_cif: str | None,
+def _get_protein_length(inference_output_dir: str, protein_name: str) -> int:
+    """Fast protein length estimate by counting CA atoms in the first available PDB."""
+    pdb_files = sorted(Path(inference_output_dir).glob(f"{protein_name}_*.pdb"))
+    if not pdb_files:
+        return 0
+    count = 0
+    with open(pdb_files[0]) as f:
+        for line in f:
+            if line.startswith("ATOM") and line[12:16].strip() == "CA":
+                count += 1
+    return count
+
+
+def _build_protein_configs(
+    protein_names: List[str],
+    cif_dir: str | None,
+    inference_config: str,
+    analysis_subdir: str,
+) -> List[Dict]:
+    """Build per-protein config dicts, sorted by sequence length (ascending)."""
+    configs = []
+    for protein_name in protein_names:
+        inference_output_dir = generate_protein_output_dir(inference_config, protein_name)
+        if not os.path.exists(inference_output_dir):
+            logger.warning(f"Inference directory not found, skipping: {inference_output_dir}")
+            continue
+        reference_cif = None
+        reference_chain = None
+        if cif_dir is not None:
+            try:
+                reference_cif = find_reference_cif(protein_name, cif_dir)
+                if "_" in protein_name:
+                    reference_chain = protein_name.split("_", 1)[1]
+            except FileNotFoundError as e:
+                logger.warning(f"CIF not found for {protein_name}: {e}")
+        output_dir = os.path.join(inference_output_dir, analysis_subdir)
+        length = _get_protein_length(inference_output_dir, protein_name)
+        configs.append({
+            "protein_id": protein_name,
+            "inference_output_dir": inference_output_dir,
+            "output_dir": output_dir,
+            "reference_cif": reference_cif,
+            "reference_chain": reference_chain,
+            "length": length,
+        })
+
+    # Sort by length ascending so the batch_size_cache in the scorer is maximally effective
+    configs.sort(key=lambda c: c["length"])
+    return configs
+
+
+def run_gpu_worker_subprocess(
+    gpu_id: int,
+    protein_configs: List[Dict],
     proteinebm_config: str,
     proteinebm_checkpoint: str,
     template_self_condition: bool,
-    analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
-    t: float = 0.05,
-):
+    t: float,
+    batch_size: int,
+) -> subprocess.CompletedProcess:
+    """Spawn one proteinebm_scorer.py subprocess for a single GPU, processing all
+    assigned proteins in a single model load (multi-protein mode)."""
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+    json.dump(protein_configs, tmp)
+    tmp.flush()
+    proteins_json_path = tmp.name
+    tmp.close()
+
     wrapper_script = os.path.join(PROTEINA_BASE_DIR, "af2rank_evaluation", "run_with_proteinebm_env.sh")
     scorer_script = os.path.join(PROTEINA_BASE_DIR, "af2rank_evaluation", "proteinebm_scorer.py")
-    output_dir = os.path.join(inference_output_dir, analysis_subdir)
 
     cmd = [
-        wrapper_script,
-        "python",
-        scorer_script,
-        "--protein_id",
-        protein_name,
-        "--inference_output_dir",
-        inference_output_dir,
-        "--output_dir",
-        output_dir,
-        "--proteinebm_config",
-        proteinebm_config,
-        "--proteinebm_checkpoint",
-        proteinebm_checkpoint,
-        "--t",
-        str(t),
+        wrapper_script, "python", scorer_script,
+        "--proteins_json", proteins_json_path,
+        "--proteinebm_config", proteinebm_config,
+        "--proteinebm_checkpoint", proteinebm_checkpoint,
+        "--t", str(t),
+        "--batch_size", str(batch_size),
     ]
-
-    if reference_cif is not None:
-        cmd.extend(["--reference_cif", reference_cif])
-
     if not template_self_condition:
         cmd.append("--no-proteinebm_template_self_condition")
 
-    return subprocess.run(cmd, cwd=os.path.join(PROTEINA_BASE_DIR, "af2rank_evaluation"))
-
-
-def process_single_protein_proteinebm(args):
-    protein_name, cif_dir, inference_config, gpu_id, proteinebm_config, proteinebm_checkpoint, template_self_condition, analysis_subdir, proteinebm_t = args
-
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    logger.info(f"[GPU {gpu_id}] Starting ProteinEBM scoring for {protein_name}")
-
-    inference_output_dir = generate_protein_output_dir(inference_config, protein_name)
-    if not os.path.exists(inference_output_dir):
-        raise FileNotFoundError(f"Inference output directory not found: {inference_output_dir}")
-
-    pdb_files = list(Path(inference_output_dir).glob(f"{protein_name}_*.pdb"))
-    if not pdb_files:
-        raise FileNotFoundError(f"No PDB files found in {inference_output_dir}")
-
-    reference_cif = None
-    if cif_dir is not None:
-        reference_cif = find_reference_cif(protein_name, cif_dir)
-        logger.info(f"[GPU {gpu_id}] Found reference CIF: {reference_cif}")
-    else:
-        logger.info(f"[GPU {gpu_id}] No CIF dir provided, skipping TM-score computation")
-
-    result = run_proteinebm_scoring_subprocess(
-        protein_name=protein_name,
-        inference_output_dir=inference_output_dir,
-        reference_cif=reference_cif,
-        proteinebm_config=proteinebm_config,
-        proteinebm_checkpoint=proteinebm_checkpoint,
-        template_self_condition=template_self_condition,
-        analysis_subdir=analysis_subdir,
-        t=proteinebm_t,
-    )
-
-    if result.returncode != 0:
-        raise Exception(f"ProteinEBM scoring failed with returncode {result.returncode}")
-
-    analysis_dir = os.path.join(inference_output_dir, analysis_subdir)
-    summary_file = os.path.join(analysis_dir, f"proteinebm_summary_{protein_name}.json")
-    summary_info = {}
-    if os.path.exists(summary_file):
-        with open(summary_file, "r") as f:
-            summary_info = json.load(f)
-
-    logger.info(f"[GPU {gpu_id}] ✅ ProteinEBM scoring completed for {protein_name}")
-
-    return {
-        "protein": protein_name,
-        "gpu": gpu_id,
-        "status": "success",
-        "output_dir": analysis_dir,
-        "summary": summary_info,
-    }
-
-
-def worker_init_proteinebm(counter, lock, num_gpus):
-    """Initialize worker with a specific GPU assignment."""
-    with lock:
-        worker_id = counter.value
-        counter.value += 1
-
-    gpu_id = worker_id % num_gpus
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    builtins._worker_gpu_id = gpu_id
-    logger.info(f"ProteinEBM Worker {worker_id} initialized with GPU {gpu_id}")
-
-
-def process_single_protein_proteinebm_wrapper(args_tuple):
-    protein_name, cif_dir, inference_config, proteinebm_config, proteinebm_checkpoint, template_self_condition, analysis_subdir, proteinebm_t = args_tuple
-    gpu_id = getattr(builtins, "_worker_gpu_id", 0)
-    full_args = (protein_name, cif_dir, inference_config, gpu_id, proteinebm_config, proteinebm_checkpoint, template_self_condition, analysis_subdir, proteinebm_t)
-    return process_single_protein_proteinebm(full_args)
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=os.path.join(PROTEINA_BASE_DIR, "af2rank_evaluation"),
+            env=env,
+        )
+    finally:
+        os.unlink(proteins_json_path)
+    return result
 
 
 def main():
@@ -292,6 +273,12 @@ def main():
         default=0.05,
         help="Diffusion time t for ProteinEBM scoring (default: 0.05)",
     )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=32,
+        help="Batch size for ProteinEBM inference per protein (default: 32). Auto-reduces on OOM.",
+    )
 
     args = parser.parse_args()
 
@@ -307,58 +294,97 @@ def main():
         sys.exit(0)
 
     logger.info(f"Using {args.num_gpus} GPU(s) for parallel ProteinEBM scoring")
+    logger.info("Sorting proteins by sequence length and building per-GPU work lists...")
 
-    start_time = time.time()
-    all_results = []
+    # Build full config list sorted by length (ascending)
+    all_configs = _build_protein_configs(
+        protein_names, args.cif_dir, args.inference_config, args.proteinebm_analysis_subdir
+    )
+    if not all_configs:
+        logger.warning("No valid protein directories found")
+        sys.exit(0)
 
-    manager = mp.Manager()
-    worker_counter = manager.Value("i", 0)
-    worker_lock = manager.Lock()
-
-    executor = ProcessPoolExecutor(
-        max_workers=args.num_gpus,
-        initializer=worker_init_proteinebm,
-        initargs=(worker_counter, worker_lock, args.num_gpus),
+    logger.info(
+        f"Length range: {all_configs[0]['length']}–{all_configs[-1]['length']} residues "
+        f"across {len(all_configs)} proteins"
     )
 
-    try:
-        work_items = [
-            (protein_name, args.cif_dir, args.inference_config, args.proteinebm_config, args.proteinebm_checkpoint, args.proteinebm_template_self_condition, args.proteinebm_analysis_subdir, args.proteinebm_t)
-            for protein_name in protein_names
+    # Split into num_gpus contiguous chunks (contiguous = same-length proteins stay together,
+    # maximising batch_size_cache hits within each GPU subprocess)
+    num_gpus = args.num_gpus
+    gpu_chunks: List[List[Dict]] = [[] for _ in range(num_gpus)]
+    for i, cfg in enumerate(all_configs):
+        gpu_chunks[i % num_gpus].append(cfg)
+    # After round-robin assignment each chunk is still roughly sorted by length
+    # (every num_gpus-th element of a sorted list). Sort each chunk explicitly.
+    for chunk in gpu_chunks:
+        chunk.sort(key=lambda c: c["length"])
+
+    start_time = time.time()
+
+    # Spawn one subprocess per GPU (each loads the model once and processes its full chunk)
+    procs: List[subprocess.Popen] = []
+    for gpu_id, chunk in enumerate(gpu_chunks):
+        if not chunk:
+            continue
+        logger.info(f"GPU {gpu_id}: {len(chunk)} proteins, lengths {chunk[0]['length']}–{chunk[-1]['length']}")
+
+    # Run GPU workers in parallel — one Popen per GPU, wait for all.
+    popen_procs: List[tuple] = []  # (gpu_id, Popen, proteins_json_path)
+
+    wrapper_script = os.path.join(PROTEINA_BASE_DIR, "af2rank_evaluation", "run_with_proteinebm_env.sh")
+    scorer_script = os.path.join(PROTEINA_BASE_DIR, "af2rank_evaluation", "proteinebm_scorer.py")
+
+    for gpu_id, chunk in enumerate(gpu_chunks):
+        if not chunk:
+            continue
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+        json.dump(chunk, tmp)
+        tmp.flush()
+        proteins_json_path = tmp.name
+        tmp.close()
+
+        cmd = [
+            wrapper_script, "python", scorer_script,
+            "--proteins_json", proteins_json_path,
+            "--proteinebm_config", args.proteinebm_config,
+            "--proteinebm_checkpoint", args.proteinebm_checkpoint,
+            "--t", str(args.proteinebm_t),
+            "--batch_size", str(args.batch_size),
         ]
+        if not args.proteinebm_template_self_condition:
+            cmd.append("--no-proteinebm_template_self_condition")
 
-        future_to_protein = {executor.submit(process_single_protein_proteinebm_wrapper, item): item[0] for item in work_items}
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        proc = subprocess.Popen(
+            cmd,
+            cwd=os.path.join(PROTEINA_BASE_DIR, "af2rank_evaluation"),
+            env=env,
+        )
+        popen_procs.append((gpu_id, proc, proteins_json_path))
+        logger.info(f"Launched GPU {gpu_id} worker (pid={proc.pid}) for {len(chunk)} proteins")
 
-        for future in as_completed(future_to_protein):
-            protein_name = future_to_protein[future]
-            result = future.result()
-            all_results.append(result)
-
-            completed = len([r for r in all_results if r["status"] == "success"])
-            total = len(work_items)
-            elapsed = time.time() - start_time
-
-            summary = result.get("summary", {})
-            successful_scores = summary.get("successful_scores", 0)
-            total_structures = summary.get("total_structures", 0)
-            logger.info(
-                f"✅ Progress: {completed}/{total} proteins completed ({successful_scores}/{total_structures} structures scored, {elapsed:.1f}s elapsed)"
-            )
-    finally:
-        executor.shutdown(wait=True, cancel_futures=True)
-        logger.info("✓ Executor shut down cleanly")
+    # Wait for all GPU workers
+    failed_gpus = []
+    for gpu_id, proc, proteins_json_path in popen_procs:
+        returncode = proc.wait()
+        try:
+            os.unlink(proteins_json_path)
+        except OSError:
+            pass
+        if returncode != 0:
+            logger.error(f"GPU {gpu_id} worker exited with code {returncode}")
+            failed_gpus.append(gpu_id)
+        else:
+            logger.info(f"GPU {gpu_id} worker finished successfully")
 
     total_time = time.time() - start_time
-    successful = len([r for r in all_results if r["status"] == "success"])
-
-    logger.info("\n📊 ProteinEBM Processing Results:")
-    logger.info(f"✅ Successful: {successful}")
-    logger.info(f"⏱️  Total time: {total_time:.1f}s")
-
-    if successful:
-        logger.info(f"🎉 Successfully processed {successful} proteins!")
-        logger.info(f"📁 Results saved to: {os.path.join(PROTEINA_BASE_DIR, 'inference', args.inference_config)}/")
-
+    n_proteins = sum(len(c) for c in gpu_chunks)
+    logger.info(f"\nProteinEBM scoring complete: {n_proteins} proteins in {total_time:.1f}s")
+    if failed_gpus:
+        logger.error(f"Failed GPU workers: {failed_gpus}")
+        sys.exit(1)
     sys.exit(0)
 
 

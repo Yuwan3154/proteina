@@ -13,6 +13,11 @@ import os
 import pickle
 import re
 from collections import defaultdict
+
+try:
+    import msgpack
+except ImportError:
+    msgpack = None
 from math import prod
 from pathlib import Path
 from typing import Dict, Literal, Optional, Tuple
@@ -691,11 +696,15 @@ class TEDLabelTransform(T.BaseTransform):
     def _subset_path(self):
         return f"{self.pkl_path}.subset"
 
+    @property
+    def _subset_msgpack_path(self):
+        return f"{self.pkl_path}.subset.msgpack"
+
     def _chunked_pkl_exists(self):
         return os.path.exists(f"{self.pkl_path}.0")
 
     def _subset_exists(self):
-        return os.path.exists(self._subset_path)
+        return os.path.exists(self._subset_msgpack_path) or os.path.exists(self._subset_path)
 
     # ------------------------------------------------------------------
     # Dataset ID discovery
@@ -754,9 +763,14 @@ class TEDLabelTransform(T.BaseTransform):
 
     def _process_file(self):
         if self._subset_exists():
-            logger.info(f"Loading AFDB CATH subset cache from {self._subset_path}")
-            with open(self._subset_path, "rb") as f:
-                self.sample_to_cath = pickle.load(f)
+            if msgpack is not None and os.path.exists(self._subset_msgpack_path):
+                logger.info(f"Loading AFDB CATH subset cache from {self._subset_msgpack_path} (msgpack)")
+                with open(self._subset_msgpack_path, "rb") as f:
+                    self.sample_to_cath = msgpack.unpackb(f.read(), strict_map_key=False)
+            else:
+                logger.info(f"Loading AFDB CATH subset cache from {self._subset_path}")
+                with open(self._subset_path, "rb") as f:
+                    self.sample_to_cath = pickle.load(f)
             logger.info(f"Loaded {len(self.sample_to_cath)} entries from subset cache.")
 
         elif self._chunked_pkl_exists():
@@ -829,12 +843,20 @@ class TEDLabelTransform(T.BaseTransform):
                 self.sample_to_cath[sample_id].extend(cath_codes)
 
     def _save_subset(self):
-        with open(self._subset_path, "wb") as f:
-            pickle.dump(self.sample_to_cath, f, protocol=pickle.HIGHEST_PROTOCOL)
-        size_mb = os.path.getsize(self._subset_path) / 1e6
+        if msgpack is not None:
+            path = self._subset_msgpack_path
+            with open(path, "wb") as f:
+                f.write(msgpack.packb(self.sample_to_cath, use_bin_type=True))
+            if os.path.exists(self._subset_path):
+                os.remove(self._subset_path)
+        else:
+            path = self._subset_path
+            with open(path, "wb") as f:
+                pickle.dump(self.sample_to_cath, f, protocol=pickle.HIGHEST_PROTOCOL)
+        size_mb = os.path.getsize(path) / 1e6
         logger.info(
             f"Saved AFDB CATH subset cache: {len(self.sample_to_cath)} entries, "
-            f"{size_mb:.1f} MB → {self._subset_path}"
+            f"{size_mb:.1f} MB → {path}"
         )
 
     def _delete_chunked_pickles(self):

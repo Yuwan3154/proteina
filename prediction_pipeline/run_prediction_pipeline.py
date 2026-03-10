@@ -113,6 +113,7 @@ def step_proteinebm_scoring(
     proteinebm_checkpoint: str,
     proteinebm_t: float = 0.05,
     proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
+    batch_size: int = 32,
 ) -> bool:
     """Run ProteinEBM scoring (energy only, no ground-truth TM-score)."""
     logger.info("Starting ProteinEBM scoring...")
@@ -127,6 +128,7 @@ def step_proteinebm_scoring(
         "--proteinebm_checkpoint", proteinebm_checkpoint,
         "--proteinebm_t", str(proteinebm_t),
         "--proteinebm_analysis_subdir", proteinebm_analysis_subdir,
+        "--batch_size", str(batch_size),
         # No --cif_dir: skips TM-score computation
     ]
     return run_with_conda_env("proteinebm", cmd)
@@ -387,6 +389,8 @@ def main():
     parser.add_argument("--proteinebm_t", type=float, default=0.05, help="Diffusion time for ProteinEBM (default: 0.05)")
     parser.add_argument("--proteinebm_analysis_subdir", default="proteinebm_v2_cathmd_analysis",
                         help="Per-protein subdir for ProteinEBM outputs")
+    parser.add_argument("--proteinebm_batch_size", type=int, default=32,
+                        help="Batch size for ProteinEBM inference (default: 32). Auto-reduces on OOM.")
     parser.add_argument("--skip_inference", action="store_true", help="Skip Proteina inference step")
     parser.add_argument("--skip_scoring", action="store_true", help="Skip ProteinEBM scoring step")
     parser.add_argument("--skip_af2rank", action="store_true", help="Skip AF2Rank step")
@@ -448,6 +452,7 @@ def main():
             working_csv, args.inference_config, args.num_gpus,
             args.proteinebm_config, args.proteinebm_checkpoint,
             args.proteinebm_t, args.proteinebm_analysis_subdir,
+            args.proteinebm_batch_size,
         ):
             logger.error("ProteinEBM scoring failed")
             success = False
