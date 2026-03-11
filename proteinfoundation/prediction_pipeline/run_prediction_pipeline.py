@@ -175,6 +175,9 @@ def step_af2rank_topk(
     num_gpus: int,
     backend: str = "colabdesign",
     proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
+    use_deepspeed_evoformer_attention: bool = True,
+    use_cuequivariance_attention: bool = True,
+    use_cuequivariance_multiplicative_update: bool = True,
     shard_args: list | None = None,
     direct_python: bool = False,
 ) -> bool:
@@ -192,6 +195,13 @@ def step_af2rank_topk(
         "--filter_existing",
         # No --dataset_file: no ground-truth comparison
     ]
+    if backend == "openfold":
+        if not use_deepspeed_evoformer_attention:
+            cmd.append("--no-use_deepspeed_evoformer_attention")
+        if not use_cuequivariance_attention:
+            cmd.append("--no-use_cuequivariance_attention")
+        if not use_cuequivariance_multiplicative_update:
+            cmd.append("--no-use_cuequivariance_multiplicative_update")
     if shard_args:
         cmd.extend(shard_args)
     return run_with_conda_env("proteina", cmd, direct_python=direct_python)
@@ -410,6 +420,12 @@ def main():
     parser.add_argument("--top_k", type=int, default=5, help="Number of top ProteinEBM templates for AF2Rank (default: 5)")
     parser.add_argument("--backend", choices=["colabdesign", "openfold"], default="colabdesign",
                         help="AF2Rank backend: colabdesign (JAX) or openfold (PyTorch)")
+    parser.add_argument("--use_deepspeed_evoformer_attention", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use DeepSpeed evoformer attention (openfold backend, default: True)")
+    parser.add_argument("--use_cuequivariance_attention", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use cuEquivariance attention kernels (openfold backend, default: True)")
+    parser.add_argument("--use_cuequivariance_multiplicative_update", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use cuEquivariance multiplicative update (openfold backend, default: True)")
     parser.add_argument("--recycles", type=int, default=3, help="AF2 recycles for AF2Rank (default: 3)")
     parser.add_argument("--proteinebm_config", default="/home/ubuntu/ProteinEBM/protein_ebm/config/base_pretrain.yaml",
                         help="Path to ProteinEBM config YAML")
@@ -513,6 +529,9 @@ def main():
         if not step_af2rank_topk(
             args.inference_config, args.top_k, args.recycles,
             args.num_gpus, args.backend, args.proteinebm_analysis_subdir,
+            use_deepspeed_evoformer_attention=args.use_deepspeed_evoformer_attention,
+            use_cuequivariance_attention=args.use_cuequivariance_attention,
+            use_cuequivariance_multiplicative_update=args.use_cuequivariance_multiplicative_update,
             shard_args=shard_cli_args,
             direct_python=args.direct_python,
         ):

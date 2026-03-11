@@ -50,6 +50,9 @@ class OpenFoldTemplateInference(nn.Module):
         max_recycling_iters: Optional[int] = None,
         compile_model: bool = False,
         use_mlm: bool = False,
+        use_deepspeed_evoformer_attention: bool = False,
+        use_cuequivariance_attention: bool = False,
+        use_cuequivariance_multiplicative_update: bool = False,
     ):
         super().__init__()
 
@@ -60,7 +63,12 @@ class OpenFoldTemplateInference(nn.Module):
                 f"params_{model_name}.npz",
             )
         self.jax_params_path = jax_params_path
-        self.cfg = model_config(model_name)
+        self.cfg = model_config(
+            model_name,
+            use_deepspeed_evoformer_attention=use_deepspeed_evoformer_attention,
+            use_cuequivariance_attention=use_cuequivariance_attention,
+            use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
+        )
         self.cfg.data.common.use_templates = True
         if max_recycling_iters is not None:
             self.cfg.data.common.max_recycling_iters = int(max_recycling_iters)

@@ -511,6 +511,9 @@ class OpenFoldAF2Rank:
         recycles: int = 3,
         debug: bool = False,
         chunk_size: Optional[int] = None,
+        use_deepspeed_evoformer_attention: bool = False,
+        use_cuequivariance_attention: bool = False,
+        use_cuequivariance_multiplicative_update: bool = False,
     ):
         if chain is None:
             chain = "A"
@@ -552,6 +555,9 @@ class OpenFoldAF2Rank:
             rm_template_sequence=True,  # AF2Rank protocol: remove template sequence
             skip_template_alignment=True,  # No alignment needed (sequences match)
             max_recycling_iters=recycles,
+            use_deepspeed_evoformer_attention=use_deepspeed_evoformer_attention,
+            use_cuequivariance_attention=use_cuequivariance_attention,
+            use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
         )
 
         # Set chunk_size if specified (0 or 1 disables chunking)
@@ -716,6 +722,9 @@ def score_proteina_structures_openfold(
     recycles: int = 3,
     model_name: str = "model_1_ptm",
     verbose: bool = False,
+    use_deepspeed_evoformer_attention: bool = True,
+    use_cuequivariance_attention: bool = True,
+    use_cuequivariance_multiplicative_update: bool = True,
 ) -> List[Dict]:
     """Score all Proteina-generated structures using AF2Rank with OpenFold backend."""
     pdb_files = sorted(glob.glob(os.path.join(inference_output_dir, "*.pdb")))
@@ -740,6 +749,9 @@ def score_proteina_structures_openfold(
 
     scorer = OpenFoldAF2Rank(
         reference_cif, chain=chain, model_name=model_name, recycles=recycles,
+        use_deepspeed_evoformer_attention=use_deepspeed_evoformer_attention,
+        use_cuequivariance_attention=use_cuequivariance_attention,
+        use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
     )
 
     scores = []
@@ -788,6 +800,9 @@ def run_af2rank_analysis_openfold(
     model_name: str = "model_1_ptm",
     verbose: bool = False,
     regenerate_summary: bool = False,
+    use_deepspeed_evoformer_attention: bool = True,
+    use_cuequivariance_attention: bool = True,
+    use_cuequivariance_multiplicative_update: bool = True,
 ) -> str:
     """Run complete AF2Rank analysis using OpenFold backend."""
     os.makedirs(output_dir, exist_ok=True)
@@ -807,6 +822,9 @@ def run_af2rank_analysis_openfold(
             recycles=recycles,
             model_name=model_name,
             verbose=verbose,
+            use_deepspeed_evoformer_attention=use_deepspeed_evoformer_attention,
+            use_cuequivariance_attention=use_cuequivariance_attention,
+            use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
         )
         if not scores:
             logger.warning(f"No scores generated for {protein_id}")
@@ -913,6 +931,9 @@ def run_af2rank_plot_only_openfold(
     chain: str = "A",
     recycles: int = 3,
     regenerate_summary: bool = True,
+    use_deepspeed_evoformer_attention: bool = True,
+    use_cuequivariance_attention: bool = True,
+    use_cuequivariance_multiplicative_update: bool = True,
 ) -> str:
     """Generate only AF2Rank plots from existing CSV data (no scoring)."""
     scores_csv_path = os.path.join(output_dir, f"af2rank_scores_{protein_id}.csv")
@@ -925,7 +946,6 @@ def run_af2rank_plot_only_openfold(
     plot_af2rank_results(scores, output_dir, protein_id)
 
     if regenerate_summary:
-        # Recompute summary (same logic as run_af2rank_analysis_openfold)
         return run_af2rank_analysis_openfold(
             protein_id=protein_id,
             reference_cif=reference_cif,
@@ -933,7 +953,10 @@ def run_af2rank_plot_only_openfold(
             output_dir=output_dir,
             chain=chain,
             recycles=recycles,
-            regenerate_summary=False,  # scores already loaded
+            regenerate_summary=False,
+            use_deepspeed_evoformer_attention=use_deepspeed_evoformer_attention,
+            use_cuequivariance_attention=use_cuequivariance_attention,
+            use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
         )
 
     return scores_csv_path

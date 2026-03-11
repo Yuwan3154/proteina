@@ -149,7 +149,7 @@ def run_proteina_inference(csv_file, csv_column, cif_dir, inference_config, num_
 
     return run_with_conda_env('proteina', cmd, direct_python=direct_python)
 
-def run_af2rank_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpus, recycles=3, regenerate_plots=False, backend="colabdesign", shard_args=None, direct_python: bool = False):
+def run_af2rank_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpus, recycles=3, regenerate_plots=False, backend="colabdesign", use_deepspeed_evoformer_attention=True, use_cuequivariance_attention=True, use_cuequivariance_multiplicative_update=True, shard_args=None, direct_python: bool = False):
     """Run the AF2Rank scoring pipeline."""
     logger.info(f"⚡ Starting AF2Rank scoring pipeline (backend={backend})...")
 
@@ -166,6 +166,13 @@ def run_af2rank_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpu
     ]
     if regenerate_plots:
         cmd.append('--regenerate_plots')
+    if backend == 'openfold':
+        if not use_deepspeed_evoformer_attention:
+            cmd.append('--no-use_deepspeed_evoformer_attention')
+        if not use_cuequivariance_attention:
+            cmd.append('--no-use_cuequivariance_attention')
+        if not use_cuequivariance_multiplicative_update:
+            cmd.append('--no-use_cuequivariance_multiplicative_update')
     if shard_args:
         cmd.extend(shard_args)
 
@@ -248,6 +255,9 @@ def run_af2rank_on_proteinebm_topk(
     filter_existing: bool = True,
     proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
     backend: str = "colabdesign",
+    use_deepspeed_evoformer_attention: bool = True,
+    use_cuequivariance_attention: bool = True,
+    use_cuequivariance_multiplicative_update: bool = True,
     shard_args=None,
     direct_python: bool = False,
     cif_dir: str = "",
@@ -275,6 +285,13 @@ def run_af2rank_on_proteinebm_topk(
         "--backend",
         backend,
     ]
+    if backend == "openfold":
+        if not use_deepspeed_evoformer_attention:
+            cmd.append("--no-use_deepspeed_evoformer_attention")
+        if not use_cuequivariance_attention:
+            cmd.append("--no-use_cuequivariance_attention")
+        if not use_cuequivariance_multiplicative_update:
+            cmd.append("--no-use_cuequivariance_multiplicative_update")
     if cif_dir:
         cmd.extend(["--cif_dir", cif_dir])
     if dataset_file:
@@ -328,6 +345,12 @@ def main():
     )
     parser.add_argument('--af2rank_backend', choices=['colabdesign', 'openfold'], default='colabdesign',
                        help='AF2Rank backend: colabdesign (JAX) or openfold (PyTorch)')
+    parser.add_argument('--use_deepspeed_evoformer_attention', action=argparse.BooleanOptionalAction, default=True,
+                       help='Use DeepSpeed evoformer attention (openfold backend, default: True)')
+    parser.add_argument('--use_cuequivariance_attention', action=argparse.BooleanOptionalAction, default=True,
+                       help='Use cuEquivariance attention kernels (openfold backend, default: True)')
+    parser.add_argument('--use_cuequivariance_multiplicative_update', action=argparse.BooleanOptionalAction, default=True,
+                       help='Use cuEquivariance multiplicative update (openfold backend, default: True)')
     parser.add_argument('--usalign_path', help='Path to USalign executable')
     parser.add_argument('--skip_inference', action='store_true', 
                        help='Skip Proteina inference (only run scoring stage)')
@@ -464,6 +487,9 @@ def main():
                 args.recycles,
                 args.regenerate_plots,
                 backend=args.af2rank_backend,
+                use_deepspeed_evoformer_attention=args.use_deepspeed_evoformer_attention,
+                use_cuequivariance_attention=args.use_cuequivariance_attention,
+                use_cuequivariance_multiplicative_update=args.use_cuequivariance_multiplicative_update,
                 shard_args=shard_cli_args,
                 direct_python=args.direct_python,
             )
@@ -509,6 +535,9 @@ def main():
             filter_existing=bool(args.af2rank_topk_filter_existing),
             proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
             backend=args.af2rank_backend,
+            use_deepspeed_evoformer_attention=args.use_deepspeed_evoformer_attention,
+            use_cuequivariance_attention=args.use_cuequivariance_attention,
+            use_cuequivariance_multiplicative_update=args.use_cuequivariance_multiplicative_update,
             shard_args=shard_cli_args,
             direct_python=args.direct_python,
             cif_dir=args.cif_dir,

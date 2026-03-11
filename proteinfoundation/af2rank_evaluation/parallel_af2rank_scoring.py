@@ -111,6 +111,9 @@ def process_single_protein_af2rank(args):
     """Process AF2Rank scoring for a single protein."""
     protein_name, cif_dir, inference_config, recycles, gpu_id, regenerate_plots, *rest = args
     backend = rest[0] if rest else "colabdesign"
+    use_ds = rest[1] if len(rest) > 1 else True
+    use_cue_attn = rest[2] if len(rest) > 2 else True
+    use_cue_mul = rest[3] if len(rest) > 3 else True
     
     # Set GPU for this process
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
@@ -141,7 +144,12 @@ def process_single_protein_af2rank(args):
         return {'protein': protein_name, 'gpu': gpu_id, 'status': 'skipped', 'reason': 'plot_regeneration_deferred'}
     # Run full AF2Rank scoring
     logger.info(f"[GPU {gpu_id}] Running full AF2Rank scoring for {protein_name} (backend={backend})")
-    result = run_af2rank_scoring(protein_name, reference_cif, inference_output_dir, recycles, backend=backend)
+    result = run_af2rank_scoring(
+        protein_name, reference_cif, inference_output_dir, recycles, backend=backend,
+        use_deepspeed_evoformer_attention=use_ds,
+        use_cuequivariance_attention=use_cue_attn,
+        use_cuequivariance_multiplicative_update=use_cue_mul,
+    )
 
     if result.returncode != 0:
         raise Exception(f"AF2Rank scoring failed with returncode {result.returncode}")
@@ -165,7 +173,16 @@ def process_single_protein_af2rank(args):
         'summary': summary_info
     }
 
-def run_af2rank_scoring(protein_name, reference_cif, inference_output_dir, recycles=3, backend="colabdesign"):
+def run_af2rank_scoring(
+    protein_name,
+    reference_cif,
+    inference_output_dir,
+    recycles=3,
+    backend="colabdesign",
+    use_deepspeed_evoformer_attention=True,
+    use_cuequivariance_attention=True,
+    use_cuequivariance_multiplicative_update=True,
+):
     """Run AF2Rank scoring for a single protein."""
     if backend == "openfold":
         wrapper_script = os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation', 'run_with_proteina_env.sh')
@@ -192,7 +209,10 @@ result = run_af2rank_analysis_openfold(
     chain=chain_id,
     recycles={recycles},
     verbose=False,
-    regenerate_summary=True
+    regenerate_summary=True,
+    use_deepspeed_evoformer_attention={use_deepspeed_evoformer_attention},
+    use_cuequivariance_attention={use_cuequivariance_attention},
+    use_cuequivariance_multiplicative_update={use_cuequivariance_multiplicative_update},
 )
 
 if result:
@@ -254,7 +274,16 @@ else:
     )
     return result
 
-def run_af2rank_plot_only(protein_name, reference_cif, inference_output_dir, recycles=3, backend="colabdesign"):
+def run_af2rank_plot_only(
+    protein_name,
+    reference_cif,
+    inference_output_dir,
+    recycles=3,
+    backend="colabdesign",
+    use_deepspeed_evoformer_attention=True,
+    use_cuequivariance_attention=True,
+    use_cuequivariance_multiplicative_update=True,
+):
     """Regenerate plots only for existing AF2Rank scores and update summary."""
     if backend == "openfold":
         wrapper_script = os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation', 'run_with_proteina_env.sh')
@@ -278,7 +307,10 @@ result = run_af2rank_plot_only_openfold(
     output_dir=af2rank_dir,
     chain=chain_id,
     recycles={recycles},
-    regenerate_summary=True
+    regenerate_summary=True,
+    use_deepspeed_evoformer_attention={use_deepspeed_evoformer_attention},
+    use_cuequivariance_attention={use_cuequivariance_attention},
+    use_cuequivariance_multiplicative_update={use_cuequivariance_multiplicative_update},
 )
 
 if result:
@@ -338,6 +370,9 @@ def process_single_protein_plot_regeneration(args):
     """Process plot regeneration for a single protein (CPU-only, no GPU needed)."""
     protein_name, cif_dir, inference_config, recycles, *rest = args
     backend = rest[0] if rest else "colabdesign"
+    use_ds = rest[1] if len(rest) > 1 else True
+    use_cue_attn = rest[2] if len(rest) > 2 else True
+    use_cue_mul = rest[3] if len(rest) > 3 else True
     
     logger.info(f"[CPU] Regenerating plots and summary for {protein_name}")
 
@@ -354,7 +389,12 @@ def process_single_protein_plot_regeneration(args):
         return {'protein': protein_name, 'status': 'skipped', 'reason': 'no_csv_file'}
 
     # Run plot regeneration (CPU-only)
-    result = run_af2rank_plot_only(protein_name, reference_cif, inference_output_dir, recycles, backend=backend)
+    result = run_af2rank_plot_only(
+        protein_name, reference_cif, inference_output_dir, recycles, backend=backend,
+        use_deepspeed_evoformer_attention=use_ds,
+        use_cuequivariance_attention=use_cue_attn,
+        use_cuequivariance_multiplicative_update=use_cue_mul,
+    )
 
     if result.returncode == 0:
         logger.info(f"[CPU] ✅ Plot regeneration completed for {protein_name}")
@@ -385,7 +425,10 @@ def process_single_protein_af2rank_wrapper(args_tuple):
     gpu_id = getattr(builtins, '_worker_gpu_id', 0)
 
     # Call the actual processing function
-    full_args = (protein_name, cif_dir, inference_config, recycles, gpu_id, False, backend)
+    use_ds = rest[1] if len(rest) > 1 else True
+    use_cue_attn = rest[2] if len(rest) > 2 else True
+    use_cue_mul = rest[3] if len(rest) > 3 else True
+    full_args = (protein_name, cif_dir, inference_config, recycles, gpu_id, False, backend, use_ds, use_cue_attn, use_cue_mul)
     return process_single_protein_af2rank(full_args)
 
 def has_multi_char_chain_id(protein_name):
@@ -463,6 +506,12 @@ def main():
                        help='Regenerate plots even if AF2Rank CSV already exists')
     parser.add_argument('--backend', choices=['colabdesign', 'openfold'], default='colabdesign',
                        help='AF2Rank backend: colabdesign (JAX) or openfold (PyTorch)')
+    parser.add_argument('--use_deepspeed_evoformer_attention', action=argparse.BooleanOptionalAction, default=True,
+                       help='Use DeepSpeed evoformer attention (openfold backend, default: True)')
+    parser.add_argument('--use_cuequivariance_attention', action=argparse.BooleanOptionalAction, default=True,
+                       help='Use cuEquivariance attention kernels (openfold backend, default: True)')
+    parser.add_argument('--use_cuequivariance_multiplicative_update', action=argparse.BooleanOptionalAction, default=True,
+                       help='Use cuEquivariance multiplicative update (openfold backend, default: True)')
     add_shard_args(parser)
 
     args = parser.parse_args()
@@ -550,8 +599,12 @@ def main():
 
         try:
             # Submit all jobs (GPU assignment happens via worker init)
-            scoring_work_items = [(protein_name, args.cif_dir, args.inference_config, args.recycles, args.backend)
-                                  for protein_name in proteins_needing_scoring]
+            scoring_work_items = [
+                (protein_name, args.cif_dir, args.inference_config, args.recycles, args.backend,
+                 args.use_deepspeed_evoformer_attention, args.use_cuequivariance_attention,
+                 args.use_cuequivariance_multiplicative_update)
+                for protein_name in proteins_needing_scoring
+            ]
             future_to_protein = {executor.submit(process_single_protein_af2rank_wrapper, item): scoring_work_items[i][0]
                                 for i, item in enumerate(scoring_work_items)}
             
@@ -589,7 +642,11 @@ def main():
         
         plot_work_items = []
         for protein_name in proteins_needing_plots:
-            plot_work_items.append((protein_name, args.cif_dir, args.inference_config, args.recycles, args.backend))
+            plot_work_items.append((
+                protein_name, args.cif_dir, args.inference_config, args.recycles, args.backend,
+                args.use_deepspeed_evoformer_attention, args.use_cuequivariance_attention,
+                args.use_cuequivariance_multiplicative_update,
+            ))
         
         # Use more CPU workers since this is lightweight
         max_cpu_workers = min(len(proteins_needing_plots), 8)

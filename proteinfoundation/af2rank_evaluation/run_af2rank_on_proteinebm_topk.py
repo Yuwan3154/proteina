@@ -251,6 +251,9 @@ def _run_af2rank_subprocess(
     backend: str = "colabdesign",
     allatom_map: Optional[Dict[str, str]] = None,
     direct_python: bool = False,
+    use_deepspeed_evoformer_attention: bool = True,
+    use_cuequivariance_attention: bool = True,
+    use_cuequivariance_multiplicative_update: bool = True,
 ) -> None:
     # Ensure each subprocess is pinned to a single GPU when requested.
     cuda_line = ""
@@ -294,7 +297,10 @@ to_score = [p for p in pdb_files if os.path.basename(p) not in processed_files]
 
 new_scores = []
 if len(to_score) > 0:
-  scorer = OpenFoldAF2Rank(reference_cif, chain=chain, model_name={model_name!r}, recycles={int(recycles)})
+  scorer = OpenFoldAF2Rank(reference_cif, chain=chain, model_name={model_name!r}, recycles={int(recycles)},
+    use_deepspeed_evoformer_attention={use_deepspeed_evoformer_attention},
+    use_cuequivariance_attention={use_cuequivariance_attention},
+    use_cuequivariance_multiplicative_update={use_cuequivariance_multiplicative_update})
   for pdb_path in to_score:
     pdb_filename = os.path.basename(pdb_path)
     structure_scores = scorer.score_structure(
@@ -442,6 +448,9 @@ def _process_one_protein(
     backend: str = "colabdesign",
     direct_python: bool = False,
     cif_dir: str = "",
+    use_deepspeed_evoformer_attention: bool = True,
+    use_cuequivariance_attention: bool = True,
+    use_cuequivariance_multiplicative_update: bool = True,
 ) -> Dict[str, object]:
     scores_csv_path = Path(scores_csv)
     protein_dir = scores_csv_path.parent.parent
@@ -564,6 +573,9 @@ def _process_one_protein(
                 backend=backend,
                 allatom_map=allatom_map,
                 direct_python=direct_python,
+                use_deepspeed_evoformer_attention=use_deepspeed_evoformer_attention,
+                use_cuequivariance_attention=use_cuequivariance_attention,
+                use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
             )
             _run_af2rank_subprocess(
                 protein_id=protein_id,
@@ -577,6 +589,9 @@ def _process_one_protein(
                 backend=backend,
                 allatom_map=allatom_map,
                 direct_python=direct_python,
+                use_deepspeed_evoformer_attention=use_deepspeed_evoformer_attention,
+                use_cuequivariance_attention=use_cuequivariance_attention,
+                use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
             )
         finally:
             # Delete reconstructed all-atom temp files after both models are done
@@ -651,6 +666,12 @@ def main() -> None:
     parser.add_argument("--proteinebm_analysis_subdir", default="proteinebm_v2_cathmd_analysis", help="Per-protein subdir containing ProteinEBM scores (default: proteinebm_v2_cathmd_analysis)")
     parser.add_argument("--backend", choices=["colabdesign", "openfold"], default="colabdesign",
                        help="AF2Rank backend: colabdesign (JAX) or openfold (PyTorch)")
+    parser.add_argument("--use_deepspeed_evoformer_attention", action=argparse.BooleanOptionalAction, default=True,
+                       help="Use DeepSpeed evoformer attention (openfold backend, default: True)")
+    parser.add_argument("--use_cuequivariance_attention", action=argparse.BooleanOptionalAction, default=True,
+                       help="Use cuEquivariance attention kernels (openfold backend, default: True)")
+    parser.add_argument("--use_cuequivariance_multiplicative_update", action=argparse.BooleanOptionalAction, default=True,
+                       help="Use cuEquivariance multiplicative update (openfold backend, default: True)")
     parser.add_argument("--direct_python", action="store_true", default=False,
                        help="Use current Python interpreter for inner subprocesses instead of shell wrappers (for HPC)")
     add_shard_args(parser)
@@ -737,7 +758,10 @@ def main() -> None:
     def _submit_args(protein_id, scores_csv, ref, gpu_id):
         return (protein_id, scores_csv, ref, int(args.top_k), int(args.recycles),
                 gpu_id, bool(args.filter_existing), bool(args.dry_run), args.backend,
-                bool(args.direct_python), cif_dir)
+                bool(args.direct_python), cif_dir,
+                bool(args.use_deepspeed_evoformer_attention),
+                bool(args.use_cuequivariance_attention),
+                bool(args.use_cuequivariance_multiplicative_update))
 
     if not has_dataset:
         # Score only; skip cross-protein plots (they require reference TM / metadata).
