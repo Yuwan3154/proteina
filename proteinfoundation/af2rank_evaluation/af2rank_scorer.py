@@ -553,7 +553,7 @@ class ModernAF2Rank:
         logger.info("Loading AlphaFold parameters for AF2Rank scoring...")
         
         # Set environment variables for AlphaFold parameters
-        params_path = os.path.expanduser("~/params")
+        params_path = os.path.expanduser("~/openfold/openfold/resources/params")
         os.environ["ALPHAFOLD_DATA_DIR"] = params_path
         assert os.path.exists(params_path)
         

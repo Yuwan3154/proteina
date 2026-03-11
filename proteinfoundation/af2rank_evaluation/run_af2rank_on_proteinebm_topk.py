@@ -332,8 +332,8 @@ import pandas as pd
 from af2rank_scorer import ModernAF2Rank, plot_af2rank_results, save_af2rank_scores, suppress_stdout, load_af2rank_scores_from_csv
 
 {cuda_line}
-os.environ['ALPHAFOLD_DATA_DIR'] = os.path.expanduser('~/params')
-os.environ['AF_PARAMS_DIR'] = os.path.expanduser('~/params')
+os.environ['ALPHAFOLD_DATA_DIR'] = os.path.expanduser('~/openfold/openfold/resources/params')
+os.environ['AF_PARAMS_DIR'] = os.path.expanduser('~/openfold/openfold/resources/params')
 
 protein_id = {protein_id!r}
 reference_cif = {reference_cif!r}

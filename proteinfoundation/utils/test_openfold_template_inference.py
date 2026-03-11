@@ -188,7 +188,7 @@ def main() -> None:
     parser.add_argument("--pdb", type=str, default="/home/ubuntu/AFdistill/1ctf.pdb")
     parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"])
     parser.add_argument("--model_name", type=str, default="model_1_ptm")
-    parser.add_argument("--jax_params", type=str, default="/home/ubuntu/params/params_model_1_ptm.npz")
+    parser.add_argument("--jax_params", type=str, default=os.path.expanduser("~/openfold/openfold/resources/params/params_model_1_ptm.npz"))
     parser.add_argument(
         "--template_mode",
         type=str,

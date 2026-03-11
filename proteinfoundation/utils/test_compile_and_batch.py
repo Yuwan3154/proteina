@@ -6,8 +6,9 @@ Usage:
 """
 import argparse
 import copy
-import time
+import os
 import sys
+import time
 
 import torch
 import numpy as np
@@ -366,7 +367,7 @@ def main():
     parser.add_argument("--skip-compile", action="store_true")
     parser.add_argument("--skip-batch", action="store_true")
     parser.add_argument("--model_name", type=str, default="model_1_ptm")
-    parser.add_argument("--jax_params", type=str, default="/home/ubuntu/params/params_model_1_ptm.npz")
+    parser.add_argument("--jax_params", type=str, default=os.path.expanduser("~/openfold/openfold/resources/params/params_model_1_ptm.npz"))
     parser.add_argument("--max_recycling_iters", type=int, default=1)
     args = parser.parse_args()
 

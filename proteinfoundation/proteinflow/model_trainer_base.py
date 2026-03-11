@@ -321,7 +321,7 @@ class ModelTrainerBase(L.LightningModule):
         # if getattr(self, "_distogram_only_inference", None) is None:
         #     model_name = self.cfg_exp.model.nn.get("openfold_model_name", "model_1_ptm")
         #     jax_params_path = self.cfg_exp.model.nn.get(
-        #         "openfold_jax_params_path", "/home/ubuntu/params/params_model_1_ptm.npz"
+        #         "openfold_jax_params_path", os.path.expanduser("~/openfold/openfold/resources/params/params_model_1_ptm.npz")
         #     )
         #     self._distogram_only_inference = OpenFoldDistogramOnlyInference(
         #         model_name=model_name,

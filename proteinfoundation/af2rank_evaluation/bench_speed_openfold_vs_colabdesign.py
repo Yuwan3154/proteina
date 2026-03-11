@@ -75,7 +75,7 @@ sys.path.insert(0, {os.path.dirname(os.path.abspath(__file__))!r})
 
 from af2rank_scorer import ModernAF2Rank, suppress_stdout
 
-os.environ['ALPHAFOLD_DATA_DIR'] = os.path.expanduser('~/params')
+os.environ['ALPHAFOLD_DATA_DIR'] = os.path.expanduser('~/openfold/openfold/resources/params')
 
 decoy_pdbs = json.loads('{decoy_paths_json}')
 

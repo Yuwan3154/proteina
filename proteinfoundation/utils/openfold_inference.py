@@ -43,7 +43,7 @@ class OpenFoldTemplateInference(nn.Module):
         self,
         *,
         model_name: str = "model_1_ptm",
-        jax_params_path: str = "/home/ubuntu/params/params_model_1_ptm.npz",
+        jax_params_path: str = None,
         device: Optional[torch.device] = None,
         rm_template_sequence: Optional[bool] = False,
         skip_template_alignment: bool = False,
@@ -54,6 +54,11 @@ class OpenFoldTemplateInference(nn.Module):
         super().__init__()
 
         self.model_name = model_name
+        if jax_params_path is None:
+            jax_params_path = os.path.join(
+                os.path.expanduser("~/openfold/openfold/resources/params"),
+                f"params_{model_name}.npz",
+            )
         self.jax_params_path = jax_params_path
         self.cfg = model_config(model_name)
         self.cfg.data.common.use_templates = True

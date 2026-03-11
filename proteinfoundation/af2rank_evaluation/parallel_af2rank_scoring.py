@@ -218,8 +218,8 @@ protein_id = '{protein_name}'
 pdb_id, chain_id = protein_id.split('_')
 
 # Set environment variables for AF2
-os.environ['ALPHAFOLD_DATA_DIR'] = os.path.expanduser('~/params')
-os.environ['AF_PARAMS_DIR'] = os.path.expanduser('~/params')
+os.environ['ALPHAFOLD_DATA_DIR'] = os.path.expanduser('~/openfold/openfold/resources/params')
+os.environ['AF_PARAMS_DIR'] = os.path.expanduser('~/openfold/openfold/resources/params')
 
 # Create AF2Rank output directory
 af2rank_dir = '{inference_output_dir}/af2rank_analysis'

@@ -34,7 +34,7 @@ from scipy.stats import spearmanr
 
 
 KALIGN_BINARY_PATH = "/usr/bin/kalign"
-DEFAULT_PARAMS_DIR = os.path.expanduser("~/params")
+DEFAULT_PARAMS_DIR = os.path.expanduser("~/openfold/openfold/resources/params")
 
 
 # ---------------------------------------------------------------------------

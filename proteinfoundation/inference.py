@@ -492,7 +492,7 @@ if __name__ == "__main__":
                     if openfold_infer is None:
                         openfold_infer = OpenFoldDistogramOnlyInference(
                             model_name="model_1_ptm",
-                            jax_params_path="/home/ubuntu/params/params_model_1_ptm.npz",
+                            jax_params_path=os.path.expanduser("~/openfold/openfold/resources/params/params_model_1_ptm.npz"),
                             device=openfold_device,
                         )
                         openfold_residue_type = residue_type_tensor.to(openfold_device)
