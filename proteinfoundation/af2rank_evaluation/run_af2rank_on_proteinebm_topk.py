@@ -59,6 +59,21 @@ def _find_proteinebm_scores(inference_dir: str, analysis_subdir: str = "proteine
     return sorted(base.glob(f"*/{analysis_subdir}/proteinebm_scores_*.csv"))
 
 
+def _find_reference_cif(protein_id: str, cif_dir: str) -> Optional[str]:
+    """Find the reference CIF file for a protein in cif_dir (same logic as parallel_af2rank_scoring)."""
+    pdb_id = protein_id.split("_")[0]
+    cif_path = Path(cif_dir)
+    for subdir in cif_path.iterdir():
+        if subdir.is_dir():
+            potential = subdir / f"{pdb_id}.cif"
+            if potential.exists():
+                return str(potential)
+    potential = cif_path / f"{pdb_id}.cif"
+    if potential.exists():
+        return str(potential)
+    return None
+
+
 def _read_proteinebm_summary(summary_path: Path) -> Dict[str, str | None]:
     with summary_path.open("r") as f:
         summary = json.load(f)
@@ -81,6 +96,18 @@ def _select_topk_templates(scores_csv: Path, top_k: int) -> pd.DataFrame:
     df = df.sort_values("energy", ascending=True).head(int(top_k)).reset_index(drop=True)
     if len(df) == 0:
         raise ValueError(f"No valid rows found in {scores_csv}")
+
+    protein_dir = scores_csv.parent.parent
+    def _rebase_path(p: str) -> str:
+        """Resolve structure_path relative to the protein dir on the current machine."""
+        orig = Path(p)
+        local = protein_dir / orig.name
+        if local.exists():
+            return str(local)
+        if orig.exists():
+            return str(orig)
+        return str(local)
+    df["structure_path"] = df["structure_path"].astype(str).apply(_rebase_path)
     return df
 
 
@@ -414,6 +441,7 @@ def _process_one_protein(
     dry_run: bool,
     backend: str = "colabdesign",
     direct_python: bool = False,
+    cif_dir: str = "",
 ) -> Dict[str, object]:
     scores_csv_path = Path(scores_csv)
     protein_dir = scores_csv_path.parent.parent
@@ -429,9 +457,13 @@ def _process_one_protein(
     reference_cif = meta["reference_structure"]
     chain = meta["chain"]
 
+    if reference_cif and not os.path.exists(str(reference_cif)) and cif_dir:
+        resolved = _find_reference_cif(protein_id, cif_dir)
+        if resolved:
+            reference_cif = resolved
+
     topk_df = _select_topk_templates(scores_csv_path, top_k)
 
-    # If no ground-truth reference, use best-energy template as reference (for sequence extraction only)
     if reference_cif is None or not os.path.exists(str(reference_cif)):
         reference_cif = str(topk_df.iloc[0]["structure_path"])
         chain = "A"
@@ -604,6 +636,7 @@ def _process_one_protein(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run AF2Rank on ProteinEBM top-k templates and plot cross-protein diagnostics")
     parser.add_argument("--inference_dir", required=True, help="Base inference directory containing per-protein folders")
+    parser.add_argument("--cif_dir", default="", help="Directory containing reference CIF files (resolves hardcoded paths from ProteinEBM summary)")
     parser.add_argument("--dataset_file", default="", help="Optional dataset CSV used for cross-protein plots (reference TM / in_train / length).")
     parser.add_argument("--id_column", default="natives_rcsb", help="Dataset column for protein ID")
     parser.add_argument("--tms_column", default="tms_single", help="Dataset column for reference TM score")
@@ -699,10 +732,12 @@ def main() -> None:
     if len(tasks) > 0:
         logger.info(f"First task: {tasks[0][0]}, last task: {tasks[-1][0]}")
 
+    cif_dir = args.cif_dir.strip() if hasattr(args, 'cif_dir') and args.cif_dir else ""
+
     def _submit_args(protein_id, scores_csv, ref, gpu_id):
         return (protein_id, scores_csv, ref, int(args.top_k), int(args.recycles),
                 gpu_id, bool(args.filter_existing), bool(args.dry_run), args.backend,
-                bool(args.direct_python))
+                bool(args.direct_python), cif_dir)
 
     if not has_dataset:
         # Score only; skip cross-protein plots (they require reference TM / metadata).

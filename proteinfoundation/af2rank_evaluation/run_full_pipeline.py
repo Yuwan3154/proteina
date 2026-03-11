@@ -250,6 +250,7 @@ def run_af2rank_on_proteinebm_topk(
     backend: str = "colabdesign",
     shard_args=None,
     direct_python: bool = False,
+    cif_dir: str = "",
 ) -> bool:
     """Run AF2Rank scoring on the ProteinEBM top-k templates per protein."""
     logger.info(f"🧪 Starting AF2Rank-on-ProteinEBM-topk step (backend={backend})...")
@@ -274,6 +275,8 @@ def run_af2rank_on_proteinebm_topk(
         "--backend",
         backend,
     ]
+    if cif_dir:
+        cmd.extend(["--cif_dir", cif_dir])
     if dataset_file:
         cmd.extend(
             [
@@ -508,6 +511,7 @@ def main():
             backend=args.af2rank_backend,
             shard_args=shard_cli_args,
             direct_python=args.direct_python,
+            cif_dir=args.cif_dir,
         )
 
         if topk_success:
