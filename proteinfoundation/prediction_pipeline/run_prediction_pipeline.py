@@ -60,8 +60,18 @@ AF2RANK_EVAL_DIR = os.path.dirname(_pf_af2rank.__file__)
 PROTEINA_BASE_DIR = os.getcwd()
 
 
-def run_with_conda_env(env_name: str, command_list: list, cwd: str | None = None) -> bool:
-    """Run a command with conda environment activation using shell script wrappers."""
+def run_with_conda_env(env_name: str, command_list: list, cwd: str | None = None, direct_python: bool = False) -> bool:
+    """Run a command. If direct_python, use current Python; else use shell script wrappers."""
+    if direct_python:
+        cmd = [sys.executable] + command_list[1:]
+        logger.info(f"Running with current Python: {' '.join(cmd)}")
+        try:
+            result = subprocess.run(cmd, cwd=cwd, check=False)
+            return result.returncode == 0
+        except Exception as e:
+            logger.error(f"Failed to run command: {e}")
+            return False
+
     wrapper_map = {
         "proteina": os.path.join(AF2RANK_EVAL_DIR, "run_with_proteina_env.sh"),
         "colabdesign": os.path.join(AF2RANK_EVAL_DIR, "run_with_colabdesign_env.sh"),
@@ -101,6 +111,7 @@ def step_proteina_inference(
     num_gpus: int,
     force_compile: bool = True,
     shard_args: list | None = None,
+    direct_python: bool = False,
 ) -> bool:
     """Run Proteina inference on all proteins."""
     logger.info("Starting Proteina inference...")
@@ -117,7 +128,7 @@ def step_proteina_inference(
         cmd.append("--force_compile")
     if shard_args:
         cmd.extend(shard_args)
-    return run_with_conda_env("proteina", cmd)
+    return run_with_conda_env("proteina", cmd, direct_python=direct_python)
 
 
 # ── Step 3: ProteinEBM scoring ────────────────────────────────────────────────
@@ -132,6 +143,7 @@ def step_proteinebm_scoring(
     proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
     batch_size: int = 32,
     shard_args: list | None = None,
+    direct_python: bool = False,
 ) -> bool:
     """Run ProteinEBM scoring (energy only, no ground-truth TM-score)."""
     logger.info("Starting ProteinEBM scoring...")
@@ -151,7 +163,7 @@ def step_proteinebm_scoring(
     ]
     if shard_args:
         cmd.extend(shard_args)
-    return run_with_conda_env("proteinebm", cmd)
+    return run_with_conda_env("proteinebm", cmd, direct_python=direct_python)
 
 
 # ── Step 4: AF2Rank on ProteinEBM top-k ──────────────────────────────────────
@@ -164,6 +176,7 @@ def step_af2rank_topk(
     backend: str = "colabdesign",
     proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
     shard_args: list | None = None,
+    direct_python: bool = False,
 ) -> bool:
     """Run AF2Rank on ProteinEBM top-k templates."""
     logger.info(f"Starting AF2Rank on ProteinEBM top-{top_k} (backend={backend})...")
@@ -181,7 +194,7 @@ def step_af2rank_topk(
     ]
     if shard_args:
         cmd.extend(shard_args)
-    return run_with_conda_env("proteina", cmd)
+    return run_with_conda_env("proteina", cmd, direct_python=direct_python)
 
 
 # ── Step 5: Collect results ───────────────────────────────────────────────────
@@ -421,6 +434,9 @@ def main():
                         help="Seconds between polls when shard 0 waits (default: 60)")
     parser.add_argument("--shard_timeout", type=int, default=86400,
                         help="Max seconds for shard 0 to wait (default: 86400)")
+    parser.add_argument("--direct_python", action="store_true",
+                        help="Use current Python interpreter for subprocesses instead of shell script wrappers. "
+                             "Useful on HPC where conda env activation is slow; requires all deps in current env.")
 
     args = parser.parse_args()
 
@@ -461,7 +477,7 @@ def main():
         logger.info("\n" + "=" * 60)
         logger.info("STEP 2: PROTEINA INFERENCE")
         logger.info("=" * 60)
-        if not step_proteina_inference(working_csv, args.inference_config, args.num_gpus, args.force_compile, shard_cli_args):
+        if not step_proteina_inference(working_csv, args.inference_config, args.num_gpus, args.force_compile, shard_cli_args, args.direct_python):
             logger.error("Proteina inference failed")
             success = False
         else:
@@ -480,6 +496,7 @@ def main():
             args.proteinebm_t, args.proteinebm_analysis_subdir,
             args.proteinebm_batch_size,
             shard_args=shard_cli_args,
+            direct_python=args.direct_python,
         ):
             logger.error("ProteinEBM scoring failed")
             success = False
@@ -497,6 +514,7 @@ def main():
             args.inference_config, args.top_k, args.recycles,
             args.num_gpus, args.backend, args.proteinebm_analysis_subdir,
             shard_args=shard_cli_args,
+            direct_python=args.direct_python,
         ):
             logger.error("AF2Rank step failed")
             success = False
