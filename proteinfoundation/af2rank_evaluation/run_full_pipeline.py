@@ -289,6 +289,8 @@ def run_af2rank_on_proteinebm_topk(
         cmd.append("--filter_existing")
     else:
         cmd.append("--no-filter_existing")
+    if direct_python:
+        cmd.append("--direct_python")
     if shard_args:
         cmd.extend(shard_args)
 
@@ -546,8 +548,9 @@ def main():
                     if not csv_path.exists():
                         return False
                 if args.scorer == "proteinebm" and int(args.af2rank_top_k) > 0:
-                    topk_csv = protein_dir / "af2rank_on_proteinebm_top_k" / "af2rank_analysis" / f"af2rank_scores_{protein_name}.csv"
-                    if not topk_csv.exists():
+                    topk_m1 = protein_dir / "af2rank_on_proteinebm_top_k" / "af2rank_analysis" / f"af2rank_scores_{protein_name}.csv"
+                    topk_m2 = protein_dir / "af2rank_on_proteinebm_top_k" / "af2rank_analysis_model_2_ptm" / f"af2rank_scores_{protein_name}.csv"
+                    if not topk_m1.exists() or not topk_m2.exists():
                         return False
                 return True
 

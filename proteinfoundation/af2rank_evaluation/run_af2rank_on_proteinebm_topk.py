@@ -166,7 +166,7 @@ def _stage_templates_as_dir(topk_df: pd.DataFrame, staged_dir: Path) -> None:
         os.symlink(str(src), str(dst))
 
 
-def _batch_reconstruct_ca_only(staged_dir: Path) -> Dict[str, str]:
+def _batch_reconstruct_ca_only(staged_dir: Path, direct_python: bool = False) -> Dict[str, str]:
     """Reconstruct all CA-only PDBs in staged_dir via cg2all (single model load).
     Returns mapping {original_path: reconstructed_path}. Empty dict if none are CA-only."""
     pdb_files = sorted(staged_dir.glob("*.pdb"))
@@ -196,12 +196,13 @@ def _batch_reconstruct_ca_only(staged_dir: Path) -> Dict[str, str]:
     with open(inputs_json, "w") as f:
         json.dump(ca_only, f)
 
-    wrapper_script = str(Path(__file__).parent / "run_with_proteina_env.sh")
     script = str(Path(__file__).parent / "cg2all_reconstruct.py")
-    result = subprocess.run(
-        [wrapper_script, "python", script, "--inputs", inputs_json, "--output_dir", tmp_dir, "--output_map", output_map_json],
-        capture_output=True, text=True, timeout=600,
-    )
+    if direct_python:
+        cmd = [sys.executable, script, "--inputs", inputs_json, "--output_dir", tmp_dir, "--output_map", output_map_json]
+    else:
+        wrapper_script = str(Path(__file__).parent / "run_with_proteina_env.sh")
+        cmd = [wrapper_script, "python", script, "--inputs", inputs_json, "--output_dir", tmp_dir, "--output_map", output_map_json]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     if result.returncode != 0:
         raise RuntimeError(f"cg2all reconstruction failed:\n{result.stderr[-3000:]}")
     with open(output_map_json) as f:
@@ -220,6 +221,7 @@ def _run_af2rank_subprocess(
     model_name: str = "model_1_ptm",
     backend: str = "colabdesign",
     allatom_map: Optional[Dict[str, str]] = None,
+    direct_python: bool = False,
 ) -> None:
     # Ensure each subprocess is pinned to a single GPU when requested.
     cuda_line = ""
@@ -357,7 +359,10 @@ plot_af2rank_results(plot_scores, output_dir, protein_id)
 """
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    cmd = [wrapper_script, "python", "-c", py]
+    if direct_python:
+        cmd = [sys.executable, "-c", py]
+    else:
+        cmd = [wrapper_script, "python", "-c", py]
     result = subprocess.run(cmd, cwd=wrapper_dir, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(
@@ -402,6 +407,7 @@ def _process_one_protein(
     filter_existing: bool,
     dry_run: bool,
     backend: str = "colabdesign",
+    direct_python: bool = False,
 ) -> Dict[str, object]:
     scores_csv_path = Path(scores_csv)
     protein_dir = scores_csv_path.parent.parent
@@ -507,7 +513,7 @@ def _process_one_protein(
         # Batch-reconstruct all CA-only templates once upfront, reuse for both models
         allatom_map: Dict[str, str] = {}
         if backend == "colabdesign":
-            allatom_map = _batch_reconstruct_ca_only(staged_dir)
+            allatom_map = _batch_reconstruct_ca_only(staged_dir, direct_python=direct_python)
         try:
             _run_af2rank_subprocess(
                 protein_id=protein_id,
@@ -520,6 +526,7 @@ def _process_one_protein(
                 model_name="model_1_ptm",
                 backend=backend,
                 allatom_map=allatom_map,
+                direct_python=direct_python,
             )
             _run_af2rank_subprocess(
                 protein_id=protein_id,
@@ -532,6 +539,7 @@ def _process_one_protein(
                 model_name="model_2_ptm",
                 backend=backend,
                 allatom_map=allatom_map,
+                direct_python=direct_python,
             )
         finally:
             # Delete reconstructed all-atom temp files after both models are done
@@ -605,6 +613,8 @@ def main() -> None:
     parser.add_argument("--proteinebm_analysis_subdir", default="proteinebm_v2_cathmd_analysis", help="Per-protein subdir containing ProteinEBM scores (default: proteinebm_v2_cathmd_analysis)")
     parser.add_argument("--backend", choices=["colabdesign", "openfold"], default="colabdesign",
                        help="AF2Rank backend: colabdesign (JAX) or openfold (PyTorch)")
+    parser.add_argument("--direct_python", action="store_true", default=False,
+                       help="Use current Python interpreter for inner subprocesses instead of shell wrappers (for HPC)")
     add_shard_args(parser)
     args = parser.parse_args()
 
@@ -631,18 +641,35 @@ def main() -> None:
     if has_dataset:
         dataset_map = _load_dataset_map(args.dataset_file, args.id_column, args.tms_column)
 
+    scores_by_protein: Dict[str, Path] = {p.parent.parent.name: p for p in score_csvs}
+
     out_dir = args.output_dir.strip()
     if not out_dir:
         out_dir = str(Path(args.inference_dir) / "af2rank_on_proteinebm_top_k_cross_protein_analysis")
     out_dir_path = Path(out_dir)
     out_dir_path.mkdir(parents=True, exist_ok=True)
 
+    shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
+    if has_dataset and shard_index is not None:
+        all_ids_for_sharding = list(dataset_map.keys())
+        data_dir = os.environ.get("DATA_PATH", os.path.join(Path(__file__).resolve().parents[2], "data"))
+        shard_ids = set(shard_proteins(all_ids_for_sharding, shard_index, num_shards, data_dir=data_dir))
+    elif shard_index is not None:
+        all_ids_for_sharding = list(scores_by_protein.keys())
+        data_dir = os.environ.get("DATA_PATH", os.path.join(Path(__file__).resolve().parents[2], "data"))
+        shard_ids = set(shard_proteins(all_ids_for_sharding, shard_index, num_shards, data_dir=data_dir))
+    else:
+        shard_ids = None
+
     tasks: List[Tuple[str, str, Dict[str, object], str]] = []
     n_considered = 0
-    for scores_csv in score_csvs:
-        protein_id = scores_csv.parent.parent.name
+    candidate_ids = list(shard_ids) if shard_ids is not None else (list(dataset_map.keys()) if has_dataset else list(scores_by_protein.keys()))
+    for protein_id in candidate_ids:
+        if protein_id not in scores_by_protein:
+            continue
         if has_dataset and protein_id not in dataset_map:
             continue
+        scores_csv = scores_by_protein[protein_id]
         gpu_id = gpu_ids[len(tasks) % len(gpu_ids)]
         if has_dataset:
             ref = dataset_map[protein_id]
@@ -656,14 +683,8 @@ def main() -> None:
 
     def _submit_args(protein_id, scores_csv, ref, gpu_id):
         return (protein_id, scores_csv, ref, int(args.top_k), int(args.recycles),
-                gpu_id, bool(args.filter_existing), bool(args.dry_run), args.backend)
-
-    shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
-    if shard_index is not None:
-        all_ids = [t[0] for t in tasks]
-        data_dir = os.environ.get("DATA_PATH", os.path.join(Path(__file__).resolve().parents[2], "data"))
-        shard_ids = set(shard_proteins(all_ids, shard_index, num_shards, data_dir=data_dir))
-        tasks = [t for t in tasks if t[0] in shard_ids]
+                gpu_id, bool(args.filter_existing), bool(args.dry_run), args.backend,
+                bool(args.direct_python))
 
     if not has_dataset:
         # Score only; skip cross-protein plots (they require reference TM / metadata).
