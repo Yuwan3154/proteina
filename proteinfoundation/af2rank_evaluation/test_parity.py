@@ -9,18 +9,18 @@ This script:
 3. Compares pTM, pLDDT, composite scores between backends
 """
 
-import os
-import sys
-import subprocess
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import warnings
 
 os.environ["OPENMM_PLUGIN_DIR"] = "/dev/null"
 warnings.filterwarnings("ignore")
-
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
+from af2rank_openfold_scorer import OpenFoldAF2Rank
 
 INFERENCE_DIR = (
     "/home/ubuntu/proteina/inference/"
@@ -35,8 +35,6 @@ RECYCLES = 3
 
 def run_openfold_scoring(model_name="model_1_ptm"):
     """Score decoys with OpenFold backend."""
-    from af2rank_openfold_scorer import OpenFoldAF2Rank
-
     decoy_pdbs = sorted(
         [os.path.join(INFERENCE_DIR, f) for f in os.listdir(INFERENCE_DIR) if f.endswith(".pdb")]
     )[:NUM_DECOYS]
@@ -69,7 +67,7 @@ def run_colabdesign_scoring(model_name="model_1_ptm"):
     py_code = f"""
 import os, sys, json
 os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.3'
-sys.path.insert(0, '/home/ubuntu/proteina/af2rank_evaluation')
+sys.path.insert(0, {os.path.dirname(os.path.abspath(__file__))!r})
 
 from af2rank_scorer import ModernAF2Rank, suppress_stdout
 

@@ -69,9 +69,13 @@ import json
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 from colabdesign import mk_af_model, clear_mem
+from colabdesign.af import prep
 from colabdesign.af.contrib import predict
+from colabdesign.af.prep import prep_pdb
+from colabdesign.shared import protein
 from colabdesign.shared.protein import _np_rmsd
 from colabdesign.shared.utils import copy_dict
+from colabdesign.af.alphafold.common import residue_constants
 
 
 def get_memory_usage_gb():
@@ -252,11 +256,6 @@ def get_pdb_fn(pdb_code):
 
 def robust_get_template_feats(pdbs, chains, query_seq, **kwargs):
     """Wrapper around predict.get_template_feats that handles model number issues."""
-    
-    # Import and store original functions
-    from colabdesign.shared import protein
-    from colabdesign.af import prep
-    
     # Store original functions
     original_protein_pdb_to_string = protein.pdb_to_string
     original_prep_pdb_to_string = prep.pdb_to_string
@@ -415,9 +414,6 @@ class ModernAF2Rank:
         
     def _get_coords_from_pdb(self, pdb_file, chain=None):
         """Extract CA coordinates from PDB file using prep_pdb."""
-        from colabdesign.af.prep import prep_pdb
-        from colabdesign.af.alphafold.common import residue_constants
-        
         # Auto-detect chain if not specified
         if chain is None:
             with open(pdb_file, 'r') as f:
@@ -429,9 +425,6 @@ class ModernAF2Rank:
                 chain = 'A'  # Default fallback
         
         # Apply our robust PDB handling
-        from colabdesign.shared import protein
-        from colabdesign.af import prep
-        
         # Store original functions
         original_protein_pdb_to_string = protein.pdb_to_string
         original_prep_pdb_to_string = prep.pdb_to_string

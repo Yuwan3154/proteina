@@ -9,14 +9,16 @@ Usage:
     conda run -n colabdesign python debug_template_features.py
 """
 
-import os
-os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.3'
-
-import sys
+import inspect
 import json
-import tempfile
+import os
 import subprocess
+import sys
+import tempfile
+
 import numpy as np
+
+os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.3'
 
 # ── paths ──────────────────────────────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -27,10 +29,11 @@ DECOY_PDB = ("/home/ubuntu/proteina/inference/"
 REFERENCE_CIF = "/home/ubuntu/data/bad_afdb/pdb/SS/5SSV.cif"
 
 # ── ColabDesign imports ─────────────────────────────────────────────────────
+from colabdesign.af import prep
+from colabdesign.af import inputs as af_inputs
 from colabdesign.af.contrib import predict
 from colabdesign.af.alphafold.common import residue_constants
 from colabdesign.shared import protein
-from colabdesign.af import prep
 
 sys.path.insert(0, SCRIPT_DIR)
 from af2rank_scorer import (
@@ -217,8 +220,6 @@ def main():
         print(f"\n{'='*60}")
         print(f"  HOW set_template uses dgram vs all_atom_positions")
         print(f"{'='*60}")
-        import inspect
-        from colabdesign.af import inputs as af_inputs
         src = inspect.getsource(af_inputs._update_template)
         print(src[:3000])
 

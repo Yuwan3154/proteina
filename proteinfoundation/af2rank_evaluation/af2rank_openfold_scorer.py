@@ -9,31 +9,28 @@ AlphaFold weights and should produce roughly equivalent results (pTM diff < 0.01
 Supports model_1_ptm and model_2_ptm for the AF2Rank-on-ProteinEBM top-k protocol.
 """
 
-import os
-import sys
+import gc
 import glob
 import json
-import tempfile
+import os
 import subprocess
+import sys
+import tempfile
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional
+
 import numpy as np
 import pandas as pd
-from Bio.PDB import MMCIFParser, PDBParser, PDBIO, Select
-import matplotlib.pyplot as plt
-from tqdm import tqdm
-from loguru import logger
-import gc
-
 import torch
+from Bio.PDB import MMCIFParser, PDBIO, PDBParser, Select
+import matplotlib.pyplot as plt
+from loguru import logger
+from tqdm import tqdm
 
-# Add proteina root to path for openfold imports
-PROTEINA_BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-if PROTEINA_BASE_DIR not in sys.path:
-    sys.path.insert(0, PROTEINA_BASE_DIR)
-
-from proteinfoundation.utils.openfold_inference import OpenFoldTemplateInference
 import openfold.np.residue_constants as rc
+from openfold.np import protein as openfold_protein
+from proteinfoundation.utils.openfold_inference import OpenFoldTemplateInference
+from scipy.stats import spearmanr
 
 
 KALIGN_BINARY_PATH = "/usr/bin/kalign"
@@ -215,14 +212,12 @@ def convert_pdb_to_cif(pdb_file, chain_id=None):
     compatible with OpenFold's mmcif_parsing (unlike BioPython's MMCIFIO which
     misses required fields like _entry.id).
     """
-    from openfold.np import protein
-
     with open(pdb_file) as f:
         pdb_str = f.read()
-    prot = protein.from_pdb_string(pdb_str, chain_id=chain_id)
+    prot = openfold_protein.from_pdb_string(pdb_str, chain_id=chain_id)
     # to_modelcif expects 1-indexed residue_index (ihm convention),
     # but from_pdb_string produces 0-indexed. Fix by adding 1.
-    prot = protein.Protein(
+    prot = openfold_protein.Protein(
         atom_positions=prot.atom_positions,
         atom_mask=prot.atom_mask,
         aatype=prot.aatype,
@@ -230,7 +225,7 @@ def convert_pdb_to_cif(pdb_file, chain_id=None):
         chain_index=prot.chain_index,
         b_factors=prot.b_factors,
     )
-    cif_str = protein.to_modelcif(prot)
+    cif_str = openfold_protein.to_modelcif(prot)
 
     temp_cif = tempfile.NamedTemporaryFile(mode='w', suffix='.cif', delete=False)
     temp_cif.write(cif_str)
@@ -366,7 +361,6 @@ def plot_metric(scores, x="ptm", y="composite",
 
         valid_mask = (~np.isnan(x_vals)) & (~np.isnan(y_vals))
         if valid_mask.sum() > 1:
-            from scipy.stats import spearmanr
             correlation = spearmanr(x_vals[valid_mask], y_vals[valid_mask]).correlation
             if not np.isnan(correlation):
                 plt.text(0.05, 0.95, f'Spearman R: {correlation:.3f}',
@@ -854,8 +848,6 @@ def run_af2rank_analysis_openfold(
                 ptm_scores.append(score['ptm'])
 
         if len(tm_ref_template_scores) > 1:
-            from scipy.stats import spearmanr
-
             correlation_result = spearmanr(tm_ref_template_scores, composite_scores)
             spearman_rho_composite = correlation_result.correlation
 

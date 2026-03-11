@@ -16,13 +16,19 @@ inputs.json: JSON list of input CA-only PDB file paths
 output_map.json: written on success, maps input_path -> reconstructed_path
 """
 
+import argparse
+import json
 import os
 import sys
-import json
-import argparse
 import tempfile
 
 import torch
+import dgl
+import cg2all.lib.libcg
+import cg2all.lib.libmodel
+from cg2all.lib.libconfig import MODEL_HOME
+from cg2all.lib.libdata import PredictionData, create_trajectory_from_batch
+from cg2all.lib.libter import patch_termini
 
 
 def main():
@@ -41,13 +47,6 @@ def main():
         return
 
     os.makedirs(args.output_dir, exist_ok=True)
-
-    import dgl
-    import cg2all.lib.libcg
-    import cg2all.lib.libmodel
-    from cg2all.lib.libconfig import MODEL_HOME
-    from cg2all.lib.libdata import PredictionData, create_trajectory_from_batch
-    from cg2all.lib.libter import patch_termini
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt_path = MODEL_HOME / "CalphaBasedModel.ckpt"

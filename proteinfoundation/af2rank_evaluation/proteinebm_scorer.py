@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -338,24 +339,108 @@ def score_decoy_pdb(
     return float(out["energy"].detach().cpu().item())
 
 
+def score_decoy_pdbs_batched(
+    pdb_paths: List[str],
+    model: ProteinEBM,
+    t: float,
+    template_self_condition: bool,
+    device: torch.device,
+    batch_size: int = 32,
+    batch_size_ref: "List[int] | None" = None,
+) -> Dict[int, float]:
+    """Score multiple decoy PDBs using batched inference.
+
+    All PDBs should have the same residue count (true for decoys of one protein).
+    Falls back to single-structure scoring on OOM.
+
+    Args:
+        batch_size_ref: Optional 1-element list holding the current batch size.
+            Mutated in-place (decreased) on OOM. Passing the same list across
+            successive proteins ensures the batch size never grows back — correct
+            because memory consumption is monotonic with protein length.
+
+    Returns:
+        Dict mapping pdb_path index -> energy.
+    """
+    # Phase 1: Build per-PDB features (sequential PDB parsing)
+    feats_list: List[Tuple[int, Dict[str, torch.Tensor]]] = []
+    results: Dict[int, float] = {}
+    for i, pdb_path in enumerate(pdb_paths):
+        try:
+            feats = build_input_feats_from_pdb(pdb_path, model, t, template_self_condition, device)
+            feats_list.append((i, feats))
+        except Exception as e:
+            print(f"  Warning: failed to build features for {pdb_path}: {e}", flush=True)
+
+    if not feats_list:
+        return results
+
+    # Phase 2: Batched inference — all decoys share the same residue count
+    current_batch_size = batch_size_ref[0] if batch_size_ref is not None else batch_size
+    remaining = list(feats_list)
+
+    while remaining:
+        chunk = remaining[:current_batch_size]
+        remaining = remaining[current_batch_size:]
+
+        if current_batch_size == 1:
+            # Single-structure fallback
+            for idx, feats in chunk:
+                try:
+                    with torch.no_grad():
+                        out = model.compute_energy(feats)
+                    results[idx] = float(out["energy"].detach().cpu().item())
+                except Exception as e:
+                    print(f"  Warning: scoring failed for index {idx}: {e}", flush=True)
+            continue
+
+        try:
+            indices = [idx for idx, _ in chunk]
+            batched = {}
+            for key in chunk[0][1]:
+                batched[key] = torch.cat([feats[key] for _, feats in chunk], dim=0)
+
+            with torch.no_grad():
+                out = model.compute_energy(batched)
+
+            energies = out["energy"].detach().cpu()
+            for j, idx in enumerate(indices):
+                results[idx] = float(energies[j].item())
+
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            current_batch_size = max(1, current_batch_size // 2)
+            n_res = feats_list[0][1]["aatype"].shape[1] if feats_list else "?"
+            print(f"  OOM at n_res={n_res}: reducing batch size to {current_batch_size}", flush=True)
+            if batch_size_ref is not None:
+                batch_size_ref[0] = current_batch_size
+            remaining = chunk + remaining  # re-queue failed chunk
+
+    return results
+
+
 def run_proteinebm_scoring_for_protein(
     protein_id: str,
     inference_output_dir: str,
     output_dir: str,
-    reference_cif: str,
+    reference_cif: str | None,
     reference_chain: str | None,
     proteinebm_config: str,
     proteinebm_checkpoint: str,
     t: float,
     template_self_condition: bool,
+    batch_size: int = 32,
+    model: "ProteinEBM | None" = None,
+    batch_size_ref: "List[int] | None" = None,
 ) -> Tuple[str, str]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model, _ = load_proteinebm_model(
-        config_path=proteinebm_config,
-        checkpoint_path=proteinebm_checkpoint,
-        device=device,
-    )
+    if model is None:
+        model, _ = load_proteinebm_model(
+            config_path=proteinebm_config,
+            checkpoint_path=proteinebm_checkpoint,
+            device=device,
+        )
 
     inference_dir = Path(inference_output_dir)
     pdb_files = sorted(inference_dir.glob(f"{protein_id}_*.pdb"))
@@ -366,21 +451,40 @@ def run_proteinebm_scoring_for_protein(
     scores_csv_path = os.path.join(output_dir, f"proteinebm_scores_{protein_id}.csv")
     summary_path = os.path.join(output_dir, f"proteinebm_summary_{protein_id}.json")
 
-    ref_coords = _extract_ca_coords(reference_cif, chain_id=reference_chain)
+    ref_coords = None
+    if reference_cif is not None:
+        ref_coords = _extract_ca_coords(reference_cif, chain_id=reference_chain)
 
     start_time = time.time()
-    results: List[Dict[str, object]] = []
 
-    for pdb_path in pdb_files:
-        energy = score_decoy_pdb(
-            pdb_path=str(pdb_path),
-            model=model,
-            t=t,
-            template_self_condition=template_self_condition,
-            device=device,
-        )
-        decoy_coords = _extract_ca_coords(str(pdb_path), chain_id=None)
-        tm_out = tmscore_ca_coords(ref_coords, decoy_coords)
+    # Batched energy scoring
+    pdb_path_strs = [str(p) for p in pdb_files]
+    energy_map = score_decoy_pdbs_batched(
+        pdb_paths=pdb_path_strs,
+        model=model,
+        t=t,
+        template_self_condition=template_self_condition,
+        device=device,
+        batch_size=batch_size,
+        batch_size_ref=batch_size_ref,
+    )
+
+    # Build results with optional TM-score computation (still per-structure, CPU-bound)
+    results: List[Dict[str, object]] = []
+    for i, pdb_path in enumerate(pdb_files):
+        if i not in energy_map:
+            continue
+        energy = energy_map[i]
+        if ref_coords is not None:
+            decoy_coords = _extract_ca_coords(str(pdb_path), chain_id=None)
+            tm_out = tmscore_ca_coords(ref_coords, decoy_coords)
+            tm_ref = tm_out["tms"]
+            rmsd_ref = tm_out["rms"]
+            gdt_ref = tm_out["gdt"]
+        else:
+            tm_ref = float("nan")
+            rmsd_ref = float("nan")
+            gdt_ref = float("nan")
         results.append(
             {
                 "protein_id": protein_id,
@@ -388,9 +492,9 @@ def run_proteinebm_scoring_for_protein(
                 "structure_path": str(pdb_path),
                 "t": t,
                 "energy": energy,
-                "tm_ref_template": tm_out["tms"],
-                "rmsd_ref_template": tm_out["rms"],
-                "gdt_ref_template": tm_out["gdt"],
+                "tm_ref_template": tm_ref,
+                "rmsd_ref_template": rmsd_ref,
+                "gdt_ref_template": gdt_ref,
             }
         )
 
@@ -420,7 +524,7 @@ def run_proteinebm_scoring_for_protein(
     top_1_tm_ref_template = None
     top_5_tm_ref_template = None
 
-    if len(successful) > 1:
+    if ref_coords is not None and len(successful) > 1:
         tm_vals = [float(r["tm_ref_template"]) for r in successful]
         score_vals = [-float(r["energy"]) for r in successful]  # higher is better
 
@@ -443,7 +547,7 @@ def run_proteinebm_scoring_for_protein(
         "successful_scores": len(results),
         "runtime_seconds": runtime_s,
         "t": t,
-        "reference_structure": os.path.abspath(os.path.expanduser(reference_cif)),
+        "reference_structure": os.path.abspath(os.path.expanduser(reference_cif)) if reference_cif else None,
         "chain": reference_chain,
         "proteinebm_config": os.path.abspath(os.path.expanduser(proteinebm_config)),
         "proteinebm_checkpoint": os.path.abspath(os.path.expanduser(proteinebm_checkpoint)),
@@ -467,13 +571,38 @@ def run_proteinebm_scoring_for_protein(
     return scores_csv_path, summary_path
 
 
+def _get_protein_length_from_pdb(inference_output_dir: str, protein_id: str) -> int:
+    """Fast protein length estimate by counting CA atoms in the first available PDB."""
+    pdb_files = sorted(Path(inference_output_dir).glob(f"{protein_id}_*.pdb"))
+    if not pdb_files:
+        return 0
+    count = 0
+    with open(pdb_files[0]) as f:
+        for line in f:
+            if line.startswith("ATOM") and line[12:16].strip() == "CA":
+                count += 1
+    return count
+
+
 def main():
     parser = argparse.ArgumentParser(description="ProteinEBM scoring for Proteina decoys (single-pass energy)")
-    parser.add_argument("--protein_id", required=True, help="Protein identifier (e.g. 1a2y_C)")
-    parser.add_argument("--reference_cif", required=True, help="Path to native/reference CIF (for TMscore ground-truth)")
+    # Single-protein mode
+    parser.add_argument("--protein_id", default=None, help="Protein identifier (e.g. 1a2y_C). Mutually exclusive with --proteins_json.")
+    parser.add_argument("--reference_cif", default=None, help="Path to native/reference CIF (for TMscore ground-truth). Optional; if omitted, TM-score metrics are skipped.")
     parser.add_argument("--chain", default=None, help="Chain ID in reference CIF (default: taken from protein_id if possible)")
-    parser.add_argument("--inference_output_dir", required=True, help="Directory containing decoy PDB files")
-    parser.add_argument("--output_dir", required=True, help="Directory to write proteinebm_analysis outputs")
+    parser.add_argument("--inference_output_dir", default=None, help="Directory containing decoy PDB files")
+    parser.add_argument("--output_dir", default=None, help="Directory to write proteinebm_analysis outputs")
+    # Multi-protein mode
+    parser.add_argument(
+        "--proteins_json", default=None,
+        help=(
+            "Path to a JSON file containing a list of protein configs to process with one "
+            "model load. Each entry: {protein_id, inference_output_dir, output_dir, "
+            "reference_cif (optional), reference_chain (optional)}. "
+            "Mutually exclusive with --protein_id."
+        ),
+    )
+    # Shared args
     parser.add_argument("--proteinebm_config", required=True, help="Path to ProteinEBM base_pretrain.yaml")
     parser.add_argument("--proteinebm_checkpoint", required=True, help="Path to ProteinEBM checkpoint (.pt)")
     parser.add_argument("--t", type=float, default=0.1, help="Diffusion time t for scoring (default: 0.1)")
@@ -483,27 +612,84 @@ def main():
         default=True,
         help="Use template coordinates for self-conditioning input (default: True)",
     )
+    parser.add_argument("--batch_size", type=int, default=32,
+                        help="Batch size for ProteinEBM inference (default: 32). Auto-reduces on OOM.")
 
     args = parser.parse_args()
 
-    print(f"Starting ProteinEBM scoring for {args.protein_id}", flush=True)
-    chain = args.chain
-    if chain is None and "_" in args.protein_id:
-        chain = args.protein_id.split("_", 1)[1]
-    scores_csv, summary_json = run_proteinebm_scoring_for_protein(
-        protein_id=args.protein_id,
-        inference_output_dir=args.inference_output_dir,
-        output_dir=args.output_dir,
-        reference_cif=args.reference_cif,
-        reference_chain=chain,
-        proteinebm_config=args.proteinebm_config,
-        proteinebm_checkpoint=args.proteinebm_checkpoint,
-        t=args.t,
-        template_self_condition=args.proteinebm_template_self_condition,
-    )
-    print(f"Completed ProteinEBM scoring for {args.protein_id}", flush=True)
-    print(f"Scores: {scores_csv}", flush=True)
-    print(f"Summary: {summary_json}", flush=True)
+    if args.proteins_json and args.protein_id:
+        print("Error: --proteins_json and --protein_id are mutually exclusive", flush=True)
+        sys.exit(1)
+    if not args.proteins_json and not args.protein_id:
+        print("Error: one of --protein_id or --proteins_json is required", flush=True)
+        sys.exit(1)
+
+    if args.proteins_json:
+        # ── Multi-protein mode: load model once, process all proteins sorted by length ──
+        with open(args.proteins_json) as f:
+            protein_configs: List[Dict] = json.load(f)
+
+        print(f"Multi-protein mode: {len(protein_configs)} proteins, batch_size={args.batch_size}", flush=True)
+
+        # Sort by sequence length (ascending) so similar-length proteins are adjacent
+        # and the batch_size_cache is most effective.
+        protein_configs.sort(
+            key=lambda c: _get_protein_length_from_pdb(c["inference_output_dir"], c["protein_id"])
+        )
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model, _ = load_proteinebm_model(
+            config_path=args.proteinebm_config,
+            checkpoint_path=args.proteinebm_checkpoint,
+            device=device,
+        )
+        # Single mutable batch size — only ever decreases as proteins get longer
+        batch_size_ref: List[int] = [args.batch_size]
+
+        for i, cfg in enumerate(protein_configs):
+            protein_id = cfg["protein_id"]
+            print(f"[{i+1}/{len(protein_configs)}] Scoring {protein_id} (batch_size={batch_size_ref[0]})", flush=True)
+            try:
+                run_proteinebm_scoring_for_protein(
+                    protein_id=protein_id,
+                    inference_output_dir=cfg["inference_output_dir"],
+                    output_dir=cfg["output_dir"],
+                    reference_cif=cfg.get("reference_cif"),
+                    reference_chain=cfg.get("reference_chain"),
+                    proteinebm_config=args.proteinebm_config,
+                    proteinebm_checkpoint=args.proteinebm_checkpoint,
+                    t=args.t,
+                    template_self_condition=args.proteinebm_template_self_condition,
+                    batch_size=args.batch_size,
+                    model=model,
+                    batch_size_ref=batch_size_ref,
+                )
+                print(f"  Done: {protein_id}", flush=True)
+            except Exception as e:
+                print(f"  ERROR scoring {protein_id}: {e}", flush=True)
+        print(f"Multi-protein scoring complete. final_batch_size={batch_size_ref[0]}", flush=True)
+
+    else:
+        # ── Single-protein mode (backward compatible) ──
+        print(f"Starting ProteinEBM scoring for {args.protein_id} (batch_size={args.batch_size})", flush=True)
+        chain = args.chain
+        if chain is None and "_" in args.protein_id:
+            chain = args.protein_id.split("_", 1)[1]
+        scores_csv, summary_json = run_proteinebm_scoring_for_protein(
+            protein_id=args.protein_id,
+            inference_output_dir=args.inference_output_dir,
+            output_dir=args.output_dir,
+            reference_cif=args.reference_cif,
+            reference_chain=chain,
+            proteinebm_config=args.proteinebm_config,
+            proteinebm_checkpoint=args.proteinebm_checkpoint,
+            t=args.t,
+            template_self_condition=args.proteinebm_template_self_condition,
+            batch_size=args.batch_size,
+        )
+        print(f"Completed ProteinEBM scoring for {args.protein_id}", flush=True)
+        print(f"Scores: {scores_csv}", flush=True)
+        print(f"Summary: {summary_json}", flush=True)
 
 
 if __name__ == "__main__":

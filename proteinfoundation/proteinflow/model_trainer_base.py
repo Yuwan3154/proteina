@@ -392,18 +392,6 @@ class ModelTrainerBase(L.LightningModule):
         if self.motif_conditioning and ("fixed_structure_mask" not in batch or "x_motif" not in batch):
             batch.update(self.motif_factory(batch, zeroes = True))  # for generation we have to pass conditioning info in. But for validation do the same as training
 
-        # Inject ext_lig default during inference/validation-sampling when not present in batch.
-        # During training ext_lig is always present from the data pipeline so the guard prevents
-        # overwriting it. Default is "unknown" (2); can be set to "absent" (0) via inference config.
-        if "ext_lig" not in batch and "x_t" in batch:
-            ext_lig_default = getattr(self, "_ext_lig_inference_default", "unknown")
-            fill_val = 0 if ext_lig_default == "absent" else 2
-            xt = batch["x_t"]
-            batch["ext_lig"] = torch.full(
-                (xt.shape[0], xt.shape[1]), fill_val,
-                dtype=torch.long, device=xt.device,
-            )
-
         nn_out = self.nn(batch, force_compile=force_compile)
         x_pred = self._nn_out_to_x_clean(nn_out, batch)
         c_pred = self._nn_out_to_c_clean(nn_out, batch)
@@ -1671,14 +1659,6 @@ class ModelTrainerBase(L.LightningModule):
         and autoguidance network (or None if not provided)."""
         self.inf_cfg = inf_cfg
         self.nn_ag = nn_ag
-        # Store ext_lig default for injection in predict_clean_n_v_w_guidance.
-        # Accepted values: "unknown" (fill=2, default) or "absent" (fill=0).
-        ext_lig_default = inf_cfg.get("ext_lig_default", "unknown")
-        if ext_lig_default not in ("unknown", "absent"):
-            raise ValueError(
-                f"ext_lig_default must be 'unknown' or 'absent', got {ext_lig_default!r}."
-            )
-        self._ext_lig_inference_default = ext_lig_default
         if self.discrete_diffusion is not None:
             sampling_grid = inf_cfg.get("sampling_grid", None)
             if sampling_grid is not None:

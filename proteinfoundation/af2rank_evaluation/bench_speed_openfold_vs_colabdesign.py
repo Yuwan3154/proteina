@@ -7,17 +7,17 @@ Scores 5 decoys of same length with both backends to compare:
 - OpenFold (PyTorch) with chunking disabled (chunk_size=0)
 """
 
-import os
-import sys
-import time
 import json
-import tempfile
+import os
 import subprocess
+import sys
+import tempfile
+import time
 
 os.environ["OPENMM_PLUGIN_DIR"] = "/dev/null"
-
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
+from af2rank_openfold_scorer import OpenFoldAF2Rank
 
 INFERENCE_DIR = (
     "/home/ubuntu/proteina/inference/"
@@ -32,8 +32,6 @@ RECYCLES = 3
 
 def run_openfold_benchmark(model_name="model_1_ptm", chunk_size=None):
     """Benchmark OpenFold backend scoring."""
-    from af2rank_openfold_scorer import OpenFoldAF2Rank
-
     decoy_pdbs = sorted(
         [os.path.join(INFERENCE_DIR, f) for f in os.listdir(INFERENCE_DIR) if f.endswith(".pdb")]
     )[:NUM_DECOYS]
@@ -73,7 +71,7 @@ def run_colabdesign_benchmark(model_name="model_1_ptm"):
     py_code = f"""
 import os, sys, json, time
 os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.3'
-sys.path.insert(0, '/home/ubuntu/proteina/af2rank_evaluation')
+sys.path.insert(0, {os.path.dirname(os.path.abspath(__file__))!r})
 
 from af2rank_scorer import ModernAF2Rank, suppress_stdout
 

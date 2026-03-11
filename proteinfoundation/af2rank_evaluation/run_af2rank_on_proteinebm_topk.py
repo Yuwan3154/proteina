@@ -10,16 +10,23 @@ This is intentionally separate from run_full_pipeline.py for now.
 
 import argparse
 import json
+import logging
 import os
 import shutil
 import subprocess
-from concurrent.futures import ProcessPoolExecutor
+import sys
+import tempfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
+
+logging.basicConfig(level=logging.ERROR, format="%(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 
 def _load_dataset_map(dataset_file: str, id_column: str, tms_column: str) -> Dict[str, Dict[str, float]]:
@@ -45,14 +52,15 @@ def _find_proteinebm_scores(inference_dir: str, analysis_subdir: str = "proteine
     return sorted(base.glob(f"*/{analysis_subdir}/proteinebm_scores_*.csv"))
 
 
-def _read_proteinebm_summary(summary_path: Path) -> Dict[str, str]:
+def _read_proteinebm_summary(summary_path: Path) -> Dict[str, str | None]:
     with summary_path.open("r") as f:
         summary = json.load(f)
     ref = summary.get("reference_structure")
     chain = summary.get("chain")
-    if not ref or not chain:
-        raise ValueError(f"Missing reference_structure/chain in {summary_path}")
-    return {"reference_structure": str(ref), "chain": str(chain)}
+    return {
+        "reference_structure": str(ref) if ref else None,
+        "chain": str(chain) if chain else None,
+    }
 
 
 def _select_topk_templates(scores_csv: Path, top_k: int) -> pd.DataFrame:
@@ -152,6 +160,49 @@ def _stage_templates_as_dir(topk_df: pd.DataFrame, staged_dir: Path) -> None:
         os.symlink(str(src), str(dst))
 
 
+def _batch_reconstruct_ca_only(staged_dir: Path) -> Dict[str, str]:
+    """Reconstruct all CA-only PDBs in staged_dir via cg2all (single model load).
+    Returns mapping {original_path: reconstructed_path}. Empty dict if none are CA-only."""
+    pdb_files = sorted(staged_dir.glob("*.pdb"))
+    if not pdb_files:
+        return {}
+
+    # Quick CA-only check: any file where all ATOM records are CA
+    def _is_ca_only(path: Path) -> bool:
+        has_non_ca = False
+        has_atom = False
+        with open(path) as f:
+            for line in f:
+                if line.startswith("ATOM"):
+                    has_atom = True
+                    if line[12:16].strip() != "CA":
+                        has_non_ca = True
+                        break
+        return has_atom and not has_non_ca
+
+    ca_only = [str(p) for p in pdb_files if _is_ca_only(p)]
+    if not ca_only:
+        return {}
+
+    tmp_dir = tempfile.mkdtemp(prefix="cg2all_topk_")
+    inputs_json = os.path.join(tmp_dir, "inputs.json")
+    output_map_json = os.path.join(tmp_dir, "output_map.json")
+    with open(inputs_json, "w") as f:
+        json.dump(ca_only, f)
+
+    wrapper_script = str(Path(__file__).parent / "run_with_proteina_env.sh")
+    script = str(Path(__file__).parent / "cg2all_reconstruct.py")
+    result = subprocess.run(
+        [wrapper_script, "python", script, "--inputs", inputs_json, "--output_dir", tmp_dir, "--output_map", output_map_json],
+        capture_output=True, text=True, timeout=600,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"cg2all reconstruction failed:\n{result.stderr[-3000:]}")
+    with open(output_map_json) as f:
+        mapping = json.load(f)
+    return mapping
+
+
 def _run_af2rank_subprocess(
     protein_id: str,
     reference_cif: str,
@@ -161,19 +212,83 @@ def _run_af2rank_subprocess(
     recycles: int,
     cuda_visible_devices: str,
     model_name: str = "model_1_ptm",
+    backend: str = "colabdesign",
+    allatom_map: Optional[Dict[str, str]] = None,
 ) -> None:
-    wrapper_script = "/home/ubuntu/proteina/af2rank_evaluation/run_with_colabdesign_env.sh"
-
     # Ensure each subprocess is pinned to a single GPU when requested.
     cuda_line = ""
     if cuda_visible_devices.strip():
         cuda_line = f"os.environ['CUDA_VISIBLE_DEVICES'] = {cuda_visible_devices!r}\n"
 
-    py = f"""
+    wrapper_dir = str(Path(__file__).parent)
+    if backend == "openfold":
+        wrapper_script = os.path.join(wrapper_dir, "run_with_proteina_env.sh")
+        py = f"""
 import os
 import sys
 import glob
-sys.path.append('/home/ubuntu/proteina/af2rank_evaluation')
+sys.path.append({wrapper_dir!r})
+
+import pandas as pd
+
+from af2rank_openfold_scorer import OpenFoldAF2Rank, plot_af2rank_results, save_af2rank_scores, load_af2rank_scores_from_csv
+
+{cuda_line}
+
+protein_id = {protein_id!r}
+reference_cif = {reference_cif!r}
+chain = {chain!r}
+inference_output_dir = {str(staged_templates_dir)!r}
+output_dir = {str(output_dir)!r}
+
+scores_csv_path = os.path.join(output_dir, f"af2rank_scores_{{protein_id}}.csv")
+
+existing_scores = []
+processed_files = set()
+if os.path.exists(scores_csv_path):
+  existing_scores = load_af2rank_scores_from_csv(scores_csv_path)
+  for s in existing_scores:
+    sf = s.get("structure_file")
+    if sf:
+      processed_files.add(str(sf))
+
+pdb_files = sorted(glob.glob(os.path.join(inference_output_dir, "*.pdb")))
+to_score = [p for p in pdb_files if os.path.basename(p) not in processed_files]
+
+new_scores = []
+if len(to_score) > 0:
+  scorer = OpenFoldAF2Rank(reference_cif, chain=chain, model_name={model_name!r}, recycles={int(recycles)})
+  for pdb_path in to_score:
+    pdb_filename = os.path.basename(pdb_path)
+    structure_scores = scorer.score_structure(
+      pdb_path,
+      decoy_chain="A",
+      recycles={int(recycles)},
+      verbose=False,
+    )
+    structure_scores.update({{
+      "protein_id": protein_id,
+      "structure_file": pdb_filename,
+      "structure_path": pdb_path,
+    }})
+    if "pred_coords" in structure_scores:
+      del structure_scores["pred_coords"]
+    new_scores.append(structure_scores)
+
+all_scores = existing_scores + new_scores
+save_af2rank_scores(all_scores, output_dir, protein_id)
+staged_filenames = set(os.path.basename(p) for p in pdb_files)
+plot_scores = [s for s in all_scores if s.get("structure_file") in staged_filenames]
+plot_af2rank_results(plot_scores, output_dir, protein_id)
+"""
+    else:
+        wrapper_script = os.path.join(wrapper_dir, "run_with_colabdesign_env.sh")
+        allatom_map_repr = repr(allatom_map or {})
+        py = f"""
+import os
+import sys
+import glob
+sys.path.append({wrapper_dir!r})
 
 import pandas as pd
 
@@ -188,6 +303,8 @@ reference_cif = {reference_cif!r}
 chain = {chain!r}
 inference_output_dir = {str(staged_templates_dir)!r}
 output_dir = {str(output_dir)!r}
+# Pre-built cg2all reconstruction map (original_path -> allatom_path)
+allatom_map = {allatom_map_repr}
 
 scores_csv_path = os.path.join(output_dir, f"af2rank_scores_{{protein_id}}.csv")
 
@@ -215,6 +332,7 @@ if len(to_score) > 0:
         decoy_chain="A",
         recycles={int(recycles)},
         verbose=False,
+        _allatom_pdb=allatom_map.get(pdb_path),
       )
     structure_scores.update({{
       "protein_id": protein_id,
@@ -227,8 +345,6 @@ if len(to_score) > 0:
 
 all_scores = existing_scores + new_scores
 save_af2rank_scores(all_scores, output_dir, protein_id)
-# Plots reflect only the currently staged top_k templates, not the full
-# accumulated history in the CSV.
 staged_filenames = set(os.path.basename(p) for p in pdb_files)
 plot_scores = [s for s in all_scores if s.get("structure_file") in staged_filenames]
 plot_af2rank_results(plot_scores, output_dir, protein_id)
@@ -236,7 +352,11 @@ plot_af2rank_results(plot_scores, output_dir, protein_id)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     cmd = [wrapper_script, "python", "-c", py]
-    subprocess.run(cmd, cwd="/home/ubuntu/proteina/af2rank_evaluation", check=True)
+    result = subprocess.run(cmd, cwd=wrapper_dir, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"AF2Rank subprocess failed for {protein_id} ({model_name}):\n{result.stderr[-3000:]}"
+        )
 
 
 def _plot_scatter(
@@ -275,6 +395,7 @@ def _process_one_protein(
     gpu_id: str,
     filter_existing: bool,
     dry_run: bool,
+    backend: str = "colabdesign",
 ) -> Dict[str, object]:
     scores_csv_path = Path(scores_csv)
     protein_dir = scores_csv_path.parent.parent
@@ -291,6 +412,11 @@ def _process_one_protein(
     chain = meta["chain"]
 
     topk_df = _select_topk_templates(scores_csv_path, top_k)
+
+    # If no ground-truth reference, use best-energy template as reference (for sequence extraction only)
+    if reference_cif is None or not os.path.exists(str(reference_cif)):
+        reference_cif = str(topk_df.iloc[0]["structure_path"])
+        chain = "A"
     staged_dir = protein_out_dir / "staged_topk_templates"
     desired = set([Path(str(p)).name for p in topk_df["structure_path"].tolist()])
     staged_filenames = desired
@@ -372,26 +498,40 @@ def _process_one_protein(
     )
 
     if not dry_run:
-        _run_af2rank_subprocess(
-            protein_id=protein_id,
-            reference_cif=reference_cif,
-            chain=chain,
-            staged_templates_dir=staged_dir,
-            output_dir=af2rank_out_dir_m1,
-            recycles=recycles,
-            cuda_visible_devices=gpu_id,
-            model_name="model_1_ptm",
-        )
-        _run_af2rank_subprocess(
-            protein_id=protein_id,
-            reference_cif=reference_cif,
-            chain=chain,
-            staged_templates_dir=staged_dir,
-            output_dir=af2rank_out_dir_m2,
-            recycles=recycles,
-            cuda_visible_devices=gpu_id,
-            model_name="model_2_ptm",
-        )
+        # Batch-reconstruct all CA-only templates once upfront, reuse for both models
+        allatom_map: Dict[str, str] = {}
+        if backend == "colabdesign":
+            allatom_map = _batch_reconstruct_ca_only(staged_dir)
+        try:
+            _run_af2rank_subprocess(
+                protein_id=protein_id,
+                reference_cif=reference_cif,
+                chain=chain,
+                staged_templates_dir=staged_dir,
+                output_dir=af2rank_out_dir_m1,
+                recycles=recycles,
+                cuda_visible_devices=gpu_id,
+                model_name="model_1_ptm",
+                backend=backend,
+                allatom_map=allatom_map,
+            )
+            _run_af2rank_subprocess(
+                protein_id=protein_id,
+                reference_cif=reference_cif,
+                chain=chain,
+                staged_templates_dir=staged_dir,
+                output_dir=af2rank_out_dir_m2,
+                recycles=recycles,
+                cuda_visible_devices=gpu_id,
+                model_name="model_2_ptm",
+                backend=backend,
+                allatom_map=allatom_map,
+            )
+        finally:
+            # Delete reconstructed all-atom temp files after both models are done
+            for tmp_path in allatom_map.values():
+                if tmp_path and os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
 
         m1_df = pd.read_csv(af2rank_scores_csv_m1)
         m2_df = pd.read_csv(af2rank_scores_csv_m2)
@@ -457,6 +597,8 @@ def main() -> None:
     parser.add_argument("--cuda_visible_devices", default="", help="Comma-separated GPU ids to use (e.g. '0,1,2'). If empty, uses 0..num_gpus-1.")
     parser.add_argument("--dry_run", action="store_true", help="Validate top-k selection and dataset joins without running AF2Rank (no pTM plot)")
     parser.add_argument("--proteinebm_analysis_subdir", default="proteinebm_v2_cathmd_analysis", help="Per-protein subdir containing ProteinEBM scores (default: proteinebm_v2_cathmd_analysis)")
+    parser.add_argument("--backend", choices=["colabdesign", "openfold"], default="colabdesign",
+                       help="AF2Rank backend: colabdesign (JAX) or openfold (PyTorch)")
     args = parser.parse_args()
 
     if args.top_k <= 0:
@@ -505,77 +647,61 @@ def main() -> None:
         if args.limit and n_considered >= int(args.limit):
             break
 
+    def _submit_args(protein_id, scores_csv, ref, gpu_id):
+        return (protein_id, scores_csv, ref, int(args.top_k), int(args.recycles),
+                gpu_id, bool(args.filter_existing), bool(args.dry_run), args.backend)
+
     if not has_dataset:
         # Score only; skip cross-protein plots (they require reference TM / metadata).
-        if args.dry_run or int(args.num_gpus) == 1:
-            for protein_id, scores_csv, ref, gpu_id in tasks:
-                _process_one_protein(
-                    protein_id=protein_id,
-                    scores_csv=scores_csv,
-                    dataset_ref=ref,
-                    top_k=int(args.top_k),
-                    recycles=int(args.recycles),
-                    gpu_id=gpu_id,
-                    filter_existing=bool(args.filter_existing),
-                    dry_run=bool(args.dry_run),
-                )
-        else:
-            with ProcessPoolExecutor(max_workers=int(args.num_gpus)) as ex:
-                futs = []
+        with tqdm(total=len(tasks), desc="AF2Rank top-k", unit="protein", file=sys.stderr) as pbar:
+            if args.dry_run or int(args.num_gpus) == 1:
                 for protein_id, scores_csv, ref, gpu_id in tasks:
-                    futs.append(
-                        ex.submit(
-                            _process_one_protein,
-                            protein_id,
-                            scores_csv,
-                            ref,
-                            int(args.top_k),
-                            int(args.recycles),
-                            gpu_id,
-                            bool(args.filter_existing),
-                            bool(args.dry_run),
-                        )
-                    )
-                for fut in futs:
-                    fut.result()
+                    try:
+                        _process_one_protein(*_submit_args(protein_id, scores_csv, ref, gpu_id))
+                    except Exception as e:
+                        logger.error("FAILED %s: %s", protein_id, e)
+                    pbar.update(1)
+            else:
+                with ProcessPoolExecutor(max_workers=int(args.num_gpus)) as ex:
+                    futs = {
+                        ex.submit(_process_one_protein, *_submit_args(pid, csv, ref, gid)): pid
+                        for pid, csv, ref, gid in tasks
+                    }
+                    for fut in as_completed(futs):
+                        pid = futs[fut]
+                        try:
+                            fut.result()
+                        except Exception as e:
+                            logger.error("FAILED %s: %s", pid, e)
+                        pbar.update(1)
         return
 
     rows: List[Dict[str, object]] = []
-    if args.dry_run or int(args.num_gpus) == 1:
-        for protein_id, scores_csv, ref, gpu_id in tasks:
-            row = _process_one_protein(
-                protein_id=protein_id,
-                scores_csv=scores_csv,
-                dataset_ref=ref,
-                top_k=int(args.top_k),
-                recycles=int(args.recycles),
-                gpu_id=gpu_id,
-                filter_existing=bool(args.filter_existing),
-                dry_run=bool(args.dry_run),
-            )
-            if row:
-                rows.append(row)
-    else:
-        with ProcessPoolExecutor(max_workers=int(args.num_gpus)) as ex:
-            futs = []
+    with tqdm(total=len(tasks), desc="AF2Rank top-k", unit="protein", file=sys.stderr) as pbar:
+        if args.dry_run or int(args.num_gpus) == 1:
             for protein_id, scores_csv, ref, gpu_id in tasks:
-                futs.append(
-                    ex.submit(
-                        _process_one_protein,
-                        protein_id,
-                        scores_csv,
-                        ref,
-                        int(args.top_k),
-                        int(args.recycles),
-                        gpu_id,
-                        bool(args.filter_existing),
-                        bool(args.dry_run),
-                    )
-                )
-            for fut in futs:
-                row = fut.result()
-                if row:
-                    rows.append(row)
+                try:
+                    row = _process_one_protein(*_submit_args(protein_id, scores_csv, ref, gpu_id))
+                    if row:
+                        rows.append(row)
+                except Exception as e:
+                    logger.error("FAILED %s: %s", protein_id, e)
+                pbar.update(1)
+        else:
+            with ProcessPoolExecutor(max_workers=int(args.num_gpus)) as ex:
+                futs = {
+                    ex.submit(_process_one_protein, *_submit_args(pid, csv, ref, gid)): pid
+                    for pid, csv, ref, gid in tasks
+                }
+                for fut in as_completed(futs):
+                    pid = futs[fut]
+                    try:
+                        row = fut.result()
+                        if row:
+                            rows.append(row)
+                    except Exception as e:
+                        logger.error("FAILED %s: %s", pid, e)
+                    pbar.update(1)
 
     if len(rows) == 0:
         print("WARNING: No protein rows collected (all skipped by filter_existing or dry_run). "

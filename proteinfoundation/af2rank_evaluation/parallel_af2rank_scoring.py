@@ -6,19 +6,24 @@ This script handles parallelized AF2Rank scoring across multiple GPUs.
 It takes inference results and compares them to ground truth structures.
 """
 
-import os
-import sys
 import argparse
-import pandas as pd
-import subprocess
-import multiprocessing as mp
 import builtins
-from pathlib import Path
-import time
-import logging
-import signal
-from concurrent.futures import ProcessPoolExecutor, as_completed
 import json
+import logging
+import multiprocessing as mp
+import os
+import signal
+import subprocess
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+
+import pandas as pd
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
 
 # Global flag for graceful shutdown
 shutdown_requested = False
@@ -58,14 +63,9 @@ def get_proteina_base_dir():
 
 PROTEINA_BASE_DIR = get_proteina_base_dir()
 
-# Try to import dotenv, but don't fail if it's not available
-try:
-    from dotenv import load_dotenv
-    env_path = os.path.join(PROTEINA_BASE_DIR, '.env')
-    if os.path.exists(env_path):
-        load_dotenv(env_path)
-except ImportError:
-    load_dotenv = None
+env_path = os.path.join(PROTEINA_BASE_DIR, '.env')
+if load_dotenv and os.path.exists(env_path):
+    load_dotenv(env_path)
 
 # Setup logging
 logging.basicConfig(
@@ -103,7 +103,8 @@ def find_reference_cif(protein_name, cif_dir):
 
 def process_single_protein_af2rank(args):
     """Process AF2Rank scoring for a single protein."""
-    protein_name, cif_dir, inference_config, recycles, gpu_id, regenerate_plots = args
+    protein_name, cif_dir, inference_config, recycles, gpu_id, regenerate_plots, *rest = args
+    backend = rest[0] if rest else "colabdesign"
     
     # Set GPU for this process
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
@@ -133,8 +134,8 @@ def process_single_protein_af2rank(args):
         logger.info(f"[GPU {gpu_id}] Skipping plot regeneration (will be handled by CPU workers)")
         return {'protein': protein_name, 'gpu': gpu_id, 'status': 'skipped', 'reason': 'plot_regeneration_deferred'}
     # Run full AF2Rank scoring
-    logger.info(f"[GPU {gpu_id}] Running full AF2Rank scoring for {protein_name}")
-    result = run_af2rank_scoring(protein_name, reference_cif, inference_output_dir, recycles)
+    logger.info(f"[GPU {gpu_id}] Running full AF2Rank scoring for {protein_name} (backend={backend})")
+    result = run_af2rank_scoring(protein_name, reference_cif, inference_output_dir, recycles, backend=backend)
 
     if result.returncode != 0:
         raise Exception(f"AF2Rank scoring failed with returncode {result.returncode}")
@@ -158,13 +159,46 @@ def process_single_protein_af2rank(args):
         'summary': summary_info
     }
 
-def run_af2rank_scoring(protein_name, reference_cif, inference_output_dir, recycles=3):
+def run_af2rank_scoring(protein_name, reference_cif, inference_output_dir, recycles=3, backend="colabdesign"):
     """Run AF2Rank scoring for a single protein."""
-    # Use the colabdesign environment wrapper to ensure correct Python is used
-    wrapper_script = os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation', 'run_with_colabdesign_env.sh')
-    
-    # Prepare the Python code to execute
-    python_code = f"""
+    if backend == "openfold":
+        wrapper_script = os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation', 'run_with_proteina_env.sh')
+        python_code = f"""
+import sys
+import os
+sys.path.append('{os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation')}')
+
+from af2rank_openfold_scorer import run_af2rank_analysis_openfold
+
+print('Starting AF2Rank scoring for {protein_name} with OpenFold backend')
+
+protein_id = '{protein_name}'
+pdb_id, chain_id = protein_id.split('_')
+
+af2rank_dir = '{inference_output_dir}/af2rank_analysis'
+os.makedirs(af2rank_dir, exist_ok=True)
+
+result = run_af2rank_analysis_openfold(
+    protein_id=protein_id,
+    reference_cif='{reference_cif}',
+    inference_output_dir='{inference_output_dir}',
+    output_dir=af2rank_dir,
+    chain=chain_id,
+    recycles={recycles},
+    verbose=False,
+    regenerate_summary=True
+)
+
+if result:
+    print(f'Successfully completed AF2Rank analysis for {{protein_id}}')
+    print(f'Results saved to: {{af2rank_dir}}')
+else:
+    print(f'ERROR: AF2Rank analysis failed for {{protein_id}}')
+    sys.exit(1)
+"""
+    else:
+        wrapper_script = os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation', 'run_with_colabdesign_env.sh')
+        python_code = f"""
 import sys
 import os
 sys.path.append('{os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation')}')
@@ -204,23 +238,53 @@ else:
     print(f'ERROR: AF2Rank analysis failed for {{protein_id}}')
     sys.exit(1)
 """
-    
-    # Use wrapper script to run in colabdesign environment
+
+    # Use wrapper script to run in the appropriate environment
     cmd = [wrapper_script, 'python', '-c', python_code]
     # Don't capture output - let it stream to terminal for real-time progress and full error tracebacks
     result = subprocess.run(
-        cmd, 
+        cmd,
         cwd=os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation')
     )
     return result
 
-def run_af2rank_plot_only(protein_name, reference_cif, inference_output_dir, recycles=3):
+def run_af2rank_plot_only(protein_name, reference_cif, inference_output_dir, recycles=3, backend="colabdesign"):
     """Regenerate plots only for existing AF2Rank scores and update summary."""
-    # Use the colabdesign environment wrapper to ensure correct Python is used
-    wrapper_script = os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation', 'run_with_colabdesign_env.sh')
-    
-    # Prepare the Python code to execute
-    python_code = f"""
+    if backend == "openfold":
+        wrapper_script = os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation', 'run_with_proteina_env.sh')
+        python_code = f"""
+import sys
+import os
+sys.path.append('{os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation')}')
+
+from af2rank_openfold_scorer import run_af2rank_plot_only_openfold
+
+print('Regenerating plots and summary for {protein_name} (OpenFold backend)', flush=True)
+
+protein_id = '{protein_name}'
+pdb_id, chain_id = protein_id.split('_')
+
+af2rank_dir = '{inference_output_dir}/af2rank_analysis'
+result = run_af2rank_plot_only_openfold(
+    protein_id=protein_id,
+    reference_cif='{reference_cif}',
+    inference_output_dir='{inference_output_dir}',
+    output_dir=af2rank_dir,
+    chain=chain_id,
+    recycles={recycles},
+    regenerate_summary=True
+)
+
+if result:
+    print(f'Successfully regenerated plots and summary for {{protein_id}}', flush=True)
+    print(f'Results saved to: {{af2rank_dir}}', flush=True)
+else:
+    print(f'ERROR: Failed to regenerate plots for {{protein_id}}', flush=True)
+    sys.exit(1)
+"""
+    else:
+        wrapper_script = os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation', 'run_with_colabdesign_env.sh')
+        python_code = f"""
 import sys
 import os
 sys.path.append('{os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation')}')
@@ -252,13 +316,13 @@ else:
     print(f'ERROR: Failed to regenerate plots for {{protein_id}}', flush=True)
     sys.exit(1)
 """
-    
-    # Use wrapper script to run in colabdesign environment
+
+    # Use wrapper script to run in the appropriate environment
     cmd = [wrapper_script, 'python', '-u', '-c', python_code]
     result = subprocess.run(
-        cmd, 
+        cmd,
         cwd=os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation'),
-        capture_output=False, 
+        capture_output=False,
         text=True
     )
     return result
@@ -266,7 +330,8 @@ else:
 
 def process_single_protein_plot_regeneration(args):
     """Process plot regeneration for a single protein (CPU-only, no GPU needed)."""
-    protein_name, cif_dir, inference_config, recycles = args
+    protein_name, cif_dir, inference_config, recycles, *rest = args
+    backend = rest[0] if rest else "colabdesign"
     
     logger.info(f"[CPU] Regenerating plots and summary for {protein_name}")
 
@@ -283,7 +348,7 @@ def process_single_protein_plot_regeneration(args):
         return {'protein': protein_name, 'status': 'skipped', 'reason': 'no_csv_file'}
 
     # Run plot regeneration (CPU-only)
-    result = run_af2rank_plot_only(protein_name, reference_cif, inference_output_dir, recycles)
+    result = run_af2rank_plot_only(protein_name, reference_cif, inference_output_dir, recycles, backend=backend)
 
     if result.returncode == 0:
         logger.info(f"[CPU] ✅ Plot regeneration completed for {protein_name}")
@@ -307,13 +372,14 @@ def worker_init_af2rank(counter, lock, num_gpus):
 # Wrapper function (must be at module level for pickling)
 def process_single_protein_af2rank_wrapper(args_tuple):
     """Wrapper that uses the GPU assigned during worker init."""
-    protein_name, cif_dir, inference_config, recycles = args_tuple
-    
+    protein_name, cif_dir, inference_config, recycles, *rest = args_tuple
+    backend = rest[0] if rest else "colabdesign"
+
     # Get GPU ID from process-local variable set by worker_init
     gpu_id = getattr(builtins, '_worker_gpu_id', 0)
-    
+
     # Call the actual processing function
-    full_args = (protein_name, cif_dir, inference_config, recycles, gpu_id, False)
+    full_args = (protein_name, cif_dir, inference_config, recycles, gpu_id, False, backend)
     return process_single_protein_af2rank(full_args)
 
 def has_multi_char_chain_id(protein_name):
@@ -389,7 +455,9 @@ def main():
                        help='Only process proteins that have completed inference')
     parser.add_argument('--regenerate_plots', action='store_true',
                        help='Regenerate plots even if AF2Rank CSV already exists')
-    
+    parser.add_argument('--backend', choices=['colabdesign', 'openfold'], default='colabdesign',
+                       help='AF2Rank backend: colabdesign (JAX) or openfold (PyTorch)')
+
     args = parser.parse_args()
     
     # Validate inputs
@@ -470,7 +538,7 @@ def main():
 
         try:
             # Submit all jobs (GPU assignment happens via worker init)
-            scoring_work_items = [(protein_name, args.cif_dir, args.inference_config, args.recycles)
+            scoring_work_items = [(protein_name, args.cif_dir, args.inference_config, args.recycles, args.backend)
                                   for protein_name in proteins_needing_scoring]
             future_to_protein = {executor.submit(process_single_protein_af2rank_wrapper, item): scoring_work_items[i][0]
                                 for i, item in enumerate(scoring_work_items)}
@@ -509,7 +577,7 @@ def main():
         
         plot_work_items = []
         for protein_name in proteins_needing_plots:
-            plot_work_items.append((protein_name, args.cif_dir, args.inference_config, args.recycles))
+            plot_work_items.append((protein_name, args.cif_dir, args.inference_config, args.recycles, args.backend))
         
         # Use more CPU workers since this is lightweight
         max_cpu_workers = min(len(proteins_needing_plots), 8)

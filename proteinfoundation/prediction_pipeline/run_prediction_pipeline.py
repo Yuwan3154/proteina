@@ -30,7 +30,14 @@ import sys
 import time
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
+import torch
+
+from proteinfoundation.prediction_pipeline.input_parser import create_pt_files, create_working_csv, parse_input
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,9 +46,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROTEINA_BASE_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
-AF2RANK_EVAL_DIR = os.path.join(PROTEINA_BASE_DIR, "af2rank_evaluation")
+import proteinfoundation.af2rank_evaluation as _pf_af2rank
+
+# af2rank_evaluation lives inside the installed proteinfoundation package
+AF2RANK_EVAL_DIR = os.path.dirname(_pf_af2rank.__file__)
+# Assume the script is always run from the proteina root directory
+PROTEINA_BASE_DIR = os.getcwd()
 
 
 def run_with_conda_env(env_name: str, command_list: list, cwd: str | None = None) -> bool:
@@ -71,8 +81,6 @@ def run_with_conda_env(env_name: str, command_list: list, cwd: str | None = None
 
 def step_parse_input(input_file: str, id_column: str, sequence_column: str, output_dir: str):
     """Parse input file, create PT files, and write working CSV."""
-    from prediction_pipeline.input_parser import create_pt_files, create_working_csv, parse_input
-
     df = parse_input(input_file, id_column=id_column, sequence_column=sequence_column)
     create_pt_files(df)
     working_csv = create_working_csv(df, os.path.join(output_dir, "working_proteins.csv"))
@@ -175,8 +183,6 @@ def step_collect_results(
 
     Returns list of per-protein result dicts.
     """
-    import pandas as pd
-
     logger.info("Collecting results...")
     inference_base = os.path.join(PROTEINA_BASE_DIR, "inference", inference_config)
     structures_dir = os.path.join(output_dir, "structures")
@@ -197,7 +203,6 @@ def step_collect_results(
         data_path = os.environ.get("DATA_PATH", os.path.join(PROTEINA_BASE_DIR, "data"))
         pt_path = os.path.join(data_path, "pdb_train", "processed", f"{protein_id}.pt")
         try:
-            import torch
             pt = torch.load(pt_path, weights_only=False, map_location="cpu")
             seq_len = len(pt.residue_type)
         except Exception:
@@ -327,10 +332,6 @@ def step_collect_results(
 
 def step_plot_distribution(results: list, output_dir: str, ptm_cutoff: float) -> None:
     """Plot histogram of best pTM scores with cutoff line and fraction annotation."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
     ptm_values = [r["best_ptm"] for r in results if not (isinstance(r["best_ptm"], float) and math.isnan(r["best_ptm"]))]
     if not ptm_values:
         logger.warning("No valid pTM scores to plot")

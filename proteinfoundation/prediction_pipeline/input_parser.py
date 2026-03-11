@@ -8,19 +8,15 @@ and writes working CSVs for downstream pipeline scripts.
 
 import logging
 import os
-import sys
 from pathlib import Path
 
 import pandas as pd
 import torch
 
+from proteinfoundation.af2rank_evaluation.cif_to_pt_converter import sequence_to_pt_data
+from proteinfoundation.utils.cluster_utils import fasta_to_df
+
 logger = logging.getLogger(__name__)
-
-# Add parent directory to path for imports
-PROTEINA_BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-sys.path.insert(0, PROTEINA_BASE_DIR)
-
-from af2rank_evaluation.cif_to_pt_converter import sequence_to_pt_data
 
 
 def parse_input(input_file: str, id_column: str = "id", sequence_column: str = "sequence") -> pd.DataFrame:
@@ -42,8 +38,6 @@ def parse_input(input_file: str, id_column: str = "id", sequence_column: str = "
     ext = Path(input_file).suffix.lower()
 
     if ext in (".fasta", ".fa", ".faa"):
-        from proteinfoundation.utils.cluster_utils import fasta_to_df
-
         df = fasta_to_df(input_file)
         # fasta_to_df returns columns ['id', 'sequence']
     elif ext in (".csv", ".tsv"):
@@ -92,7 +86,7 @@ def create_pt_files(df: pd.DataFrame) -> str:
     Returns:
         Path to the processed directory.
     """
-    data_path = os.environ.get("DATA_PATH", os.path.join(PROTEINA_BASE_DIR, "data"))
+    data_path = os.environ.get("DATA_PATH", os.path.join(os.getcwd(), "data"))
     processed_dir = os.path.join(data_path, "pdb_train", "processed")
     os.makedirs(processed_dir, exist_ok=True)
 

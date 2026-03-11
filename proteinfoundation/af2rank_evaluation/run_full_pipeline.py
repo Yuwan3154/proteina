@@ -83,7 +83,7 @@ def run_with_conda_env(env_name, command_list, cwd=None):
     """Run a command with conda environment activation using shell script wrappers."""
     # Get the wrapper script path
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    
+
     if env_name == 'proteina':
         wrapper_script = os.path.join(script_dir, 'run_with_proteina_env.sh')
     elif env_name == 'colabdesign':
@@ -93,20 +93,22 @@ def run_with_conda_env(env_name, command_list, cwd=None):
     else:
         logger.error(f"❌ Unknown environment: {env_name}")
         return False
-    
+
     # Check if wrapper script exists
     if not os.path.exists(wrapper_script):
         logger.error(f"❌ Wrapper script not found: {wrapper_script}")
         return False
-    
+
     # Build command with wrapper script
     cmd = [wrapper_script] + command_list
-    
+
     logger.info(f"🚀 Running in {env_name} environment: {' '.join(command_list)}")
     logger.debug(f"Full command: {' '.join(cmd)}")
-    
+
+    # Default cwd to script_dir so bare script names resolve correctly
+    effective_cwd = cwd if cwd is not None else script_dir
     try:
-        result = subprocess.run(cmd, cwd=cwd, check=False)
+        result = subprocess.run(cmd, cwd=effective_cwd, check=False)
         return result.returncode == 0
     except Exception as e:
         logger.error(f"❌ Failed to run command: {e}")
@@ -134,10 +136,10 @@ def run_proteina_inference(csv_file, csv_column, cif_dir, inference_config, num_
     # Run in proteina environment using shell script wrapper
     return run_with_conda_env('proteina', cmd)
 
-def run_af2rank_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpus, recycles=3, regenerate_plots=False):
+def run_af2rank_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpus, recycles=3, regenerate_plots=False, backend="colabdesign"):
     """Run the AF2Rank scoring pipeline."""
-    logger.info("⚡ Starting AF2Rank scoring pipeline...")
-    
+    logger.info(f"⚡ Starting AF2Rank scoring pipeline (backend={backend})...")
+
     cmd = [
         'python', 'parallel_af2rank_scoring.py',
         '--csv_file', csv_file,
@@ -146,14 +148,16 @@ def run_af2rank_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpu
         '--inference_config', inference_config,
         '--num_gpus', str(num_gpus),
         '--recycles', str(recycles),
-        '--filter_existing'  # Always filter to only score proteins needing AF2Rank
+        '--filter_existing',  # Always filter to only score proteins needing AF2Rank
+        '--backend', backend,
     ]
-    
+
     if regenerate_plots:
         cmd.append('--regenerate_plots')
-    
-    # Run in colabdesign environment using shell script wrapper
-    return run_with_conda_env('colabdesign', cmd)
+
+    # Run in appropriate environment
+    env_name = 'proteina' if backend == 'openfold' else 'colabdesign'
+    return run_with_conda_env(env_name, cmd)
 
 def run_proteinebm_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpus, proteinebm_config, proteinebm_checkpoint, proteinebm_template_self_condition=True, proteinebm_analysis_subdir='proteinebm_v2_cathmd_analysis', proteinebm_t=0.05):
     """Run the ProteinEBM scoring pipeline."""
@@ -229,9 +233,10 @@ def run_af2rank_on_proteinebm_topk(
     num_gpus: int,
     filter_existing: bool = True,
     proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
+    backend: str = "colabdesign",
 ) -> bool:
     """Run AF2Rank scoring on the ProteinEBM top-k templates per protein."""
-    logger.info("🧪 Starting AF2Rank-on-ProteinEBM-topk step...")
+    logger.info(f"🧪 Starting AF2Rank-on-ProteinEBM-topk step (backend={backend})...")
 
     if top_k <= 0:
         logger.error("top_k must be > 0 for AF2Rank-on-ProteinEBM-topk")
@@ -250,6 +255,8 @@ def run_af2rank_on_proteinebm_topk(
         str(int(num_gpus)),
         "--proteinebm_analysis_subdir",
         proteinebm_analysis_subdir,
+        "--backend",
+        backend,
     ]
 
     if dataset_file:
@@ -300,6 +307,8 @@ def main():
         default=True,
         help='Skip proteins whose af2rank_on_proteinebm_topk outputs already exist.',
     )
+    parser.add_argument('--af2rank_backend', choices=['colabdesign', 'openfold'], default='colabdesign',
+                       help='AF2Rank backend: colabdesign (JAX) or openfold (PyTorch)')
     parser.add_argument('--usalign_path', help='Path to USalign executable')
     parser.add_argument('--skip_inference', action='store_true', 
                        help='Skip Proteina inference (only run scoring stage)')
@@ -362,7 +371,7 @@ def main():
         args.num_gpus = gpu_count
     
     start_time = time.time()
-    project_root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+    project_root = os.getcwd()
     
     logger.info(f"🚀 Starting complete AF2Rank evaluation pipeline")
     logger.info(f"📊 Dataset file: {args.dataset_file}")
@@ -374,6 +383,7 @@ def main():
     logger.info(f"🐍 Using shell script wrappers for conda environments")
     logger.info(f"🔑 ID column: {args.id_column}")
     logger.info(f"🔑 TM score column: {args.tms_column}")
+    logger.info(f"🔧 AF2Rank backend: {args.af2rank_backend}")
     
     success = True
     
@@ -418,7 +428,8 @@ def main():
                 args.inference_config,
                 args.num_gpus,
                 args.recycles,
-                args.regenerate_plots
+                args.regenerate_plots,
+                backend=args.af2rank_backend,
             )
         else:
             scoring_success = run_proteinebm_scoring(
@@ -459,6 +470,7 @@ def main():
             num_gpus=int(args.num_gpus),
             filter_existing=bool(args.af2rank_topk_filter_existing),
             proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
+            backend=args.af2rank_backend,
         )
 
         if topk_success:
