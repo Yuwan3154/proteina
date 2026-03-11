@@ -9,6 +9,7 @@ It processes all proteins from a CSV file and distributes them across available 
 import argparse
 import builtins
 import logging
+import sys
 import multiprocessing as mp
 import os
 import shutil
@@ -29,6 +30,11 @@ except ImportError:
     load_dotenv = None
 
 from proteinfoundation.af2rank_evaluation.cif_to_pt_converter import convert_from_csv
+from proteinfoundation.af2rank_evaluation.sharding_utils import (
+    add_shard_args,
+    resolve_shard_args,
+    shard_proteins,
+)
 
 def _terminate_process_group(signum: int) -> None:
     """
@@ -331,37 +337,6 @@ def get_protein_names(csv_file, csv_column):
     proteins = df[csv_column].dropna().unique().tolist()
     return [p for p in proteins if p.strip()]
 
-def get_protein_lengths(protein_names):
-    """Load PT files to get protein lengths for workload balancing."""
-    data_dir = os.path.join(
-        os.environ.get('DATA_PATH', os.path.join(PROTEINA_BASE_DIR, 'data')),
-        'pdb_train', 'processed'
-    )
-    lengths = {}
-    for name in protein_names:
-        pt_path = os.path.join(data_dir, f"{name}.pt")
-        if os.path.exists(pt_path):
-            pt = torch.load(pt_path, weights_only=False, map_location='cpu')
-            lengths[name] = len(pt.residue_type)
-        else:
-            lengths[name] = 0  # unknown -> treated as shortest
-    return lengths
-
-
-def shard_proteins_by_length(protein_names, shard_index, num_shards):
-    """
-    Sort proteins by length (ascending) and distribute via round-robin
-    to balance total workload across shards.
-    """
-    lengths = get_protein_lengths(protein_names)
-    sorted_names = sorted(protein_names, key=lambda p: lengths.get(p, 0))
-    # Round-robin (deal cards): shard 0 gets indices 0, num_shards, 2*num_shards, ...
-    shard_names = sorted_names[shard_index::num_shards]
-    total_residues = sum(lengths.get(p, 0) for p in shard_names)
-    logger.info(f"Shard {shard_index}/{num_shards}: {len(shard_names)} proteins, "
-                f"~{total_residues} total residues")
-    return shard_names
-
 
 def find_proteins_needing_inference(csv_file, csv_column, inference_config):
     """Find proteins from CSV that need inference (no PDB files generated yet)."""
@@ -410,14 +385,7 @@ def main():
         action='store_true',
         help='Skip CIF-to-PT conversion (use when PT files already exist, e.g. created from sequences).',
     )
-    parser.add_argument(
-        '--shard_index', type=int, default=None,
-        help='Shard index (0-based). Auto-detected from SLURM_ARRAY_TASK_ID if not set.',
-    )
-    parser.add_argument(
-        '--num_shards', type=int, default=None,
-        help='Total number of shards. Auto-detected from SLURM_ARRAY_TASK_COUNT if not set.',
-    )
+    add_shard_args(parser)
 
     args = parser.parse_args()
     
@@ -445,25 +413,10 @@ def main():
     # Note: Multi-character chain IDs are now supported in AF2Rank via chain extraction
     # Proteina PT conversion also handles them correctly
 
-    # --- Sharding: distribute proteins across SLURM array tasks ---
-    shard_index = args.shard_index
-    num_shards = args.num_shards
-    # Auto-detect from SLURM array env vars, or MIT SuperCloud LLsub env vars
-    if shard_index is None:
-        for var in ('SLURM_ARRAY_TASK_ID', 'LLSUB_RANK'):
-            if var in os.environ:
-                shard_index = int(os.environ[var])
-                break
-    if num_shards is None:
-        for var in ('SLURM_ARRAY_TASK_COUNT', 'LLSUB_SIZE'):
-            if var in os.environ:
-                num_shards = int(os.environ[var])
-                break
-
-    if shard_index is not None and num_shards is not None:
-        logger.info(f"Sharding enabled: shard {shard_index} of {num_shards}")
-        protein_names = shard_proteins_by_length(protein_names, shard_index, num_shards)
-    # ---
+    shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
+    if shard_index is not None:
+        data_dir = os.environ.get("DATA_PATH", os.path.join(PROTEINA_BASE_DIR, "data"))
+        protein_names = shard_proteins(protein_names, shard_index, num_shards, data_dir=data_dir)
 
     logger.info(f"Proteins: {protein_names}")
     

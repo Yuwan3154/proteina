@@ -14,11 +14,18 @@ import multiprocessing as mp
 import os
 import signal
 import subprocess
+import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
+
+from proteinfoundation.af2rank_evaluation.sharding_utils import (
+    add_shard_args,
+    resolve_shard_args,
+    shard_proteins,
+)
 
 try:
     from dotenv import load_dotenv
@@ -457,6 +464,7 @@ def main():
                        help='Regenerate plots even if AF2Rank CSV already exists')
     parser.add_argument('--backend', choices=['colabdesign', 'openfold'], default='colabdesign',
                        help='AF2Rank backend: colabdesign (JAX) or openfold (PyTorch)')
+    add_shard_args(parser)
 
     args = parser.parse_args()
     
@@ -483,10 +491,15 @@ def main():
     if not protein_names:
         logger.warning("No proteins to process")
         sys.exit(0)
-    
+
+    shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
+    if shard_index is not None:
+        data_dir = os.environ.get("DATA_PATH", os.path.join(PROTEINA_BASE_DIR, "data"))
+        protein_names = shard_proteins(protein_names, shard_index, num_shards, data_dir=data_dir)
+
     # Note: Multi-character chain IDs are now supported via chain extraction and renaming
     # No need to filter them out anymore!
-    
+
     logger.info(f"Proteins to score: {protein_names}")
     
     # Check available GPUs

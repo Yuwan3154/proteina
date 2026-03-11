@@ -21,6 +21,15 @@ import time
 import shutil
 from pathlib import Path
 
+import pandas as pd
+
+from proteinfoundation.af2rank_evaluation.sharding_utils import (
+    add_shard_args,
+    build_shard_cli_args,
+    resolve_shard_args,
+    wait_for_completion,
+)
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -114,10 +123,10 @@ def run_with_conda_env(env_name, command_list, cwd=None):
         logger.error(f"❌ Failed to run command: {e}")
         return False
 
-def run_proteina_inference(csv_file, csv_column, cif_dir, inference_config, num_gpus, usalign_path=None, force_compile: bool = False):
+def run_proteina_inference(csv_file, csv_column, cif_dir, inference_config, num_gpus, usalign_path=None, force_compile: bool = False, shard_args=None):
     """Run the Proteina inference pipeline."""
     logger.info("🧬 Starting Proteina inference pipeline...")
-    
+
     cmd = [
         'python', 'parallel_proteina_inference.py',
         '--csv_file', csv_file,
@@ -129,14 +138,14 @@ def run_proteina_inference(csv_file, csv_column, cif_dir, inference_config, num_
     ]
     if force_compile:
         cmd.append('--force_compile')
-    
     if usalign_path:
         cmd.extend(['--usalign_path', usalign_path])
-    
-    # Run in proteina environment using shell script wrapper
+    if shard_args:
+        cmd.extend(shard_args)
+
     return run_with_conda_env('proteina', cmd)
 
-def run_af2rank_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpus, recycles=3, regenerate_plots=False, backend="colabdesign"):
+def run_af2rank_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpus, recycles=3, regenerate_plots=False, backend="colabdesign", shard_args=None):
     """Run the AF2Rank scoring pipeline."""
     logger.info(f"⚡ Starting AF2Rank scoring pipeline (backend={backend})...")
 
@@ -151,18 +160,18 @@ def run_af2rank_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpu
         '--filter_existing',  # Always filter to only score proteins needing AF2Rank
         '--backend', backend,
     ]
-
     if regenerate_plots:
         cmd.append('--regenerate_plots')
+    if shard_args:
+        cmd.extend(shard_args)
 
-    # Run in appropriate environment
     env_name = 'proteina' if backend == 'openfold' else 'colabdesign'
     return run_with_conda_env(env_name, cmd)
 
-def run_proteinebm_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpus, proteinebm_config, proteinebm_checkpoint, proteinebm_template_self_condition=True, proteinebm_analysis_subdir='proteinebm_v2_cathmd_analysis', proteinebm_t=0.05):
+def run_proteinebm_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpus, proteinebm_config, proteinebm_checkpoint, proteinebm_template_self_condition=True, proteinebm_analysis_subdir='proteinebm_v2_cathmd_analysis', proteinebm_t=0.05, shard_args=None):
     """Run the ProteinEBM scoring pipeline."""
     logger.info("💸 Starting ProteinEBM scoring pipeline...")
-    
+
     cmd = [
         'python', 'parallel_proteinebm_scoring.py',
         '--csv_file', csv_file,
@@ -176,11 +185,11 @@ def run_proteinebm_scoring(csv_file, csv_column, cif_dir, inference_config, num_
         '--proteinebm_analysis_subdir', proteinebm_analysis_subdir,
         '--proteinebm_t', str(proteinebm_t),
     ]
-    
     if not proteinebm_template_self_condition:
         cmd.append('--no-proteinebm_template_self_condition')
-    
-    # Run in proteinebm environment using shell script wrapper
+    if shard_args:
+        cmd.extend(shard_args)
+
     return run_with_conda_env('proteinebm', cmd)
 
 def run_cross_protein_plots(
@@ -234,6 +243,7 @@ def run_af2rank_on_proteinebm_topk(
     filter_existing: bool = True,
     proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
     backend: str = "colabdesign",
+    shard_args=None,
 ) -> bool:
     """Run AF2Rank scoring on the ProteinEBM top-k templates per protein."""
     logger.info(f"🧪 Starting AF2Rank-on-ProteinEBM-topk step (backend={backend})...")
@@ -258,7 +268,6 @@ def run_af2rank_on_proteinebm_topk(
         "--backend",
         backend,
     ]
-
     if dataset_file:
         cmd.extend(
             [
@@ -270,14 +279,13 @@ def run_af2rank_on_proteinebm_topk(
                 tms_column,
             ]
         )
-
     if filter_existing:
         cmd.append("--filter_existing")
     else:
         cmd.append("--no-filter_existing")
+    if shard_args:
+        cmd.extend(shard_args)
 
-    # This script launches colabdesign subprocesses internally via wrapper script,
-    # but the driver itself can run under proteina env.
     return run_with_conda_env("proteina", cmd, cwd=os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -322,6 +330,11 @@ def main():
         default=True,
         help='Pass --force_compile to Proteina inference (torch.compile even in eval/no_grad).',
     )
+    add_shard_args(parser)
+    parser.add_argument('--shard_poll_interval', type=int, default=60,
+                        help='Seconds between polls when shard 0 waits for other shards (default: 60)')
+    parser.add_argument('--shard_timeout', type=int, default=86400,
+                        help='Max seconds for shard 0 to wait for completion (default: 86400)')
     parser.add_argument('--tms_column', required=True,
                        help='Dataset column name to use as reference TM score (required, used for cross-protein plots)')
     parser.add_argument(
@@ -349,7 +362,12 @@ def main():
                        help='Diffusion time t for ProteinEBM scoring (default: 0.05)')
     
     args = parser.parse_args()
-    
+
+    shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
+    shard_cli_args = build_shard_cli_args(shard_index, num_shards)
+    if shard_index is not None:
+        logger.info(f"Sharding enabled: shard {shard_index} of {num_shards}")
+
     # Validate inputs
     if not os.path.exists(args.dataset_file):
         logger.error(f"Dataset file not found: {args.dataset_file}")
@@ -396,11 +414,12 @@ def main():
         inference_success = run_proteina_inference(
             args.dataset_file,
             args.id_column,
-            args.cif_dir, 
-            args.inference_config, 
+            args.cif_dir,
+            args.inference_config,
             args.num_gpus,
             args.usalign_path,
             force_compile=args.proteina_force_compile,
+            shard_args=shard_cli_args,
         )
         
         if inference_success:
@@ -430,6 +449,7 @@ def main():
                 args.recycles,
                 args.regenerate_plots,
                 backend=args.af2rank_backend,
+                shard_args=shard_cli_args,
             )
         else:
             scoring_success = run_proteinebm_scoring(
@@ -443,6 +463,7 @@ def main():
                 proteinebm_template_self_condition=args.proteinebm_template_self_condition,
                 proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
                 proteinebm_t=args.proteinebm_t,
+                shard_args=shard_cli_args,
             )
         
         if scoring_success:
@@ -471,6 +492,7 @@ def main():
             filter_existing=bool(args.af2rank_topk_filter_existing),
             proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
             backend=args.af2rank_backend,
+            shard_args=shard_cli_args,
         )
 
         if topk_success:
@@ -479,7 +501,11 @@ def main():
             logger.error("❌ AF2Rank-on-ProteinEBM-topk failed")
             success = False
 
-    # Step 4: Cross-protein plots (always, if previous steps succeeded)
+    # Step 4: Cross-protein plots (only shard 0 when sharded; non-zero shards exit early)
+    if shard_index is not None and shard_index != 0:
+        logger.info("Per-protein work complete (non-zero shard), exiting.")
+        sys.exit(0 if success else 1)
+
     if success:
         logger.info("\n" + "="*60)
         logger.info("STEP 4: CROSS-PROTEIN PLOTS")
@@ -491,20 +517,48 @@ def main():
         else:
             cross_out_dir = os.path.join(inference_dir, f"{Path(args.dataset_file).stem}_cross_protein_analysis")
 
-        plot_success = run_cross_protein_plots(
-            inference_dir=inference_dir,
-            output_dir=cross_out_dir,
-            scorer=args.scorer,
-            dataset_file=args.dataset_file,
-            id_column=args.id_column,
-            tms_column=args.tms_column,
-            af2rank_top_k=int(args.af2rank_top_k),
-            proteinebm_plot_mode=str(args.proteinebm_cross_protein_plot_mode),
-            proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
-        )
-        if not plot_success:
-            logger.error("❌ Cross-protein plotting failed")
-            success = False
+        if shard_index is not None:
+            df = pd.read_csv(args.dataset_file)
+            all_protein_names = df[args.id_column].dropna().astype(str).str.strip().unique().tolist()
+            all_protein_names = [p for p in all_protein_names if p]
+
+            def _check_complete(protein_name):
+                protein_dir = Path(inference_dir) / protein_name
+                if args.scorer == "af2rank":
+                    csv_path = protein_dir / "af2rank_analysis" / f"af2rank_scores_{protein_name}.csv"
+                    if not csv_path.exists():
+                        return False
+                else:
+                    csv_path = protein_dir / args.proteinebm_analysis_subdir / f"proteinebm_scores_{protein_name}.csv"
+                    if not csv_path.exists():
+                        return False
+                if args.scorer == "proteinebm" and int(args.af2rank_top_k) > 0:
+                    topk_csv = protein_dir / "af2rank_on_proteinebm_top_k" / "af2rank_analysis" / f"af2rank_scores_{protein_name}.csv"
+                    if not topk_csv.exists():
+                        return False
+                return True
+
+            if not wait_for_completion(all_protein_names, _check_complete,
+                                      poll_interval=args.shard_poll_interval,
+                                      timeout=args.shard_timeout):
+                logger.error("Timeout waiting for all shards to complete")
+                success = False
+
+        if success:
+            plot_success = run_cross_protein_plots(
+                inference_dir=inference_dir,
+                output_dir=cross_out_dir,
+                scorer=args.scorer,
+                dataset_file=args.dataset_file,
+                id_column=args.id_column,
+                tms_column=args.tms_column,
+                af2rank_top_k=int(args.af2rank_top_k),
+                proteinebm_plot_mode=str(args.proteinebm_cross_protein_plot_mode),
+                proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
+            )
+            if not plot_success:
+                logger.error("❌ Cross-protein plotting failed")
+                success = False
 
         if success and args.scorer == "proteinebm" and int(args.af2rank_top_k) > 0:
             plot_success_2 = run_cross_protein_plots(

@@ -25,6 +25,12 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
+from proteinfoundation.af2rank_evaluation.sharding_utils import (
+    add_shard_args,
+    resolve_shard_args,
+    shard_proteins,
+)
+
 logging.basicConfig(level=logging.ERROR, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -599,6 +605,7 @@ def main() -> None:
     parser.add_argument("--proteinebm_analysis_subdir", default="proteinebm_v2_cathmd_analysis", help="Per-protein subdir containing ProteinEBM scores (default: proteinebm_v2_cathmd_analysis)")
     parser.add_argument("--backend", choices=["colabdesign", "openfold"], default="colabdesign",
                        help="AF2Rank backend: colabdesign (JAX) or openfold (PyTorch)")
+    add_shard_args(parser)
     args = parser.parse_args()
 
     if args.top_k <= 0:
@@ -650,6 +657,13 @@ def main() -> None:
     def _submit_args(protein_id, scores_csv, ref, gpu_id):
         return (protein_id, scores_csv, ref, int(args.top_k), int(args.recycles),
                 gpu_id, bool(args.filter_existing), bool(args.dry_run), args.backend)
+
+    shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
+    if shard_index is not None:
+        all_ids = [t[0] for t in tasks]
+        data_dir = os.environ.get("DATA_PATH", os.path.join(Path(__file__).resolve().parents[2], "data"))
+        shard_ids = set(shard_proteins(all_ids, shard_index, num_shards, data_dir=data_dir))
+        tasks = [t for t in tasks if t[0] in shard_ids]
 
     if not has_dataset:
         # Score only; skip cross-protein plots (they require reference TM / metadata).
@@ -706,6 +720,10 @@ def main() -> None:
     if len(rows) == 0:
         print("WARNING: No protein rows collected (all skipped by filter_existing or dry_run). "
               "Cross-protein plots may be generated from pre-existing data by generate_cross_protein_plots.py.")
+        return
+
+    if shard_index is not None and shard_index != 0:
+        logger.info("Per-protein work complete (non-zero shard), skipping cross-protein summary/plots.")
         return
 
     summary_df = pd.DataFrame(rows)

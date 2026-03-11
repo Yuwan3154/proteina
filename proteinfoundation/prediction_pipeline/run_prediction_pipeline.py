@@ -37,6 +37,12 @@ import numpy as np
 import pandas as pd
 import torch
 
+from proteinfoundation.af2rank_evaluation.sharding_utils import (
+    add_shard_args,
+    build_shard_cli_args,
+    resolve_shard_args,
+    wait_for_completion,
+)
 from proteinfoundation.prediction_pipeline.input_parser import create_pt_files, create_working_csv, parse_input
 
 logging.basicConfig(
@@ -94,6 +100,7 @@ def step_proteina_inference(
     inference_config: str,
     num_gpus: int,
     force_compile: bool = True,
+    shard_args: list | None = None,
 ) -> bool:
     """Run Proteina inference on all proteins."""
     logger.info("Starting Proteina inference...")
@@ -108,6 +115,8 @@ def step_proteina_inference(
     ]
     if force_compile:
         cmd.append("--force_compile")
+    if shard_args:
+        cmd.extend(shard_args)
     return run_with_conda_env("proteina", cmd)
 
 
@@ -122,6 +131,7 @@ def step_proteinebm_scoring(
     proteinebm_t: float = 0.05,
     proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
     batch_size: int = 32,
+    shard_args: list | None = None,
 ) -> bool:
     """Run ProteinEBM scoring (energy only, no ground-truth TM-score)."""
     logger.info("Starting ProteinEBM scoring...")
@@ -139,6 +149,8 @@ def step_proteinebm_scoring(
         "--batch_size", str(batch_size),
         # No --cif_dir: skips TM-score computation
     ]
+    if shard_args:
+        cmd.extend(shard_args)
     return run_with_conda_env("proteinebm", cmd)
 
 
@@ -151,6 +163,7 @@ def step_af2rank_topk(
     num_gpus: int,
     backend: str = "colabdesign",
     proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
+    shard_args: list | None = None,
 ) -> bool:
     """Run AF2Rank on ProteinEBM top-k templates."""
     logger.info(f"Starting AF2Rank on ProteinEBM top-{top_k} (backend={backend})...")
@@ -166,6 +179,8 @@ def step_af2rank_topk(
         "--filter_existing",
         # No --dataset_file: no ground-truth comparison
     ]
+    if shard_args:
+        cmd.extend(shard_args)
     return run_with_conda_env("proteina", cmd)
 
 
@@ -401,8 +416,18 @@ def main():
         default=True,
         help="torch.compile for Proteina inference (default: True)",
     )
+    add_shard_args(parser)
+    parser.add_argument("--shard_poll_interval", type=int, default=60,
+                        help="Seconds between polls when shard 0 waits (default: 60)")
+    parser.add_argument("--shard_timeout", type=int, default=86400,
+                        help="Max seconds for shard 0 to wait (default: 86400)")
 
     args = parser.parse_args()
+
+    shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
+    shard_cli_args = build_shard_cli_args(shard_index, num_shards)
+    if shard_index is not None:
+        logger.info(f"Sharding enabled: shard {shard_index} of {num_shards}")
 
     if not os.path.exists(args.input):
         logger.error(f"Input file not found: {args.input}")
@@ -436,7 +461,7 @@ def main():
         logger.info("\n" + "=" * 60)
         logger.info("STEP 2: PROTEINA INFERENCE")
         logger.info("=" * 60)
-        if not step_proteina_inference(working_csv, args.inference_config, args.num_gpus, args.force_compile):
+        if not step_proteina_inference(working_csv, args.inference_config, args.num_gpus, args.force_compile, shard_cli_args):
             logger.error("Proteina inference failed")
             success = False
         else:
@@ -454,6 +479,7 @@ def main():
             args.proteinebm_config, args.proteinebm_checkpoint,
             args.proteinebm_t, args.proteinebm_analysis_subdir,
             args.proteinebm_batch_size,
+            shard_args=shard_cli_args,
         ):
             logger.error("ProteinEBM scoring failed")
             success = False
@@ -470,6 +496,7 @@ def main():
         if not step_af2rank_topk(
             args.inference_config, args.top_k, args.recycles,
             args.num_gpus, args.backend, args.proteinebm_analysis_subdir,
+            shard_args=shard_cli_args,
         ):
             logger.error("AF2Rank step failed")
             success = False
@@ -478,21 +505,41 @@ def main():
     elif args.skip_af2rank:
         logger.info("Skipping AF2Rank step")
 
-    # ── Step 5: Collect results ──
-    if success:
-        logger.info("\n" + "=" * 60)
-        logger.info("STEP 5: COLLECT RESULTS")
-        logger.info("=" * 60)
-        results = step_collect_results(
-            protein_ids, args.inference_config, args.output_dir,
-            args.ptm_cutoff, args.proteinebm_analysis_subdir,
-        )
+    # Non-zero shards exit after step 4; only shard 0 continues to steps 5-6
+    if shard_index is not None and shard_index != 0:
+        logger.info("Per-protein work complete (non-zero shard), exiting.")
+        sys.exit(0 if success else 1)
 
-        # ── Step 6: Plot distribution ──
-        logger.info("\n" + "=" * 60)
-        logger.info("STEP 6: PTM DISTRIBUTION PLOT")
-        logger.info("=" * 60)
-        step_plot_distribution(results, args.output_dir, args.ptm_cutoff)
+    # ── Step 5: Collect results (shard 0 only; waits for all shards if sharded) ──
+    if success:
+        if shard_index is not None:
+            def _check_af2rank_done(protein_id):
+                inference_base = os.path.join(PROTEINA_BASE_DIR, "inference", args.inference_config)
+                protein_dir = Path(inference_base) / protein_id
+                m1 = protein_dir / "af2rank_on_proteinebm_top_k" / "af2rank_analysis" / f"af2rank_scores_{protein_id}.csv"
+                m2 = protein_dir / "af2rank_on_proteinebm_top_k" / "af2rank_analysis_model_2_ptm" / f"af2rank_scores_{protein_id}.csv"
+                return m1.exists() and m2.exists()
+
+            if not wait_for_completion(protein_ids, _check_af2rank_done,
+                                      poll_interval=args.shard_poll_interval,
+                                      timeout=args.shard_timeout):
+                logger.error("Timeout waiting for all shards to complete")
+                success = False
+
+        if success:
+            logger.info("\n" + "=" * 60)
+            logger.info("STEP 5: COLLECT RESULTS")
+            logger.info("=" * 60)
+            results = step_collect_results(
+                protein_ids, args.inference_config, args.output_dir,
+                args.ptm_cutoff, args.proteinebm_analysis_subdir,
+            )
+
+            # ── Step 6: Plot distribution ──
+            logger.info("\n" + "=" * 60)
+            logger.info("STEP 6: PTM DISTRIBUTION PLOT")
+            logger.info("=" * 60)
+            step_plot_distribution(results, args.output_dir, args.ptm_cutoff)
 
     # ── Summary ──
     total_time = time.time() - start_time

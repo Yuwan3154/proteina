@@ -23,6 +23,12 @@ import time
 from pathlib import Path
 from typing import Dict, List
 
+from proteinfoundation.af2rank_evaluation.sharding_utils import (
+    add_shard_args,
+    resolve_shard_args,
+    shard_proteins,
+)
+
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -281,6 +287,7 @@ def main():
         default=32,
         help="Batch size for ProteinEBM inference per protein (default: 32). Auto-reduces on OOM.",
     )
+    add_shard_args(parser)
 
     args = parser.parse_args()
 
@@ -294,6 +301,11 @@ def main():
     if not protein_names:
         logger.warning("No proteins to process")
         sys.exit(0)
+
+    shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
+    if shard_index is not None:
+        data_dir = os.environ.get("DATA_PATH", os.path.join(PROTEINA_BASE_DIR, "data"))
+        protein_names = shard_proteins(protein_names, shard_index, num_shards, data_dir=data_dir)
 
     logger.info(f"Using {args.num_gpus} GPU(s) for parallel ProteinEBM scoring")
     logger.info("Sorting proteins by sequence length and building per-GPU work lists...")
