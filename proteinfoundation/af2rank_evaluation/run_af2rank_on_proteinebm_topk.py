@@ -31,7 +31,8 @@ from proteinfoundation.af2rank_evaluation.sharding_utils import (
     shard_proteins,
 )
 
-logging.basicConfig(level=logging.ERROR, format="%(levelname)s: %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s",
+                    stream=sys.stdout)
 logger = logging.getLogger(__name__)
 
 
@@ -204,7 +205,8 @@ def _batch_reconstruct_ca_only(staged_dir: Path, direct_python: bool = False) ->
         cmd = [wrapper_script, "python", script, "--inputs", inputs_json, "--output_dir", tmp_dir, "--output_map", output_map_json]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     if result.returncode != 0:
-        raise RuntimeError(f"cg2all reconstruction failed:\n{result.stderr[-3000:]}")
+        err_tail = result.stderr[-3000:] if result.stderr else "(no stderr)"
+        raise RuntimeError(f"cg2all reconstruction failed:\n{err_tail}")
     with open(output_map_json) as f:
         mapping = json.load(f)
     return mapping
@@ -363,10 +365,14 @@ plot_af2rank_results(plot_scores, output_dir, protein_id)
         cmd = [sys.executable, "-c", py]
     else:
         cmd = [wrapper_script, "python", "-c", py]
+    logger.info(f"Running AF2Rank subprocess for {protein_id} ({model_name}): {cmd[0]}")
     result = subprocess.run(cmd, cwd=wrapper_dir, capture_output=True, text=True)
     if result.returncode != 0:
+        err_tail = result.stderr[-3000:] if result.stderr else "(no stderr)"
+        out_tail = result.stdout[-1000:] if result.stdout else "(no stdout)"
         raise RuntimeError(
-            f"AF2Rank subprocess failed for {protein_id} ({model_name}):\n{result.stderr[-3000:]}"
+            f"AF2Rank subprocess failed for {protein_id} ({model_name}), "
+            f"exit={result.returncode}:\nSTDERR:\n{err_tail}\nSTDOUT:\n{out_tail}"
         )
 
 
@@ -436,7 +442,6 @@ def _process_one_protein(
     def _prefix_metrics(m: Dict[str, float], prefix: str) -> Dict[str, float]:
         return {f"{prefix}_{k}": v for k, v in m.items()}
 
-    # Check filter_existing BEFORE staging — both models must have all desired templates.
     if filter_existing and af2rank_scores_csv_m1.exists() and af2rank_scores_csv_m2.exists():
         m1_df = pd.read_csv(af2rank_scores_csv_m1)
         m2_df = pd.read_csv(af2rank_scores_csv_m2)
@@ -633,6 +638,7 @@ def main() -> None:
         raise ValueError("No GPU ids provided/derived for AF2Rank subprocesses")
 
     score_csvs = _find_proteinebm_scores(args.inference_dir, args.proteinebm_analysis_subdir)
+    logger.info(f"Found {len(score_csvs)} ProteinEBM score CSVs under {args.inference_dir}")
     if len(score_csvs) == 0:
         raise FileNotFoundError(f"No proteinebm_scores_*.csv found under {args.inference_dir}")
 
@@ -640,8 +646,10 @@ def main() -> None:
     dataset_map: Dict[str, Dict[str, float]] = {}
     if has_dataset:
         dataset_map = _load_dataset_map(args.dataset_file, args.id_column, args.tms_column)
+        logger.info(f"Loaded {len(dataset_map)} proteins from dataset CSV")
 
     scores_by_protein: Dict[str, Path] = {p.parent.parent.name: p for p in score_csvs}
+    logger.info(f"scores_by_protein has {len(scores_by_protein)} entries")
 
     out_dir = args.output_dir.strip()
     if not out_dir:
@@ -653,19 +661,25 @@ def main() -> None:
     if has_dataset and shard_index is not None:
         all_ids_for_sharding = list(dataset_map.keys())
         data_dir = os.environ.get("DATA_PATH", os.path.join(Path(__file__).resolve().parents[2], "data"))
+        logger.info(f"Sharding {len(all_ids_for_sharding)} dataset proteins into shard {shard_index}/{num_shards} (data_dir={data_dir})")
         shard_ids = set(shard_proteins(all_ids_for_sharding, shard_index, num_shards, data_dir=data_dir))
+        logger.info(f"Shard {shard_index} assigned {len(shard_ids)} proteins")
     elif shard_index is not None:
         all_ids_for_sharding = list(scores_by_protein.keys())
         data_dir = os.environ.get("DATA_PATH", os.path.join(Path(__file__).resolve().parents[2], "data"))
+        logger.info(f"Sharding {len(all_ids_for_sharding)} score proteins into shard {shard_index}/{num_shards} (data_dir={data_dir})")
         shard_ids = set(shard_proteins(all_ids_for_sharding, shard_index, num_shards, data_dir=data_dir))
+        logger.info(f"Shard {shard_index} assigned {len(shard_ids)} proteins")
     else:
         shard_ids = None
 
     tasks: List[Tuple[str, str, Dict[str, object], str]] = []
     n_considered = 0
+    n_no_scores = 0
     candidate_ids = list(shard_ids) if shard_ids is not None else (list(dataset_map.keys()) if has_dataset else list(scores_by_protein.keys()))
     for protein_id in candidate_ids:
         if protein_id not in scores_by_protein:
+            n_no_scores += 1
             continue
         if has_dataset and protein_id not in dataset_map:
             continue
@@ -680,6 +694,10 @@ def main() -> None:
         n_considered += 1
         if args.limit and n_considered >= int(args.limit):
             break
+
+    logger.info(f"Built {len(tasks)} tasks (candidates={len(candidate_ids)}, skipped_no_scores={n_no_scores}, filter_existing={args.filter_existing}, direct_python={args.direct_python})")
+    if len(tasks) > 0:
+        logger.info(f"First task: {tasks[0][0]}, last task: {tasks[-1][0]}")
 
     def _submit_args(protein_id, scores_csv, ref, gpu_id):
         return (protein_id, scores_csv, ref, int(args.top_k), int(args.recycles),
@@ -712,6 +730,8 @@ def main() -> None:
         return
 
     rows: List[Dict[str, object]] = []
+    n_failed = 0
+    n_skipped_existing = 0
     with tqdm(total=len(tasks), desc="AF2Rank top-k", unit="protein", file=sys.stderr) as pbar:
         if args.dry_run or int(args.num_gpus) == 1:
             for protein_id, scores_csv, ref, gpu_id in tasks:
@@ -719,7 +739,12 @@ def main() -> None:
                     row = _process_one_protein(*_submit_args(protein_id, scores_csv, ref, gpu_id))
                     if row:
                         rows.append(row)
+                        if row.get("af2rank_scores_csv"):
+                            csv_path = Path(str(row["af2rank_scores_csv"]))
+                            if csv_path.exists():
+                                n_skipped_existing += 0
                 except Exception as e:
+                    n_failed += 1
                     logger.error("FAILED %s: %s", protein_id, e)
                 pbar.update(1)
         else:
@@ -735,12 +760,18 @@ def main() -> None:
                         if row:
                             rows.append(row)
                     except Exception as e:
+                        n_failed += 1
                         logger.error("FAILED %s: %s", pid, e)
                     pbar.update(1)
 
+    logger.info(f"Processing complete: {len(rows)} rows collected, {n_failed} failed, from {len(tasks)} tasks")
+
     if len(rows) == 0:
-        print("WARNING: No protein rows collected (all skipped by filter_existing or dry_run). "
-              "Cross-protein plots may be generated from pre-existing data by generate_cross_protein_plots.py.")
+        logger.warning("No protein rows collected (all skipped by filter_existing or all failed). "
+                        "Cross-protein plots may be generated from pre-existing data by generate_cross_protein_plots.py.")
+        if n_failed > 0:
+            logger.error(f"{n_failed}/{len(tasks)} proteins failed — check errors above")
+            sys.exit(1)
         return
 
     if shard_index is not None and shard_index != 0:
