@@ -21,11 +21,10 @@ from pathlib import Path
 
 import pandas as pd
 
-from proteinfoundation.af2rank_evaluation.sharding_utils import (
-    add_shard_args,
-    resolve_shard_args,
-    shard_proteins,
-)
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+from sharding_utils import add_shard_args, resolve_shard_args, shard_proteins
 
 try:
     from dotenv import load_dotenv
