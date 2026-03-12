@@ -219,218 +219,46 @@ class OpenFoldTemplateInference(nn.Module):
         logger.info("OpenFold submodule compilation disabled")
 
     def enable_tracing(self, sample_input: dict) -> None:
-        """Trace compute-intensive evoformer ops with torch.jit.trace + freeze.
+        """Enable torch.compile on evoformer blocks for the fixed length in sample_input.
 
-        OpenFold's official trace_model_ utility targets an older model structure
-        (block.core.outer_product_mean, block.core.tri_mul_*) that does not match
-        the current OpenFold version (block.outer_product_mean, block.pair_stack.*).
-        This method reimplements the same idea adapted for the current structure.
+        OpenFold's official trace_model_ (torch.jit.trace) cannot be used with
+        the current OpenFold version because:
+        1. The model structure has changed (block.outer_product_mean, not
+           block.core.outer_product_mean; block.pair_stack.*, not block.core.*).
+        2. Different code paths call individual ops with different argument counts,
+           which torch.jit.trace cannot handle.
 
-        Traced ops per evoformer block:
-          - msa_att_row, msa_att_col  (MSA attention)
-          - outer_product_mean        (outer product mean)
-          - pair_stack.tri_mul_out/in (triangular multiplicative update)
-          - pair_stack.tri_att_start/end (triangular attention)
+        Instead, this method compiles the full evoformer blocks using torch.compile
+        with dynamic=False (shape-specialized compilation).  Inputs are padded to
+        the sequence length recorded here, so the compiled kernels are always reused
+        without recompilation.
 
-        The model is modified **in-place** and cannot be re-traced at a different
-        length.  All future inference calls must use inputs padded to the same
-        sequence length recorded in `_traced_length`.
-
-        When `trace_model=True` is passed to `__init__`, this is called
-        automatically on the first `forward()` call.
+        The padding target (`_traced_length`) is set from sample_input and all
+        future calls to forward() must use inputs padded to this same length.
 
         Args:
             sample_input: A processed feature dict (output of `build_batch`) at
-                the desired fixed sequence length.  Each tensor's last dimension
-                is the recycling dimension (standard output of process_features).
+                the desired fixed sequence length.  Sets _traced_length to
+                sample_input["aatype"].shape[0].
         """
-        import contextlib
-
         if self._traced_length is not None:
             raise RuntimeError(
-                f"Model already traced at length {self._traced_length}. "
-                "Tracing can only happen once. Create a new instance for a different length."
+                f"Model already compiled/traced at length {self._traced_length}. "
+                "Cannot re-trace. Create a new instance for a different length."
             )
 
-        model = self.model
+        # Compile blocks with dynamic=False for shape-specialized kernels
+        self.enable_compilation(dynamic=False)
 
-        # ----------------------------------------------------------------
-        # Gather metadata from sample_input (same as trace_model_)
-        # ----------------------------------------------------------------
-        feats = {k: v[..., -1] for k, v in sample_input.items()
-                 if isinstance(v, torch.Tensor) and v.dim() > 0}
-
-        n = feats["aatype"].shape[-1]         # sequence length
-        msa_depth = feats["true_msa"].shape[-2]
-        extra_msa_depth = feats["extra_msa"].shape[-2]
-        device = feats["aatype"].device
-
-        seq_mask = feats["seq_mask"].to(device)
-        pair_mask = seq_mask[..., None] * seq_mask[..., None, :]
-        msa_mask = torch.randint(0, 2, (msa_depth + 4, n), device=device)
-
-        # Fake representations at the correct shapes
-        c_m = model.globals.c_m
-        c_z = model.globals.c_z
-        m = torch.rand(msa_depth + 4, n, c_m, device=device)
-        z = torch.rand(n, n, c_z, device=device)
-
-        g = model.globals
-        chunk_size = g.chunk_size
-        attn_chunk = max(chunk_size, chunk_size // 4)
-
-        # ----------------------------------------------------------------
-        # Dry run (1 recycling iter) so chunk-size tuners complete
-        # ----------------------------------------------------------------
-        single_input = {k: v[..., :1] for k, v in sample_input.items()
-                        if isinstance(v, torch.Tensor)}
+        # Run a warmup forward at this exact shape so compilation happens now,
+        # not during the first production call
         with torch.no_grad():
-            _evo_blocks = model.evoformer.blocks
-            model.evoformer.blocks = _evo_blocks[:1]
-            _extra_blocks = model.extra_msa_stack.blocks
-            model.extra_msa_stack.blocks = _extra_blocks[:1]
-            _ = model(single_input)
-            model.evoformer.blocks = _evo_blocks
-            model.extra_msa_stack.blocks = _extra_blocks
+            _ = self.model(sample_input)
 
-        if model.evoformer.chunk_size_tuner is not None:
-            tuned = model.evoformer.chunk_size_tuner.cached_chunk_size
-            if tuned is not None:
-                chunk_size = tuned
-                attn_chunk = max(model.globals.chunk_size, chunk_size // 4)
-
-        # ----------------------------------------------------------------
-        # Helper: trace a single submodule
-        # ----------------------------------------------------------------
-        def trace_block(module, arg_list):
-            args = [v for _, v in arg_list]
-            with contextlib.redirect_stderr(None):
-                traced = torch.jit.trace(module, args)
-            traced = torch.jit.freeze(traced, optimize_numerics=True)
-            def wrapper(*a, **kw):
-                def to_t(x): return torch.tensor(x) if not isinstance(x, torch.Tensor) else x
-                return traced(*[to_t(x) for x in a])
-            return wrapper
-
-        def verify_args(fn, arg_list):
-            names = fn.__code__.co_varnames[1:len(arg_list) + 1]  # skip 'self'
-            for (exp, _), got in zip(arg_list, names):
-                assert exp == got, f"Arg order mismatch: expected {exp}, got {got}"
-
-        # ----------------------------------------------------------------
-        # Trace evoformer ops
-        # ----------------------------------------------------------------
-        with torch.no_grad():
-            # --- msa_att_row ---
-            row_args = [
-                ("m", m), ("z", z), ("mask", msa_mask),
-                ("chunk_size", torch.tensor(attn_chunk)),
-                ("use_memory_efficient_kernel", torch.tensor(False)),
-                ("use_deepspeed_evo_attention", torch.tensor(g.use_deepspeed_evo_attention)),
-                ("use_cuequivariance_attention", torch.tensor(g.use_cuequivariance_attention)),
-                ("use_lma", torch.tensor(g.use_lma)),
-                ("use_flash", torch.tensor(g.use_flash)),
-                ("inplace_safe", torch.tensor(True)),
-                ("_chunk_logits", torch.tensor(True)),
-                ("_checkpoint_chunks", torch.tensor(False)),
-            ]
-            verify_args(model.evoformer.blocks[0].msa_att_row.forward, row_args)
-            for b in model.evoformer.blocks:
-                traced = trace_block(b.msa_att_row, row_args)
-                del b.msa_att_row; b.msa_att_row = traced
-
-            # --- msa_att_col ---
-            col_args = [
-                ("m", m), ("mask", msa_mask),
-                ("chunk_size", torch.tensor(chunk_size)),
-                ("use_deepspeed_evo_attention", torch.tensor(g.use_deepspeed_evo_attention)),
-                ("use_cuequivariance_attention", torch.tensor(g.use_cuequivariance_attention)),
-                ("use_lma", torch.tensor(g.use_lma)),
-                ("use_flash", torch.tensor(g.use_flash)),
-            ]
-            verify_args(model.evoformer.blocks[0].msa_att_col.forward, col_args)
-            for b in model.evoformer.blocks:
-                traced = trace_block(b.msa_att_col, col_args)
-                del b.msa_att_col; b.msa_att_col = traced
-
-            # --- outer_product_mean ---
-            opm_args = [
-                ("m", m), ("mask", msa_mask.float()),
-                ("chunk_size", torch.tensor(chunk_size)),
-                ("inplace_safe", torch.tensor(True)),
-            ]
-            verify_args(model.evoformer.blocks[0].outer_product_mean.forward, opm_args)
-            for b in model.evoformer.blocks:
-                traced = trace_block(b.outer_product_mean, opm_args)
-                del b.outer_product_mean; b.outer_product_mean = traced
-
-            # --- tri_mul_out ---
-            tmo_args = [
-                ("z", z), ("mask", pair_mask.float()),
-                ("inplace_safe", torch.tensor(True)),
-                ("use_cuequivariance_multiplicative_update",
-                 torch.tensor(g.use_cuequivariance_multiplicative_update)),
-                ("_add_with_inplace", torch.tensor(True)),
-                ("_inplace_chunk_size", torch.tensor(chunk_size)),
-            ]
-            verify_args(model.evoformer.blocks[0].pair_stack.tri_mul_out.forward, tmo_args)
-            for b in model.evoformer.blocks:
-                traced = trace_block(b.pair_stack.tri_mul_out, tmo_args)
-                del b.pair_stack.tri_mul_out; b.pair_stack.tri_mul_out = traced
-
-            # --- tri_mul_in ---
-            tmi_args = [
-                ("z", z), ("mask", pair_mask.float()),
-                ("inplace_safe", torch.tensor(True)),
-                ("use_cuequivariance_multiplicative_update",
-                 torch.tensor(g.use_cuequivariance_multiplicative_update)),
-                ("_add_with_inplace", torch.tensor(True)),
-                ("_inplace_chunk_size", torch.tensor(chunk_size)),
-            ]
-            verify_args(model.evoformer.blocks[0].pair_stack.tri_mul_in.forward, tmi_args)
-            for b in model.evoformer.blocks:
-                traced = trace_block(b.pair_stack.tri_mul_in, tmi_args)
-                del b.pair_stack.tri_mul_in; b.pair_stack.tri_mul_in = traced
-
-            # --- tri_att_start ---
-            tas_args = [
-                ("x", z), ("mask", pair_mask.float()),
-                ("chunk_size", torch.tensor(attn_chunk)),
-                ("use_memory_efficient_kernel", torch.tensor(False)),
-                ("use_deepspeed_evo_attention", torch.tensor(g.use_deepspeed_evo_attention)),
-                ("use_cuequivariance_attention", torch.tensor(g.use_cuequivariance_attention)),
-                ("use_lma", torch.tensor(g.use_lma)),
-                ("inplace_safe", torch.tensor(True)),
-            ]
-            verify_args(model.evoformer.blocks[0].pair_stack.tri_att_start.forward, tas_args)
-            for b in model.evoformer.blocks:
-                traced = trace_block(b.pair_stack.tri_att_start, tas_args)
-                del b.pair_stack.tri_att_start; b.pair_stack.tri_att_start = traced
-
-            # --- tri_att_end ---
-            tae_args = [
-                ("x", z.transpose(-2, -3)),
-                ("mask", pair_mask.transpose(-1, -2).float()),
-                ("chunk_size", torch.tensor(attn_chunk)),
-                ("use_memory_efficient_kernel", torch.tensor(False)),
-                ("use_deepspeed_evo_attention", torch.tensor(g.use_deepspeed_evo_attention)),
-                ("use_cuequivariance_attention", torch.tensor(g.use_cuequivariance_attention)),
-                ("use_lma", torch.tensor(g.use_lma)),
-                ("inplace_safe", torch.tensor(True)),
-            ]
-            verify_args(model.evoformer.blocks[0].pair_stack.tri_att_end.forward, tae_args)
-            for b in model.evoformer.blocks:
-                traced = trace_block(b.pair_stack.tri_att_end, tae_args)
-                del b.pair_stack.tri_att_end; b.pair_stack.tri_att_end = traced
-
-        # Warmup run (2 recycling iters) to reach top speed
-        two_input = {k: v[..., :2] for k, v in sample_input.items()
-                     if isinstance(v, torch.Tensor)}
-        with torch.no_grad():
-            _ = model(two_input)
-
-        self._traced_length = n
-        logger.info("OpenFold tracing completed at length %d", self._traced_length)
+        # aatype shape: [N_res, N_recycling] for single-sample,
+        # or [B, N_res, N_recycling] for batched — use shape[-2] either way
+        self._traced_length = sample_input["aatype"].shape[-2]
+        logger.info("OpenFold compiled (shape-specialized) at length %d", self._traced_length)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -836,13 +664,13 @@ class OpenFoldTemplateInference(nn.Module):
             **kwargs,
         )
 
-        # Auto-trace on first call when trace_model=True
+        # Auto-trace on first call when trace_model=True.
+        # Pass the full batched dict so the compilation warmup fires at the
+        # same rank/shape that will be used in production.
         if self._trace_model and self._traced_length is None:
-            # Use a single-sample slice for tracing (trace_model_ expects no batch dim)
-            single_batch = {k: v[0] for k, v in batch.items()}
             logger.info("Auto-tracing model at length %d (trace_interval=%d)...",
                         _pad_to, self._trace_interval)
-            self.enable_tracing(single_batch)
+            self.enable_tracing(batch)
 
         with torch.no_grad():
             out = self.model(batch)

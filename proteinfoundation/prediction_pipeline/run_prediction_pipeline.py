@@ -173,6 +173,8 @@ def step_af2rank_topk(
     top_k: int,
     recycles: int,
     num_gpus: int,
+    csv_file: str,
+    csv_column: str = "id",
     backend: str = "colabdesign",
     proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
     use_deepspeed_evoformer_attention: bool = True,
@@ -181,12 +183,14 @@ def step_af2rank_topk(
     shard_args: list | None = None,
     direct_python: bool = False,
 ) -> bool:
-    """Run AF2Rank on ProteinEBM top-k templates."""
+    """Run AF2Rank on ProteinEBM top-k templates. Restricts to proteins in csv_file."""
     logger.info(f"Starting AF2Rank on ProteinEBM top-{top_k} (backend={backend})...")
     inference_dir = os.path.join(PROTEINA_BASE_DIR, "inference", inference_config)
     cmd = [
         "python", os.path.join(AF2RANK_EVAL_DIR, "run_af2rank_on_proteinebm_topk.py"),
         "--inference_dir", inference_dir,
+        "--csv_file", csv_file,
+        "--csv_column", csv_column,
         "--top_k", str(top_k),
         "--recycles", str(recycles),
         "--num_gpus", str(num_gpus),
@@ -427,9 +431,9 @@ def main():
     parser.add_argument("--use_cuequivariance_multiplicative_update", action=argparse.BooleanOptionalAction, default=False,
                         help="Use cuEquivariance multiplicative update (openfold backend, default: False)")
     parser.add_argument("--recycles", type=int, default=3, help="AF2 recycles for AF2Rank (default: 3)")
-    parser.add_argument("--proteinebm_config", default="/home/ubuntu/ProteinEBM/protein_ebm/config/base_pretrain.yaml",
+    parser.add_argument("--proteinebm_config", default="/home/ubuntu/ProteinEBM/protein_ebm/config/proteinebm_v2_cathmd_config.yaml",
                         help="Path to ProteinEBM config YAML")
-    parser.add_argument("--proteinebm_checkpoint", default="/home/ubuntu/ProteinEBM/weights/model_1_frozen_1m_md.pt",
+    parser.add_argument("--proteinebm_checkpoint", default="/home/ubuntu/ProteinEBM/weights/proteinebm_v2_cathmd_weights.pt",
                         help="Path to ProteinEBM checkpoint")
     parser.add_argument("--proteinebm_t", type=float, default=0.05, help="Diffusion time for ProteinEBM (default: 0.05)")
     parser.add_argument("--proteinebm_analysis_subdir", default="proteinebm_v2_cathmd_analysis",
@@ -528,7 +532,8 @@ def main():
         logger.info("=" * 60)
         if not step_af2rank_topk(
             args.inference_config, args.top_k, args.recycles,
-            args.num_gpus, args.backend, args.proteinebm_analysis_subdir,
+            args.num_gpus, working_csv, args.id_column,
+            args.backend, args.proteinebm_analysis_subdir,
             use_deepspeed_evoformer_attention=args.use_deepspeed_evoformer_attention,
             use_cuequivariance_attention=args.use_cuequivariance_attention,
             use_cuequivariance_multiplicative_update=args.use_cuequivariance_multiplicative_update,
