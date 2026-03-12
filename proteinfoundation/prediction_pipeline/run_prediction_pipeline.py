@@ -420,12 +420,12 @@ def main():
     parser.add_argument("--top_k", type=int, default=5, help="Number of top ProteinEBM templates for AF2Rank (default: 5)")
     parser.add_argument("--backend", choices=["colabdesign", "openfold"], default="colabdesign",
                         help="AF2Rank backend: colabdesign (JAX) or openfold (PyTorch)")
-    parser.add_argument("--use_deepspeed_evoformer_attention", action=argparse.BooleanOptionalAction, default=True,
-                        help="Use DeepSpeed evoformer attention (openfold backend, default: True)")
-    parser.add_argument("--use_cuequivariance_attention", action=argparse.BooleanOptionalAction, default=True,
-                        help="Use cuEquivariance attention kernels (openfold backend, default: True)")
-    parser.add_argument("--use_cuequivariance_multiplicative_update", action=argparse.BooleanOptionalAction, default=True,
-                        help="Use cuEquivariance multiplicative update (openfold backend, default: True)")
+    parser.add_argument("--use_deepspeed_evoformer_attention", action=argparse.BooleanOptionalAction, default=False,
+                        help="Use DeepSpeed evoformer attention (openfold backend, default: False)")
+    parser.add_argument("--use_cuequivariance_attention", action=argparse.BooleanOptionalAction, default=False,
+                        help="Use cuEquivariance attention kernels (openfold backend, default: False)")
+    parser.add_argument("--use_cuequivariance_multiplicative_update", action=argparse.BooleanOptionalAction, default=False,
+                        help="Use cuEquivariance multiplicative update (openfold backend, default: False)")
     parser.add_argument("--recycles", type=int, default=3, help="AF2 recycles for AF2Rank (default: 3)")
     parser.add_argument("--proteinebm_config", default="/home/ubuntu/ProteinEBM/protein_ebm/config/base_pretrain.yaml",
                         help="Path to ProteinEBM config YAML")

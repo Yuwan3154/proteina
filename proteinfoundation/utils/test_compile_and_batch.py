@@ -1,8 +1,8 @@
 #!/usr/bin/env python
-"""Tests and benchmarks for OpenFoldTemplateInference compilation and batching.
+"""Tests and benchmarks for OpenFoldTemplateInference compilation, tracing, and batching.
 
 Usage:
-    python -u test_compile_and_batch.py [--skip-compile] [--skip-batch]
+    python -u test_compile_and_batch.py [--skip-compile] [--skip-trace] [--skip-batch]
 """
 import argparse
 import copy
@@ -31,6 +31,11 @@ def make_dummy_inputs(seq_len: int, device: torch.device = torch.device("cpu")):
 def p(*args, **kwargs):
     """print with flush=True."""
     print(*args, flush=True, **kwargs)
+
+
+def _sync():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 
 # ------------------------------------------------------------------
@@ -109,6 +114,63 @@ def test_compilation_toggle(infer: OpenFoldTemplateInference):
     p(f"    Max diff (base vs restored): {max_diff_restored:.2e}")
     assert max_diff_restored < 1e-4, f"Restored output diverged: {max_diff_restored}"
     p("    OK: compilation toggle works")
+
+
+def test_tracing(model_name, jax_params, max_recycling_iters):
+    """Test enable_tracing via trace_model_ and verify output consistency."""
+    p("  Testing trace_model_ (fresh model instance, trace_interval=64)...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Baseline (no tracing)
+    infer_base = OpenFoldTemplateInference(
+        model_name=model_name, jax_params_path=jax_params, device=device,
+        max_recycling_iters=max_recycling_iters, use_mlm=False,
+    )
+    dgram, rtype, mask = make_dummy_inputs(50, device=device)
+    batch = infer_base.build_batch(dgram, rtype, mask, _pad_to_length=64)
+    with torch.no_grad():
+        out_base = infer_base.model(copy.deepcopy(batch))
+    pos_base = out_base["final_atom_positions"].detach().clone()
+
+    # Traced model (separate instance — trace_model_ modifies in-place)
+    infer_traced = OpenFoldTemplateInference(
+        model_name=model_name, jax_params_path=jax_params, device=device,
+        max_recycling_iters=max_recycling_iters, use_mlm=False,
+    )
+    # Build batch padded to 64 (same as baseline) then trace explicitly
+    batch_t = infer_traced.build_batch(dgram, rtype, mask, _pad_to_length=64)
+    p("    Calling enable_tracing (one-time tracing cost)...")
+    t0 = time.time()
+    infer_traced.enable_tracing(batch_t)
+    p(f"    Tracing overhead: {time.time() - t0:.2f}s")
+    p(f"    Traced length: {infer_traced._traced_length}")
+
+    p("    Running traced forward...")
+    t0 = time.time()
+    with torch.no_grad():
+        out_traced = infer_traced.model(copy.deepcopy(batch_t))
+    p(f"    First traced forward: {time.time() - t0:.2f}s")
+
+    pos_traced = out_traced["final_atom_positions"].detach().clone()
+    # Both were padded to 64 — compare first 50 residues
+    max_diff = (pos_base[:50] - pos_traced[:50]).abs().max().item()
+    mean_diff = (pos_base[:50] - pos_traced[:50]).abs().mean().item()
+    p(f"    Max diff (base vs traced):  {max_diff:.2e} Angstrom")
+    p(f"    Mean diff (base vs traced): {mean_diff:.2e} Angstrom")
+    assert max_diff < 1.5, f"Traced output diverged too much: max_diff={max_diff}"
+    assert mean_diff < 1.0, f"Traced output mean diff too large: mean_diff={mean_diff}"
+
+    # Second call — should reuse traced model, same batch
+    t0 = time.time()
+    with torch.no_grad():
+        out_traced2 = infer_traced.model(copy.deepcopy(batch_t))
+    p(f"    Second traced forward (cached): {time.time() - t0:.2f}s")
+
+    d2 = (out_traced["final_atom_positions"] - out_traced2["final_atom_positions"]).abs().max().item()
+    p(f"    Determinism check: {d2:.2e}")
+    assert d2 == 0.0, f"Traced model non-deterministic: {d2}"
+    p("    OK: tracing works and is deterministic")
+    return infer_traced
 
 
 def test_build_batch_padding(infer: OpenFoldTemplateInference):
@@ -198,15 +260,10 @@ def test_batching_variable_length(infer: OpenFoldTemplateInference):
 # Benchmarks
 # ------------------------------------------------------------------
 
-def _sync():
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-
-
 def benchmark_compilation(infer: OpenFoldTemplateInference, seq_len: int = 50,
                           n_warmup: int = 3, n_measure: int = 5):
-    """Benchmark compiled vs uncompiled model forward (single sample)."""
-    p(f"  Benchmarking compilation (seq_len={seq_len}, single sample)...")
+    """Benchmark torch.compile vs uncompiled model forward (single sample)."""
+    p(f"  Benchmarking torch.compile (seq_len={seq_len}, single sample)...")
     dgram, rtype, mask = make_dummy_inputs(seq_len, device=infer.device)
     batch = infer.build_batch(dgram, rtype, mask)
 
@@ -242,11 +299,76 @@ def benchmark_compilation(infer: OpenFoldTemplateInference, seq_len: int = 50,
     compiled_time = (time.time() - t0) / n_measure
 
     speedup = base_time / compiled_time if compiled_time > 0 else float("inf")
-    p(f"    Compiled:   {compiled_time:.3f}s/iter")
-    p(f"    Speedup:    {speedup:.2f}x")
+    p(f"    torch.compile: {compiled_time:.3f}s/iter  speedup={speedup:.2f}x")
 
     infer.disable_compilation()
     return base_time, compiled_time
+
+
+def benchmark_tracing(model_name, jax_params, max_recycling_iters,
+                      seq_len: int = 50, n_warmup: int = 3, n_measure: int = 5):
+    """Benchmark trace_model_ (JIT trace) vs uncompiled model forward.
+
+    Uses a fresh model instance because tracing is in-place and irreversible.
+    Builds the batch explicitly at seq_len, then calls enable_tracing directly
+    before measuring repeated model forwards.
+    """
+    p(f"  Benchmarking trace_model_ (seq_len={seq_len}, single sample)...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ---- Uncompiled baseline (new instance) ----
+    infer_base = OpenFoldTemplateInference(
+        model_name=model_name, jax_params_path=jax_params, device=device,
+        max_recycling_iters=max_recycling_iters, use_mlm=False,
+    )
+    dgram, rtype, mask = make_dummy_inputs(seq_len, device=device)
+    batch = infer_base.build_batch(dgram, rtype, mask, _pad_to_length=seq_len)
+
+    for _ in range(n_warmup):
+        with torch.no_grad():
+            infer_base.model(copy.deepcopy(batch))
+    _sync()
+
+    t0 = time.time()
+    for _ in range(n_measure):
+        with torch.no_grad():
+            infer_base.model(copy.deepcopy(batch))
+        _sync()
+    base_time = (time.time() - t0) / n_measure
+    p(f"    Uncompiled: {base_time:.3f}s/iter")
+
+    # ---- Traced (new instance) ----
+    infer_traced = OpenFoldTemplateInference(
+        model_name=model_name, jax_params_path=jax_params, device=device,
+        max_recycling_iters=max_recycling_iters, use_mlm=False,
+    )
+    # Build the batch at seq_len on the traced instance (same weights, same batch)
+    batch_t = infer_traced.build_batch(dgram, rtype, mask, _pad_to_length=seq_len)
+
+    p("    Tracing model (one-time cost)...")
+    t_trace_start = time.time()
+    infer_traced.enable_tracing(batch_t)   # explicit trace call
+    p(f"    Tracing overhead: {time.time() - t_trace_start:.2f}s")
+    p(f"    Traced at length: {infer_traced._traced_length}")
+
+    # Warmup on traced model
+    for _ in range(n_warmup):
+        with torch.no_grad():
+            infer_traced.model(copy.deepcopy(batch_t))
+    _sync()
+
+    t0 = time.time()
+    for _ in range(n_measure):
+        with torch.no_grad():
+            infer_traced.model(copy.deepcopy(batch_t))
+        _sync()
+    traced_time = (time.time() - t0) / n_measure
+
+    speedup = base_time / traced_time if traced_time > 0 else float("inf")
+    p(f"    trace_model_: {traced_time:.3f}s/iter  speedup={speedup:.2f}x")
+
+    del infer_base, infer_traced
+    return base_time, traced_time
 
 
 def benchmark_batching(infer: OpenFoldTemplateInference, seq_len: int = 50,
@@ -300,16 +422,84 @@ def benchmark_batching(infer: OpenFoldTemplateInference, seq_len: int = 50,
     return seq_time, batch_time
 
 
+def benchmark_trace_plus_batch(model_name, jax_params, max_recycling_iters,
+                                seq_len: int = 50, n_samples: int = 4,
+                                n_warmup: int = 3, n_measure: int = 5):
+    """Benchmark trace_model_ + batching vs sequential uncompiled (model forward only)."""
+    p(f"  Benchmarking trace_model_ + batching (seq_len={seq_len}, n_samples={n_samples})...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    dgrams = []; rtypes = []; masks = []
+    for _ in range(n_samples):
+        d, r, m = make_dummy_inputs(seq_len, device=device)
+        dgrams.append(d); rtypes.append(r); masks.append(m)
+
+    # ---- Baseline: sequential uncompiled ----
+    infer_base = OpenFoldTemplateInference(
+        model_name=model_name, jax_params_path=jax_params, device=device,
+        max_recycling_iters=max_recycling_iters, use_mlm=False,
+    )
+    single_batches = [infer_base.build_batch(d, r, m) for d, r, m in zip(dgrams, rtypes, masks)]
+
+    for _ in range(n_warmup):
+        for b in single_batches:
+            with torch.no_grad():
+                infer_base.model(copy.deepcopy(b))
+    _sync()
+
+    t0 = time.time()
+    for _ in range(n_measure):
+        for b in single_batches:
+            with torch.no_grad():
+                infer_base.model(copy.deepcopy(b))
+        _sync()
+    baseline = (time.time() - t0) / n_measure
+    p(f"    Baseline (seq uncompiled, {n_samples}x): {baseline:.3f}s")
+
+    # ---- Traced + batched ----
+    infer_traced = OpenFoldTemplateInference(
+        model_name=model_name, jax_params_path=jax_params, device=device,
+        max_recycling_iters=max_recycling_iters, use_mlm=False,
+    )
+    multi_batch = infer_traced.build_batch_multi(dgrams, rtypes, masks, _pad_to_length=seq_len)
+    # Use first sample for tracing (trace_model_ expects no batch dim)
+    single_for_trace = {k: v[0] for k, v in multi_batch.items()}
+
+    p("    Tracing model (one-time cost)...")
+    t_trace = time.time()
+    infer_traced.enable_tracing(single_for_trace)   # explicit trace
+    p(f"    Tracing overhead: {time.time() - t_trace:.2f}s")
+
+    for _ in range(n_warmup):
+        with torch.no_grad():
+            infer_traced.model(copy.deepcopy(multi_batch))
+    _sync()
+
+    t0 = time.time()
+    for _ in range(n_measure):
+        with torch.no_grad():
+            infer_traced.model(copy.deepcopy(multi_batch))
+        _sync()
+    combined = (time.time() - t0) / n_measure
+
+    total_speedup = baseline / combined if combined > 0 else float("inf")
+    p(f"    trace_model_+batched ({n_samples}x): {combined:.3f}s")
+    p(f"    Total speedup: {total_speedup:.2f}x  ({baseline/n_samples:.3f}s/sample seq vs {combined/n_samples:.3f}s/sample)")
+
+    del infer_base, infer_traced
+    return baseline, combined
+
+
 def benchmark_combined(infer: OpenFoldTemplateInference, seq_len: int = 50,
                        n_samples: int = 4, n_warmup: int = 3, n_measure: int = 5):
-    """Benchmark compile + batching combined vs sequential uncompiled (model forward only).
+    """Benchmark torch.compile + batching combined vs sequential uncompiled (model forward only).
 
     IMPORTANT: compile with dynamic=True so the same compiled kernels work for
     both single-sample (rank-3 tensors) and batched (rank-4 tensors) inputs.
     Warm up the compiled model exclusively on batched inputs to ensure the
     rank-4 specialization is cached before measuring.
     """
-    p(f"  Benchmarking compile + batching (seq_len={seq_len}, n_samples={n_samples})...")
+    p(f"  Benchmarking torch.compile + batching (seq_len={seq_len}, n_samples={n_samples})...")
 
     dgrams, rtypes, masks = [], [], []
     for _ in range(n_samples):
@@ -355,7 +545,7 @@ def benchmark_combined(infer: OpenFoldTemplateInference, seq_len: int = 50,
     combined = (time.time() - t0) / n_measure
 
     total_speedup = baseline / combined if combined > 0 else float("inf")
-    p(f"    Combined  (compiled+batched, {n_samples}x): {combined:.3f}s")
+    p(f"    torch.compile+batched ({n_samples}x): {combined:.3f}s")
     p(f"    Total speedup: {total_speedup:.2f}x  ({baseline/n_samples:.3f}s/sample seq vs {combined/n_samples:.3f}s/sample)")
 
     infer.disable_compilation()
@@ -365,6 +555,7 @@ def benchmark_combined(infer: OpenFoldTemplateInference, seq_len: int = 50,
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--skip-compile", action="store_true")
+    parser.add_argument("--skip-trace", action="store_true")
     parser.add_argument("--skip-batch", action="store_true")
     parser.add_argument("--model_name", type=str, default="model_1_ptm")
     parser.add_argument("--jax_params", type=str, default=os.path.expanduser("~/openfold/openfold/resources/params/params_model_1_ptm.npz"))
@@ -404,8 +595,12 @@ def main():
         test_batching_variable_length(infer)
 
     if not args.skip_compile:
-        p("\n=== Compilation Toggle ===")
+        p("\n=== Compilation Toggle (torch.compile) ===")
         test_compilation_toggle(infer)
+
+    if not args.skip_trace:
+        p("\n=== Tracing (trace_model_) ===")
+        test_tracing(args.model_name, args.jax_params, args.max_recycling_iters)
 
     # ----------------------------------------------------------------
     # Benchmarks
@@ -416,8 +611,14 @@ def main():
 
     if not args.skip_compile:
         for sl in [50, 100, 200]:
-            p(f"\n--- Compilation speedup (seq_len={sl}) ---")
+            p(f"\n--- torch.compile speedup (seq_len={sl}) ---")
             benchmark_compilation(infer, seq_len=sl)
+
+    if not args.skip_trace:
+        for sl in [50, 100, 200]:
+            p(f"\n--- trace_model_ speedup (seq_len={sl}) ---")
+            benchmark_tracing(args.model_name, args.jax_params, args.max_recycling_iters,
+                              seq_len=sl)
 
     if not args.skip_batch:
         for n in [2, 4, 8]:
@@ -426,8 +627,14 @@ def main():
 
     if not args.skip_compile and not args.skip_batch:
         for sl, n in [(50, 4), (50, 8), (100, 4)]:
-            p(f"\n--- Combined compile+batch (seq_len={sl}, n_samples={n}) ---")
+            p(f"\n--- torch.compile+batch (seq_len={sl}, n_samples={n}) ---")
             benchmark_combined(infer, seq_len=sl, n_samples=n)
+
+    if not args.skip_trace and not args.skip_batch:
+        for sl, n in [(50, 4), (50, 8), (100, 4)]:
+            p(f"\n--- trace_model_+batch (seq_len={sl}, n_samples={n}) ---")
+            benchmark_trace_plus_batch(args.model_name, args.jax_params,
+                                       args.max_recycling_iters, seq_len=sl, n_samples=n)
 
     p("\n=== ALL TESTS AND BENCHMARKS COMPLETE ===")
 

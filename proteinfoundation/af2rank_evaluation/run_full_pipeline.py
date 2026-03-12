@@ -345,12 +345,12 @@ def main():
     )
     parser.add_argument('--af2rank_backend', choices=['colabdesign', 'openfold'], default='colabdesign',
                        help='AF2Rank backend: colabdesign (JAX) or openfold (PyTorch)')
-    parser.add_argument('--use_deepspeed_evoformer_attention', action=argparse.BooleanOptionalAction, default=True,
-                       help='Use DeepSpeed evoformer attention (openfold backend, default: True)')
-    parser.add_argument('--use_cuequivariance_attention', action=argparse.BooleanOptionalAction, default=True,
-                       help='Use cuEquivariance attention kernels (openfold backend, default: True)')
-    parser.add_argument('--use_cuequivariance_multiplicative_update', action=argparse.BooleanOptionalAction, default=True,
-                       help='Use cuEquivariance multiplicative update (openfold backend, default: True)')
+    parser.add_argument('--use_deepspeed_evoformer_attention', action=argparse.BooleanOptionalAction, default=False,
+                       help='Use DeepSpeed evoformer attention (openfold backend, default: False)')
+    parser.add_argument('--use_cuequivariance_attention', action=argparse.BooleanOptionalAction, default=False,
+                       help='Use cuEquivariance attention kernels (openfold backend, default: False)')
+    parser.add_argument('--use_cuequivariance_multiplicative_update', action=argparse.BooleanOptionalAction, default=False,
+                       help='Use cuEquivariance multiplicative update (openfold backend, default: False)')
     parser.add_argument('--usalign_path', help='Path to USalign executable')
     parser.add_argument('--skip_inference', action='store_true', 
                        help='Skip Proteina inference (only run scoring stage)')
