@@ -767,7 +767,7 @@ def score_proteina_structures_openfold(
     model_name: str = "model_1_ptm",
     verbose: bool = False,
     use_deepspeed_evoformer_attention: bool = True,
-    use_cuequivariance_attention: bool = True,
+    use_cuequivariance_attention: bool = False,
     use_cuequivariance_multiplicative_update: bool = True,
     scorer: Optional["OpenFoldAF2Rank"] = None,
 ) -> List[Dict]:
@@ -884,7 +884,7 @@ def run_af2rank_analysis_openfold(
     verbose: bool = False,
     regenerate_summary: bool = False,
     use_deepspeed_evoformer_attention: bool = True,
-    use_cuequivariance_attention: bool = True,
+    use_cuequivariance_attention: bool = False,
     use_cuequivariance_multiplicative_update: bool = True,
     scorer: Optional["OpenFoldAF2Rank"] = None,
 ) -> str:

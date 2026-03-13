@@ -302,7 +302,7 @@ def main() -> None:
     parser.add_argument("--use_deepspeed_evoformer_attention",
                         action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use_cuequivariance_attention",
-                        action=argparse.BooleanOptionalAction, default=True)
+                        action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--use_cuequivariance_multiplicative_update",
                         action=argparse.BooleanOptionalAction, default=True)
 

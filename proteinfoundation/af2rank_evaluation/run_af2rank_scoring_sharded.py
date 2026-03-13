@@ -198,7 +198,7 @@ def main() -> None:
     parser.add_argument("--use_cuequivariance_attention",
                         action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--use_cuequivariance_multiplicative_update",
-                        action=argparse.BooleanOptionalAction, default=False)
+                        action=argparse.BooleanOptionalAction, default=True)
     add_shard_args(parser)
     args = parser.parse_args()
 
