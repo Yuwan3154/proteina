@@ -48,19 +48,31 @@ def _backfill_single(
     database: str,
     overwrite: bool,
 ) -> dict:
-    """Backfill ext_lig for a single .pt file. Returns stats dict."""
+    """Backfill ext_lig for a single .pt file. Stores ext_lig as int8 to save disk space.
+    Returns stats dict."""
     stats = {"path": pt_path, "status": "skipped", "time_s": 0.0}
     t0 = time.time()
     try:
         graph = torch.load(pt_path, weights_only=False)
-        if hasattr(graph, "ext_lig") and not overwrite:
-            stats["status"] = "already_has_ext_lig"
+
+        # Case 1: ext_lig present, correct dtype (int8), and not overwriting
+        if hasattr(graph, "ext_lig") and graph.ext_lig.dtype == torch.int8 and not overwrite:
+            stats["status"] = "already_has_ext_lig_int8"
             return stats
 
+        # Case 2: ext_lig present but wrong dtype — convert to int8 and save
+        if hasattr(graph, "ext_lig") and graph.ext_lig.dtype != torch.int8 and not overwrite:
+            graph.ext_lig = graph.ext_lig.to(torch.int8)
+            torch.save(graph, pt_path)
+            stats["status"] = "converted_to_int8"
+            stats["time_s"] = time.time() - t0
+            return stats
+
+        # Case 3: ext_lig absent (or overwrite) — compute and save in int8
         L = graph.coords.shape[0]
 
         if database == "afdb":
-            graph.ext_lig = make_unknown_ext_lig(L)
+            graph.ext_lig = make_unknown_ext_lig(L).to(torch.int8)
         else:
             graph_id = graph.id
             parts = graph_id.rsplit("_", 1)
@@ -82,7 +94,7 @@ def _backfill_single(
                 full_df=full_df,
                 self_chains=chains,
                 graph_residue_ids=list(graph.residue_id),
-            )
+            ).to(torch.int8)
 
         torch.save(graph, pt_path)
         stats["status"] = "backfilled"
@@ -129,11 +141,15 @@ def main():
 
     if args.dry_run:
         need_backfill = 0
+        need_convert = 0
         for pt_path in tqdm(pt_files, desc="Checking"):
             graph = torch.load(str(pt_path), weights_only=False)
             if not hasattr(graph, "ext_lig"):
                 need_backfill += 1
+            elif graph.ext_lig.dtype != torch.int8:
+                need_convert += 1
         print(f"{need_backfill} / {len(pt_files)} files need ext_lig backfill")
+        print(f"{need_convert} / {len(pt_files)} files need ext_lig dtype conversion to int8")
         return
 
     if args.database == "pdb" and args.raw_dir is None:

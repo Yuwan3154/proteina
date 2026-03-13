@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -567,6 +568,89 @@ class OpenFoldAF2Rank:
 
         logger.info("OpenFold model loaded successfully")
 
+    def reset_reference(self, reference_pdb: str, chain: Optional[str] = None) -> None:
+        """Update the reference structure without reloading the model weights.
+
+        Call this between proteins when reusing the same scorer instance across
+        multiple proteins in a single model-load pass.
+        """
+        if chain is None:
+            chain = "A"
+        self.chain = chain
+
+        is_cif = reference_pdb.lower().endswith('.cif')
+        detected_chain = _detect_chain_in_cif(reference_pdb, chain) if is_cif else chain
+
+        self.reference_sequence = get_sequence_from_structure(reference_pdb, detected_chain)
+        self.reference_coords = get_ca_coords_from_structure(reference_pdb, detected_chain)
+        self._residue_type = torch.tensor(
+            [[rc.restype_order.get(aa, rc.restype_num) for aa in self.reference_sequence]],
+            dtype=torch.long,
+        )
+        self._mask = torch.ones((1, len(self.reference_sequence)), dtype=torch.float32)
+        logger.info(f"reset_reference: new sequence length {len(self.reference_sequence)}")
+
+    def _featurize(
+        self,
+        decoy_pdb: str,
+        decoy_chain: Optional[str] = None,
+        rm_seq: bool = True,
+        rm_sc: bool = True,
+        seed: int = 0,
+        _original_pdb: Optional[str] = None,
+    ) -> tuple:
+        """CPU-only featurization for a single decoy. Returns (batch, template_coords).
+
+        Separated from score_structure so that featurization for decoy i+1 can be
+        prefetched in a background thread while the GPU runs decoy i's forward pass.
+        Temp CIF files are created and deleted internally — nothing leaks to the caller.
+        """
+        if decoy_chain is None:
+            decoy_chain = "A"
+
+        ca_source = _original_pdb if _original_pdb else decoy_pdb
+        template_coords = get_ca_coords_from_structure(ca_source, decoy_chain)
+
+        # If decoy is already all-atom, use directly; otherwise reconstruct.
+        # Note: score_proteina_structures_openfold pre-reconstructs all CA-only
+        # structures via cg2all before the loop, so this branch is a fallback
+        # for direct callers of score_structure with CA-only input.
+        if _is_ca_only_pdb(decoy_pdb):
+            allatom_pdb = reconstruct_all_atom(decoy_pdb)
+            pdb_for_template = allatom_pdb if allatom_pdb else decoy_pdb
+        else:
+            allatom_pdb = None
+            pdb_for_template = decoy_pdb
+
+        temp_cif = convert_pdb_to_cif(pdb_for_template, chain_id=decoy_chain)
+        try:
+            cif_chain = _detect_chain_in_cif(temp_cif)
+            # Set numpy/torch CPU seeds before build_batch.
+            # torch.cuda.manual_seed is intentionally omitted: build_batch is
+            # CPU-only, and setting the CUDA seed from a background thread is
+            # unnecessary and could interfere with the GPU forward on the main thread.
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            batch = self.model.build_batch(
+                distogram_probs=None,
+                residue_type=self._residue_type,
+                mask=self._mask,
+                template_mode="full_template",
+                template_mmcif_path=temp_cif,
+                template_chain_id=cif_chain,
+                kalign_binary_path=KALIGN_BINARY_PATH,
+                mask_template_aatype=rm_seq,
+                zero_template_unit_vector=rm_sc,
+                zero_template_torsion_angles=rm_sc,
+            )
+        finally:
+            if os.path.exists(temp_cif):
+                os.unlink(temp_cif)
+            if allatom_pdb and os.path.exists(allatom_pdb):
+                os.unlink(allatom_pdb)
+
+        return batch, template_coords
+
     def score_structure(
         self,
         decoy_pdb: str,
@@ -593,60 +677,20 @@ class OpenFoldAF2Rank:
         if verbose:
             logger.debug(f"Scoring {decoy_pdb} with OpenFold AF2Rank")
 
-        # Get template coordinates for TMscore calculations (from original PDB)
-        ca_source = _original_pdb if _original_pdb else decoy_pdb
-        template_coords = get_ca_coords_from_structure(ca_source, decoy_chain)
+        batch, template_coords = self._featurize(
+            decoy_pdb,
+            decoy_chain=decoy_chain,
+            rm_seq=rm_seq,
+            rm_sc=rm_sc,
+            seed=seed,
+            _original_pdb=_original_pdb,
+        )
 
-        # If decoy is already all-atom, use directly; otherwise reconstruct
-        if _is_ca_only_pdb(decoy_pdb):
-            allatom_pdb = reconstruct_all_atom(decoy_pdb)
-            pdb_for_template = allatom_pdb if allatom_pdb else decoy_pdb
-        else:
-            allatom_pdb = None
-            pdb_for_template = decoy_pdb
+        with torch.no_grad():
+            out = self.model.model(batch)
 
-        # Convert PDB to temporary mmCIF for OpenFold template pipeline
-        temp_cif = convert_pdb_to_cif(pdb_for_template, chain_id=decoy_chain)
+        scores = self._extract_scores(out, template_coords)
 
-        try:
-            # Detect chain ID in the temporary CIF (may differ from PDB)
-            cif_chain = _detect_chain_in_cif(temp_cif)
-
-            # Set seeds for reproducibility before batch construction and inference
-            # (FeaturePipeline uses numpy random for bert_mask/msa_feat processing)
-            np.random.seed(seed)
-            torch.manual_seed(seed)
-            torch.cuda.manual_seed(seed)
-
-            # Build batch using OpenFoldTemplateInference
-            batch = self.model.build_batch(
-                distogram_probs=None,
-                residue_type=self._residue_type,
-                mask=self._mask,
-                template_mode="full_template",
-                template_mmcif_path=temp_cif,
-                template_chain_id=cif_chain,
-                kalign_binary_path=KALIGN_BINARY_PATH,
-                mask_template_aatype=rm_seq,
-                zero_template_unit_vector=rm_sc,
-                zero_template_torsion_angles=rm_sc,
-            )
-
-            # Run forward pass
-            with torch.no_grad():
-                out = self.model.model(batch)
-
-            # Extract scores
-            scores = self._extract_scores(out, template_coords)
-
-        finally:
-            # Clean up temp files
-            if os.path.exists(temp_cif):
-                os.unlink(temp_cif)
-            if allatom_pdb and os.path.exists(allatom_pdb):
-                os.unlink(allatom_pdb)
-
-        # Memory cleanup
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -725,8 +769,18 @@ def score_proteina_structures_openfold(
     use_deepspeed_evoformer_attention: bool = True,
     use_cuequivariance_attention: bool = True,
     use_cuequivariance_multiplicative_update: bool = True,
+    scorer: Optional["OpenFoldAF2Rank"] = None,
 ) -> List[Dict]:
-    """Score all Proteina-generated structures using AF2Rank with OpenFold backend."""
+    """Score all Proteina-generated structures using AF2Rank with OpenFold backend.
+
+    Args:
+        scorer: Optional pre-loaded OpenFoldAF2Rank instance.  When provided, the
+            caller is responsible for calling scorer.reset_reference() before this
+            function so that it uses the correct reference structure for protein_id.
+            Model-loading kwargs (model_name, recycles, use_*) are ignored when a
+            scorer is supplied.  Pass scorer= to avoid the per-protein model reload
+            when scoring many proteins in a single process (sharded / batched use).
+    """
     pdb_files = sorted(glob.glob(os.path.join(inference_output_dir, "*.pdb")))
 
     if not pdb_files:
@@ -747,39 +801,68 @@ def score_proteina_structures_openfold(
         except Exception as e:
             logger.warning(f"Batch cg2all failed, falling back to per-structure: {e}")
 
-    scorer = OpenFoldAF2Rank(
-        reference_cif, chain=chain, model_name=model_name, recycles=recycles,
-        use_deepspeed_evoformer_attention=use_deepspeed_evoformer_attention,
-        use_cuequivariance_attention=use_cuequivariance_attention,
-        use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
-    )
+    _owns_scorer = scorer is None
+    if _owns_scorer:
+        scorer = OpenFoldAF2Rank(
+            reference_cif, chain=chain, model_name=model_name, recycles=recycles,
+            use_deepspeed_evoformer_attention=use_deepspeed_evoformer_attention,
+            use_cuequivariance_attention=use_cuequivariance_attention,
+            use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
+        )
+
+    # Pipeline featurization and GPU forward: while the GPU runs the model for
+    # decoy i, a background thread pre-featurizes decoy i+1 (build_batch is
+    # CPU-only, ~0.7–1.4 s; GPU forward is ~2–5 s, so overlap is nearly free).
+    items = [(p, allatom_map.get(p, p)) for p in pdb_files]
+
+    def _featurize_item(item):
+        orig_pdb, scored_pdb = item
+        batch, template_coords = scorer._featurize(
+            scored_pdb, decoy_chain="A", _original_pdb=orig_pdb,
+        )
+        return orig_pdb, batch, template_coords
 
     scores = []
-    for pdb_path in tqdm(pdb_files, desc=f"AF2Rank-OpenFold scoring {protein_id}"):
-        pdb_filename = os.path.basename(pdb_path)
-        try:
-            # Use pre-reconstructed all-atom PDB if available
-            pdb_for_scoring = allatom_map.get(pdb_path, pdb_path)
-            structure_scores = scorer.score_structure(
-                pdb_for_scoring, decoy_chain="A", recycles=recycles, verbose=verbose,
-                _original_pdb=pdb_path,
-            )
-            structure_scores.update({
-                "protein_id": protein_id,
-                "structure_file": pdb_filename,
-                "structure_path": pdb_path,
-            })
-            if "pred_coords" in structure_scores:
-                del structure_scores["pred_coords"]
-            scores.append(structure_scores)
-        except Exception as e:
-            logger.error(f"Failed to score {pdb_filename}: {e}")
-            scores.append({
-                "protein_id": protein_id,
-                "structure_file": pdb_filename,
-                "structure_path": pdb_path,
-                "error": str(e),
-            })
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_featurize_item, items[0])
+
+        for i, pdb_path in enumerate(tqdm(pdb_files, desc=f"AF2Rank-OpenFold scoring {protein_id}")):
+            pdb_filename = os.path.basename(pdb_path)
+
+            # Submit featurization for the next decoy before waiting for the
+            # current one — this is the overlap that hides featurization latency.
+            if i + 1 < len(items):
+                next_future = executor.submit(_featurize_item, items[i + 1])
+
+            try:
+                _, batch, template_coords = future.result()
+
+                with torch.no_grad():
+                    out = scorer.model.model(batch)
+
+                structure_scores = scorer._extract_scores(out, template_coords)
+                gc.collect()
+                torch.cuda.empty_cache()
+
+                structure_scores.update({
+                    "protein_id": protein_id,
+                    "structure_file": pdb_filename,
+                    "structure_path": pdb_path,
+                })
+                if "pred_coords" in structure_scores:
+                    del structure_scores["pred_coords"]
+                scores.append(structure_scores)
+            except Exception as e:
+                logger.error(f"Failed to score {pdb_filename}: {e}")
+                scores.append({
+                    "protein_id": protein_id,
+                    "structure_file": pdb_filename,
+                    "structure_path": pdb_path,
+                    "error": str(e),
+                })
+
+            if i + 1 < len(items):
+                future = next_future
 
     # Clean up batch-reconstructed temp files
     for temp_path in allatom_map.values():
@@ -803,8 +886,15 @@ def run_af2rank_analysis_openfold(
     use_deepspeed_evoformer_attention: bool = True,
     use_cuequivariance_attention: bool = True,
     use_cuequivariance_multiplicative_update: bool = True,
+    scorer: Optional["OpenFoldAF2Rank"] = None,
 ) -> str:
-    """Run complete AF2Rank analysis using OpenFold backend."""
+    """Run complete AF2Rank analysis using OpenFold backend.
+
+    Args:
+        scorer: Optional pre-loaded OpenFoldAF2Rank instance.  Caller must call
+            scorer.reset_reference(reference_cif, chain) before this function.
+            When provided, model_name / recycles / use_* kwargs are ignored.
+    """
     os.makedirs(output_dir, exist_ok=True)
 
     scores_csv_path = os.path.join(output_dir, f"af2rank_scores_{protein_id}.csv")
@@ -825,6 +915,7 @@ def run_af2rank_analysis_openfold(
             use_deepspeed_evoformer_attention=use_deepspeed_evoformer_attention,
             use_cuequivariance_attention=use_cuequivariance_attention,
             use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
+            scorer=scorer,
         )
         if not scores:
             logger.warning(f"No scores generated for {protein_id}")

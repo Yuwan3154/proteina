@@ -272,12 +272,15 @@ def _run_af2rank_subprocess(
     if backend == "openfold":
         wrapper_script = os.path.join(wrapper_dir, "run_with_proteina_env.sh")
         py = f"""
+import gc
 import os
 import sys
 import glob
+from concurrent.futures import ThreadPoolExecutor
 sys.path.append({wrapper_dir!r})
 
 import pandas as pd
+import torch
 
 from af2rank_openfold_scorer import OpenFoldAF2Rank, plot_af2rank_results, save_af2rank_scores, load_af2rank_scores_from_csv
 
@@ -309,22 +312,33 @@ if len(to_score) > 0:
     use_deepspeed_evoformer_attention={use_deepspeed_evoformer_attention},
     use_cuequivariance_attention={use_cuequivariance_attention},
     use_cuequivariance_multiplicative_update={use_cuequivariance_multiplicative_update})
-  for pdb_path in to_score:
-    pdb_filename = os.path.basename(pdb_path)
-    structure_scores = scorer.score_structure(
-      pdb_path,
-      decoy_chain="A",
-      recycles={int(recycles)},
-      verbose=False,
-    )
-    structure_scores.update({{
-      "protein_id": protein_id,
-      "structure_file": pdb_filename,
-      "structure_path": pdb_path,
-    }})
-    if "pred_coords" in structure_scores:
-      del structure_scores["pred_coords"]
-    new_scores.append(structure_scores)
+  def _featurize_item(pdb_path):
+    batch, template_coords = scorer._featurize(pdb_path, decoy_chain="A")
+    return pdb_path, batch, template_coords
+  with ThreadPoolExecutor(max_workers=1) as executor:
+    future = executor.submit(_featurize_item, to_score[0])
+    for i, pdb_path in enumerate(to_score):
+      pdb_filename = os.path.basename(pdb_path)
+      if i + 1 < len(to_score):
+        next_future = executor.submit(_featurize_item, to_score[i + 1])
+      try:
+        _, batch, template_coords = future.result()
+        with torch.no_grad():
+          out = scorer.model.model(batch)
+        structure_scores = scorer._extract_scores(out, template_coords)
+        gc.collect()
+        torch.cuda.empty_cache()
+        structure_scores.update({{
+          "protein_id": protein_id,
+          "structure_file": pdb_filename,
+          "structure_path": pdb_path,
+        }})
+        structure_scores.pop("pred_coords", None)
+        new_scores.append(structure_scores)
+      except Exception as e:
+        print(f"Failed to score {{pdb_filename}}: {{e}}", flush=True)
+      if i + 1 < len(to_score):
+        future = next_future
 
 all_scores = existing_scores + new_scores
 save_af2rank_scores(all_scores, output_dir, protein_id)

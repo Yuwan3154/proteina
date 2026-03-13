@@ -50,11 +50,11 @@ class OpenFoldTemplateInference(nn.Module):
         skip_template_alignment: bool = False,
         max_recycling_iters: Optional[int] = None,
         compile_model: bool = False,
-        trace_model: bool = False,
-        trace_interval: int = 256,
+        compile_interval: int = 64,
         use_mlm: bool = False,
-        use_deepspeed_evoformer_attention: bool = False,
+        use_deepspeed_evoformer_attention: bool = True,
         use_cuequivariance_attention: bool = False,
+        use_cuequivariance_triangle_attention: bool = False,
         use_cuequivariance_multiplicative_update: bool = False,
     ):
         super().__init__()
@@ -66,6 +66,10 @@ class OpenFoldTemplateInference(nn.Module):
                 f"params_{model_name}.npz",
             )
         self.jax_params_path = jax_params_path
+        # use_cuequivariance_triangle_attention routes cuequivariance only to
+        # triangle attention in PairStack (via monkey-patching), while MSA attention
+        # continues to use deepspeed.  Model config must have cue_attn=False so
+        # AlphaFold.forward passes False to EvoformerBlock MSA attention.
         self.cfg = model_config(
             model_name,
             use_deepspeed_evoformer_attention=use_deepspeed_evoformer_attention,
@@ -105,17 +109,45 @@ class OpenFoldTemplateInference(nn.Module):
         if hasattr(self.model, "template_embedder") and hasattr(self.model.template_embedder, "config"):
             self._template_use_unit_vector_default = self.model.template_embedder.config.use_unit_vector
 
+        if use_cuequivariance_triangle_attention:
+            if use_cuequivariance_attention:
+                logger.warning(
+                    "use_cuequivariance_triangle_attention=True has no effect when "
+                    "use_cuequivariance_attention=True (already applied globally)."
+                )
+            else:
+                self._wrap_pair_stacks_for_cue_triangle_attn()
+
         # Compilation state (torch.compile approach)
         self._compiled = False
+        self._compile_dynamic = True  # default: dynamic shapes
         self._original_forwards = {}
+        self._compile_interval = compile_interval
 
         if compile_model:
-            self.enable_compilation()
+            if use_deepspeed_evoformer_attention:
+                # deepspeed attention uses a custom CUDA kernel whose fake/meta
+                # kernel is incompatible with torch.compile (stride mismatch).
+                # The two optimisations are mutually exclusive; deepspeed gives
+                # a larger speedup (1.4-1.6x vs 1.17-1.19x), so we skip compile.
+                logger.warning(
+                    "compile_model=True is incompatible with "
+                    "use_deepspeed_evoformer_attention=True (stride mismatch in "
+                    "deepspeed's custom CUDA kernel).  Compilation will be skipped. "
+                    "Disable deepspeed attention to use torch.compile."
+                )
+            else:
+                # Use dynamic=False with interval-based padding for better per-call
+                # speedup (~1.19x) vs dynamic=True (~1.17x).  Inputs are padded to
+                # the nearest multiple of compile_interval so torch.compile reuses
+                # shape-specialized kernels.  Each new bucket triggers ~12-17s of
+                # one-time compilation; with interval=64, typical proteins (50-512
+                # residues) need up to 8 buckets.  We raise the dynamo recompile
+                # limit to 32 to give each sub-function (evoformer, msa, structure
+                # module) enough headroom for all bucket shapes.
+                self.enable_compilation(dynamic=False)
+                self._compile_dynamic = False
 
-        # Tracing state (torch.jit.trace approach via OpenFold's trace_model_)
-        self._trace_model = trace_model
-        self._trace_interval = trace_interval
-        self._traced_length: Optional[int] = None
 
     # ------------------------------------------------------------------
     # torch.compile support
@@ -140,6 +172,15 @@ class OpenFoldTemplateInference(nn.Module):
         """
         if self._compiled:
             return
+
+        if not dynamic:
+            # Raise dynamo's per-function recompile limit so that interval-based
+            # bucket padding (up to 8 distinct shapes for interval=64, max 512) does
+            # not exhaust the default limit of 8 guards per frame.
+            # NOTE: access via attribute (not `import torch._dynamo`) to avoid
+            # Python treating `torch` as a local variable and breaking torch.compile
+            # calls later in this function.
+            torch._dynamo.config.recompile_limit = 32
 
         compile_kwargs = dict(fullgraph=False, dynamic=dynamic)
 
@@ -218,47 +259,48 @@ class OpenFoldTemplateInference(nn.Module):
         self._compiled = False
         logger.info("OpenFold submodule compilation disabled")
 
-    def enable_tracing(self, sample_input: dict) -> None:
-        """Enable torch.compile on evoformer blocks for the fixed length in sample_input.
+    def _wrap_pair_stacks_for_cue_triangle_attn(self) -> None:
+        """Route cuequivariance attention to triangle ops only, keeping deepspeed for MSA.
 
-        OpenFold's official trace_model_ (torch.jit.trace) cannot be used with
-        the current OpenFold version because:
-        1. The model structure has changed (block.outer_product_mean, not
-           block.core.outer_product_mean; block.pair_stack.*, not block.core.*).
-        2. Different code paths call individual ops with different argument counts,
-           which torch.jit.trace cannot handle.
+        EvoformerBlock.forward() passes use_cuequivariance_attention from the global
+        config to both MSA attention (row/col) and PairStack (triangle attention).
+        When the global config has use_cuequivariance_attention=False (to let deepspeed
+        handle MSA attention), this method monkey-patches each PairStack.forward to
+        inject use_cuequivariance_attention=True, so triangle attention gets the
+        cuequivariance kernel while MSA attention keeps deepspeed.
 
-        Instead, this method compiles the full evoformer blocks using torch.compile
-        with dynamic=False (shape-specialized compilation).  Inputs are padded to
-        the sequence length recorded here, so the compiled kernels are always reused
-        without recompilation.
-
-        The padding target (`_traced_length`) is set from sample_input and all
-        future calls to forward() must use inputs padded to this same length.
-
-        Args:
-            sample_input: A processed feature dict (output of `build_batch`) at
-                the desired fixed sequence length.  Sets _traced_length to
-                sample_input["aatype"].shape[0].
+        This achieves:
+          MSA row/col attention → deepspeed kernel  (1.4-1.6x speedup)
+          Triangle start/end    → cuequivariance kernel
+          Triangle mul update   → cuequivariance (if use_cuequivariance_multiplicative_update)
         """
-        if self._traced_length is not None:
-            raise RuntimeError(
-                f"Model already compiled/traced at length {self._traced_length}. "
-                "Cannot re-trace. Create a new instance for a different length."
-            )
+        count = 0
+        for block in self.model.evoformer.blocks:
+            if not hasattr(block, "pair_stack"):
+                continue
+            orig = block.pair_stack.forward
+            # Use default arg to capture `orig` in the closure correctly
+            def _patched(orig=orig, *args, **kwargs):
+                kwargs["use_cuequivariance_attention"] = True
+                kwargs["use_deepspeed_evo_attention"] = False  # must clear; deepspeed takes unconditional priority in primitives.py
+                return orig(*args, **kwargs)
+            block.pair_stack.forward = _patched
+            count += 1
+        logger.info(
+            "Patched %d PairStack.forward methods to use cuequivariance triangle attention "
+            "while MSA attention uses deepspeed.", count
+        )
 
-        # Compile blocks with dynamic=False for shape-specialized kernels
-        self.enable_compilation(dynamic=False)
+    def _compute_pad_length(self, true_length: int) -> Optional[int]:
+        """Return the padded length for compiled model, or None if not compiling.
 
-        # Run a warmup forward at this exact shape so compilation happens now,
-        # not during the first production call
-        with torch.no_grad():
-            _ = self.model(sample_input)
-
-        # aatype shape: [N_res, N_recycling] for single-sample,
-        # or [B, N_res, N_recycling] for batched — use shape[-2] either way
-        self._traced_length = sample_input["aatype"].shape[-2]
-        logger.info("OpenFold compiled (shape-specialized) at length %d", self._traced_length)
+        When compiled with dynamic=False, inputs are padded to the nearest
+        multiple of compile_interval so that torch.compile reuses
+        shape-specialized kernels instead of recompiling for every new length.
+        """
+        if not self._compiled or self._compile_dynamic:
+            return None
+        return math.ceil(true_length / self._compile_interval) * self._compile_interval
 
     # ------------------------------------------------------------------
     # Helpers
@@ -648,7 +690,7 @@ class OpenFoldTemplateInference(nn.Module):
             [B, L_max, ...]; use the per-sample masks to extract valid
             residues.
         """
-        # Compute max true length across samples for trace padding
+        # When compiled with dynamic=False, pad to interval bucket
         lengths = []
         for m in mask_list:
             mf = m.float() if m.dtype != torch.float32 else m
@@ -664,14 +706,6 @@ class OpenFoldTemplateInference(nn.Module):
             **kwargs,
         )
 
-        # Auto-trace on first call when trace_model=True.
-        # Pass the full batched dict so the compilation warmup fires at the
-        # same rank/shape that will be used in production.
-        if self._trace_model and self._traced_length is None:
-            logger.info("Auto-tracing model at length %d (trace_interval=%d)...",
-                        _pad_to, self._trace_interval)
-            self.enable_tracing(batch)
-
         with torch.no_grad():
             out = self.model(batch)
         return out
@@ -679,29 +713,6 @@ class OpenFoldTemplateInference(nn.Module):
     # ------------------------------------------------------------------
     # Original single-sample forward (backward-compatible)
     # ------------------------------------------------------------------
-
-    def _compute_pad_length(self, true_length: int) -> Optional[int]:
-        """Return the padded length to use for tracing, or None if not tracing.
-
-        When tracing is enabled:
-          - First call: rounds up to the next multiple of trace_interval and
-            stores that as the permanent traced length.
-          - Subsequent calls: always pads to the stored traced length. Raises
-            if the input is longer than the traced length.
-        """
-        if not self._trace_model:
-            return None
-        if self._traced_length is None:
-            # First call: pick bucket
-            return math.ceil(true_length / self._trace_interval) * self._trace_interval
-        # Subsequent calls: enforce same length
-        if true_length > self._traced_length:
-            raise ValueError(
-                f"Input length {true_length} exceeds traced model length "
-                f"{self._traced_length}. Create a new model instance for "
-                "longer sequences, or use trace_model=False."
-            )
-        return self._traced_length
 
     def forward(
         self,
@@ -727,7 +738,7 @@ class OpenFoldTemplateInference(nn.Module):
         Returns:
             dict with atom37 coordinates [B, L, 37, 3]
         """
-        # When trace_model=True, determine padded length before building batch
+        # When compiled with dynamic=False, pad to interval bucket
         true_l = int(mask.float().reshape(-1).sum().item()) if mask.dim() >= 2 else int(mask.float().sum().item())
         _pad_to = self._compute_pad_length(true_l)
 
@@ -745,12 +756,6 @@ class OpenFoldTemplateInference(nn.Module):
             seed=seed,
             _pad_to_length=_pad_to,
         )
-
-        # Auto-trace on first call when trace_model=True
-        if self._trace_model and self._traced_length is None:
-            logger.info("Auto-tracing model at length %d (trace_interval=%d)...",
-                        _pad_to, self._trace_interval)
-            self.enable_tracing(batch)
 
         with torch.no_grad():
             out = self.model(batch)

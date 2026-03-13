@@ -183,29 +183,32 @@ def step_af2rank_topk(
     shard_args: list | None = None,
     direct_python: bool = False,
 ) -> bool:
-    """Run AF2Rank on ProteinEBM top-k templates. Restricts to proteins in csv_file."""
-    logger.info(f"Starting AF2Rank on ProteinEBM top-{top_k} (backend={backend})...")
+    """Run AF2Rank on ProteinEBM top-k templates.
+
+    Uses run_af2rank_prediction.py which initialises each AF2Rank model variant
+    exactly once across all proteins (instead of once per protein), and reads
+    top-k templates directly from the ProteinEBM scores CSV without requiring
+    a summary JSON file.
+    """
+    logger.info(f"Starting AF2Rank on ProteinEBM top-{top_k} ...")
     inference_dir = os.path.join(PROTEINA_BASE_DIR, "inference", inference_config)
+    prediction_pipeline_dir = os.path.dirname(os.path.abspath(__file__))
     cmd = [
-        "python", os.path.join(AF2RANK_EVAL_DIR, "run_af2rank_on_proteinebm_topk.py"),
+        "python", os.path.join(prediction_pipeline_dir, "run_af2rank_prediction.py"),
         "--inference_dir", inference_dir,
         "--csv_file", csv_file,
         "--csv_column", csv_column,
         "--top_k", str(top_k),
         "--recycles", str(recycles),
-        "--num_gpus", str(num_gpus),
-        "--backend", backend,
         "--proteinebm_analysis_subdir", proteinebm_analysis_subdir,
         "--filter_existing",
-        # No --dataset_file: no ground-truth comparison
     ]
-    if backend == "openfold":
-        if not use_deepspeed_evoformer_attention:
-            cmd.append("--no-use_deepspeed_evoformer_attention")
-        if not use_cuequivariance_attention:
-            cmd.append("--no-use_cuequivariance_attention")
-        if not use_cuequivariance_multiplicative_update:
-            cmd.append("--no-use_cuequivariance_multiplicative_update")
+    if not use_deepspeed_evoformer_attention:
+        cmd.append("--no-use_deepspeed_evoformer_attention")
+    if not use_cuequivariance_attention:
+        cmd.append("--no-use_cuequivariance_attention")
+    if not use_cuequivariance_multiplicative_update:
+        cmd.append("--no-use_cuequivariance_multiplicative_update")
     if shard_args:
         cmd.extend(shard_args)
     return run_with_conda_env("proteina", cmd, direct_python=direct_python)

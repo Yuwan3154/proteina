@@ -1,8 +1,8 @@
 #!/usr/bin/env python
-"""Tests and benchmarks for OpenFoldTemplateInference compilation, tracing, and batching.
+"""Tests and benchmarks for OpenFoldTemplateInference compilation and batching.
 
 Usage:
-    python -u test_compile_and_batch.py [--skip-compile] [--skip-trace] [--skip-batch]
+    python -u test_compile_and_batch.py [--skip-compile] [--skip-batch]
 """
 import argparse
 import copy
@@ -114,63 +114,6 @@ def test_compilation_toggle(infer: OpenFoldTemplateInference):
     p(f"    Max diff (base vs restored): {max_diff_restored:.2e}")
     assert max_diff_restored < 1e-4, f"Restored output diverged: {max_diff_restored}"
     p("    OK: compilation toggle works")
-
-
-def test_tracing(model_name, jax_params, max_recycling_iters):
-    """Test enable_tracing via trace_model_ and verify output consistency."""
-    p("  Testing trace_model_ (fresh model instance, trace_interval=64)...")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Baseline (no tracing)
-    infer_base = OpenFoldTemplateInference(
-        model_name=model_name, jax_params_path=jax_params, device=device,
-        max_recycling_iters=max_recycling_iters, use_mlm=False,
-    )
-    dgram, rtype, mask = make_dummy_inputs(50, device=device)
-    batch = infer_base.build_batch(dgram, rtype, mask, _pad_to_length=64)
-    with torch.no_grad():
-        out_base = infer_base.model(copy.deepcopy(batch))
-    pos_base = out_base["final_atom_positions"].detach().clone()
-
-    # Traced model (separate instance — trace_model_ modifies in-place)
-    infer_traced = OpenFoldTemplateInference(
-        model_name=model_name, jax_params_path=jax_params, device=device,
-        max_recycling_iters=max_recycling_iters, use_mlm=False,
-    )
-    # Build batch padded to 64 (same as baseline) then trace explicitly
-    batch_t = infer_traced.build_batch(dgram, rtype, mask, _pad_to_length=64)
-    p("    Calling enable_tracing (one-time tracing cost)...")
-    t0 = time.time()
-    infer_traced.enable_tracing(batch_t)
-    p(f"    Tracing overhead: {time.time() - t0:.2f}s")
-    p(f"    Traced length: {infer_traced._traced_length}")
-
-    p("    Running traced forward...")
-    t0 = time.time()
-    with torch.no_grad():
-        out_traced = infer_traced.model(copy.deepcopy(batch_t))
-    p(f"    First traced forward: {time.time() - t0:.2f}s")
-
-    pos_traced = out_traced["final_atom_positions"].detach().clone()
-    # Both were padded to 64 — compare first 50 residues
-    max_diff = (pos_base[:50] - pos_traced[:50]).abs().max().item()
-    mean_diff = (pos_base[:50] - pos_traced[:50]).abs().mean().item()
-    p(f"    Max diff (base vs traced):  {max_diff:.2e} Angstrom")
-    p(f"    Mean diff (base vs traced): {mean_diff:.2e} Angstrom")
-    assert max_diff < 1.5, f"Traced output diverged too much: max_diff={max_diff}"
-    assert mean_diff < 1.0, f"Traced output mean diff too large: mean_diff={mean_diff}"
-
-    # Second call — should reuse traced model, same batch
-    t0 = time.time()
-    with torch.no_grad():
-        out_traced2 = infer_traced.model(copy.deepcopy(batch_t))
-    p(f"    Second traced forward (cached): {time.time() - t0:.2f}s")
-
-    d2 = (out_traced["final_atom_positions"] - out_traced2["final_atom_positions"]).abs().max().item()
-    p(f"    Determinism check: {d2:.2e}")
-    assert d2 == 0.0, f"Traced model non-deterministic: {d2}"
-    p("    OK: tracing works and is deterministic")
-    return infer_traced
 
 
 def test_build_batch_padding(infer: OpenFoldTemplateInference):
@@ -305,72 +248,6 @@ def benchmark_compilation(infer: OpenFoldTemplateInference, seq_len: int = 50,
     return base_time, compiled_time
 
 
-def benchmark_tracing(model_name, jax_params, max_recycling_iters,
-                      seq_len: int = 50, n_warmup: int = 3, n_measure: int = 5):
-    """Benchmark trace_model_ (JIT trace) vs uncompiled model forward.
-
-    Uses a fresh model instance because tracing is in-place and irreversible.
-    Builds the batch explicitly at seq_len, then calls enable_tracing directly
-    before measuring repeated model forwards.
-    """
-    p(f"  Benchmarking trace_model_ (seq_len={seq_len}, single sample)...")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # ---- Uncompiled baseline (new instance) ----
-    infer_base = OpenFoldTemplateInference(
-        model_name=model_name, jax_params_path=jax_params, device=device,
-        max_recycling_iters=max_recycling_iters, use_mlm=False,
-    )
-    dgram, rtype, mask = make_dummy_inputs(seq_len, device=device)
-    batch = infer_base.build_batch(dgram, rtype, mask, _pad_to_length=seq_len)
-
-    for _ in range(n_warmup):
-        with torch.no_grad():
-            infer_base.model(copy.deepcopy(batch))
-    _sync()
-
-    t0 = time.time()
-    for _ in range(n_measure):
-        with torch.no_grad():
-            infer_base.model(copy.deepcopy(batch))
-        _sync()
-    base_time = (time.time() - t0) / n_measure
-    p(f"    Uncompiled: {base_time:.3f}s/iter")
-
-    # ---- Traced (new instance) ----
-    infer_traced = OpenFoldTemplateInference(
-        model_name=model_name, jax_params_path=jax_params, device=device,
-        max_recycling_iters=max_recycling_iters, use_mlm=False,
-    )
-    # Build the batch at seq_len on the traced instance (same weights, same batch)
-    batch_t = infer_traced.build_batch(dgram, rtype, mask, _pad_to_length=seq_len)
-
-    p("    Tracing model (one-time cost)...")
-    t_trace_start = time.time()
-    infer_traced.enable_tracing(batch_t)   # explicit trace call
-    p(f"    Tracing overhead: {time.time() - t_trace_start:.2f}s")
-    p(f"    Traced at length: {infer_traced._traced_length}")
-
-    # Warmup on traced model
-    for _ in range(n_warmup):
-        with torch.no_grad():
-            infer_traced.model(copy.deepcopy(batch_t))
-    _sync()
-
-    t0 = time.time()
-    for _ in range(n_measure):
-        with torch.no_grad():
-            infer_traced.model(copy.deepcopy(batch_t))
-        _sync()
-    traced_time = (time.time() - t0) / n_measure
-
-    speedup = base_time / traced_time if traced_time > 0 else float("inf")
-    p(f"    trace_model_: {traced_time:.3f}s/iter  speedup={speedup:.2f}x")
-
-    del infer_base, infer_traced
-    return base_time, traced_time
-
-
 def benchmark_batching(infer: OpenFoldTemplateInference, seq_len: int = 50,
                        n_samples: int = 4, n_warmup: int = 1, n_measure: int = 3):
     """Benchmark batched vs sequential model forward only (no feature pipeline)."""
@@ -420,74 +297,6 @@ def benchmark_batching(infer: OpenFoldTemplateInference, seq_len: int = 50,
     p(f"    Batched    ({n_samples}x in 1 fwd):   {batch_time:.3f}s")
     p(f"    Speedup: {speedup:.2f}x  ({seq_time/n_samples:.3f}s/sample seq vs {batch_time/n_samples:.3f}s/sample batched)")
     return seq_time, batch_time
-
-
-def benchmark_trace_plus_batch(model_name, jax_params, max_recycling_iters,
-                                seq_len: int = 50, n_samples: int = 4,
-                                n_warmup: int = 3, n_measure: int = 5):
-    """Benchmark trace_model_ + batching vs sequential uncompiled (model forward only)."""
-    p(f"  Benchmarking trace_model_ + batching (seq_len={seq_len}, n_samples={n_samples})...")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    dgrams = []; rtypes = []; masks = []
-    for _ in range(n_samples):
-        d, r, m = make_dummy_inputs(seq_len, device=device)
-        dgrams.append(d); rtypes.append(r); masks.append(m)
-
-    # ---- Baseline: sequential uncompiled ----
-    infer_base = OpenFoldTemplateInference(
-        model_name=model_name, jax_params_path=jax_params, device=device,
-        max_recycling_iters=max_recycling_iters, use_mlm=False,
-    )
-    single_batches = [infer_base.build_batch(d, r, m) for d, r, m in zip(dgrams, rtypes, masks)]
-
-    for _ in range(n_warmup):
-        for b in single_batches:
-            with torch.no_grad():
-                infer_base.model(copy.deepcopy(b))
-    _sync()
-
-    t0 = time.time()
-    for _ in range(n_measure):
-        for b in single_batches:
-            with torch.no_grad():
-                infer_base.model(copy.deepcopy(b))
-        _sync()
-    baseline = (time.time() - t0) / n_measure
-    p(f"    Baseline (seq uncompiled, {n_samples}x): {baseline:.3f}s")
-
-    # ---- Traced + batched ----
-    infer_traced = OpenFoldTemplateInference(
-        model_name=model_name, jax_params_path=jax_params, device=device,
-        max_recycling_iters=max_recycling_iters, use_mlm=False,
-    )
-    multi_batch = infer_traced.build_batch_multi(dgrams, rtypes, masks, _pad_to_length=seq_len)
-    # Use first sample for tracing (trace_model_ expects no batch dim)
-    single_for_trace = {k: v[0] for k, v in multi_batch.items()}
-
-    p("    Tracing model (one-time cost)...")
-    t_trace = time.time()
-    infer_traced.enable_tracing(single_for_trace)   # explicit trace
-    p(f"    Tracing overhead: {time.time() - t_trace:.2f}s")
-
-    for _ in range(n_warmup):
-        with torch.no_grad():
-            infer_traced.model(copy.deepcopy(multi_batch))
-    _sync()
-
-    t0 = time.time()
-    for _ in range(n_measure):
-        with torch.no_grad():
-            infer_traced.model(copy.deepcopy(multi_batch))
-        _sync()
-    combined = (time.time() - t0) / n_measure
-
-    total_speedup = baseline / combined if combined > 0 else float("inf")
-    p(f"    trace_model_+batched ({n_samples}x): {combined:.3f}s")
-    p(f"    Total speedup: {total_speedup:.2f}x  ({baseline/n_samples:.3f}s/sample seq vs {combined/n_samples:.3f}s/sample)")
-
-    del infer_base, infer_traced
-    return baseline, combined
 
 
 def benchmark_combined(infer: OpenFoldTemplateInference, seq_len: int = 50,
@@ -552,11 +361,143 @@ def benchmark_combined(infer: OpenFoldTemplateInference, seq_len: int = 50,
     return baseline, combined
 
 
+def _make_synthetic_allatom_pdb(seq_len: int) -> str:
+    """Write a minimal all-atom backbone PDB (N, CA, C, O) and return its path.
+
+    Used to test the full-template featurization path (which requires a real
+    3D structure, not just a sequence stub).  Coordinates are placed on a
+    straight helix-like backbone to avoid degenerate geometry.
+    """
+    import tempfile, math
+    lines = ["MODEL     1"]
+    atom_idx = 1
+    residues = ["ALA"] * seq_len
+    for res_idx, resname in enumerate(residues):
+        # Simple helical coordinates
+        angle = res_idx * (100.0 * math.pi / 180.0)
+        ca_x = 2.3 * math.cos(angle)
+        ca_y = 2.3 * math.sin(angle)
+        ca_z = res_idx * 1.5
+        # Place N, CA, C, O at approximate backbone positions
+        for atom_name, dx, dy, dz in [(" N  ", -1.2, 0.0, -0.5),
+                                       (" CA ", 0.0, 0.0, 0.0),
+                                       (" C  ", 1.1, 0.6, 0.0),
+                                       (" O  ", 1.4, 1.7, 0.0)]:
+            # 0-indexed residue numbers so that convert_pdb_to_cif's +1 offset
+            # produces 1..seq_len which fits within the CIF entity definition.
+            lines.append(
+                f"ATOM  {atom_idx:5d} {atom_name} {resname} A{res_idx:4d}    "
+                f"{ca_x+dx:8.3f}{ca_y+dy:8.3f}{ca_z+dz:8.3f}  1.00  0.00           C"
+            )
+            atom_idx += 1
+    lines.append("ENDMDL")
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".pdb", delete=False)
+    tmp.write("\n".join(lines) + "\n")
+    tmp.close()
+    return tmp.name
+
+
+def benchmark_featurization(infer: OpenFoldTemplateInference, seq_len: int = 50,
+                            n_warmup: int = 1, n_measure: int = 3):
+    """Benchmark featurization (build_batch) vs model forward to identify bottleneck.
+
+    Tests BOTH paths used in production:
+      A) distogram_only: stub template (no mmcif, no kalign) — used in Proteina diffusion
+      B) full_template: real CIF + kalign alignment — used in AF2Rank scoring
+
+    Model forward is benchmarked once (same in both paths).
+    """
+    import tempfile, os
+    sys.path.insert(0, "/home/ubuntu/proteina")
+    sys.path.insert(0, "/home/ubuntu/openfold")
+
+    p(f"  Benchmarking featurization vs model forward (seq_len={seq_len})...")
+    dgram, rtype, mask = make_dummy_inputs(seq_len, device=infer.device)
+
+    # ---- Path A: distogram_only (stub template, no mmcif) ----
+    for _ in range(n_warmup):
+        infer.build_batch(dgram, rtype, mask, template_mode="distogram_only")
+    t0 = time.time()
+    for _ in range(n_measure):
+        infer.build_batch(dgram, rtype, mask, template_mode="distogram_only")
+    feat_distogram = (time.time() - t0) / n_measure
+    p(f"    build_batch distogram_only:    {feat_distogram:.3f}s/iter")
+
+    # ---- Path B: full_template (real CIF, skip_template_alignment=True) ----
+    # Production AF2Rank uses UNK query (residue index 20) and skips kalign.
+    # infer.skip_template_alignment must be True (set at construction in main()).
+    rtype_unk = torch.full((1, seq_len), 20, dtype=torch.long, device=infer.device)  # UNK=20
+    if not getattr(infer, "skip_template_alignment", False):
+        p("    WARNING: infer.skip_template_alignment is False; full_template path will call kalign")
+    try:
+        from proteinfoundation.af2rank_evaluation.af2rank_openfold_scorer import convert_pdb_to_cif
+        pdb_path = _make_synthetic_allatom_pdb(seq_len)
+        cif_path = convert_pdb_to_cif(pdb_path, chain_id="A")
+
+        full_kwargs = dict(
+            template_mode="full_template",
+            template_mmcif_path=cif_path,
+            template_chain_id="A",
+            kalign_binary_path="/usr/bin/kalign",
+            mask_template_aatype=True,   # mask out template sequence (AF2Rank protocol)
+            zero_template_unit_vector=True,
+            zero_template_torsion_angles=True,
+        )
+
+        # Smoke-test: verify features look correct on first call
+        feat_check = infer.build_batch(None, rtype_unk, mask, **full_kwargs)
+        # template_aatype should be all-UNK (index 20) when mask_template_aatype=True
+        tpl_aa = feat_check.get("template_aatype")
+        if tpl_aa is not None:
+            n_unk = int((tpl_aa == 20).sum().item())
+            n_total = int(tpl_aa.numel())
+            p(f"    [check] template_aatype UNK(20) entries: {n_unk}/{n_total} (expect all-UNK with mask_template_aatype=True)")
+        # template_all_atom_positions should be non-zero (real backbone coords)
+        tpl_pos = feat_check.get("template_all_atom_positions")
+        if tpl_pos is not None:
+            pos_max = float(tpl_pos.abs().max().item())
+            p(f"    [check] template_all_atom_positions max abs: {pos_max:.2f} Angstrom (expect >0 for real coords)")
+
+        for _ in range(n_warmup):
+            infer.build_batch(None, rtype_unk, mask, **full_kwargs)
+        t0 = time.time()
+        for _ in range(n_measure):
+            infer.build_batch(None, rtype_unk, mask, **full_kwargs)
+        feat_full = (time.time() - t0) / n_measure
+        p(f"    build_batch full_template:     {feat_full:.3f}s/iter  (skip_alignment=True, no kalign)")
+        os.unlink(pdb_path)
+        os.unlink(cif_path)
+    except Exception as e:
+        feat_full = None
+        p(f"    build_batch full_template:     FAILED: {e}")
+
+    # ---- Model forward (GPU) ----
+    batch = infer.build_batch(dgram, rtype, mask, template_mode="distogram_only")
+    for _ in range(n_warmup):
+        with torch.no_grad():
+            infer.model(copy.deepcopy(batch))
+    _sync()
+    t0 = time.time()
+    for _ in range(n_measure):
+        with torch.no_grad():
+            infer.model(copy.deepcopy(batch))
+        _sync()
+    model_time = (time.time() - t0) / n_measure
+    p(f"    model forward (GPU):           {model_time:.3f}s/iter")
+
+    if feat_full is not None:
+        total_full = feat_full + model_time
+        p(f"    Total (full_template path):    {total_full:.3f}s/iter")
+        p(f"      featurization fraction:      {feat_full/total_full*100:.1f}%")
+        p(f"      model fraction:              {model_time/total_full*100:.1f}%")
+    return feat_distogram, feat_full, model_time
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--skip-compile", action="store_true")
-    parser.add_argument("--skip-trace", action="store_true")
     parser.add_argument("--skip-batch", action="store_true")
+    parser.add_argument("--skip-feat", action="store_true")
     parser.add_argument("--model_name", type=str, default="model_1_ptm")
     parser.add_argument("--jax_params", type=str, default=os.path.expanduser("~/openfold/openfold/resources/params/params_model_1_ptm.npz"))
     parser.add_argument("--max_recycling_iters", type=int, default=1)
@@ -572,6 +513,11 @@ def main():
         device=device,
         max_recycling_iters=args.max_recycling_iters,
         use_mlm=False,
+        # deepspeed attention is now the default (1.4-1.6x speedup).
+        # It is mutually exclusive with compile_model.
+        use_deepspeed_evoformer_attention=True,
+        # Production AF2Rank scorer always skips kalign alignment.
+        skip_template_alignment=True,
     )
     p("Model loaded.")
 
@@ -598,10 +544,6 @@ def main():
         p("\n=== Compilation Toggle (torch.compile) ===")
         test_compilation_toggle(infer)
 
-    if not args.skip_trace:
-        p("\n=== Tracing (trace_model_) ===")
-        test_tracing(args.model_name, args.jax_params, args.max_recycling_iters)
-
     # ----------------------------------------------------------------
     # Benchmarks
     # ----------------------------------------------------------------
@@ -609,16 +551,16 @@ def main():
     p("BENCHMARKS  (max_recycling_iters=" + str(args.max_recycling_iters) + ")")
     p("=" * 60)
 
+    if not args.skip_feat:
+        p("\n=== Featurization vs Model Forward (bottleneck analysis) ===")
+        for sl in [50, 100, 200]:
+            p(f"\n--- Featurization breakdown (seq_len={sl}) ---")
+            benchmark_featurization(infer, seq_len=sl)
+
     if not args.skip_compile:
         for sl in [50, 100, 200]:
             p(f"\n--- torch.compile speedup (seq_len={sl}) ---")
             benchmark_compilation(infer, seq_len=sl)
-
-    if not args.skip_trace:
-        for sl in [50, 100, 200]:
-            p(f"\n--- trace_model_ speedup (seq_len={sl}) ---")
-            benchmark_tracing(args.model_name, args.jax_params, args.max_recycling_iters,
-                              seq_len=sl)
 
     if not args.skip_batch:
         for n in [2, 4, 8]:
@@ -629,12 +571,6 @@ def main():
         for sl, n in [(50, 4), (50, 8), (100, 4)]:
             p(f"\n--- torch.compile+batch (seq_len={sl}, n_samples={n}) ---")
             benchmark_combined(infer, seq_len=sl, n_samples=n)
-
-    if not args.skip_trace and not args.skip_batch:
-        for sl, n in [(50, 4), (50, 8), (100, 4)]:
-            p(f"\n--- trace_model_+batch (seq_len={sl}, n_samples={n}) ---")
-            benchmark_trace_plus_batch(args.model_name, args.jax_params,
-                                       args.max_recycling_iters, seq_len=sl, n_samples=n)
 
     p("\n=== ALL TESTS AND BENCHMARKS COMPLETE ===")
 

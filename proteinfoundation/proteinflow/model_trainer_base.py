@@ -823,10 +823,9 @@ class ModelTrainerBase(L.LightningModule):
                 batch["residue_type_unmasked"] = residue_type_unmasked
 
             # Mask the sequence (vectorized)
-            seq = mask_seq(seq, mask, self.cfg_exp.training.mask_seq_proportion)
+            seq = mask_seq(seq, mask, self.cfg_exp.training.mask_seq_proportion, mask_value=20)
             
             batch["residue_type"] = seq
-
         else:
             # Keep residue_type if IPA coordinates are needed for contact_map_mode
             need_residue_type = (
@@ -836,6 +835,10 @@ class ModelTrainerBase(L.LightningModule):
             if "residue_type" in batch and not need_residue_type:
                 batch.pop("residue_type")
 
+        # ext_lig masking (when model uses ext_lig embeddings)
+        mask_extlig = self.cfg_exp.training.get("mask_extlig_proportion", 0.0)
+        if mask_extlig > 0 and "ext_lig" in batch and getattr(self.cfg_exp.model.nn, "ext_lig_emb_dim", None):
+            batch["ext_lig"] = mask_seq(batch["ext_lig"], mask, mask_extlig, mask_value=2)
         
         
         # Prediction for self-conditioning

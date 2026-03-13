@@ -436,31 +436,36 @@ if __name__ == "__main__":
 
     # Set checkpointing
     if cfg_exp.log.checkpoint and not args.nolog:
+        # last_ckpt_every_n_steps: default 1000 when omitted (only-save-last mode)
+        last_ckpt_every = cfg_exp.log.get("last_ckpt_every_n_steps", 1000)
         args_ckpt_last = {
             "dirpath": checkpoint_path_store,
             "save_weights_only": False,
             "filename": "ignore",
-            "every_n_train_steps": cfg_exp.log.last_ckpt_every_n_steps,
+            "every_n_train_steps": last_ckpt_every,
             "save_last": True,
             "enable_version_counter": False,
             "save_top_k": 0,
         }
-        args_ckpt = {
-            "dirpath": checkpoint_path_store,
-            "save_last": False,
-            "save_weights_only": False,
-            "filename": "chk_{epoch:08d}_{step:012d}",
-            "every_n_train_steps": cfg_exp.log.checkpoint_every_n_steps,
-            "monitor": "validation_loss/loss",  # Works for both coordinate and contact map modes
-            "save_top_k": 5,
-            "mode": "min",
-        }
-        checkpoint_callback = EmaModelCheckpoint(**args_ckpt)
         checkpoint_callback_last = EmaModelCheckpoint(**args_ckpt_last)
-
         create_dir(checkpoint_path_store, parents=True, exist_ok=True)
-        callbacks.append(checkpoint_callback)
         callbacks.append(checkpoint_callback_last)
+
+        # checkpoint_every_n_steps: when omitted, skip top-k checkpoint (only last ckpt saved)
+        checkpoint_every = cfg_exp.log.get("checkpoint_every_n_steps", None)
+        if checkpoint_every is not None:
+            args_ckpt = {
+                "dirpath": checkpoint_path_store,
+                "save_last": False,
+                "save_weights_only": False,
+                "filename": "chk_{epoch:08d}_{step:012d}",
+                "every_n_train_steps": checkpoint_every,
+                "monitor": "validation_loss/loss",  # Works for both coordinate and contact map modes
+                "save_top_k": 5,
+                "mode": "min",
+            }
+            checkpoint_callback = EmaModelCheckpoint(**args_ckpt)
+            callbacks.append(checkpoint_callback)
 
         # Save and log config files
         path_configs = [

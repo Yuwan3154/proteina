@@ -378,13 +378,19 @@ def mask_cath_code_by_level(
         _cath_code.append(".".join(code))
     return _cath_code
 
-def mask_seq(seq: Union[np.ndarray, torch.Tensor], mask: Union[np.ndarray, torch.Tensor], mask_seq_proportion: float) -> Union[np.ndarray, torch.Tensor]:
+def mask_seq(
+    seq: Union[np.ndarray, torch.Tensor],
+    mask: Union[np.ndarray, torch.Tensor],
+    mask_seq_proportion: float,
+    mask_value: Union[int, float] = -1,
+) -> Union[np.ndarray, torch.Tensor]:
     """Mask sequence.
 
     Args:
       seq: Sequence.
       mask: Mask.
       mask_seq_proportion: Proportion of sequence to be masked.
+      mask_value: Value to write at masked positions. Default -1.
     """
     if mask_seq_proportion == 0:
         return seq
@@ -416,7 +422,7 @@ def mask_seq(seq: Union[np.ndarray, torch.Tensor], mask: Union[np.ndarray, torch
         mask_selection = ranks < num_mask.unsqueeze(1)
 
         # Apply masking out-of-place
-        seq = torch.where(mask_selection, torch.tensor(20, device=seq.device, dtype=seq.dtype), seq)
+        seq = torch.where(mask_selection, torch.tensor(mask_value, device=seq.device, dtype=seq.dtype), seq)
 
         if is_1d:
             seq = seq.squeeze(0)
@@ -435,6 +441,6 @@ def mask_seq(seq: Union[np.ndarray, torch.Tensor], mask: Union[np.ndarray, torch
         
         if num_mask > 0:
             mask_idx = np.random.choice(range(int(seq_len)), size=num_mask, replace=False)
-            seq[mask_idx] = 20
+            seq[mask_idx] = mask_value
 
     return seq

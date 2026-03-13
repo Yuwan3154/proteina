@@ -315,7 +315,8 @@ class ExtLigEmbeddingSeqFeat(Feature):
 
     def forward(self, batch):
         if "ext_lig" in batch:
-            return self.embedding(batch["ext_lig"])  # [b, n, ext_lig_emb_dim]
+            # nn.Embedding expects long indices; ext_lig may be stored as int8 on disk
+            return self.embedding(batch["ext_lig"].to(torch.long))  # [b, n, ext_lig_emb_dim]
         xt = batch["x_t"]  # [b, n, 3]
         # Default to all unknown (index 2) when ext_lig is missing
         unknown = torch.full(
