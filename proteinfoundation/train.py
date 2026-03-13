@@ -282,8 +282,6 @@ if __name__ == "__main__":
         L.seed_everything(cfg_exp.seed)
 
     # Load data config
-    
-    
     dataset_config_subdir = cfg_exp.get("dataset_config_subdir", None)
     if dataset_config_subdir is not None:
         # if args.dataset_config_subdir:
@@ -293,6 +291,10 @@ if __name__ == "__main__":
     with hydra.initialize(config_path, version_base=hydra.__version__):
         cfg_data = hydra.compose(config_name=cfg_exp["dataset"])
         cfg_data.datamodule.num_workers = num_cpus  # Overwrite number of cpus
+        # Propagate multilabel_mode from model config (single source of truth)
+        multilabel_mode = OmegaConf.select(cfg_exp, "model.nn.multilabel_mode")
+        if multilabel_mode is not None:
+            cfg_data.datamodule.multilabel_mode = multilabel_mode
         batch_size = cfg_exp.opt.get("batch_size")
         if batch_size is not None:
             cfg_data.datamodule.batch_size = batch_size

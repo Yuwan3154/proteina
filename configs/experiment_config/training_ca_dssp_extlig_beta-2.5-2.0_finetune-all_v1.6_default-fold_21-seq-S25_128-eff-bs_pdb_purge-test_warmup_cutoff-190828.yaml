@@ -33,6 +33,7 @@ defaults:
 
 model:
   nn:
+    multilabel_mode: "sum"
     residue_type_emb_init_seq: True
     residue_type_emb_cond_seq: True
     residue_type_emb_init_pair: True

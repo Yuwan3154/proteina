@@ -1,4 +1,4 @@
-run_name_: ca_dssp_extlig_beta-2.5-2.0_finetune-all_v1.6_default-fold_21-seq-S25_128-eff-bs_pdb_max768_purge-test_cutoff-190828
+run_name_: ca_dssp_extlig_beta-2.5-2.0_finetune-all_v1.6_default-fold-sum_21-seq-S25_128-eff-bs_pdb_max768_purge-test_cutoff-190828
 pretrain_ckpt_path: ~/proteina/data/weights/ca_dssp_extlig_beta-2.5-2.0_finetune-all_v1.6_default-fold_21-seq-S25_128-eff-bs_pdb_purge-test_warmup_cutoff-190828_last.ckpt
 
 hardware:
@@ -29,13 +29,13 @@ defaults:
 
 model:
   nn:
+    multilabel_mode: "sum"
     residue_type_emb_init_seq: True
     residue_type_emb_cond_seq: True
     residue_type_emb_init_pair: True
     residue_type_emb_cond_pair: True
     seq_emb_dim: 21
     predict_dssp: true
-    # ext_lig: per-residue external-ligand-context embedding (0=absent, 1=present, 2=unknown)
     ext_lig_emb_init_seq: True
     ext_lig_emb_cond_seq: True
     ext_lig_emb_dim: 3
