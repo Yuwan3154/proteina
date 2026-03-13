@@ -69,7 +69,16 @@ def _backfill_single(
             return stats
 
         # Case 3: ext_lig absent (or overwrite) — compute and save in int8
-        L = graph.coords.shape[0]
+        # Some .pt files lack coords (e.g. PyG removes None attributes) — skip those
+        coords = getattr(graph, "coords", None)
+        if coords is None and hasattr(graph, "get"):
+            coords = graph.get("coords")
+        if coords is None:
+            stats["status"] = "incompatible_format_no_coords"
+            stats["time_s"] = time.time() - t0
+            return stats
+
+        L = coords.shape[0]
 
         if database == "afdb":
             graph.ext_lig = make_unknown_ext_lig(L).to(torch.int8)
@@ -133,6 +142,7 @@ def main():
     parser.add_argument("--workers", type=int, default=1, help="Number of parallel workers")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing ext_lig")
     parser.add_argument("--dry_run", action="store_true", help="Only count files needing backfill")
+    parser.add_argument("--list_incompatible", action="store_true", help="Print paths of files with no coords (use with --dry_run)")
     args = parser.parse_args()
 
     processed_dir = Path(args.processed_dir)
@@ -142,14 +152,30 @@ def main():
     if args.dry_run:
         need_backfill = 0
         need_convert = 0
+        no_coords = 0
+        incompatible_paths = []
         for pt_path in tqdm(pt_files, desc="Checking"):
             graph = torch.load(str(pt_path), weights_only=False)
+            coords = getattr(graph, "coords", None)
+            if coords is None and hasattr(graph, "get"):
+                coords = graph.get("coords")
+            if coords is None:
+                no_coords += 1
+                if args.list_incompatible:
+                    incompatible_paths.append(str(pt_path))
+                continue
             if not hasattr(graph, "ext_lig"):
                 need_backfill += 1
             elif graph.ext_lig.dtype != torch.int8:
                 need_convert += 1
         print(f"{need_backfill} / {len(pt_files)} files need ext_lig backfill")
         print(f"{need_convert} / {len(pt_files)} files need ext_lig dtype conversion to int8")
+        if no_coords:
+            print(f"{no_coords} / {len(pt_files)} files have incompatible format (no coords)")
+            if args.list_incompatible and incompatible_paths:
+                print("\nIncompatible files:")
+                for p in incompatible_paths:
+                    print(f"  {p}")
         return
 
     if args.database == "pdb" and args.raw_dir is None:
@@ -176,14 +202,21 @@ def main():
 
     statuses = {}
     total_time = 0.0
+    incompatible_paths = []
     for r in results:
         s = r["status"]
         statuses[s] = statuses.get(s, 0) + 1
         total_time += r.get("time_s", 0.0)
+        if s == "incompatible_format_no_coords" and args.list_incompatible:
+            incompatible_paths.append(r.get("path", ""))
 
     print(f"\nResults ({len(results)} files, {total_time:.1f}s total):")
     for s, count in sorted(statuses.items()):
         print(f"  {s}: {count}")
+    if args.list_incompatible and incompatible_paths:
+        print("\nIncompatible files (no coords):")
+        for p in incompatible_paths:
+            print(f"  {p}")
 
 
 if __name__ == "__main__":
