@@ -10,6 +10,20 @@ Usage:
         --database pdb \
         --workers 16
 
+    # Only backfill chains in the dataset (avoids OOM on huge complexes):
+    DATA_PATH=/path/to/data python script_utils/backfill_ext_lig.py \
+        --processed_dir data/pdb_train/processed \
+        --raw_dir data/pdb_train/raw \
+        --config configs/datasets_config/pdb/pdb_train_S25_max512_purge-test_cutoff-190828.yaml \
+        --database pdb --workers 16
+
+    # Or pass the dataset CSV directly:
+    python script_utils/backfill_ext_lig.py \
+        --processed_dir data/pdb_train/processed \
+        --raw_dir data/pdb_train/raw \
+        --allowlist_csv data/pdb_train/df_pdb_*.csv \
+        --database pdb --workers 16
+
     # Backfill AFDB .pt files (set all unknown):
     python script_utils/backfill_ext_lig.py \
         --processed_dir data/d_FS/processed \
@@ -28,6 +42,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
+import pandas as pd
 import torch
 from tqdm import tqdm
 
@@ -133,6 +148,95 @@ def _find_raw_file(raw_dir, pdb_code, format_type):
     return None
 
 
+def _resolve_oc_env(cfg_str: str) -> str:
+    """Expand ${oc.env:VAR} and ${oc.env:VAR,default} placeholders in YAML."""
+    import re
+
+    def _replacer(m):
+        content = m.group(1)
+        if "," in content:
+            var, default = content.split(",", 1)
+        else:
+            var, default = content, None
+        val = os.environ.get(var.strip())
+        if val is None and default is not None:
+            return default.strip()
+        if val is None:
+            raise EnvironmentError(
+                f"Environment variable '{var.strip()}' is required. Export it, e.g.: export {var.strip()}=/path"
+            )
+        return val
+
+    return re.sub(r"\$\{oc\.env:([^}]+)\}", _replacer, cfg_str)
+
+
+def _get_file_identifier_from_config(ds_cfg) -> str:
+    """Build file_identifier from dataselector config (matches PDBLightningDataModule._get_file_identifier)."""
+    ds = ds_cfg if hasattr(ds_cfg, "get") else dict(ds_cfg)
+    get = lambda k, d=None: ds.get(k, d) if hasattr(ds, "get") else getattr(ds, k, d)
+    return (
+        f"df_pdb_f{get('fraction', 1)}_minl{get('min_length')}_maxl{get('max_length')}_mt{get('molecule_type')}"
+        f"_et{''.join(get('experiment_types') or [])}"
+        f"_mino{get('oligomeric_min')}_maxo{get('oligomeric_max')}"
+        f"_minr{get('best_resolution')}_maxr{get('worst_resolution')}"
+        f"_hl{''.join(get('has_ligands') or [])}"
+        f"_rl{''.join(get('remove_ligands') or [])}"
+        f"_rnsr{get('remove_non_standard_residues', True)}_rpu{get('remove_pdb_unavailable', True)}"
+        f"_l{''.join(get('labels') or [])}"
+        f"_rcu{get('remove_cath_unavailable', False)}"
+    )
+
+
+def _load_allowlist(config_path: str = None, allowlist_csv: str = None, data_dir: str = None) -> set:
+    """Load set of chain IDs (pt file stems) from config or CSV. Returns empty set if neither provided."""
+    if allowlist_csv:
+        # Direct path or glob
+        base = Path(root)
+        csv_path = Path(allowlist_csv)
+        if not csv_path.is_absolute():
+            csv_path = base / csv_path
+        if "*" in str(csv_path):
+            matches = list(Path(csv_path.parent).glob(csv_path.name))
+            if not matches:
+                print(f"WARNING: No CSV matched {allowlist_csv}", file=sys.stderr)
+                return set()
+            csv_path = matches[0]
+        if not csv_path.exists():
+            print(f"WARNING: Allowlist CSV not found: {csv_path}", file=sys.stderr)
+            return set()
+        df = pd.read_csv(csv_path)
+        if "id" not in df.columns:
+            print(f"WARNING: CSV has no 'id' column, using first column", file=sys.stderr)
+            id_col = df.columns[0]
+        else:
+            id_col = "id"
+        return set(df[id_col].astype(str).tolist())
+
+    if config_path and data_dir:
+        from omegaconf import OmegaConf
+
+        cfg_path = Path(config_path)
+        if not cfg_path.is_absolute():
+            cfg_path = Path(root) / cfg_path
+        raw = cfg_path.read_text()
+        resolved = _resolve_oc_env(raw)
+        cfg = OmegaConf.create(resolved)
+        dm = cfg.get("datamodule") or cfg
+        dd = dm.get("data_dir") or data_dir
+        data_dir_resolved = Path(_resolve_oc_env(str(dd)))
+        ds_cfg = dm.get("dataselector") or {}
+        file_id = _get_file_identifier_from_config(ds_cfg)
+        csv_path = data_dir_resolved / f"{file_id}.csv"
+        if not csv_path.exists():
+            print(f"WARNING: Dataset CSV not found: {csv_path}", file=sys.stderr)
+            return set()
+        df = pd.read_csv(csv_path)
+        id_col = "id" if "id" in df.columns else df.columns[0]
+        return set(df[id_col].astype(str).tolist())
+
+    return set()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--processed_dir", required=True, help="Directory containing .pt files")
@@ -143,11 +247,41 @@ def main():
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing ext_lig")
     parser.add_argument("--dry_run", action="store_true", help="Only count files needing backfill")
     parser.add_argument("--list_incompatible", action="store_true", help="Print paths of files with no coords (use with --dry_run)")
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Dataset config YAML. With DATA_PATH set, only backfill chains in the dataset CSV (avoids OOM on huge complexes).",
+    )
+    parser.add_argument(
+        "--allowlist_csv",
+        default=None,
+        help="Path to dataset CSV (id column = pt file stem). Alternative to --config. Only backfill these chains.",
+    )
     args = parser.parse_args()
 
     processed_dir = Path(args.processed_dir)
     pt_files = sorted(processed_dir.glob("*.pt"))
     print(f"Found {len(pt_files)} .pt files in {processed_dir}")
+
+    # Optionally restrict to chains in the dataset (avoids OOM on huge complexes)
+    allowlist = set()
+    if args.config or args.allowlist_csv:
+        data_dir = str(processed_dir.parent)  # e.g. .../pdb_train
+        allowlist = _load_allowlist(
+            config_path=args.config,
+            allowlist_csv=args.allowlist_csv,
+            data_dir=data_dir,
+        )
+        if allowlist:
+            before = len(pt_files)
+            pt_files = [p for p in pt_files if p.stem in allowlist]
+            print(f"Restricted to {len(pt_files)} chains in dataset (excluded {before - len(pt_files)} not in allowlist)")
+        else:
+            print("WARNING: Could not load allowlist, processing all files")
+
+    if not pt_files:
+        print("No .pt files to process.")
+        return
 
     if args.dry_run:
         need_backfill = 0
