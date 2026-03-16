@@ -235,8 +235,12 @@ def plot_proteinebm_results(results: List[Dict[str, object]], output_dir: str, p
     plt.close(fig)
 
     # Plot 2: energy histogram
+    valid_energies = energies[~np.isnan(energies)]
     fig = plt.figure(figsize=(8, 6), dpi=120)
-    plt.hist(energies, bins=30, alpha=0.8)
+    if len(valid_energies) > 0:
+        plt.hist(valid_energies, bins=30, alpha=0.8)
+    else:
+        plt.text(0.5, 0.5, "No valid energies (all NaN)", ha="center", va="center", transform=plt.gca().transAxes)
     plt.title(f"ProteinEBM energy histogram\n{protein_id}")
     plt.xlabel("Energy (lower is better)")
     plt.ylabel("Count")
@@ -247,8 +251,12 @@ def plot_proteinebm_results(results: List[Dict[str, object]], output_dir: str, p
     plt.close(fig)
 
     # Plot 3: TM histogram
+    valid_tm = tm[~np.isnan(tm)]
     fig = plt.figure(figsize=(8, 6), dpi=120)
-    plt.hist(tm, bins=30, alpha=0.8)
+    if len(valid_tm) > 0:
+        plt.hist(valid_tm, bins=30, alpha=0.8)
+    else:
+        plt.text(0.5, 0.5, "No valid TM scores (all NaN)", ha="center", va="center", transform=plt.gca().transAxes)
     plt.title(f"TM(ref, decoy) histogram\n{protein_id}")
     plt.xlabel("TM-score (Reference vs Decoy)")
     plt.ylabel("Count")
@@ -516,6 +524,10 @@ def run_proteinebm_scoring_for_protein(
         ]
         writer.writeheader()
         writer.writerows(results)
+
+    n_nan = sum(1 for r in results if np.isnan(float(r["energy"])))
+    if n_nan > 0:
+        print(f"  WARNING: {n_nan}/{len(results)} energies are NaN for {protein_id}!", flush=True)
 
     successful = results
     spearman_rho_energy = None

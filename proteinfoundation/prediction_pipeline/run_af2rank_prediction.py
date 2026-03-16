@@ -34,6 +34,12 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import torch
 
+from proteinfoundation.af2rank_evaluation.sharding_utils import (
+    add_shard_args,
+    resolve_shard_args,
+    shard_proteins,
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -305,6 +311,7 @@ def main() -> None:
                         action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--use_cuequivariance_multiplicative_update",
                         action=argparse.BooleanOptionalAction, default=True)
+    add_shard_args(parser)
 
     args = parser.parse_args()
 
@@ -314,6 +321,12 @@ def main() -> None:
     # ── Build per-protein work list ──────────────────────────────────────────
     protein_ids = _load_protein_ids(args.csv_file, args.csv_column)
     logger.info(f"Loaded {len(protein_ids)} proteins from {args.csv_file}")
+
+    shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
+    if shard_index is not None:
+        data_dir = os.environ.get("DATA_PATH", str(inference_base.parent.parent / "data"))
+        protein_ids = shard_proteins(protein_ids, shard_index, num_shards, data_dir=data_dir)
+        logger.info(f"Shard {shard_index}/{num_shards}: {len(protein_ids)} proteins")
 
     ProteinConfig = Dict  # type alias for clarity
     protein_configs: List[ProteinConfig] = []
