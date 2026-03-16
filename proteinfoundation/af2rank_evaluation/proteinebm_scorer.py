@@ -35,6 +35,38 @@ from protein_ebm.model.ebm import ProteinEBM
 from protein_ebm.model.r3_diffuser import R3Diffuser
 
 
+# ---------------------------------------------------------------------------
+# Diagnostic helpers (mirrored from test_proteinebm_single.py)
+# ---------------------------------------------------------------------------
+
+def _tensor_stats(name: str, t: torch.Tensor) -> str:
+    """Return a one-line stats string for a tensor."""
+    arr = t.detach().float().cpu().numpy().ravel()
+    n_nan = int(np.isnan(arr).sum())
+    n_inf = int(np.isinf(arr).sum())
+    finite = arr[np.isfinite(arr)]
+    if len(finite):
+        return (f"shape={list(t.shape)} dtype={t.dtype} "
+                f"min={finite.min():.4g} max={finite.max():.4g} mean={finite.mean():.4g} "
+                f"nan={n_nan} inf={n_inf}")
+    return f"shape={list(t.shape)} dtype={t.dtype} ALL NaN/Inf  nan={n_nan} inf={n_inf}"
+
+
+def _check_model_weights(model: torch.nn.Module) -> None:
+    """Print a one-line model weight NaN/Inf summary; list any bad parameters."""
+    n_params = n_nan = n_inf = 0
+    for pname, p in model.named_parameters():
+        n_params += 1
+        arr = p.detach().float().cpu().numpy().ravel()
+        has_nan = bool(np.isnan(arr).any())
+        has_inf = bool(np.isinf(arr).any())
+        if has_nan or has_inf:
+            n_nan += has_nan
+            n_inf += has_inf
+            print(f"  PROBLEM param: {pname}  nan={has_nan} inf={has_inf}  shape={list(p.shape)}", flush=True)
+    print(f"Model weight check: {n_params} params,  nan_params={n_nan}  inf_params={n_inf}", flush=True)
+
+
 def load_proteinebm_model(config_path: str, checkpoint_path: str, device: torch.device) -> Tuple[ProteinEBM, ConfigDict]:
     config_path = os.path.abspath(os.path.expanduser(config_path))
     checkpoint_path = os.path.abspath(os.path.expanduser(checkpoint_path))
@@ -383,9 +415,16 @@ def score_decoy_pdbs_batched(
     if not feats_list:
         return results
 
+    # Print input feature stats for the first PDB of this protein
+    first_feats = feats_list[0][1]
+    print(f"  Input tensor stats (first PDB, {len(feats_list)} structures total):", flush=True)
+    for key, val in first_feats.items():
+        print(f"    {key}: {_tensor_stats(key, val)}", flush=True)
+
     # Phase 2: Batched inference — all decoys share the same residue count
     current_batch_size = batch_size_ref[0] if batch_size_ref is not None else batch_size
     remaining = list(feats_list)
+    nan_hook_fired = [False]  # fire forward-hook NaN trace at most once per call
 
     while remaining:
         chunk = remaining[:current_batch_size]
@@ -414,6 +453,51 @@ def score_decoy_pdbs_batched(
             energies = out["energy"].detach().cpu()
             for j, idx in enumerate(indices):
                 results[idx] = float(energies[j].item())
+
+            # --- Diagnostic: print energy stats for this batch ---
+            e_arr = energies.float().numpy()
+            n_nan_e = int(np.isnan(e_arr).sum())
+            finite_e = e_arr[~np.isnan(e_arr)]
+            if len(finite_e):
+                print(f"  Batch energies: size={len(e_arr)} "
+                      f"min={finite_e.min():.4g} max={finite_e.max():.4g} "
+                      f"mean={finite_e.mean():.4g} nan={n_nan_e}", flush=True)
+            else:
+                print(f"  Batch energies: size={len(e_arr)} ALL NaN", flush=True)
+
+            # --- Diagnostic: forward-hook NaN trace (fires at most once) ---
+            if n_nan_e > 0 and not nan_hook_fired[0]:
+                nan_hook_fired[0] = True
+                print("  Tracing NaN source with forward hooks (single-structure re-run)...", flush=True)
+                nan_detected: List[str] = []
+
+                def _make_hook(mname: str):
+                    def _hook(module, inp, output):
+                        if nan_detected:
+                            return
+                        outs = output if isinstance(output, (list, tuple)) else [output]
+                        for o in outs:
+                            if isinstance(o, torch.Tensor) and (o.isnan().any() or o.isinf().any()):
+                                nan_detected.append(mname)
+                                print(f"  !!! First NaN/Inf in module: {mname}", flush=True)
+                                print(f"      output: {_tensor_stats(mname, o)}", flush=True)
+                    return _hook
+
+                hooks = [m.register_forward_hook(_make_hook(n)) for n, m in model.named_modules()]
+                try:
+                    # Re-run only the first NaN element as a batch-of-1
+                    nan_batch_pos = int(np.where(np.isnan(e_arr))[0][0])
+                    single = {k: v[nan_batch_pos:nan_batch_pos + 1] for k, v in batched.items()}
+                    print(f"  Input tensor stats for first-NaN element (pos {nan_batch_pos}):", flush=True)
+                    for key, val in single.items():
+                        print(f"    {key}: {_tensor_stats(key, val)}", flush=True)
+                    with torch.no_grad():
+                        model.compute_energy(single)
+                finally:
+                    for h in hooks:
+                        h.remove()
+                if not nan_detected:
+                    print("  (no NaN/Inf caught by hooks — NaN may originate in inputs above)", flush=True)
 
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
@@ -650,11 +734,17 @@ def main():
         )
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(device)
+            mem_free, mem_total = torch.cuda.mem_get_info(device)
+            print(f"GPU: {props.name}  VRAM free/total: {mem_free/1e9:.1f}/{mem_total/1e9:.1f} GB", flush=True)
         model, _ = load_proteinebm_model(
             config_path=args.proteinebm_config,
             checkpoint_path=args.proteinebm_checkpoint,
             device=device,
         )
+        print(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters", flush=True)
+        _check_model_weights(model)
         # Single mutable batch size — only ever decreases as proteins get longer
         batch_size_ref: List[int] = [args.batch_size]
 
