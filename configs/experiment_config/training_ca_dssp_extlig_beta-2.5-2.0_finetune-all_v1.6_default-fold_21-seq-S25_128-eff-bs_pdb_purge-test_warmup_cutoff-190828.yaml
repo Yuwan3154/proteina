@@ -46,7 +46,7 @@ model:
     ext_lig_emb_dim: 3
 
 # Dataset: PDB only (purge-test, no mixed d_FS)
-dataset: pdb_train_S25_max512_purge-test_cutoff-190828
+dataset: pdb_train_S25_max768_purge-test_cutoff-190828
 dataset_config_subdir: pdb
 
 force_precision_f32: False
@@ -74,9 +74,9 @@ lora:
 
 opt:
   lr: 0.0001
-  max_epochs: 200
-  batch_size: 2
-  accumulate_grad_batches: 64
+  max_epochs: 300
+  batch_size: 1
+  accumulate_grad_batches: 128
   val_check_interval: 1000
   skip_nan_grad: False
   grad_and_weight_analysis: False

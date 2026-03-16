@@ -288,6 +288,12 @@ def main():
         help="Batch size for ProteinEBM inference per protein (default: 32). Auto-reduces on OOM.",
     )
     add_shard_args(parser)
+    parser.add_argument(
+        "--direct_python",
+        action="store_true",
+        default=False,
+        help="Use the current Python interpreter instead of conda wrapper scripts to launch scorer subprocesses",
+    )
 
     args = parser.parse_args()
 
@@ -346,8 +352,12 @@ def main():
     # Run GPU workers in parallel — one Popen per GPU, wait for all.
     popen_procs: List[tuple] = []  # (gpu_id, Popen, proteins_json_path)
 
-    wrapper_script = os.path.join(_SCRIPT_DIR, "run_with_proteinebm_env.sh")
     scorer_script = os.path.join(_SCRIPT_DIR, "proteinebm_scorer.py")
+    if args.direct_python:
+        python_cmd = [sys.executable]
+    else:
+        wrapper_script = os.path.join(_SCRIPT_DIR, "run_with_proteinebm_env.sh")
+        python_cmd = [wrapper_script, "python"]
 
     for gpu_id, chunk in enumerate(gpu_chunks):
         if not chunk:
@@ -358,8 +368,8 @@ def main():
         proteins_json_path = tmp.name
         tmp.close()
 
-        cmd = [
-            wrapper_script, "python", scorer_script,
+        cmd = python_cmd + [
+            scorer_script,
             "--proteins_json", proteins_json_path,
             "--proteinebm_config", args.proteinebm_config,
             "--proteinebm_checkpoint", args.proteinebm_checkpoint,

@@ -161,6 +161,8 @@ def step_proteinebm_scoring(
         "--batch_size", str(batch_size),
         # No --cif_dir: skips TM-score computation
     ]
+    if direct_python:
+        cmd.append("--direct_python")
     if shard_args:
         cmd.extend(shard_args)
     return run_with_conda_env("proteinebm", cmd, direct_python=direct_python)
