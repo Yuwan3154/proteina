@@ -198,6 +198,8 @@ def run_proteinebm_scoring(csv_file, csv_column, cif_dir, inference_config, num_
     ]
     if not proteinebm_template_self_condition:
         cmd.append('--no-proteinebm_template_self_condition')
+    if direct_python:
+        cmd.append('--direct_python')
     if shard_args:
         cmd.extend(shard_args)
 

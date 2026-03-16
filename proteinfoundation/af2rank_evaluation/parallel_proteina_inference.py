@@ -153,7 +153,7 @@ def run_proteina_inference(protein_name, inference_config, force_compile: bool =
     Environment activation is handled by the caller (shell script wrapper).
     """
     cmd = [
-        'python', 'proteinfoundation/inference.py',
+        sys.executable, 'proteinfoundation/inference.py',
         '--pt', protein_name,
         '--config_name', inference_config,
     ]
