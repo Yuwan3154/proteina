@@ -387,6 +387,7 @@ def score_decoy_pdbs_batched(
     device: torch.device,
     batch_size: int = 32,
     batch_size_ref: "List[int] | None" = None,
+    verbose: bool = False,
 ) -> Dict[int, float]:
     """Score multiple decoy PDBs using batched inference.
 
@@ -415,11 +416,12 @@ def score_decoy_pdbs_batched(
     if not feats_list:
         return results
 
-    # Print input feature stats for the first PDB of this protein
-    first_feats = feats_list[0][1]
-    print(f"  Input tensor stats (first PDB, {len(feats_list)} structures total):", flush=True)
-    for key, val in first_feats.items():
-        print(f"    {key}: {_tensor_stats(key, val)}", flush=True)
+    # Print input feature stats for the first PDB of this protein (verbose only)
+    if verbose:
+        first_feats = feats_list[0][1]
+        print(f"  Input tensor stats (first PDB, {len(feats_list)} structures total):", flush=True)
+        for key, val in first_feats.items():
+            print(f"    {key}: {_tensor_stats(key, val)}", flush=True)
 
     # Phase 2: Batched inference — all decoys share the same residue count
     current_batch_size = batch_size_ref[0] if batch_size_ref is not None else batch_size
@@ -454,19 +456,20 @@ def score_decoy_pdbs_batched(
             for j, idx in enumerate(indices):
                 results[idx] = float(energies[j].item())
 
-            # --- Diagnostic: print energy stats for this batch ---
+            # --- Diagnostic: print energy stats for this batch (verbose only) ---
             e_arr = energies.float().numpy()
             n_nan_e = int(np.isnan(e_arr).sum())
-            finite_e = e_arr[~np.isnan(e_arr)]
-            if len(finite_e):
-                print(f"  Batch energies: size={len(e_arr)} "
-                      f"min={finite_e.min():.4g} max={finite_e.max():.4g} "
-                      f"mean={finite_e.mean():.4g} nan={n_nan_e}", flush=True)
-            else:
-                print(f"  Batch energies: size={len(e_arr)} ALL NaN", flush=True)
+            if verbose:
+                finite_e = e_arr[~np.isnan(e_arr)]
+                if len(finite_e):
+                    print(f"  Batch energies: size={len(e_arr)} "
+                          f"min={finite_e.min():.4g} max={finite_e.max():.4g} "
+                          f"mean={finite_e.mean():.4g} nan={n_nan_e}", flush=True)
+                else:
+                    print(f"  Batch energies: size={len(e_arr)} ALL NaN", flush=True)
 
-            # --- Diagnostic: forward-hook NaN trace (fires at most once) ---
-            if n_nan_e > 0 and not nan_hook_fired[0]:
+            # --- Diagnostic: forward-hook NaN trace (verbose only, fires at most once) ---
+            if verbose and n_nan_e > 0 and not nan_hook_fired[0]:
                 nan_hook_fired[0] = True
                 print("  Tracing NaN source with forward hooks (single-structure re-run)...", flush=True)
                 nan_detected: List[str] = []
@@ -524,6 +527,7 @@ def run_proteinebm_scoring_for_protein(
     batch_size: int = 32,
     model: "ProteinEBM | None" = None,
     batch_size_ref: "List[int] | None" = None,
+    verbose: bool = False,
 ) -> Tuple[str, str]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -559,6 +563,7 @@ def run_proteinebm_scoring_for_protein(
         device=device,
         batch_size=batch_size,
         batch_size_ref=batch_size_ref,
+        verbose=verbose,
     )
 
     # Build results with optional TM-score computation (still per-structure, CPU-bound)
@@ -710,6 +715,9 @@ def main():
     )
     parser.add_argument("--batch_size", type=int, default=32,
                         help="Batch size for ProteinEBM inference (default: 32). Auto-reduces on OOM.")
+    parser.add_argument("--verbose", action="store_true", default=False,
+                        help="Print detailed diagnostics: model weight check, input tensor stats, "
+                             "per-batch energy stats, and forward-hook NaN tracing.")
 
     args = parser.parse_args()
 
@@ -734,7 +742,7 @@ def main():
         )
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if torch.cuda.is_available():
+        if args.verbose and torch.cuda.is_available():
             props = torch.cuda.get_device_properties(device)
             mem_free, mem_total = torch.cuda.mem_get_info(device)
             print(f"GPU: {props.name}  VRAM free/total: {mem_free/1e9:.1f}/{mem_total/1e9:.1f} GB", flush=True)
@@ -743,8 +751,9 @@ def main():
             checkpoint_path=args.proteinebm_checkpoint,
             device=device,
         )
-        print(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters", flush=True)
-        _check_model_weights(model)
+        if args.verbose:
+            print(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters", flush=True)
+            _check_model_weights(model)
         # Single mutable batch size — only ever decreases as proteins get longer
         batch_size_ref: List[int] = [args.batch_size]
 
@@ -765,6 +774,7 @@ def main():
                     batch_size=args.batch_size,
                     model=model,
                     batch_size_ref=batch_size_ref,
+                    verbose=args.verbose,
                 )
                 print(f"  Done: {protein_id}", flush=True)
             except Exception as e:
@@ -788,6 +798,7 @@ def main():
             t=args.t,
             template_self_condition=args.proteinebm_template_self_condition,
             batch_size=args.batch_size,
+            verbose=args.verbose,
         )
         print(f"Completed ProteinEBM scoring for {args.protein_id}", flush=True)
         print(f"Scores: {scores_csv}", flush=True)
