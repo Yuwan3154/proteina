@@ -162,7 +162,45 @@ if __name__ == "__main__":
         action="store_true",
         help="Run dataset preparation (and confind precompute if applicable) then exit.",
     )
+    parser.add_argument(
+        "--ngpus_per_node",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Override hardware.ngpus_per_node_ from config.",
+    )
+    parser.add_argument(
+        "--nnodes",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Override hardware.nnodes_ from config.",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Override opt.batch_size from config.",
+    )
+    parser.add_argument(
+        "--accumulate_grad_batches",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Override opt.accumulate_grad_batches from config.",
+    )
     args, overrides = parser.parse_known_args()
+
+    # Apply CLI overrides for GPU/node and batch settings
+    if args.ngpus_per_node is not None:
+        overrides.append(f"hardware.ngpus_per_node_={args.ngpus_per_node}")
+    if args.nnodes is not None:
+        overrides.append(f"hardware.nnodes_={args.nnodes}")
+    if args.batch_size is not None:
+        overrides.append(f"opt.batch_size={args.batch_size}")
+    if args.accumulate_grad_batches is not None:
+        overrides.append(f"opt.accumulate_grad_batches={args.accumulate_grad_batches}")
 
     # Disable verbose data loading logs by default unless explicitly requested
     if "DATA_LOADING_DEBUG" not in os.environ:
