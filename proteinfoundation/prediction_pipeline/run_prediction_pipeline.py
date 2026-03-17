@@ -546,9 +546,14 @@ def main():
         logger.info("\n" + "=" * 60)
         logger.info("STEP 4: AF2RANK ON PROTEINEBM TOP-K")
         logger.info("=" * 60)
+        if args.backend != "openfold":
+            logger.warning(
+                f"--backend {args.backend!r} is ignored: the prediction pipeline always uses "
+                "run_af2rank_prediction.py which is openfold-only."
+            )
         if not step_af2rank_topk(
             args.inference_config, args.top_k, args.recycles,
-            args.num_gpus, working_csv, args.id_column,
+            args.num_gpus, working_csv, "id",  # working_csv always uses normalized "id" column
             args.backend, args.proteinebm_analysis_subdir,
             use_deepspeed_evoformer_attention=args.use_deepspeed_evoformer_attention,
             use_cuequivariance_attention=args.use_cuequivariance_attention,

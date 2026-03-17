@@ -358,6 +358,8 @@ def main():
                        help='Skip Proteina inference (only run scoring stage)')
     parser.add_argument('--skip_scoring', action='store_true',
                        help='Skip scoring stage (AF2Rank or ProteinEBM depending on --scorer)')
+    parser.add_argument('--skip_af2rank_on_top_k', action='store_true',
+                       help='Skip AF2Rank-on-ProteinEBM-top-k step even if --af2rank_top_k > 0')
     parser.add_argument('--regenerate_plots', action='store_true',
                        help='Regenerate AF2Rank plots even if scoring already completed')
     parser.add_argument('--rerun_proteina', action='store_true',
@@ -529,7 +531,7 @@ def main():
         logger.info(f"⏭️  Skipping scoring stage ({args.scorer})")
 
     # Step 3: Optional AF2Rank scoring on ProteinEBM top-k templates
-    if success and (not args.skip_scoring) and args.scorer == "proteinebm" and int(args.af2rank_top_k) > 0:
+    if success and (not args.skip_scoring) and (not args.skip_af2rank_on_top_k) and args.scorer == "proteinebm" and int(args.af2rank_top_k) > 0:
         logger.info("\n" + "="*60)
         logger.info("STEP 3: AF2RANK ON PROTEINEBM TOP-K TEMPLATES")
         logger.info("="*60)
@@ -591,7 +593,7 @@ def main():
                     csv_path = protein_dir / args.proteinebm_analysis_subdir / f"proteinebm_scores_{protein_name}.csv"
                     if not csv_path.exists():
                         return False
-                if args.scorer == "proteinebm" and int(args.af2rank_top_k) > 0:
+                if args.scorer == "proteinebm" and int(args.af2rank_top_k) > 0 and not args.skip_af2rank_on_top_k:
                     topk_m1 = protein_dir / "af2rank_on_proteinebm_top_k" / "af2rank_analysis" / f"af2rank_scores_{protein_name}.csv"
                     topk_m2 = protein_dir / "af2rank_on_proteinebm_top_k" / "af2rank_analysis_model_2_ptm" / f"af2rank_scores_{protein_name}.csv"
                     if not topk_m1.exists() or not topk_m2.exists():
@@ -621,7 +623,7 @@ def main():
                 logger.error("❌ Cross-protein plotting failed")
                 success = False
 
-        if success and args.scorer == "proteinebm" and int(args.af2rank_top_k) > 0:
+        if success and args.scorer == "proteinebm" and int(args.af2rank_top_k) > 0 and not args.skip_af2rank_on_top_k:
             plot_success_2 = run_cross_protein_plots(
                 inference_dir=inference_dir,
                 output_dir=cross_out_dir,
