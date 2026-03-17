@@ -127,7 +127,7 @@ def run_with_conda_env(env_name, command_list, cwd=None, direct_python: bool = F
         logger.error(f"❌ Failed to run command: {e}")
         return False
 
-def run_proteina_inference(csv_file, csv_column, cif_dir, inference_config, num_gpus, usalign_path=None, force_compile: bool = False, shard_args=None, direct_python: bool = False):
+def run_proteina_inference(csv_file, csv_column, cif_dir, inference_config, num_gpus, usalign_path=None, force_compile: bool = False, shard_args=None, direct_python: bool = False, rerun: bool = False):
     """Run the Proteina inference pipeline."""
     logger.info("🧬 Starting Proteina inference pipeline...")
 
@@ -138,7 +138,7 @@ def run_proteina_inference(csv_file, csv_column, cif_dir, inference_config, num_
         '--cif_dir', cif_dir,
         '--inference_config', inference_config,
         '--num_gpus', str(num_gpus),
-        '--skip_existing'  # Always skip existing to avoid re-processing
+        *([] if rerun else ['--skip_existing'])
     ]
     if force_compile:
         cmd.append('--force_compile')
@@ -149,7 +149,7 @@ def run_proteina_inference(csv_file, csv_column, cif_dir, inference_config, num_
 
     return run_with_conda_env('proteina', cmd, direct_python=direct_python)
 
-def run_af2rank_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpus, recycles=3, regenerate_plots=False, backend="colabdesign", use_deepspeed_evoformer_attention=True, use_cuequivariance_attention=True, use_cuequivariance_multiplicative_update=True, shard_args=None, direct_python: bool = False):
+def run_af2rank_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpus, recycles=3, regenerate_plots=False, backend="colabdesign", use_deepspeed_evoformer_attention=True, use_cuequivariance_attention=True, use_cuequivariance_multiplicative_update=True, shard_args=None, direct_python: bool = False, rerun: bool = False):
     """Run the AF2Rank scoring pipeline."""
     logger.info(f"⚡ Starting AF2Rank scoring pipeline (backend={backend})...")
 
@@ -161,7 +161,7 @@ def run_af2rank_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpu
         '--inference_config', inference_config,
         '--num_gpus', str(num_gpus),
         '--recycles', str(recycles),
-        '--filter_existing',  # Always filter to only score proteins needing AF2Rank
+        '--no-filter_existing' if rerun else '--filter_existing',
         '--backend', backend,
     ]
     if regenerate_plots:
@@ -179,7 +179,7 @@ def run_af2rank_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpu
     env_name = 'proteina' if backend == 'openfold' else 'colabdesign'
     return run_with_conda_env(env_name, cmd, direct_python=direct_python)
 
-def run_proteinebm_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpus, proteinebm_config, proteinebm_checkpoint, proteinebm_template_self_condition=True, proteinebm_analysis_subdir='proteinebm_v2_cathmd_analysis', proteinebm_t=0.05, shard_args=None, direct_python: bool = False):
+def run_proteinebm_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpus, proteinebm_config, proteinebm_checkpoint, proteinebm_template_self_condition=True, proteinebm_analysis_subdir='proteinebm_v2_cathmd_analysis', proteinebm_t=0.05, shard_args=None, direct_python: bool = False, rerun: bool = False):
     """Run the ProteinEBM scoring pipeline."""
     logger.info("💸 Starting ProteinEBM scoring pipeline...")
 
@@ -190,7 +190,7 @@ def run_proteinebm_scoring(csv_file, csv_column, cif_dir, inference_config, num_
         '--cif_dir', cif_dir,
         '--inference_config', inference_config,
         '--num_gpus', str(num_gpus),
-        '--filter_existing',  # Always filter to only score proteins needing ProteinEBM
+        '--no-filter_existing' if rerun else '--filter_existing',
         '--proteinebm_config', proteinebm_config,
         '--proteinebm_checkpoint', proteinebm_checkpoint,
         '--proteinebm_analysis_subdir', proteinebm_analysis_subdir,
@@ -354,12 +354,18 @@ def main():
     parser.add_argument('--use_cuequivariance_multiplicative_update', action=argparse.BooleanOptionalAction, default=False,
                        help='Use cuEquivariance multiplicative update (openfold backend, default: False)')
     parser.add_argument('--usalign_path', help='Path to USalign executable')
-    parser.add_argument('--skip_inference', action='store_true', 
+    parser.add_argument('--skip_inference', action='store_true',
                        help='Skip Proteina inference (only run scoring stage)')
     parser.add_argument('--skip_scoring', action='store_true',
                        help='Skip scoring stage (AF2Rank or ProteinEBM depending on --scorer)')
     parser.add_argument('--regenerate_plots', action='store_true',
                        help='Regenerate AF2Rank plots even if scoring already completed')
+    parser.add_argument('--rerun_proteina', action='store_true',
+                       help='Force re-run Proteina inference even if outputs already exist')
+    parser.add_argument('--rerun_score', action='store_true',
+                       help='Force re-run scoring (AF2Rank or ProteinEBM) even if outputs already exist')
+    parser.add_argument('--rerun_af2rank_on_top_k', action='store_true',
+                       help='Force re-run AF2Rank on ProteinEBM top-k even if outputs already exist')
     parser.add_argument(
         '--proteina_force_compile',
         action=argparse.BooleanOptionalAction,
@@ -460,6 +466,7 @@ def main():
             force_compile=args.proteina_force_compile,
             shard_args=shard_cli_args,
             direct_python=args.direct_python,
+            rerun=args.rerun_proteina,
         )
         
         if inference_success:
@@ -494,6 +501,7 @@ def main():
                 use_cuequivariance_multiplicative_update=args.use_cuequivariance_multiplicative_update,
                 shard_args=shard_cli_args,
                 direct_python=args.direct_python,
+                rerun=args.rerun_score,
             )
         else:
             scoring_success = run_proteinebm_scoring(
@@ -509,6 +517,7 @@ def main():
                 proteinebm_t=args.proteinebm_t,
                 shard_args=shard_cli_args,
                 direct_python=args.direct_python,
+                rerun=args.rerun_score,
             )
         
         if scoring_success:
@@ -534,7 +543,7 @@ def main():
             top_k=int(args.af2rank_top_k),
             recycles=int(args.recycles),
             num_gpus=int(args.num_gpus),
-            filter_existing=bool(args.af2rank_topk_filter_existing),
+            filter_existing=bool(args.af2rank_topk_filter_existing) and not args.rerun_af2rank_on_top_k,
             proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
             backend=args.af2rank_backend,
             use_deepspeed_evoformer_attention=args.use_deepspeed_evoformer_attention,

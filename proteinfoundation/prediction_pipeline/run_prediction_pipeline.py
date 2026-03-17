@@ -112,6 +112,7 @@ def step_proteina_inference(
     force_compile: bool = True,
     shard_args: list | None = None,
     direct_python: bool = False,
+    rerun: bool = False,
 ) -> bool:
     """Run Proteina inference on all proteins."""
     logger.info("Starting Proteina inference...")
@@ -121,9 +122,10 @@ def step_proteina_inference(
         "--csv_column", "id",
         "--inference_config", inference_config,
         "--num_gpus", str(num_gpus),
-        "--skip_existing",
         "--skip_pt_conversion",
     ]
+    if not rerun:
+        cmd.append("--skip_existing")
     if force_compile:
         cmd.append("--force_compile")
     if shard_args:
@@ -144,6 +146,7 @@ def step_proteinebm_scoring(
     batch_size: int = 32,
     shard_args: list | None = None,
     direct_python: bool = False,
+    rerun: bool = False,
 ) -> bool:
     """Run ProteinEBM scoring (energy only, no ground-truth TM-score)."""
     logger.info("Starting ProteinEBM scoring...")
@@ -153,7 +156,7 @@ def step_proteinebm_scoring(
         "--csv_column", "id",
         "--inference_config", inference_config,
         "--num_gpus", str(num_gpus),
-        "--filter_existing",
+        "--no-filter_existing" if rerun else "--filter_existing",
         "--proteinebm_config", proteinebm_config,
         "--proteinebm_checkpoint", proteinebm_checkpoint,
         "--proteinebm_t", str(proteinebm_t),
@@ -184,6 +187,7 @@ def step_af2rank_topk(
     use_cuequivariance_multiplicative_update: bool = True,
     shard_args: list | None = None,
     direct_python: bool = False,
+    rerun: bool = False,
 ) -> bool:
     """Run AF2Rank on ProteinEBM top-k templates.
 
@@ -203,7 +207,7 @@ def step_af2rank_topk(
         "--top_k", str(top_k),
         "--recycles", str(recycles),
         "--proteinebm_analysis_subdir", proteinebm_analysis_subdir,
-        "--filter_existing",
+        "--no-filter_existing" if rerun else "--filter_existing",
     ]
     if not use_deepspeed_evoformer_attention:
         cmd.append("--no-use_deepspeed_evoformer_attention")
@@ -448,6 +452,12 @@ def main():
     parser.add_argument("--skip_inference", action="store_true", help="Skip Proteina inference step")
     parser.add_argument("--skip_scoring", action="store_true", help="Skip ProteinEBM scoring step")
     parser.add_argument("--skip_af2rank", action="store_true", help="Skip AF2Rank step")
+    parser.add_argument("--rerun_proteina", action="store_true",
+                        help="Force re-run Proteina inference even if outputs already exist")
+    parser.add_argument("--rerun_score", action="store_true",
+                        help="Force re-run ProteinEBM scoring even if outputs already exist")
+    parser.add_argument("--rerun_af2rank_on_top_k", action="store_true",
+                        help="Force re-run AF2Rank on ProteinEBM top-k even if outputs already exist")
     parser.add_argument(
         "--force_compile",
         action=argparse.BooleanOptionalAction,
@@ -502,7 +512,7 @@ def main():
         logger.info("\n" + "=" * 60)
         logger.info("STEP 2: PROTEINA INFERENCE")
         logger.info("=" * 60)
-        if not step_proteina_inference(working_csv, args.inference_config, args.num_gpus, args.force_compile, shard_cli_args, args.direct_python):
+        if not step_proteina_inference(working_csv, args.inference_config, args.num_gpus, args.force_compile, shard_cli_args, args.direct_python, rerun=args.rerun_proteina):
             logger.error("Proteina inference failed")
             success = False
         else:
@@ -522,6 +532,7 @@ def main():
             args.proteinebm_batch_size,
             shard_args=shard_cli_args,
             direct_python=args.direct_python,
+            rerun=args.rerun_score,
         ):
             logger.error("ProteinEBM scoring failed")
             success = False
@@ -544,6 +555,7 @@ def main():
             use_cuequivariance_multiplicative_update=args.use_cuequivariance_multiplicative_update,
             shard_args=shard_cli_args,
             direct_python=args.direct_python,
+            rerun=args.rerun_af2rank_on_top_k,
         ):
             logger.error("AF2Rank step failed")
             success = False

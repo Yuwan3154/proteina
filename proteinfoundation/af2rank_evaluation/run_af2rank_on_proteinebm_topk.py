@@ -202,9 +202,21 @@ def _stage_templates_as_dir(topk_df: pd.DataFrame, staged_dir: Path) -> None:
         os.symlink(str(src), str(dst))
 
 
-def _batch_reconstruct_ca_only(staged_dir: Path, direct_python: bool = False) -> Dict[str, str]:
+def _batch_reconstruct_ca_only(
+    staged_dir: Path,
+    output_dir: Path,
+    direct_python: bool = False,
+) -> Dict[str, str]:
     """Reconstruct all CA-only PDBs in staged_dir via cg2all (single model load).
-    Returns mapping {original_path: reconstructed_path}. Empty dict if none are CA-only."""
+
+    Args:
+        staged_dir:  Directory containing (symlinked) CA-only PDB files.
+        output_dir:  Persistent directory where cg2all all-atom PDBs are written.
+                     Files are retained after this function returns (no temp cleanup).
+
+    Returns mapping {original_pdb_path: reconstructed_allatom_pdb_path}.
+    Empty dict if no CA-only files are found.
+    """
     pdb_files = sorted(staged_dir.glob("*.pdb"))
     if not pdb_files:
         return {}
@@ -222,11 +234,14 @@ def _batch_reconstruct_ca_only(staged_dir: Path, direct_python: bool = False) ->
                         break
         return has_atom and not has_non_ca
 
-    ca_only = [str(p) for p in pdb_files if _is_ca_only(p)]
+    # Resolve symlinks so we map original paths (not staged symlink paths)
+    ca_only = [str(p.resolve()) for p in pdb_files if _is_ca_only(p)]
     if not ca_only:
         return {}
 
-    tmp_dir = tempfile.mkdtemp(prefix="cg2all_topk_")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    # Use a temp dir for the JSON bookkeeping files only; actual PDBs go to output_dir
+    tmp_dir = tempfile.mkdtemp(prefix="cg2all_topk_meta_")
     inputs_json = os.path.join(tmp_dir, "inputs.json")
     output_map_json = os.path.join(tmp_dir, "output_map.json")
     with open(inputs_json, "w") as f:
@@ -234,16 +249,18 @@ def _batch_reconstruct_ca_only(staged_dir: Path, direct_python: bool = False) ->
 
     script = str(Path(__file__).parent / "cg2all_reconstruct.py")
     if direct_python:
-        cmd = [sys.executable, script, "--inputs", inputs_json, "--output_dir", tmp_dir, "--output_map", output_map_json]
+        cmd = [sys.executable, script, "--inputs", inputs_json, "--output_dir", str(output_dir), "--output_map", output_map_json]
     else:
         wrapper_script = str(Path(__file__).parent / "run_with_proteina_env.sh")
-        cmd = [wrapper_script, "python", script, "--inputs", inputs_json, "--output_dir", tmp_dir, "--output_map", output_map_json]
+        cmd = [wrapper_script, "python", script, "--inputs", inputs_json, "--output_dir", str(output_dir), "--output_map", output_map_json]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     if result.returncode != 0:
         err_tail = result.stderr[-3000:] if result.stderr else "(no stderr)"
         raise RuntimeError(f"cg2all reconstruction failed:\n{err_tail}")
     with open(output_map_json) as f:
         mapping = json.load(f)
+    # Clean up only the bookkeeping temp dir, not the output PDBs
+    shutil.rmtree(tmp_dir, ignore_errors=True)
     return mapping
 
 
@@ -499,6 +516,7 @@ def _process_one_protein(
         reference_cif = str(topk_df.iloc[0]["structure_path"])
         chain = "A"
     staged_dir = protein_out_dir / "staged_topk_templates"
+    cg2all_dir = protein_out_dir / "cg2all_topk_structures"
     desired = set([Path(str(p)).name for p in topk_df["structure_path"].tolist()])
     staged_filenames = desired
 
@@ -529,6 +547,27 @@ def _process_one_protein(
             min_df = _merge_min_across_models(m1_df, m2_df, desired)
             jmin = topk_df2.merge(min_df[["structure_file", "ptm"]], on="structure_file", how="left")
             min_max_ptm = float(pd.to_numeric(jmin["ptm"], errors="coerce").dropna().max())
+            # Generate summary CSV if not already present
+            summary_csv = protein_out_dir / f"af2rank_topk_summary_{protein_id}.csv"
+            if not summary_csv.exists():
+                try:
+                    from proteinfoundation.af2rank_evaluation.topk_summary_utils import generate_topk_summary_csv
+                    # Build allatom_map from existing cg2all_topk_structures/ dir
+                    existing_allatom: Dict[str, str] = {}
+                    if cg2all_dir.exists():
+                        for row in topk_df.itertuples():
+                            orig = str(row.structure_path)
+                            stem = Path(orig).stem
+                            candidate = cg2all_dir / f"{stem}_allatom.pdb"
+                            if candidate.exists():
+                                existing_allatom[orig] = str(candidate)
+                    generate_topk_summary_csv(
+                        protein_id, topk_df,
+                        af2rank_scores_csv_m1, af2rank_scores_csv_m2,
+                        existing_allatom, protein_out_dir,
+                    )
+                except Exception as _e:
+                    logger.warning(f"{protein_id}: summary CSV generation failed (filter_existing path): {_e}")
             return {
                 "protein_id": protein_id,
                 "reference_tm": float(dataset_ref["reference_tm"]),
@@ -578,48 +617,45 @@ def _process_one_protein(
     )
 
     if not dry_run:
-        # Batch-reconstruct all CA-only templates once upfront, reuse for both models
+        # Batch-reconstruct all CA-only templates once upfront, reuse for both models.
+        # Files are saved persistently in cg2all_topk_structures/ (no cleanup needed).
         allatom_map: Dict[str, str] = {}
-        if backend == "colabdesign":
-            allatom_map = _batch_reconstruct_ca_only(staged_dir, direct_python=direct_python)
-        try:
-            _run_af2rank_subprocess(
-                protein_id=protein_id,
-                reference_cif=reference_cif,
-                chain=chain,
-                staged_templates_dir=staged_dir,
-                output_dir=af2rank_out_dir_m1,
-                recycles=recycles,
-                cuda_visible_devices=gpu_id,
-                model_name="model_1_ptm",
-                backend=backend,
-                allatom_map=allatom_map,
-                direct_python=direct_python,
-                use_deepspeed_evoformer_attention=use_deepspeed_evoformer_attention,
-                use_cuequivariance_attention=use_cuequivariance_attention,
-                use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
-            )
-            _run_af2rank_subprocess(
-                protein_id=protein_id,
-                reference_cif=reference_cif,
-                chain=chain,
-                staged_templates_dir=staged_dir,
-                output_dir=af2rank_out_dir_m2,
-                recycles=recycles,
-                cuda_visible_devices=gpu_id,
-                model_name="model_2_ptm",
-                backend=backend,
-                allatom_map=allatom_map,
-                direct_python=direct_python,
-                use_deepspeed_evoformer_attention=use_deepspeed_evoformer_attention,
-                use_cuequivariance_attention=use_cuequivariance_attention,
-                use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
-            )
-        finally:
-            # Delete reconstructed all-atom temp files after both models are done
-            for tmp_path in allatom_map.values():
-                if tmp_path and os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
+        cg2all_dir.mkdir(parents=True, exist_ok=True)
+        allatom_map = _batch_reconstruct_ca_only(
+            staged_dir, output_dir=cg2all_dir, direct_python=direct_python
+        )
+        _run_af2rank_subprocess(
+            protein_id=protein_id,
+            reference_cif=reference_cif,
+            chain=chain,
+            staged_templates_dir=staged_dir,
+            output_dir=af2rank_out_dir_m1,
+            recycles=recycles,
+            cuda_visible_devices=gpu_id,
+            model_name="model_1_ptm",
+            backend=backend,
+            allatom_map=allatom_map,
+            direct_python=direct_python,
+            use_deepspeed_evoformer_attention=use_deepspeed_evoformer_attention,
+            use_cuequivariance_attention=use_cuequivariance_attention,
+            use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
+        )
+        _run_af2rank_subprocess(
+            protein_id=protein_id,
+            reference_cif=reference_cif,
+            chain=chain,
+            staged_templates_dir=staged_dir,
+            output_dir=af2rank_out_dir_m2,
+            recycles=recycles,
+            cuda_visible_devices=gpu_id,
+            model_name="model_2_ptm",
+            backend=backend,
+            allatom_map=allatom_map,
+            direct_python=direct_python,
+            use_deepspeed_evoformer_attention=use_deepspeed_evoformer_attention,
+            use_cuequivariance_attention=use_cuequivariance_attention,
+            use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
+        )
 
         m1_df = pd.read_csv(af2rank_scores_csv_m1)
         m2_df = pd.read_csv(af2rank_scores_csv_m2)
@@ -639,6 +675,17 @@ def _process_one_protein(
         m1_metrics = _prefix_metrics(_extract_top1_top5_metrics(m1_df, staged_filenames), "m1")
         m2_metrics = _prefix_metrics(_extract_top1_top5_metrics(m2_df, staged_filenames), "m2")
         min_metrics = _prefix_metrics(_extract_top1_top5_metrics(min_df, staged_filenames), "min")
+
+        # Generate per-protein summary CSV (includes cg2all fidelity + all AF2Rank metrics)
+        try:
+            from proteinfoundation.af2rank_evaluation.topk_summary_utils import generate_topk_summary_csv
+            generate_topk_summary_csv(
+                protein_id, topk_df,
+                af2rank_scores_csv_m1, af2rank_scores_csv_m2,
+                allatom_map, protein_out_dir,
+            )
+        except Exception as _e:
+            logger.warning(f"{protein_id}: summary CSV generation failed: {_e}")
 
     min_energy = float(topk_df["energy"].min())
     m1_raw = {k.replace("m1_", ""): v for k, v in m1_metrics.items()}

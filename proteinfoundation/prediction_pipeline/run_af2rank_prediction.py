@@ -26,6 +26,7 @@ import argparse
 import gc
 import logging
 import os
+import shutil
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -181,6 +182,52 @@ def _batch_reconstruct_all_proteins(
             f"falling back to per-structure reconstruction inside score_structure()"
         )
         return {}
+
+
+# ---------------------------------------------------------------------------
+# Persistent cg2all file management
+# ---------------------------------------------------------------------------
+
+def _persist_allatom_files(
+    allatom_map: Dict[str, str],
+    protein_configs: List[Dict],
+    inference_base: Path,
+) -> Dict[str, str]:
+    """Copy temp cg2all files to persistent per-protein cg2all_topk_structures/ dirs.
+
+    The temp files are removed after copying.  The returned map uses the same
+    original CA-only PDB paths as keys but points to the persistent copies.
+    """
+    if not allatom_map:
+        return {}
+
+    # Build lookup: original CA-only PDB path → protein_id
+    template_to_protein: Dict[str, str] = {}
+    for cfg in protein_configs:
+        for _, row in cfg["topk_df"].iterrows():
+            template_to_protein[str(row["structure_path"])] = cfg["protein_id"]
+
+    persistent_map: Dict[str, str] = {}
+    for ca_path, tmp_path in allatom_map.items():
+        protein_id = template_to_protein.get(ca_path, Path(ca_path).parent.name)
+        cg2all_dir = (
+            inference_base / protein_id
+            / "af2rank_on_proteinebm_top_k"
+            / "cg2all_topk_structures"
+        )
+        cg2all_dir.mkdir(parents=True, exist_ok=True)
+        dest = cg2all_dir / (Path(ca_path).stem + "_allatom.pdb")
+        if tmp_path and Path(tmp_path).exists():
+            shutil.copy2(tmp_path, dest)
+            try:
+                Path(tmp_path).unlink()
+            except OSError:
+                pass
+        persistent_map[ca_path] = str(dest)
+
+    n_copied = sum(1 for v in persistent_map.values() if Path(v).exists())
+    logger.info(f"Saved {n_copied} cg2all reconstructed PDBs to persistent cg2all_topk_structures/ dirs")
+    return persistent_map
 
 
 # ---------------------------------------------------------------------------
@@ -377,46 +424,56 @@ def main() -> None:
     # ── Pre-reconstruct CA-only templates ONCE (shared across both model passes)
     allatom_map = _batch_reconstruct_all_proteins(protein_configs)
 
-    try:
-        # ── Model 1: model_1_ptm ─────────────────────────────────────────────
-        _run_model_pass(
-            protein_configs=protein_configs,
-            model_name="model_1_ptm",
-            out_dir_key="out_dir_m1",
-            recycles=args.recycles,
-            filter_existing=args.filter_existing,
-            use_deepspeed_evoformer_attention=args.use_deepspeed_evoformer_attention,
-            use_cuequivariance_attention=args.use_cuequivariance_attention,
-            use_cuequivariance_multiplicative_update=args.use_cuequivariance_multiplicative_update,
-            OpenFoldAF2Rank=OpenFoldAF2Rank,
-            allatom_map=allatom_map,
-        )
+    # ── Persist cg2all outputs to per-protein cg2all_topk_structures/ dirs ──
+    # Temp files are moved to persistent locations; any leftover temps are cleaned up.
+    allatom_map = _persist_allatom_files(allatom_map, protein_configs, inference_base)
 
-        # ── Model 2: model_2_ptm ─────────────────────────────────────────────
-        _run_model_pass(
-            protein_configs=protein_configs,
-            model_name="model_2_ptm",
-            out_dir_key="out_dir_m2",
-            recycles=args.recycles,
-            filter_existing=args.filter_existing,
-            use_deepspeed_evoformer_attention=args.use_deepspeed_evoformer_attention,
-            use_cuequivariance_attention=args.use_cuequivariance_attention,
-            use_cuequivariance_multiplicative_update=args.use_cuequivariance_multiplicative_update,
-            OpenFoldAF2Rank=OpenFoldAF2Rank,
-            allatom_map=allatom_map,
-        )
-    finally:
-        # Clean up pre-reconstructed temp files (safe even if a pass failed)
-        n_cleaned = 0
-        for tmp_path in allatom_map.values():
-            if tmp_path and Path(tmp_path).exists():
-                try:
-                    Path(tmp_path).unlink()
-                    n_cleaned += 1
-                except OSError:
-                    pass
-        if n_cleaned:
-            logger.info(f"Cleaned up {n_cleaned} pre-reconstructed temp files")
+    # ── Model 1: model_1_ptm ─────────────────────────────────────────────────
+    _run_model_pass(
+        protein_configs=protein_configs,
+        model_name="model_1_ptm",
+        out_dir_key="out_dir_m1",
+        recycles=args.recycles,
+        filter_existing=args.filter_existing,
+        use_deepspeed_evoformer_attention=args.use_deepspeed_evoformer_attention,
+        use_cuequivariance_attention=args.use_cuequivariance_attention,
+        use_cuequivariance_multiplicative_update=args.use_cuequivariance_multiplicative_update,
+        OpenFoldAF2Rank=OpenFoldAF2Rank,
+        allatom_map=allatom_map,
+    )
+
+    # ── Model 2: model_2_ptm ─────────────────────────────────────────────────
+    _run_model_pass(
+        protein_configs=protein_configs,
+        model_name="model_2_ptm",
+        out_dir_key="out_dir_m2",
+        recycles=args.recycles,
+        filter_existing=args.filter_existing,
+        use_deepspeed_evoformer_attention=args.use_deepspeed_evoformer_attention,
+        use_cuequivariance_attention=args.use_cuequivariance_attention,
+        use_cuequivariance_multiplicative_update=args.use_cuequivariance_multiplicative_update,
+        OpenFoldAF2Rank=OpenFoldAF2Rank,
+        allatom_map=allatom_map,
+    )
+
+    # ── Generate per-protein summary CSVs ────────────────────────────────────
+    from proteinfoundation.af2rank_evaluation.topk_summary_utils import generate_topk_summary_csv
+
+    for cfg in protein_configs:
+        protein_id = cfg["protein_id"]
+        out_dir = inference_base / protein_id / "af2rank_on_proteinebm_top_k"
+        m1_csv = out_dir / "af2rank_analysis" / f"af2rank_scores_{protein_id}.csv"
+        m2_csv = out_dir / "af2rank_analysis_model_2_ptm" / f"af2rank_scores_{protein_id}.csv"
+        if not m1_csv.exists() or not m2_csv.exists():
+            logger.warning(f"{protein_id}: AF2Rank score CSVs not found; skipping summary CSV")
+            continue
+        try:
+            generate_topk_summary_csv(
+                protein_id, cfg["topk_df"], m1_csv, m2_csv,
+                allatom_map, out_dir,
+            )
+        except Exception as e:
+            logger.warning(f"{protein_id}: summary CSV generation failed: {e}")
 
     logger.info("AF2Rank prediction scoring complete.")
 
