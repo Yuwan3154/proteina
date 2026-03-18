@@ -139,11 +139,10 @@ def _pick_reference(topk_df: pd.DataFrame, cif_dir: Optional[str], protein_id: s
 def _batch_reconstruct_all_proteins(
     protein_configs: List[Dict],
 ) -> Dict[str, str]:
-    """Reconstruct CA-only templates for all proteins in a single cg2all batch call.
+    """Reconstruct CA-only templates for all proteins via batched cg2all.
 
     Returns a mapping {original_ca_pdb_path: temp_allatom_pdb_path}.
-    Falls back to an empty dict on any cg2all import/runtime failure so that
-    score_structure() can still do per-structure lazy reconstruction.
+    Raises on any cg2all failure — callers must not proceed without reconstruction.
     """
     # Collect every unique CA-only template path across all proteins
     all_ca_paths: List[str] = []
@@ -160,28 +159,17 @@ def _batch_reconstruct_all_proteins(
         return {}
 
     logger.info(
-        f"Pre-reconstructing {len(all_ca_paths)} CA-only templates via cg2all "
-        f"(single batch, shared across both model passes) ..."
+        f"Pre-reconstructing {len(all_ca_paths)} CA-only templates via cg2all ..."
     )
-    try:
-        from proteinfoundation.af2rank_evaluation.af2rank_openfold_scorer import (
-            _get_cg2all_reconstructor,
-        )
-        reconstructor = _get_cg2all_reconstructor()
-        allatom_map = reconstructor.reconstruct_batch(all_ca_paths)
-        n_ok = len(allatom_map)
-        n_fail = len(all_ca_paths) - n_ok
-        logger.info(
-            f"Pre-reconstruction complete: {n_ok} succeeded, {n_fail} failed "
-            f"(failures will fall back to per-structure reconstruction)"
-        )
-        return allatom_map
-    except Exception as e:
-        logger.warning(
-            f"cg2all batch pre-reconstruction failed ({e}); "
-            f"falling back to per-structure reconstruction inside score_structure()"
-        )
-        return {}
+    from proteinfoundation.af2rank_evaluation.af2rank_openfold_scorer import (
+        _get_cg2all_reconstructor,
+    )
+    reconstructor = _get_cg2all_reconstructor()
+    allatom_map = reconstructor.reconstruct_batch(all_ca_paths)
+    n_ok = len(allatom_map)
+    n_fail = len(all_ca_paths) - n_ok
+    logger.info(f"Pre-reconstruction complete: {n_ok} succeeded, {n_fail} failed")
+    return allatom_map
 
 
 # ---------------------------------------------------------------------------

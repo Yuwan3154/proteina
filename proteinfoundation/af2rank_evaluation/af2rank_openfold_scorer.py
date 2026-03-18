@@ -161,8 +161,8 @@ class CG2AllReconstructor:
         _fix_pdb_model_number(out_path)
         return out_path
 
-    def reconstruct_batch(self, pdb_files):
-        """Reconstruct multiple CA-only PDBs in a single GPU forward pass.
+    def reconstruct_batch(self, pdb_files, batch_size=32):
+        """Reconstruct multiple CA-only PDBs in chunked GPU forward passes.
 
         Returns dict mapping input path -> temp all-atom PDB path.
         """
@@ -180,19 +180,21 @@ class CG2AllReconstructor:
         if not graphs:
             return {}
 
-        batched = self.dgl.batch(graphs).to(self.device)
-        with torch.no_grad():
-            R = self.model.forward(batched)[0]["R"]
-        traj_s, _ = self.create_trajectory_from_batch(batched, R)
-
         result = {}
-        for idx, traj in zip(valid_indices, traj_s):
-            output = self.patch_termini(traj)
-            fd, out_path = tempfile.mkstemp(suffix=".pdb", prefix="cg2all_")
-            os.close(fd)
-            output.save(out_path)
-            _fix_pdb_model_number(out_path)
-            result[pdb_files[idx]] = out_path
+        for start in range(0, len(graphs), batch_size):
+            chunk_graphs = graphs[start:start + batch_size]
+            chunk_indices = valid_indices[start:start + batch_size]
+            batched = self.dgl.batch(chunk_graphs).to(self.device)
+            with torch.no_grad():
+                R = self.model.forward(batched)[0]["R"]
+            traj_s, _ = self.create_trajectory_from_batch(batched, R)
+            for idx, traj in zip(chunk_indices, traj_s):
+                output = self.patch_termini(traj)
+                fd, out_path = tempfile.mkstemp(suffix=".pdb", prefix="cg2all_")
+                os.close(fd)
+                output.save(out_path)
+                _fix_pdb_model_number(out_path)
+                result[pdb_files[idx]] = out_path
         return result
 
 
@@ -806,17 +808,14 @@ def score_proteina_structures_openfold(
 
     logger.info(f"Starting OpenFold AF2Rank scoring for {len(pdb_files)} structures of {protein_id}")
 
-    # Batch-reconstruct all CA-only structures via cg2all (single GPU forward pass)
+    # Batch-reconstruct all CA-only structures via cg2all
     ca_only_pdbs = [p for p in pdb_files if _is_ca_only_pdb(p)]
     allatom_map = {}  # original_pdb -> reconstructed_pdb
     if ca_only_pdbs:
         logger.info(f"Reconstructing {len(ca_only_pdbs)} CA-only structures with cg2all...")
-        try:
-            reconstructor = _get_cg2all_reconstructor()
-            allatom_map = reconstructor.reconstruct_batch(ca_only_pdbs)
-            logger.info(f"Reconstructed {len(allatom_map)} structures")
-        except Exception as e:
-            logger.warning(f"Batch cg2all failed, falling back to per-structure: {e}")
+        reconstructor = _get_cg2all_reconstructor()
+        allatom_map = reconstructor.reconstruct_batch(ca_only_pdbs)
+        logger.info(f"Reconstructed {len(allatom_map)} structures")
 
     _owns_scorer = scorer is None
     if _owns_scorer:

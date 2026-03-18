@@ -7,7 +7,7 @@ CA-only PDB files to all-atom PDBs using cg2all. Designed to be called as a
 subprocess from other environments (e.g. colabdesign) that lack PyTorch/cg2all.
 
 Usage:
-    conda run -n cue_openfold python cg2all_reconstruct.py \
+    /path/to/cue_openfold/bin/python cg2all_reconstruct.py \
         --inputs inputs.json \
         --output_dir /tmp/cg2all_out/ \
         --output_map output_map.json
@@ -22,6 +22,7 @@ import os
 import re
 import sys
 import tempfile
+from pathlib import Path
 
 import torch
 import dgl
@@ -30,6 +31,76 @@ import cg2all.lib.libmodel
 from cg2all.lib.libconfig import MODEL_HOME
 from cg2all.lib.libdata import PredictionData, create_trajectory_from_batch
 from cg2all.lib.libter import patch_termini
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint download
+# ---------------------------------------------------------------------------
+
+# Google Drive file IDs and Zenodo record for each cg2all model variant.
+_GDRIVE_IDS = {
+    "CalphaBasedModel": "1uzsVPB_0t0RDp2P8qJ44LzE3JiVowtTx",
+    "ResidueBasedModel": "1KsxfB0B90YQQd1iBzw3buznHIwzN_0sA",
+    "SidechainModel": "1kd_wq-Jq6z4CpRNLwkeAgPLQOl_xL64q",
+    "CalphaCMModel": "1kLrmeO2F0WXvy0ujq0H4U5drjnuxNy8d",
+    "CalphaSCModel": "1sFW-g1_1fOYUtKVi7I8898Xs-NiKgG5R",
+    "BackboneModel": "17OZDDCiwo7M8egPgRIlMfHujOT-oy0Fz",
+    "MainchainModel": "1Q6Xlop_u1hQdLwTlHHdCDxWTC34I8TQg",
+    "Martini": "1GiEtLiIOotLrj--7-jJI8aRE10duQoBE",
+    "Martini3": "1oqz8BVheg534BydxPL6bFc-J2OeHOcfn",
+    "PRIMO": "1FW_QFijewI-z48GC-aDEjHMO_8g1syTH",
+    "CalphaBasedModel-FIX": "16FfIW72BDy-RT46kgVoRsGYCcpHOeee1",
+    "CalphaCMModel-FIX": "1xdDT-6kkkNiXcg3WxJm1gkw7wDj07Mw9",
+    "CalphaSCModel-FIX": "1ODp46hxHlfDiSVSbNwrVQvk1xugtuAH9",
+    "BackboneModel-FIX": "1uosDHt20KokQBMqyZylO0m8VEONcEuK6",
+    "MainchainModel-FIX": "1TaOn42s-3HPlxB4sJ8V21g8rO447F4_v",
+}
+_ZENODO_RECORD = "8393343"
+
+
+def download_ckpt_file(model_type: str, ckpt_fn: Path, fix_atom: bool = False) -> None:
+    """Download a cg2all checkpoint file from Google Drive (preferred) or Zenodo.
+
+    Args:
+        model_type: Base model name, e.g. ``"CalphaBasedModel"`` or ``"BackboneModel"``.
+        ckpt_fn:    Destination path for the ``.ckpt`` file.
+        fix_atom:   If True, appends ``"-FIX"`` to the model_type key (fix-atom variant).
+    """
+    if fix_atom:
+        model_type = f"{model_type}-FIX"
+
+    if model_type not in _GDRIVE_IDS:
+        raise ValueError(f"Unknown cg2all model type: {model_type!r}. "
+                         f"Known types: {sorted(_GDRIVE_IDS)}")
+
+    ckpt_fn = Path(ckpt_fn)
+    ckpt_fn.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        import gdown
+        sys.stdout.write(f"Downloading from Google Drive ... {ckpt_fn}\n")
+        sys.stdout.flush()
+        gdown.download(id=_GDRIVE_IDS[model_type], output=str(ckpt_fn), quiet=True)
+    except Exception:
+        import requests
+        sys.stdout.write(f"Downloading from Zenodo ... {ckpt_fn}\n")
+        sys.stdout.flush()
+        url = f"https://zenodo.org/record/{_ZENODO_RECORD}/files/{ckpt_fn.name}"
+        with open(ckpt_fn, "wb") as fout:
+            fout.write(requests.get(url).content)
+
+
+def ensure_ckpt(model_type: str, fix_atom: bool = False) -> Path:
+    """Return path to checkpoint, downloading it first if not present."""
+    suffix = "-FIX" if fix_atom else ""
+    ckpt_path = MODEL_HOME / f"{model_type}{suffix}.ckpt"
+    if not ckpt_path.exists():
+        sys.stdout.write(
+            f"cg2all checkpoint not found at {ckpt_path}; downloading...\n"
+        )
+        sys.stdout.flush()
+        download_ckpt_file(model_type, ckpt_path, fix_atom=fix_atom)
+    return ckpt_path
 
 
 def _fix_pdb_model_number(pdb_path: str) -> None:
@@ -64,7 +135,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt_path = MODEL_HOME / "CalphaBasedModel.ckpt"
+    ckpt_path = ensure_ckpt("CalphaBasedModel")
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     config = ckpt["hyper_parameters"]
     cg_model = cg2all.lib.libcg.CalphaBasedModel
@@ -89,14 +160,16 @@ def main():
         except Exception as e:
             print(f"Warning: cg2all failed to load {pdb_file}: {e}", file=sys.stderr)
 
+    CG2ALL_BATCH_SIZE = 32
     result = {}
-    if graphs:
-        batched = dgl.batch(graphs).to(device)
+    for start in range(0, len(graphs), CG2ALL_BATCH_SIZE):
+        chunk_graphs = graphs[start:start + CG2ALL_BATCH_SIZE]
+        chunk_indices = valid_indices[start:start + CG2ALL_BATCH_SIZE]
+        batched = dgl.batch(chunk_graphs).to(device)
         with torch.no_grad():
             R = model.forward(batched)[0]["R"]
         traj_s, _ = create_trajectory_from_batch(batched, R)
-
-        for idx, traj in zip(valid_indices, traj_s):
+        for idx, traj in zip(chunk_indices, traj_s):
             output = patch_termini(traj)
             out_name = os.path.splitext(os.path.basename(pdb_files[idx]))[0] + "_allatom.pdb"
             out_path = os.path.join(args.output_dir, out_name)
