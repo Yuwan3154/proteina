@@ -8,6 +8,7 @@ Used by both:
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -136,7 +137,14 @@ def _extract_top1_top5_metrics(af2_df: pd.DataFrame, staged_filenames: set) -> D
 def _merge_min_across_models(
     m1_df: pd.DataFrame, m2_df: pd.DataFrame, staged_filenames: set
 ) -> pd.DataFrame:
-    """Merge model_1 and model_2 results, taking min of each metric per template."""
+    """Merge model_1 and model_2 results, taking element-wise min per metric.
+
+    Each metric (ptm, tm_ref_pred, composite, plddt) is independently
+    minimised across the two models for every structure.  This means that,
+    for a given structure, the reported ``ptm`` and ``tm_ref_pred`` may
+    originate from *different* models — the result is a conservative /
+    pessimistic estimate rather than a consistent single-model selection.
+    """
     needed = {"structure_file", "ptm"}
     for df in (m1_df, m2_df):
         if not needed.issubset(df.columns):
@@ -149,6 +157,7 @@ def _merge_min_across_models(
         if c not in m2.columns:
             m2[c] = float("nan")
     merged = m1.merge(m2, on="structure_file", how="inner", suffixes=("_m1", "_m2"))
+    # Element-wise min across models (independent per metric — see docstring).
     merged["ptm"] = merged[["ptm_m1", "ptm_m2"]].min(axis=1)
     merged["tm_ref_pred"] = merged[["tm_ref_pred_m1", "tm_ref_pred_m2"]].min(axis=1)
     merged["composite"] = merged[["composite_m1", "composite_m2"]].min(axis=1)
@@ -168,22 +177,27 @@ def generate_topk_summary_csv(
     allatom_map: Dict[str, str],
     out_dir: Path,
 ) -> None:
-    """Write af2rank_topk_summary_{protein_id}.csv to out_dir.
+    """Write per-template CSV and protein-level summary JSON to out_dir.
 
-    One row per top-k template, with columns:
-      - template metadata (file, path, cg2all path)
-      - ProteinEBM energy
-      - cg2all fidelity vs original CA backbone (RMSD, TM-score)
-      - template vs ground-truth metrics from AF2Rank (NaN in prediction mode)
-      - per-template AF2Rank metrics: m1/m2/min  × ptm/plddt/composite/tm_ref_pred
-      - protein-level top-1/top-5 aggregates repeated on every row: m1/m2/min × top_1/top_5
+    Writes two files:
+
+    1. ``af2rank_topk_summary_{protein_id}.csv`` — one row per top-k template:
+       - template metadata (file, path, cg2all path)
+       - ProteinEBM energy
+       - cg2all fidelity vs original CA backbone (RMSD, TM-score)
+       - template vs ground-truth metrics from AF2Rank (NaN in prediction mode)
+       - per-template AF2Rank metrics: m1/m2/min × ptm/plddt/composite/tm_ref_pred
+
+    2. ``af2rank_topk_protein_summary_{protein_id}.json`` — protein-level scalar aggregates:
+       - ``protein_id``, ``n_templates``
+       - ``m1/m2/min_top_1/top_5 × ptm/tm_ref_pred/composite/plddt`` (24 metrics total)
 
     Args:
         topk_df:    Energy-ranked top-k dataframe (columns: structure_path, energy, ...).
         m1_csv:     Path to model_1_ptm AF2Rank scores CSV.
         m2_csv:     Path to model_2_ptm AF2Rank scores CSV.
         allatom_map: {orig_ca_pdb_path: cg2all_allatom_pdb_path}.  May be partial or empty.
-        out_dir:    Directory where the CSV will be written (af2rank_on_proteinebm_top_k/).
+        out_dir:    Directory where output files will be written (af2rank_on_proteinebm_top_k/).
     """
     nan = float("nan")
     out_path = out_dir / f"af2rank_topk_summary_{protein_id}.csv"
@@ -260,14 +274,7 @@ def generate_topk_summary_csv(
     m2_agg = _extract_top1_top5_metrics(m2_df, staged_filenames)
     min_agg = _extract_top1_top5_metrics(min_df, staged_filenames)
 
-    for key, val in m1_agg.items():
-        merged[f"m1_{key}"] = val
-    for key, val in m2_agg.items():
-        merged[f"m2_{key}"] = val
-    for key, val in min_agg.items():
-        merged[f"min_{key}"] = val
-
-    # ── Assemble final column order ──────────────────────────────────────────
+    # ── Assemble final column order (per-template only — no aggregates) ──────
     leading_cols = [
         "template_file",
         "structure_path",
@@ -280,12 +287,6 @@ def generate_topk_summary_csv(
         "m1_ptm", "m1_plddt", "m1_composite", "m1_tm_ref_pred",
         "m2_ptm", "m2_plddt", "m2_composite", "m2_tm_ref_pred",
         "min_ptm", "min_plddt", "min_composite", "min_tm_ref_pred",
-        "m1_top_1_ptm", "m1_top_1_tm_ref_pred", "m1_top_1_composite", "m1_top_1_plddt",
-        "m1_top_5_ptm", "m1_top_5_tm_ref_pred", "m1_top_5_composite", "m1_top_5_plddt",
-        "m2_top_1_ptm", "m2_top_1_tm_ref_pred", "m2_top_1_composite", "m2_top_1_plddt",
-        "m2_top_5_ptm", "m2_top_5_tm_ref_pred", "m2_top_5_composite", "m2_top_5_plddt",
-        "min_top_1_ptm", "min_top_1_tm_ref_pred", "min_top_1_composite", "min_top_1_plddt",
-        "min_top_5_ptm", "min_top_5_tm_ref_pred", "min_top_5_composite", "min_top_5_plddt",
     ]
     # Keep only columns that exist; append any remaining columns at the end
     present_leading = [c for c in leading_cols if c in merged.columns]
@@ -296,3 +297,13 @@ def generate_topk_summary_csv(
     out_dir.mkdir(parents=True, exist_ok=True)
     merged.to_csv(out_path, index=False)
     logger.info(f"{protein_id}: wrote {len(merged)}-row topk summary to {out_path}")
+
+    # ── Write protein-level summary JSON ────────────────────────────────────
+    summary = {"protein_id": protein_id, "n_templates": len(merged)}
+    summary.update({f"m1_{k}": v for k, v in m1_agg.items()})
+    summary.update({f"m2_{k}": v for k, v in m2_agg.items()})
+    summary.update({f"min_{k}": v for k, v in min_agg.items()})
+    json_path = out_dir / f"af2rank_topk_protein_summary_{protein_id}.json"
+    with open(json_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    logger.info(f"{protein_id}: wrote protein-level summary to {json_path}")

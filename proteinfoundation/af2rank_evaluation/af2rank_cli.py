@@ -189,7 +189,7 @@ def tmscore(x, y, tmscore_exe="USalign"):
         if os.path.exists(exe) or os.system(f"which {exe} > /dev/null 2>&1") == 0:
             cmd = f'{exe} {f1.name} {f2.name}'
             if exe == "USalign":
-                cmd += " -TMscore 1"
+                cmd += " -TMscore 5"
             output = os.popen(cmd).readlines()
             break
     else:

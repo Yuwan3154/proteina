@@ -20,7 +20,6 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -446,33 +445,6 @@ plot_af2rank_results(plot_scores, output_dir, protein_id)
             f"AF2Rank subprocess failed for {protein_id} ({model_name}), "
             f"exit={result.returncode}:\nSTDERR:\n{err_tail}\nSTDOUT:\n{out_tail}"
         )
-
-
-def _plot_scatter(
-    df: pd.DataFrame,
-    x_col: str,
-    y_col: str,
-    title: str,
-    xlabel: str,
-    ylabel: str,
-    out_path: Path,
-) -> None:
-    plt.figure(figsize=(10, 8), dpi=140)
-    valid = df.dropna(subset=[x_col, y_col, "in_train", "length"])
-    if len(valid) == 0:
-        raise ValueError(f"No valid points to plot for {x_col} vs {y_col}")
-
-    colors = valid["in_train"].map({True: "blue", False: "red"})
-    sizes = np.clip(valid["length"].astype(float).to_numpy() / 1.5, 20, 800)
-
-    plt.scatter(valid[x_col], valid[y_col], c=colors, s=sizes, alpha=0.25)
-    plt.title(title)
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=300, bbox_inches="tight")
-    plt.close()
 
 
 def _process_one_protein(
@@ -913,158 +885,7 @@ def main() -> None:
     summary_df = pd.DataFrame(rows)
     summary_csv = out_dir_path / f"af2rank_on_proteinebm_top_{int(args.top_k)}_summary.csv"
     summary_df.to_csv(summary_csv, index=False)
-
-    _plot_scatter(
-        summary_df,
-        x_col="reference_tm",
-        y_col="min_energy_topk",
-        title=f"Reference TM vs ProteinEBM energy (top-{int(args.top_k)} templates by min energy)",
-        xlabel="Reference TM score",
-        ylabel="ProteinEBM energy (lower is better)",
-        out_path=out_dir_path / f"ref_tm_vs_proteinebm_energy_topk{int(args.top_k)}.png",
-    )
-
-    if not args.dry_run:
-        _plot_scatter(
-            summary_df,
-            x_col="reference_tm",
-            y_col="max_ptm_topk",
-            title=f"Reference TM vs AF2Rank pTM (best pTM within ProteinEBM top-{int(args.top_k)})",
-            xlabel="Reference TM score",
-            ylabel="AF2Rank pTM (higher is better)",
-            out_path=out_dir_path / f"ref_tm_vs_af2rank_ptm_topk{int(args.top_k)}.png",
-        )
-
-        # TM_ref_pred vs pTM: does AF2 confidence correlate with prediction quality?
-        if "top_1_ptm" in summary_df.columns and "top_1_tm_ref_pred" in summary_df.columns:
-            _plot_scatter(
-                summary_df,
-                x_col="top_1_ptm",
-                y_col="top_1_tm_ref_pred",
-                title=f"Top-1 by pTM: Prediction TM (tm_ref_pred) vs AF2 pTM",
-                xlabel="AF2 pTM (confidence)",
-                ylabel="TM(ref vs pred)",
-                out_path=out_dir_path / f"tm_ref_pred_vs_ptm_top1_topk{int(args.top_k)}.png",
-            )
-        if "top_5_ptm" in summary_df.columns and "top_5_tm_ref_pred" in summary_df.columns:
-            _plot_scatter(
-                summary_df,
-                x_col="top_5_ptm",
-                y_col="top_5_tm_ref_pred",
-                title=f"Top-5 by pTM (best tm_ref_pred): Prediction TM vs AF2 pTM",
-                xlabel="AF2 pTM (confidence)",
-                ylabel="TM(ref vs pred)",
-                out_path=out_dir_path / f"tm_ref_pred_vs_ptm_top5_topk{int(args.top_k)}.png",
-            )
-
-        if "top_1_composite" in summary_df.columns and "top_1_tm_ref_pred" in summary_df.columns:
-            _plot_scatter(
-                summary_df,
-                x_col="top_1_composite",
-                y_col="top_1_tm_ref_pred",
-                title=f"Top-1 by pTM: Prediction TM vs composite score",
-                xlabel="Composite score",
-                ylabel="TM(ref vs pred)",
-                out_path=out_dir_path / f"tm_ref_pred_vs_composite_top1_topk{int(args.top_k)}.png",
-            )
-        if "top_5_composite" in summary_df.columns and "top_5_tm_ref_pred" in summary_df.columns:
-            _plot_scatter(
-                summary_df,
-                x_col="top_5_composite",
-                y_col="top_5_tm_ref_pred",
-                title=f"Top-5 by pTM (best tm_ref_pred): Prediction TM vs composite score",
-                xlabel="Composite score",
-                ylabel="TM(ref vs pred)",
-                out_path=out_dir_path / f"tm_ref_pred_vs_composite_top5_topk{int(args.top_k)}.png",
-            )
-
-        if "top_1_plddt" in summary_df.columns and "top_1_tm_ref_pred" in summary_df.columns:
-            _plot_scatter(
-                summary_df,
-                x_col="top_1_plddt",
-                y_col="top_1_tm_ref_pred",
-                title=f"Top-1 by pTM: Prediction TM vs pLDDT",
-                xlabel="pLDDT",
-                ylabel="TM(ref vs pred)",
-                out_path=out_dir_path / f"tm_ref_pred_vs_plddt_top1_topk{int(args.top_k)}.png",
-            )
-        if "top_5_plddt" in summary_df.columns and "top_5_tm_ref_pred" in summary_df.columns:
-            _plot_scatter(
-                summary_df,
-                x_col="top_5_plddt",
-                y_col="top_5_tm_ref_pred",
-                title=f"Top-5 by pTM (best tm_ref_pred): Prediction TM vs pLDDT",
-                xlabel="pLDDT",
-                ylabel="TM(ref vs pred)",
-                out_path=out_dir_path / f"tm_ref_pred_vs_plddt_top5_topk{int(args.top_k)}.png",
-            )
-
-        # Model 2 (model_2_ptm) plots
-        if "m2_max_ptm_topk" in summary_df.columns:
-            valid = summary_df.dropna(subset=["reference_tm", "m2_max_ptm_topk", "in_train", "length"])
-            if len(valid) > 0:
-                _plot_scatter(
-                    summary_df,
-                    x_col="reference_tm",
-                    y_col="m2_max_ptm_topk",
-                    title=f"Reference TM vs AF2Rank pTM (model_2_ptm, top-{int(args.top_k)})",
-                    xlabel="Reference TM score",
-                    ylabel="AF2Rank pTM model_2_ptm",
-                    out_path=out_dir_path / f"ref_tm_vs_af2rank_ptm_topk{int(args.top_k)}_model_2_ptm.png",
-                )
-        for suffix, x, y, top_num in [
-            ("ptm", "m2_top_1_ptm", "m2_top_1_tm_ref_pred", "1"),
-            ("ptm", "m2_top_5_ptm", "m2_top_5_tm_ref_pred", "5"),
-            ("composite", "m2_top_1_composite", "m2_top_1_tm_ref_pred", "1"),
-            ("composite", "m2_top_5_composite", "m2_top_5_tm_ref_pred", "5"),
-            ("plddt", "m2_top_1_plddt", "m2_top_1_tm_ref_pred", "1"),
-            ("plddt", "m2_top_5_plddt", "m2_top_5_tm_ref_pred", "5"),
-        ]:
-            if x in summary_df.columns and y in summary_df.columns:
-                valid = summary_df.dropna(subset=[x, y, "in_train", "length"])
-                if len(valid) > 0:
-                    _plot_scatter(
-                        summary_df,
-                        x_col=x,
-                        y_col=y,
-                        title=f"Top-{top_num} by pTM (model_2_ptm): TM vs {suffix}",
-                        xlabel="AF2 pTM" if suffix == "ptm" else f"Composite score" if suffix == "composite" else "pLDDT",
-                        ylabel="TM(ref vs pred)",
-                        out_path=out_dir_path / f"tm_ref_pred_vs_{suffix}_top{top_num}_topk{int(args.top_k)}_model_2_ptm.png",
-                    )
-        # Min across models plots
-        if "min_max_ptm_topk" in summary_df.columns:
-            valid = summary_df.dropna(subset=["reference_tm", "min_max_ptm_topk", "in_train", "length"])
-            if len(valid) > 0:
-                _plot_scatter(
-                    summary_df,
-                    x_col="reference_tm",
-                    y_col="min_max_ptm_topk",
-                    title=f"Reference TM vs min(pTM_1,pTM_2) (top-{int(args.top_k)})",
-                    xlabel="Reference TM score",
-                    ylabel="min(pTM_1, pTM_2)",
-                    out_path=out_dir_path / f"ref_tm_vs_af2rank_ptm_topk{int(args.top_k)}_min.png",
-                )
-        for suffix, x, y, top_num in [
-            ("ptm", "min_top_1_ptm", "min_top_1_tm_ref_pred", "1"),
-            ("ptm", "min_top_5_ptm", "min_top_5_tm_ref_pred", "5"),
-            ("composite", "min_top_1_composite", "min_top_1_tm_ref_pred", "1"),
-            ("composite", "min_top_5_composite", "min_top_5_tm_ref_pred", "5"),
-            ("plddt", "min_top_1_plddt", "min_top_1_tm_ref_pred", "1"),
-            ("plddt", "min_top_5_plddt", "min_top_5_tm_ref_pred", "5"),
-        ]:
-            if x in summary_df.columns and y in summary_df.columns:
-                valid = summary_df.dropna(subset=[x, y, "in_train", "length"])
-                if len(valid) > 0:
-                    _plot_scatter(
-                        summary_df,
-                        x_col=x,
-                        y_col=y,
-                        title=f"Top-{top_num} by min(pTM): TM vs {suffix}",
-                        xlabel="min(pTM)" if suffix == "ptm" else f"min(composite)" if suffix == "composite" else "min(pLDDT)",
-                        ylabel="TM(ref vs pred)",
-                        out_path=out_dir_path / f"tm_ref_pred_vs_{suffix}_top{top_num}_topk{int(args.top_k)}_min.png",
-                    )
+    logger.info(f"Summary CSV written to {summary_csv} — cross-protein plots are generated by generate_cross_protein_plots.py")
 
 
 if __name__ == "__main__":

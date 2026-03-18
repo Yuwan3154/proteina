@@ -19,6 +19,7 @@ output_map.json: written on success, maps input_path -> reconstructed_path
 import argparse
 import json
 import os
+import re
 import sys
 import tempfile
 
@@ -29,6 +30,20 @@ import cg2all.lib.libmodel
 from cg2all.lib.libconfig import MODEL_HOME
 from cg2all.lib.libdata import PredictionData, create_trajectory_from_batch
 from cg2all.lib.libter import patch_termini
+
+
+def _fix_pdb_model_number(pdb_path: str) -> None:
+    """Rewrite MODEL 0 → MODEL 1 in cg2all PDB output.
+
+    MDAnalysis (used by cg2all) writes 0-indexed MODEL records, but the PDB
+    format standard and OpenFold's template reader expect 1-indexed models.
+    """
+    with open(pdb_path) as f:
+        text = f.read()
+    patched = re.sub(r"^MODEL(\s+)0(\s*)$", r"MODEL\g<1>1\2", text, flags=re.MULTILINE)
+    if patched != text:
+        with open(pdb_path, "w") as f:
+            f.write(patched)
 
 
 def main():
@@ -86,6 +101,7 @@ def main():
             out_name = os.path.splitext(os.path.basename(pdb_files[idx]))[0] + "_allatom.pdb"
             out_path = os.path.join(args.output_dir, out_name)
             output.save(out_path)
+            _fix_pdb_model_number(out_path)
             result[pdb_files[idx]] = out_path
 
     with open(args.output_map, 'w') as f:

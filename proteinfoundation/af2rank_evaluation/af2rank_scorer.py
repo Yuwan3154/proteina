@@ -357,7 +357,7 @@ def tmscore(x, y, tmscore_exe="USalign"):
         if os.path.exists(exe) or os.system(f"which {exe} > /dev/null 2>&1") == 0:
             cmd = f'{exe} {f1.name} {f2.name}'
             if exe == "USalign":
-                cmd += " -TMscore 1"
+                cmd += " -TMscore 5"
             output = os.popen(cmd).readlines()
             break
     else:
@@ -398,6 +398,21 @@ def _is_ca_only_pdb(pdb_file):
                 if len(atom_names) > 1:
                     return False
     return atom_names == {"CA"} or len(atom_names) == 0
+
+
+def _fix_pdb_model_number(pdb_path: str) -> None:
+    """Rewrite MODEL 0 → MODEL 1 in cg2all PDB output.
+
+    MDAnalysis (used by cg2all) writes 0-indexed MODEL records, but the PDB
+    format standard and OpenFold's template reader expect 1-indexed models.
+    """
+    import re
+    with open(pdb_path) as f:
+        text = f.read()
+    patched = re.sub(r"^MODEL(\s+)0(\s*)$", r"MODEL\g<1>1\2", text, flags=re.MULTILINE)
+    if patched != text:
+        with open(pdb_path, "w") as f:
+            f.write(patched)
 
 
 def _reconstruct_ca_only_pdbs(pdb_files):
@@ -458,6 +473,7 @@ def _reconstruct_ca_only_pdbs(pdb_files):
                 fd, out_path = tempfile.mkstemp(suffix=".pdb", prefix="cg2all_")
                 os.close(fd)
                 output.save(out_path)
+                _fix_pdb_model_number(out_path)
                 result[pdb_files[idx]] = out_path
         logger.info(f"cg2all (direct): reconstructed {len(result)}/{len(pdb_files)} structures")
         return result

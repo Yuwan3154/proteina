@@ -191,7 +191,7 @@ def tmscore_ca_coords(x: np.ndarray, y: np.ndarray, tmscore_exe: str = "USalign"
 
     cmd = [exe, f1.name, f2.name]
     if os.path.basename(exe) == "USalign":
-        cmd += ["-TMscore", "1"]
+        cmd += ["-TMscore", "5"]
 
     output = subprocess.check_output(cmd, text=True)
     os.unlink(f1.name)

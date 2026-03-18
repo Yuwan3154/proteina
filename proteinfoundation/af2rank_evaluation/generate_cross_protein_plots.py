@@ -95,6 +95,7 @@ def load_af2rank_on_proteinebm_topk_data(
     id_column: str,
     tms_column: str,
     top_k: int,
+    proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
 ) -> pd.DataFrame:
     """
     Load per-protein summary metrics from AF2Rank-on-ProteinEBM-topk score CSVs.
@@ -106,6 +107,8 @@ def load_af2rank_on_proteinebm_topk_data(
       - top_1_tm_ref_template: tm_ref_template at rank 1 (same entry as top_1_tm_ref_pred)
       - top_5_tm_ref_template: tm_ref_template for the entry that achieves top_5_tm_ref_pred
       - n_scored: number of AF2Rank-scored templates available in that folder
+      - min_energy_topk: minimum ProteinEBM energy among top-k templates
+      - max_ptm_topk / m2_max_ptm_topk / min_max_ptm_topk: best pTM per model variant
 
     If fewer than 5 entries exist, we use whatever is present.
     """
@@ -150,6 +153,15 @@ def load_af2rank_on_proteinebm_topk_data(
         }
 
     def _merge_min(m1_df: pd.DataFrame, m2_df: pd.DataFrame, staged_names: set) -> pd.DataFrame:
+        """Merge model_1 and model_2 AF2Rank results, taking element-wise min per metric.
+
+        Each metric (ptm, tm_ref_pred, composite, plddt, tm_ref_template) is
+        independently minimised across the two models for every structure.  This
+        means that, for a given structure, the reported ``ptm`` and
+        ``tm_ref_pred`` may originate from *different* models — the result is a
+        conservative / pessimistic estimate rather than a consistent single-model
+        selection.
+        """
         needed = {"structure_file", "ptm", "tm_ref_pred"}
         if not needed.issubset(m1_df.columns) or not needed.issubset(m2_df.columns):
             return pd.DataFrame()
@@ -163,6 +175,7 @@ def load_af2rank_on_proteinebm_topk_data(
         m1 = m1_df[m1_df["structure_file"].astype(str).isin(staged_names)].copy()
         m2 = m2_df[m2_df["structure_file"].astype(str).isin(staged_names)].copy()
         merged = m1.merge(m2, on="structure_file", how="inner", suffixes=("_m1", "_m2"))
+        # Element-wise min across models (independent per metric — see docstring).
         merged["ptm"] = merged[["ptm_m1", "ptm_m2"]].min(axis=1)
         merged["tm_ref_pred"] = merged[["tm_ref_pred_m1", "tm_ref_pred_m2"]].min(axis=1)
         merged["composite"] = merged[["composite_m1", "composite_m2"]].min(axis=1)
@@ -193,6 +206,21 @@ def load_af2rank_on_proteinebm_topk_data(
             continue
 
         m2_path = Path(score_file).parent.parent / "af2rank_analysis_model_2_ptm" / Path(score_file).name
+
+        # Load ProteinEBM energy for this protein (min energy among top-k)
+        protein_dir = Path(score_file).parent.parent.parent
+        ebm_csv_path = protein_dir / proteinebm_analysis_subdir / f"proteinebm_scores_{protein_id}.csv"
+        min_energy = float("nan")
+        if ebm_csv_path.exists():
+            try:
+                ebm_df = pd.read_csv(ebm_csv_path)
+                if "energy" in ebm_df.columns and "structure_file" in ebm_df.columns:
+                    ebm_staged = ebm_df[ebm_df["structure_file"].astype(str).isin(staged_names)]
+                    if len(ebm_staged) > 0:
+                        min_energy = float(ebm_staged["energy"].astype(float).min())
+            except Exception as e:
+                logger.debug(f"Could not read ProteinEBM scores for {protein_id}: {e}")
+
         row = {
             "protein_id": protein_id,
             "n_scored": len(m1_df[m1_df["structure_file"].astype(str).isin(staged_names)]),
@@ -207,6 +235,9 @@ def load_af2rank_on_proteinebm_topk_data(
             "top_1_plddt": m1_metrics["top_1_plddt"],
             "top_5_plddt": m1_metrics["top_5_plddt"],
             "scores_csv": str(score_file),
+            "min_energy_topk": min_energy,
+            # max_ptm_topk = top_1_ptm (top-1 by pTM is the max pTM)
+            "max_ptm_topk": m1_metrics["top_1_ptm"],
         }
         if m2_path.exists():
             m2_df = pd.read_csv(m2_path)
@@ -218,6 +249,11 @@ def load_af2rank_on_proteinebm_topk_data(
                     if metrics:
                         for k, v in metrics.items():
                             row[f"{prefix}_{k}"] = v
+                # max pTM aliases for m2 and min variants
+                if m2_metrics:
+                    row["m2_max_ptm_topk"] = m2_metrics["top_1_ptm"]
+                if min_metrics:
+                    row["min_max_ptm_topk"] = min_metrics["top_1_ptm"]
         data.append(row)
 
     if len(data) == 0:
@@ -248,15 +284,63 @@ def load_af2rank_on_proteinebm_topk_data(
 def create_af2rank_on_proteinebm_topk_plots(df: pd.DataFrame, output_dir: str, tms_column: str, top_k: int) -> None:
     """
     Create cross-protein plots for AF2Rank-on-ProteinEBM-topk:
-      - Reference TM vs Top-1 tm_ref_pred (rank by pTM)
-      - Reference TM vs Top-5 tm_ref_pred (rank by pTM; uses min(5, n_scored))
-      - Template TM vs Prediction TM for Top-1 (same entry as top_1_tm_ref_pred)
-      - Template TM vs Prediction TM for Top-5 (entry achieving best tm_ref_pred among top-5 by pTM)
+      - Reference TM vs ProteinEBM energy (min energy among top-k)
+      - Reference TM vs AF2Rank pTM (max pTM among top-k, per model variant)
+      - Reference TM vs Top-1/Top-5 tm_ref_pred (rank by pTM)
+      - Template TM vs Prediction TM (top-1/top-5, per model variant)
+      - TM_ref_pred vs pTM / composite / pLDDT (per model variant)
     """
     os.makedirs(output_dir, exist_ok=True)
     plt.style.use("default")
 
-    # Figure 1: reference TM vs prediction TM (top-1/top-5)
+    # ── Helper: single-panel scatter ──────────────────────────────────────────
+    def _scatter_single(x_data, y_data, df_valid, title, xlabel, ylabel, out_path, diagonal=False):
+        fig, ax = plt.subplots(figsize=(10, 8))
+        ax.scatter(
+            x_data, y_data,
+            alpha=0.3,
+            c=df_valid["in_train"].map({True: "blue", False: "red"}),
+            s=df_valid["length"] / 1.5,
+        )
+        if diagonal:
+            ax.plot([0, 1], [0, 1], "r--", alpha=0.75, linewidth=2)
+        ax.set_xlabel(xlabel, fontsize=12)
+        ax.set_ylabel(ylabel, fontsize=12)
+        ax.set_title(title, fontsize=13)
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=900, bbox_inches="tight")
+        logger.info(f"Saved AF2Rank-on-ProteinEBM-topk plot: {out_path}")
+        plt.close()
+
+    # ── Figure 0a: Reference TM vs ProteinEBM energy ─────────────────────────
+    if "min_energy_topk" in df.columns:
+        valid_e = df.dropna(subset=[tms_column, "min_energy_topk", "in_train", "length"])
+        if len(valid_e) > 0:
+            _scatter_single(
+                valid_e[tms_column], valid_e["min_energy_topk"], valid_e,
+                f"Reference TM vs ProteinEBM energy (top-{int(top_k)} templates by min energy)",
+                "Reference TM score", "ProteinEBM energy (lower is better)",
+                os.path.join(output_dir, f"cross_protein_af2rank_on_proteinebm_top_k_ref_tm_vs_energy_top{int(top_k)}.png"),
+            )
+
+    # ── Figure 0b: Reference TM vs AF2Rank pTM (per variant) ─────────────────
+    for ptm_col, label, suffix in [
+        ("max_ptm_topk", "model_1", ""),
+        ("m2_max_ptm_topk", "model_2_ptm", "_model_2_ptm"),
+        ("min_max_ptm_topk", "min(pTM_1, pTM_2)", "_min"),
+    ]:
+        if ptm_col in df.columns:
+            valid_p = df.dropna(subset=[tms_column, ptm_col, "in_train", "length"])
+            if len(valid_p) > 0:
+                _scatter_single(
+                    valid_p[tms_column], valid_p[ptm_col], valid_p,
+                    f"Reference TM vs AF2Rank pTM ({label}, top-{int(top_k)})",
+                    "Reference TM score", f"AF2Rank pTM ({label})",
+                    os.path.join(output_dir, f"cross_protein_af2rank_on_proteinebm_top_k_ref_tm_vs_ptm_top{int(top_k)}{suffix}.png"),
+                )
+
+    # ── Figure 1: reference TM vs prediction TM (top-1/top-5) ────────────────
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 8))
 
     valid_1 = df.dropna(subset=[tms_column, "top_1_tm_ref_pred", "in_train", "length"])
@@ -295,54 +379,48 @@ def create_af2rank_on_proteinebm_topk_plots(df: pd.DataFrame, output_dir: str, t
     logger.info(f"Saved AF2Rank-on-ProteinEBM-topk plot: {out_path}")
     plt.close()
 
-    # Figure 2: template TM vs prediction TM (top-1/top-5)
-    fig2, (ax3, ax4) = plt.subplots(1, 2, figsize=(18, 8))
+    # ── Helper: template TM vs prediction TM (2-panel) ───────────────────────
+    def _plot_template_vs_prediction(df_plot, prefix, label, file_suffix):
+        t1_tmpl = f"{prefix}_top_1_tm_ref_template" if prefix else "top_1_tm_ref_template"
+        t1_pred = f"{prefix}_top_1_tm_ref_pred" if prefix else "top_1_tm_ref_pred"
+        t5_tmpl = f"{prefix}_top_5_tm_ref_template" if prefix else "top_5_tm_ref_template"
+        t5_pred = f"{prefix}_top_5_tm_ref_pred" if prefix else "top_5_tm_ref_pred"
+        if t1_tmpl not in df_plot.columns or t1_pred not in df_plot.columns:
+            return
+        fig_tv, (ax_l, ax_r) = plt.subplots(1, 2, figsize=(18, 8))
+        v1 = df_plot.dropna(subset=[t1_tmpl, t1_pred, "in_train", "length"])
+        if len(v1) > 0:
+            ax_l.scatter(v1[t1_tmpl], v1[t1_pred], alpha=0.3,
+                         c=v1["in_train"].map({True: "blue", False: "red"}), s=v1["length"] / 1.5)
+            ax_l.plot([0, 1], [0, 1], "r--", alpha=0.75, linewidth=2)
+            ax_l.set_xlabel(f"Top-1 Template TM ({label})", fontsize=12)
+            ax_l.set_ylabel(f"Top-1 Prediction TM ({label})", fontsize=12)
+            ax_l.set_title(f"Template TM vs Prediction TM (Top-1, {label})\n(AF2Rank on ProteinEBM top-{int(top_k)} templates)", fontsize=13)
+            ax_l.grid(True, alpha=0.3)
+        v5 = df_plot.dropna(subset=[t5_tmpl, t5_pred, "in_train", "length"])
+        if len(v5) > 0:
+            ax_r.scatter(v5[t5_tmpl], v5[t5_pred], alpha=0.3,
+                         c=v5["in_train"].map({True: "blue", False: "red"}), s=v5["length"] / 1.5)
+            ax_r.plot([0, 1], [0, 1], "r--", alpha=0.75, linewidth=2)
+            ax_r.set_xlabel(f"Top-5 Template TM ({label})", fontsize=12)
+            ax_r.set_ylabel(f"Top-5 Prediction TM ({label})", fontsize=12)
+            ax_r.set_title(f"Template TM vs Prediction TM (Top-5, {label})\n(AF2Rank on ProteinEBM top-{int(top_k)} templates)", fontsize=13)
+            ax_r.grid(True, alpha=0.3)
+        plt.tight_layout()
+        fname = f"cross_protein_af2rank_on_proteinebm_top_k_template_vs_prediction_top{int(top_k)}{file_suffix}.png"
+        out = os.path.join(output_dir, fname)
+        plt.savefig(out, dpi=900, bbox_inches="tight")
+        logger.info(f"Saved AF2Rank-on-ProteinEBM-topk plot: {out}")
+        plt.close()
 
-    valid_3 = df.dropna(subset=["top_1_tm_ref_template", "top_1_tm_ref_pred", "in_train", "length"])
-    if len(valid_3) > 0:
-        ax3.scatter(
-            valid_3["top_1_tm_ref_template"],
-            valid_3["top_1_tm_ref_pred"],
-            alpha=0.3,
-            c=valid_3["in_train"].map({True: "blue", False: "red"}),
-            s=valid_3["length"] / 1.5,
-        )
-        ax3.plot([0, 1], [0, 1], "r--", alpha=0.75, linewidth=2)
-        ax3.set_xlabel("Top-1 Template TM (tm_ref_template) by pTM", fontsize=12)
-        ax3.set_ylabel("Top-1 Prediction TM (tm_ref_pred) by pTM", fontsize=12)
-        ax3.set_title(
-            f"Template TM vs Prediction TM (Top-1 by pTM)\n(AF2Rank on ProteinEBM top-{int(top_k)} templates)",
-            fontsize=13,
-        )
-        ax3.grid(True, alpha=0.3)
+    # ── Figure 2: template TM vs prediction TM (all model variants) ──────────
+    _plot_template_vs_prediction(df, "", "model_1", "")
+    if "m2_top_1_tm_ref_template" in df.columns:
+        _plot_template_vs_prediction(df, "m2", "model_2_ptm", "_model_2_ptm")
+    if "min_top_1_tm_ref_template" in df.columns:
+        _plot_template_vs_prediction(df, "min", "min", "_min")
 
-    valid_4 = df.dropna(subset=["top_5_tm_ref_template", "top_5_tm_ref_pred", "in_train", "length"])
-    if len(valid_4) > 0:
-        ax4.scatter(
-            valid_4["top_5_tm_ref_template"],
-            valid_4["top_5_tm_ref_pred"],
-            alpha=0.3,
-            c=valid_4["in_train"].map({True: "blue", False: "red"}),
-            s=valid_4["length"] / 1.5,
-        )
-        ax4.plot([0, 1], [0, 1], "r--", alpha=0.75, linewidth=2)
-        ax4.set_xlabel("Top-5 Template TM (tm_ref_template for best tm_ref_pred in top-5 by pTM)", fontsize=12)
-        ax4.set_ylabel("Top-5 Prediction TM (best tm_ref_pred in top-5 by pTM)", fontsize=12)
-        ax4.set_title(
-            f"Template TM vs Prediction TM (Top-5 by pTM)\n(AF2Rank on ProteinEBM top-{int(top_k)} templates)",
-            fontsize=13,
-        )
-        ax4.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    out_path2 = os.path.join(
-        output_dir, f"cross_protein_af2rank_on_proteinebm_top_k_template_vs_prediction_top{int(top_k)}.png"
-    )
-    plt.savefig(out_path2, dpi=900, bbox_inches="tight")
-    logger.info(f"Saved AF2Rank-on-ProteinEBM-topk plot: {out_path2}")
-    plt.close()
-
-    # Figure 3: TM_ref_pred vs pTM (does AF2 confidence correlate with prediction quality?)
+    # ── Figure 3: TM_ref_pred vs pTM (does AF2 confidence correlate with prediction quality?)
     if "top_1_ptm" in df.columns and "top_5_ptm" in df.columns:
         fig3, (ax5, ax6) = plt.subplots(1, 2, figsize=(18, 8))
 
@@ -385,7 +463,7 @@ def create_af2rank_on_proteinebm_topk_plots(df: pd.DataFrame, output_dir: str, t
         logger.info(f"Saved AF2Rank-on-ProteinEBM-topk plot: {out_path3}")
         plt.close()
 
-    # Figure 4: TM_ref_pred vs composite score
+    # ── Figure 4: TM_ref_pred vs composite score
     if "top_1_composite" in df.columns and "top_5_composite" in df.columns:
         fig4, (ax7, ax8) = plt.subplots(1, 2, figsize=(18, 8))
 
@@ -428,7 +506,7 @@ def create_af2rank_on_proteinebm_topk_plots(df: pd.DataFrame, output_dir: str, t
         logger.info(f"Saved AF2Rank-on-ProteinEBM-topk plot: {out_path4}")
         plt.close()
 
-    # Figure 5: TM_ref_pred vs pLDDT
+    # ── Figure 5: TM_ref_pred vs pLDDT
     if "top_1_plddt" in df.columns and "top_5_plddt" in df.columns:
         fig5, (ax9, ax10) = plt.subplots(1, 2, figsize=(18, 8))
 
@@ -471,6 +549,7 @@ def create_af2rank_on_proteinebm_topk_plots(df: pd.DataFrame, output_dir: str, t
         logger.info(f"Saved AF2Rank-on-ProteinEBM-topk plot: {out_path5}")
         plt.close()
 
+    # ── Per-variant plots (m2 / min) for confidence vs prediction quality ─────
     def _plot_variant(df_plot: pd.DataFrame, prefix: str, label: str, xlabel_override: dict = None) -> None:
         xlabel_override = xlabel_override or {}
         for suffix, x, y, top_num in [
@@ -1341,6 +1420,7 @@ def main():
             args.id_column,
             args.tms_column,
             top_k=int(args.af2rank_top_k),
+            proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
         )
     else:
         if args.proteinebm_plot_mode == "tm":

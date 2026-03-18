@@ -185,7 +185,7 @@ def run_usalign(pdb_path: str, pdb_chain: str, afdb_path: str, usalign_path: str
         '-chain1', pdb_chain,
         afdb_path,
         '-chain2', 'A',
-        '-TMscore', '1',
+        '-TMscore', '5',
         '-outfmt', '2'
     ]
     
