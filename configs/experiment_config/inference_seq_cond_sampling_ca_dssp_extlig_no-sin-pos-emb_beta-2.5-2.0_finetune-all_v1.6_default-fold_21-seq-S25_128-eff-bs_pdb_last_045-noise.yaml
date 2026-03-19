@@ -1,0 +1,42 @@
+# Inference config: seq-conditioned sampling for PDB-only ext_lig model (no sinusoidal positional embedding).
+# Checkpoint from training with zero_sin_pos_emb enabled.
+# ext_lig_default: "unknown" for unconditional-style; "absent" for apo/ligand-free.
+
+defaults:
+  - inference_base
+  - _self_
+
+run_name_: seq_cond_pdb_no-sin-pos-emb
+ckpt_name: ca_dssp_extlig_no-sin-pos-emb_beta-2.5-2.0_finetune-all_v1.6_default-fold-sum_21-seq-S25_128-eff-bs_pdb_max768_purge-test_cutoff-190828_last.ckpt
+
+self_cond: True
+fold_cond: False
+cath_code_level: "T"
+seq_cond: True
+zero_sin_pos_emb: True
+
+data_dir: ${oc.env:DATA_PATH}/pdb_train/
+# Create from train split after first run: dfs_splits["train"].to_csv("cath_codes_train_<file_id>.csv", columns=["cath_code"])
+cath_code_file: cath_codes_train_df_pdb_f1_minl50_maxl256_mtprotein_etdiffractionEM_minoNone_maxoNone_minr0.0_maxr5.0_hl_rl_rnsrTrue_rpuTrue_l_rcuFalse.csv
+
+# ext_lig inference default: "unknown" (default) or "absent"
+ext_lig_default: "unknown"
+
+# Sampling
+dt: 0.005
+nsamples_per_len: 256
+max_nsamples: 4
+
+lora:
+  use: False
+  lora_alpha: 32.0
+  lora_dropout: 0.0
+  r: 0
+  train_bias: "none"
+
+sampling_caflow:
+  sampling_mode: sc
+  sc_scale_noise: 0.45
+
+compute_designability: False
+compute_fid: False

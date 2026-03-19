@@ -332,6 +332,10 @@ class IdxEmbeddingSeqFeat(Feature):
         super().__init__(dim=idx_emb_dim)
 
     def forward(self, batch):
+        # Zero out sinusoidal positional embedding when requested (fine-tuning mode)
+        if batch.get("_zero_idx_emb", False):
+            xt = batch["x_t"]  # [b, n, 3]
+            return torch.zeros(xt.shape[0], xt.shape[1], self.dim, device=xt.device, dtype=xt.dtype)
         # If it has the actual residue indices
         if "residue_pdb_idx" in batch:
             inds = batch["residue_pdb_idx"]  # [b, n]

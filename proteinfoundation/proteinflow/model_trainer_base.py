@@ -392,6 +392,10 @@ class ModelTrainerBase(L.LightningModule):
         if self.motif_conditioning and ("fixed_structure_mask" not in batch or "x_motif" not in batch):
             batch.update(self.motif_factory(batch, zeroes = True))  # for generation we have to pass conditioning info in. But for validation do the same as training
 
+        # Zero out sinusoidal positional embedding during inference if configured
+        if getattr(self, "_inf_zero_sin_pos_emb", False):
+            batch["_zero_idx_emb"] = True
+
         nn_out = self.nn(batch, force_compile=force_compile)
         x_pred = self._nn_out_to_x_clean(nn_out, batch)
         c_pred = self._nn_out_to_c_clean(nn_out, batch)
@@ -839,8 +843,11 @@ class ModelTrainerBase(L.LightningModule):
         mask_extlig = self.cfg_exp.training.get("mask_extlig_proportion", 0.0)
         if mask_extlig > 0 and "ext_lig" in batch and getattr(self.cfg_exp.model.nn, "ext_lig_emb_dim", None):
             batch["ext_lig"] = mask_seq(batch["ext_lig"], mask, mask_extlig, mask_value=2)
-        
-        
+
+        # Zero out sinusoidal positional embedding (for fine-tuning without position info)
+        if self.cfg_exp.training.get("zero_sin_pos_emb", False):
+            batch["_zero_idx_emb"] = True
+
         # Prediction for self-conditioning
         if random.random() > 0.5 and self.cfg_exp.training.self_cond:
             if contact_map_mode:
@@ -1662,6 +1669,7 @@ class ModelTrainerBase(L.LightningModule):
         and autoguidance network (or None if not provided)."""
         self.inf_cfg = inf_cfg
         self.nn_ag = nn_ag
+        self._inf_zero_sin_pos_emb = bool(inf_cfg.get("zero_sin_pos_emb", False))
         if self.discrete_diffusion is not None:
             sampling_grid = inf_cfg.get("sampling_grid", None)
             if sampling_grid is not None:
