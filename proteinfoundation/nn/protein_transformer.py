@@ -902,18 +902,25 @@ class ProteinTransformerAF3(torch.nn.Module):
         return seqs[:, r:, :], pair[:, r:, r:, :], mask[:, r:]
 
     def forward(self, batch_nn: Dict[str, torch.Tensor], force_compile: bool = False):
-        # TorchDynamo treats `requires_grad` / grad-mode as a compile guard. In Lightning we
-        # call the model under both grad-enabled (training) and `torch.no_grad()` (validation,
-        # validation sampling, self-conditioning helpers). If we always run the compiled graph,
-        # Dynamo will keep recompiling on these mode switches until hitting `recompile_limit`
-        # and then fall back to eager.
+        # TorchDynamo treats `requires_grad` / grad-mode as a compile guard. If a single
+        # compiled artifact is shared across grad-enabled (training) and `torch.no_grad()`
+        # (validation) contexts, Dynamo will keep recompiling on these mode switches until
+        # hitting `recompile_limit` and then fall back to eager.
         #
-        # To keep training fast/stable and avoid validation recompiles, only use `torch.compile`
-        # in grad-enabled contexts and run eager under `no_grad()`.
-        if self.use_torch_compile and (torch.is_grad_enabled() or force_compile):
-            if getattr(self, "_forward_compiled", None) is None:
-                self._forward_compiled = torch.compile(self._forward_impl)
-            return self._forward_compiled(batch_nn)
+        # Strategy: maintain TWO separate compiled artifacts — one for grad-enabled contexts
+        # (training) and one for no-grad contexts (validation/inference). Each gets its own
+        # independent guard cache so switching between train/eval never triggers recompilation.
+        if self.use_torch_compile:
+            if torch.is_grad_enabled():
+                # Training path: grad-enabled compiled artifact
+                if getattr(self, "_forward_compiled_train", None) is None:
+                    self._forward_compiled_train = torch.compile(self._forward_impl)
+                return self._forward_compiled_train(batch_nn)
+            else:
+                # Validation/inference path: no-grad compiled artifact
+                if getattr(self, "_forward_compiled_eval", None) is None:
+                    self._forward_compiled_eval = torch.compile(self._forward_impl)
+                return self._forward_compiled_eval(batch_nn)
         return self._forward_impl(batch_nn)
 
     def _forward_impl(self, batch_nn: Dict[str, torch.Tensor]):
