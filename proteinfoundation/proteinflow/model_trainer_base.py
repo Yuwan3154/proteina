@@ -1540,6 +1540,45 @@ class ModelTrainerBase(L.LightningModule):
     def on_validation_epoch_end_data(self):
         self.validation_output_data = []
 
+    def _resolve_validation_length_bounds(self, val_sampling_cfg) -> tuple:
+        """Return (min_length, max_length) for validation trajectory sampling, or (None, None).
+
+        Order: explicit ``validation_sampling.{min,max}_length`` → datamodule dataselector
+        → optional ``cfg_exp.dataset_length_bounds``.
+        """
+        mn = val_sampling_cfg.get("min_length")
+        mx = val_sampling_cfg.get("max_length")
+        if mn is not None and mx is not None:
+            return int(mn), int(mx)
+        dm = getattr(self.trainer, "datamodule", None)
+        if dm is not None:
+            ds = getattr(dm, "dataselector", None)
+            if ds is not None:
+                m = getattr(ds, "min_length", None)
+                x = getattr(ds, "max_length", None)
+                if m is not None and x is not None:
+                    return int(m), int(x)
+        db = self.cfg_exp.get("dataset_length_bounds")
+        if db is not None and db.get("min_length") is not None and db.get("max_length") is not None:
+            return int(db["min_length"]), int(db["max_length"])
+        return None, None
+
+    def _use_variable_length_validation_sampling(self, val_sampling_cfg, min_l, max_l) -> bool:
+        """Whether to sample a random length in [min_l, max_l] for validation trajectories."""
+        flag = val_sampling_cfg.get("variable_length_sampling", None)
+        if flag is False:
+            return False
+        if flag is True:
+            if min_l is None or max_l is None or max_l < min_l:
+                logger.warning(
+                    "variable_length_sampling=True but min/max length could not be resolved; "
+                    "using full padded width."
+                )
+                return False
+            return True
+        # Default when flag is omitted: enable when bounds are available.
+        return min_l is not None and max_l is not None and max_l >= min_l
+
     def _run_validation_trajectory(self, batch, val_sampling_cfg):
         if self.logger is None or not hasattr(self.logger, "experiment"):
             return
@@ -1591,6 +1630,26 @@ class ModelTrainerBase(L.LightningModule):
                 fixed_structure_mask = fs_mask[:nsamples].to(self.device)
             else:
                 fixed_structure_mask = fixed_sequence_mask[:, :, None] * fixed_sequence_mask[:, None, :]
+
+        # Variable-length validation trajectory: sample L ~ Uniform(min_length, max_length).
+        # Inputs stay padded to max length (fixed shapes for compile); only ``mask`` is set so
+        # positions [L:] are invalid (False), matching the sampled sequence length L.
+        min_l, max_l = self._resolve_validation_length_bounds(val_sampling_cfg)
+        if self._use_variable_length_validation_sampling(val_sampling_cfg, min_l, max_l):
+            n_pad = n
+            L = random.randint(min_l, max_l)
+            L = min(L, n_pad)  # cannot exceed padded tensor width
+            if L < min_l:
+                logger.warning(
+                    f"validation_sampling: padded width {n_pad} < min_length={min_l}; using L={L}."
+                )
+            mask = torch.zeros(nsamples, n_pad, dtype=torch.bool, device=self.device)
+            mask[:, :L] = True
+            # n, residue_type, cath_*, motif tensors unchanged — full padded width for static shapes
+            logger.info(
+                f"validation_sampling: variable length L={L} (bounds [{min_l}, {max_l}]), "
+                f"mask valid prefix on padded width {n_pad}"
+            )
 
         discrete_enabled = getattr(self, "contact_map_mode", False) and self._discrete_diffusion_enabled()
         prev_sampling_grid = None

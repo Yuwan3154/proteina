@@ -91,10 +91,17 @@ log:
   checkpoint: True
   last_ckpt_every_n_steps: 500
 
+# Validation trajectory (W&B structure): by default samples L uniformly in
+# [dataselector.min_length, dataselector.max_length]; inputs stay padded to max length (compile-friendly)
+# and ``mask`` is True only on the first L positions. Set variable_length_sampling: false to use the
+# batch mask as-is (typically all valid positions up to each structure's length).
 validation_sampling:
   dt: 0.005
   sampling_mode: sc
   sc_scale_noise: 0.45
+  # variable_length_sampling: false
+  # min_length: 50    # optional; overrides dataselector when both set with max_length
+  # max_length: 768
 
 seed: 42
 
