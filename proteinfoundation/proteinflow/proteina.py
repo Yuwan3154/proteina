@@ -654,6 +654,22 @@ class Proteina(ModelTrainerBase):
                 add_dataloader_idx=False,
                 rank_zero_only=True,
             )
+            # DSSP prediction accuracy (argmax vs ground-truth)
+            dssp_pred = dssp_logits.argmax(dim=-1)  # [b, n]
+            dssp_correct = (dssp_pred == dssp_target) & valid  # only valid residues
+            dssp_acc = dssp_correct.sum().float() / valid.sum().float().clamp(min=1)
+            self.log(
+                f"{log_prefix}/dssp_acc",
+                dssp_acc,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+                batch_size=mask.shape[0],
+                sync_dist=True,
+                add_dataloader_idx=False,
+                rank_zero_only=True,
+            )
 
         self.log(
             f"{log_prefix}/distogram_loss",
