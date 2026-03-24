@@ -287,6 +287,12 @@ def main():
         default=32,
         help="Batch size for ProteinEBM inference per protein (default: 32). Auto-reduces on OOM.",
     )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=None,
+        help="Parallel CPU workers for USalign TM-score vs reference when --cif_dir is set (default: clamp(os.cpu_count()), 1–64).",
+    )
     add_shard_args(parser)
     parser.add_argument(
         "--direct_python",
@@ -376,6 +382,8 @@ def main():
             "--t", str(args.proteinebm_t),
             "--batch_size", str(args.batch_size),
         ]
+        if args.num_workers is not None:
+            cmd.extend(["--num_workers", str(args.num_workers)])
         if not args.proteinebm_template_self_condition:
             cmd.append("--no-proteinebm_template_self_condition")
 

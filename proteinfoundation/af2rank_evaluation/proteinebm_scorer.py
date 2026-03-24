@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -33,6 +34,21 @@ from protein_ebm.data.protein_utils import residues_to_features
 from protein_ebm.model.boltz_utils import center_random_augmentation
 from protein_ebm.model.ebm import ProteinEBM
 from protein_ebm.model.r3_diffuser import R3Diffuser
+
+
+_USALIGN_PARALLEL_ENV = {
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+}
+
+
+def _resolve_tm_workers(explicit: Optional[int]) -> int:
+    """Clamp CPU worker count for parallel USalign (1–64); mirrors proteina_diversity.resolve_num_workers."""
+    if explicit is not None:
+        return max(1, min(64, int(explicit)))
+    n = os.cpu_count() or 1
+    return max(1, min(64, n))
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +225,30 @@ def tmscore_ca_coords(
     output = subprocess.check_output(cmd, text=True, env=subprocess_env)
     os.unlink(f1.name)
     os.unlink(f2.name)
+    return _parse_usalign_output(output.splitlines())
+
+
+def tmscore_pdb_paths(
+    path_a: str,
+    path_b: str,
+    tmscore_exe: str = "USalign",
+    env: Optional[Dict[str, str]] = None,
+) -> Dict[str, float]:
+    """
+    Run USalign (or TMscore) on two existing PDB files. Same -TMscore 5 mode as
+    tmscore_ca_coords when the executable is USalign. Avoids writing temporary PDBs.
+    """
+    exe = shutil.which(tmscore_exe) or shutil.which("USalign") or shutil.which("TMscore")
+    if exe is None:
+        raise FileNotFoundError("Neither USalign nor TMscore found in PATH")
+    cmd = [exe, path_a, path_b]
+    if os.path.basename(exe) == "USalign":
+        cmd += ["-TMscore", "5"]
+    subprocess_env = None
+    if env is not None:
+        subprocess_env = os.environ.copy()
+        subprocess_env.update(env)
+    output = subprocess.check_output(cmd, text=True, env=subprocess_env)
     return _parse_usalign_output(output.splitlines())
 
 
@@ -541,6 +581,7 @@ def run_proteinebm_scoring_for_protein(
     model: "ProteinEBM | None" = None,
     batch_size_ref: "List[int] | None" = None,
     verbose: bool = False,
+    num_workers: Optional[int] = None,
 ) -> Tuple[str, str]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -579,15 +620,33 @@ def run_proteinebm_scoring_for_protein(
         verbose=verbose,
     )
 
-    # Build results with optional TM-score computation (still per-structure, CPU-bound)
+    # Build results with optional TM-score computation (CPU-bound; parallel USalign when num_workers>1)
+    tm_by_index: Dict[int, Dict[str, float]] = {}
+    if ref_coords is not None:
+        indices_with_energy = [i for i in range(len(pdb_files)) if i in energy_map]
+        workers = _resolve_tm_workers(num_workers)
+
+        def _tm_for_index(ii: int) -> Tuple[int, Dict[str, float]]:
+            decoy_coords = _extract_ca_coords(str(pdb_files[ii]), chain_id=None)
+            env = _USALIGN_PARALLEL_ENV if workers > 1 else None
+            return ii, tmscore_ca_coords(ref_coords, decoy_coords, env=env)
+
+        if workers <= 1:
+            for ii in indices_with_energy:
+                i, tm_out = _tm_for_index(ii)
+                tm_by_index[i] = tm_out
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                for i, tm_out in ex.map(_tm_for_index, indices_with_energy):
+                    tm_by_index[i] = tm_out
+
     results: List[Dict[str, object]] = []
     for i, pdb_path in enumerate(pdb_files):
         if i not in energy_map:
             continue
         energy = energy_map[i]
         if ref_coords is not None:
-            decoy_coords = _extract_ca_coords(str(pdb_path), chain_id=None)
-            tm_out = tmscore_ca_coords(ref_coords, decoy_coords)
+            tm_out = tm_by_index[i]
             tm_ref = tm_out["tms"]
             rmsd_ref = tm_out["rms"]
             gdt_ref = tm_out["gdt"]
@@ -731,6 +790,12 @@ def main():
     parser.add_argument("--verbose", action="store_true", default=False,
                         help="Print detailed diagnostics: model weight check, input tensor stats, "
                              "per-batch energy stats, and forward-hook NaN tracing.")
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=None,
+        help="Parallel CPU workers for USalign TM-score vs reference (default: clamp(os.cpu_count()), 1–64).",
+    )
 
     args = parser.parse_args()
 
@@ -788,6 +853,7 @@ def main():
                     model=model,
                     batch_size_ref=batch_size_ref,
                     verbose=args.verbose,
+                    num_workers=args.num_workers,
                 )
                 print(f"  Done: {protein_id}", flush=True)
             except Exception as e:
@@ -812,6 +878,7 @@ def main():
             template_self_condition=args.proteinebm_template_self_condition,
             batch_size=args.batch_size,
             verbose=args.verbose,
+            num_workers=args.num_workers,
         )
         print(f"Completed ProteinEBM scoring for {args.protein_id}", flush=True)
         print(f"Scores: {scores_csv}", flush=True)

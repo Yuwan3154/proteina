@@ -27,6 +27,7 @@ import json
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -340,52 +341,63 @@ def get_sequence_from_pdb(pdb_file, chain=None):
                 os.unlink(temp_pdb_file)
 
 
-def tmscore(x, y, tmscore_exe="USalign"):
-    """Calculate TMscore between two structures using temporary files."""
+def tmscore(x, y, tmscore_exe="USalign", env=None):
+    """Calculate TMscore between two structures using temporary files.
+
+    env: optional dict merged into the subprocess environment (e.g. OMP_NUM_THREADS=1
+    when multiple USalign processes run concurrently).
+    """
     with tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False) as f1, \
          tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False) as f2:
-        
-        # Save structures to temporary PDB files
         for f, z in zip([f1, f2], [x, y]):
             for k, c in enumerate(z):
-                f.write("ATOM  %5d  %-2s  %3s %s%4d    %8.3f%8.3f%8.3f  %4.2f  %4.2f\n" 
+                f.write("ATOM  %5d  %-2s  %3s %s%4d    %8.3f%8.3f%8.3f  %4.2f  %4.2f\n"
                           % (k+1, "CA", "ALA", "A", k+1, c[0], c[1], c[2], 1, 0))
             f.flush()
-    
-    # Run TMscore
+
+    output_lines = None
     for exe in [tmscore_exe, "./TMscore", "TMscore", "/usr/local/bin/TMscore"]:
         if os.path.exists(exe) or os.system(f"which {exe} > /dev/null 2>&1") == 0:
-            cmd = f'{exe} {f1.name} {f2.name}'
+            cmd = [exe, f1.name, f2.name]
             if exe == "USalign":
-                cmd += " -TMscore 5"
-            output = os.popen(cmd).readlines()
+                cmd += ["-TMscore", "5"]
+            subprocess_env = os.environ.copy()
+            if env is not None:
+                subprocess_env.update(env)
+            out = subprocess.check_output(cmd, text=True, env=subprocess_env)
+            output_lines = out.splitlines()
             break
     else:
         print("Warning: TMscore executable not found. Using RMSD calculation.")
         rmsd = _np_rmsd(x, y, use_jax=False)
+        for temp_file in [f1.name, f2.name]:
+            os.unlink(temp_file)
         return {"rms": rmsd, "tms": 0.0, "gdt": 0.0}
-    
-    # Parse outputs
-    parse_float = lambda x: float(x.split("=")[1].split()[0])
+
+    parse_float = lambda s: float(s.split("=")[1].split()[0])
     o = {"rms": 0.0, "tms": 0.0, "gdt": 0.0}
-        
-    for line in output:
+    for line in output_lines:
         line = line.rstrip()
-        if line.startswith("RMSD"): 
+        if line.startswith("RMSD"):
             o["rms"] = parse_float(line)
-        elif line.startswith("TM-score"): 
+        elif line.startswith("TM-score"):
             o["tms"] = parse_float(line)
-        elif line.startswith("GDT-TS-score"): 
+        elif line.startswith("GDT-TS-score"):
             o["gdt"] = parse_float(line)
-    
-    # Clean up temporary files
+
     for temp_file in [f1.name, f2.name]:
         os.unlink(temp_file)
-    
+
     return o
 
 
 _AF2RANK_EVAL_DIR = os.path.dirname(os.path.abspath(__file__))
+
+_USALIGN_PARALLEL_ENV = {
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+}
 
 
 def _is_ca_only_pdb(pdb_file):
@@ -839,26 +851,45 @@ class ModernAF2Rank:
         
         # Get predicted coordinates (CA atoms)
         pred_coords = aux["atom_positions"][:, 1]
-        
-        # TMscore calculations for AF2Rank analysis
-        if self.reference_coords is not None:
-            # TMscore between reference and prediction (key metric)
-            tm_ref_pred = tmscore(self.reference_coords, pred_coords)
+
+        # TMscore calculations (USalign subprocess; overlap up to 3 calls when all are needed)
+        n_tm = (
+            (self.reference_coords is not None)
+            + (template_coords is not None and self.reference_coords is not None)
+            + (template_coords is not None)
+        )
+        env = _USALIGN_PARALLEL_ENV if n_tm > 1 else None
+        fut_by_key = {}
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            if self.reference_coords is not None:
+                fut_by_key["ref_pred"] = ex.submit(
+                    tmscore, self.reference_coords, pred_coords, "USalign", env
+                )
+            if template_coords is not None and self.reference_coords is not None:
+                fut_by_key["ref_template"] = ex.submit(
+                    tmscore, self.reference_coords, template_coords, "USalign", env
+                )
+            if template_coords is not None:
+                fut_by_key["template_pred"] = ex.submit(
+                    tmscore, template_coords, pred_coords, "USalign", env
+                )
+            tm_by_key = {k: fut.result() for k, fut in fut_by_key.items()}
+
+        if "ref_pred" in tm_by_key:
+            tm_ref_pred = tm_by_key["ref_pred"]
             scores["tm_ref_pred"] = tm_ref_pred["tms"]
             scores["rmsd_ref_pred"] = tm_ref_pred["rms"]
             scores["gdt_ref_pred"] = tm_ref_pred.get("gdt", 0.0)
-        
-        if template_coords is not None:
-            # TMscore between reference and template (input quality)
-            if self.reference_coords is not None:
-                tm_ref_template = tmscore(self.reference_coords, template_coords)
-                scores["tm_ref_template"] = tm_ref_template["tms"]
-                scores["rmsd_ref_template"] = tm_ref_template["rms"]
-                scores["gdt_ref_template"] = tm_ref_template.get("gdt", 0.0)
-            
-            # TMscore between template and prediction (improvement)
-            tm_template_pred = tmscore(template_coords, pred_coords)
-            scores["tm_template_pred"] = tm_template_pred["tms"] 
+
+        if "ref_template" in tm_by_key:
+            tm_ref_template = tm_by_key["ref_template"]
+            scores["tm_ref_template"] = tm_ref_template["tms"]
+            scores["rmsd_ref_template"] = tm_ref_template["rms"]
+            scores["gdt_ref_template"] = tm_ref_template.get("gdt", 0.0)
+
+        if "template_pred" in tm_by_key:
+            tm_template_pred = tm_by_key["template_pred"]
+            scores["tm_template_pred"] = tm_template_pred["tms"]
             scores["rmsd_template_pred"] = tm_template_pred["rms"]
             scores["gdt_template_pred"] = tm_template_pred.get("gdt", 0.0)
         

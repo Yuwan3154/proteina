@@ -179,7 +179,7 @@ def run_af2rank_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpu
     env_name = 'proteina' if backend == 'openfold' else 'colabdesign'
     return run_with_conda_env(env_name, cmd, direct_python=direct_python)
 
-def run_proteinebm_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpus, proteinebm_config, proteinebm_checkpoint, proteinebm_template_self_condition=True, proteinebm_analysis_subdir='proteinebm_v2_cathmd_analysis', proteinebm_t=0.05, shard_args=None, direct_python: bool = False, rerun: bool = False):
+def run_proteinebm_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpus, proteinebm_config, proteinebm_checkpoint, proteinebm_template_self_condition=True, proteinebm_analysis_subdir='proteinebm_v2_cathmd_analysis', proteinebm_t=0.05, num_workers=None, shard_args=None, direct_python: bool = False, rerun: bool = False):
     """Run the ProteinEBM scoring pipeline."""
     logger.info("💸 Starting ProteinEBM scoring pipeline...")
 
@@ -196,6 +196,8 @@ def run_proteinebm_scoring(csv_file, csv_column, cif_dir, inference_config, num_
         '--proteinebm_analysis_subdir', proteinebm_analysis_subdir,
         '--proteinebm_t', str(proteinebm_t),
     ]
+    if num_workers is not None:
+        cmd.extend(['--num_workers', str(num_workers)])
     if not proteinebm_template_self_condition:
         cmd.append('--no-proteinebm_template_self_condition')
     if direct_python:
@@ -549,6 +551,7 @@ def main():
                 proteinebm_template_self_condition=args.proteinebm_template_self_condition,
                 proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
                 proteinebm_t=args.proteinebm_t,
+                num_workers=args.num_workers,
                 shard_args=shard_cli_args,
                 direct_python=args.direct_python,
                 rerun=args.rerun_score,

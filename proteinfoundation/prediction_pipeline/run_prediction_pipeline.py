@@ -144,6 +144,7 @@ def step_proteinebm_scoring(
     proteinebm_t: float = 0.05,
     proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
     batch_size: int = 32,
+    num_workers: int | None = None,
     shard_args: list | None = None,
     direct_python: bool = False,
     rerun: bool = False,
@@ -164,6 +165,8 @@ def step_proteinebm_scoring(
         "--batch_size", str(batch_size),
         # No --cif_dir: skips TM-score computation
     ]
+    if num_workers is not None:
+        cmd.extend(["--num_workers", str(num_workers)])
     if direct_python:
         cmd.append("--direct_python")
     if shard_args:
@@ -483,8 +486,8 @@ def main():
         "--num_workers",
         type=int,
         default=None,
-        help="Max parallel CPU workers for diversity (USalign) and future CPU-parallel steps; "
-             "default is clamped os.cpu_count() (1–64).",
+        help="Max parallel CPU workers for diversity (USalign), ProteinEBM reference TM (when CIF/TM is used), "
+             "and similar steps; default is clamped os.cpu_count() (1–64).",
     )
     parser.add_argument("--skip_scoring", action="store_true", help="Skip ProteinEBM scoring step")
     parser.add_argument("--skip_af2rank", action="store_true", help="Skip AF2Rank step")
@@ -585,6 +588,7 @@ def main():
             args.proteinebm_config, args.proteinebm_checkpoint,
             args.proteinebm_t, args.proteinebm_analysis_subdir,
             args.proteinebm_batch_size,
+            num_workers=args.num_workers,
             shard_args=shard_cli_args,
             direct_python=args.direct_python,
             rerun=args.rerun_score,

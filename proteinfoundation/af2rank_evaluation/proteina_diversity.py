@@ -21,7 +21,10 @@ import glob
 import json
 import logging
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import combinations
@@ -35,7 +38,7 @@ import matplotlib.pyplot as plt
 
 from proteinfoundation.af2rank_evaluation.proteinebm_scorer import (
     _extract_ca_coords,
-    tmscore_ca_coords,
+    tmscore_pdb_paths,
 )
 
 logger = logging.getLogger(__name__)
@@ -49,6 +52,62 @@ _USALIGN_PARALLEL_ENV = {
     "MKL_NUM_THREADS": "1",
     "OPENBLAS_NUM_THREADS": "1",
 }
+
+
+def _parse_usalign_dir_stdout(text: str) -> List[float]:
+    """
+    Extract the first TM-score per alignment block from `USalign -dir` stdout
+    (normalized by Structure_1), matching one value per unique pair.
+    """
+    out: List[float] = []
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        if lines[i].startswith("Name of Structure_1:"):
+            j = i + 1
+            while j < len(lines):
+                if lines[j].startswith("TM-score="):
+                    rest = lines[j].split("=", 1)[1].strip()
+                    out.append(float(rest.split()[0]))
+                    break
+                j += 1
+            i = j
+        i += 1
+    return out
+
+
+def _pairwise_tm_via_usalign_dir(
+    protein_dir: str,
+    basenames: List[str],
+    env: Optional[Dict[str, str]],
+) -> Optional[List[float]]:
+    """
+    Run one USalign process: all-against-all alignment for PDBs listed in a temp
+    chain list (see USalign -dir). Returns TM-scores in encounter order, or None
+    if USalign is missing or the command fails.
+    """
+    exe = shutil.which("USalign")
+    if exe is None:
+        return None
+    list_f = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8")
+    for b in basenames:
+        list_f.write(b + "\n")
+    list_f.close()
+    list_path = list_f.name
+    folder = os.path.abspath(protein_dir)
+    if not folder.endswith(os.sep):
+        folder = folder + os.sep
+    cmd = [exe, "-dir", folder, list_path, "-TMscore", "5"]
+    subprocess_env = os.environ.copy()
+    if env is not None:
+        subprocess_env.update(env)
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=subprocess_env)
+    os.unlink(list_path)
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "")[-2000:]
+        logger.warning(f"USalign -dir failed (rc={proc.returncode}): {tail}")
+        return None
+    return _parse_usalign_dir_stdout(proc.stdout)
 
 
 def resolve_num_workers(explicit: Optional[int]) -> int:
@@ -73,6 +132,7 @@ def compute_pairwise_tm(
     output_subdir: str = "proteina_diversity",
     skip_existing: bool = True,
     pair_workers: int = 1,
+    use_usalign_dir: bool = True,
 ) -> Optional[dict]:
     """
     Compute all-to-all pairwise TMscores for all Proteina samples of a protein.
@@ -80,7 +140,13 @@ def compute_pairwise_tm(
     Since all samples share the same sequence length, TM1 == TM2 (symmetric),
     so we only run USalign once per unique pair (i < j) and take TM1.
 
-    pair_workers: max concurrent USalign subprocesses for this protein (>= 1).
+    When use_usalign_dir is True and USalign is on PATH, uses a single
+    ``USalign -dir <folder> <chain_list> -TMscore 5`` run (all-against-all
+    built into USalign), which is much faster than one subprocess per pair.
+
+    Otherwise falls back to per-pair ``USalign pdb_i pdb_j -TMscore 5`` (via
+    tmscore_pdb_paths). pair_workers then
+    applies to that fallback: max concurrent USalign subprocesses (>= 1).
     When > 1, each subprocess uses OMP_NUM_THREADS=1 in its environment.
 
     Returns summary dict or None on failure.
@@ -104,51 +170,72 @@ def compute_pairwise_tm(
         logger.warning(f"{protein_id}: found {len(pdb_files)} PDB files, need >= 2 for pairwise TM")
         return None
 
-    # Extract CA coordinates from each PDB
-    ca_coords: List[np.ndarray] = []
+    # Validate each PDB (CA-extractable); keep paths for -dir and per-pair USalign on files
+    valid_pdbs: List[str] = []
+    valid_basenames: List[str] = []
     for pdb_path in pdb_files:
         try:
-            coords = _extract_ca_coords(pdb_path, chain_id=None)
-            ca_coords.append(coords)
+            _extract_ca_coords(pdb_path, chain_id=None)
+            valid_pdbs.append(pdb_path)
+            valid_basenames.append(os.path.basename(pdb_path))
         except Exception as e:
             logger.warning(f"{protein_id}: failed to extract CA coords from {os.path.basename(pdb_path)}: {e}")
 
-    n = len(ca_coords)
+    n = len(valid_pdbs)
     if n < 2:
         logger.warning(f"{protein_id}: only {n} valid structures after CA extraction, need >= 2")
         return None
 
-    # Compute pairwise TMscore for all unique pairs (i < j)
     n_pairs = n * (n - 1) // 2
     pw = max(1, int(pair_workers))
     pair_indices = list(combinations(range(n), 2))
-    logger.info(f"{protein_id}: computing {n_pairs} pairwise TMscores for {n} samples (pair_workers={pw})")
 
     tm_values: List[float] = []
-    use_parallel = pw > 1 and n_pairs > 0
-    tm_env = _USALIGN_PARALLEL_ENV if use_parallel else None
+    pairwise_mode = "per_pair"
+    tm_env = _USALIGN_PARALLEL_ENV if pw > 1 else None
 
-    def _pair_tm_safe(ij: tuple) -> Optional[float]:
-        i, j = ij
-        try:
-            result = tmscore_ca_coords(ca_coords[i], ca_coords[j], env=tm_env)
-            return float(result["tms"])
-        except Exception as e:
-            logger.warning(f"{protein_id}: TMscore failed for pair ({i},{j}): {e}")
-            return None
+    if use_usalign_dir and shutil.which("USalign"):
+        logger.info(
+            f"{protein_id}: computing {n_pairs} pairwise TMscores for {n} samples "
+            f"(USalign -dir single pass)"
+        )
+        tm_values = _pairwise_tm_via_usalign_dir(protein_dir, valid_basenames, tm_env) or []
+        if len(tm_values) != n_pairs:
+            logger.warning(
+                f"{protein_id}: USalign -dir parsed {len(tm_values)} TM-scores, expected {n_pairs}; "
+                "falling back to per-pair USalign"
+            )
+            tm_values = []
 
-    if use_parallel:
-        with ThreadPoolExecutor(max_workers=pw) as ex:
-            for val in ex.map(_pair_tm_safe, pair_indices):
-                if val is not None:
-                    tm_values.append(val)
-    else:
-        for i, j in pair_indices:
+    if not tm_values:
+        pairwise_mode = "per_pair"
+        logger.info(f"{protein_id}: computing {n_pairs} pairwise TMscores for {n} samples (pair_workers={pw})")
+        use_parallel = pw > 1 and n_pairs > 0
+        tm_env = _USALIGN_PARALLEL_ENV if use_parallel else None
+
+        def _pair_tm_safe(ij: tuple) -> Optional[float]:
+            i, j = ij
             try:
-                result = tmscore_ca_coords(ca_coords[i], ca_coords[j])
-                tm_values.append(result["tms"])
+                result = tmscore_pdb_paths(valid_pdbs[i], valid_pdbs[j], env=tm_env)
+                return float(result["tms"])
             except Exception as e:
                 logger.warning(f"{protein_id}: TMscore failed for pair ({i},{j}): {e}")
+                return None
+
+        if use_parallel:
+            with ThreadPoolExecutor(max_workers=pw) as ex:
+                for val in ex.map(_pair_tm_safe, pair_indices):
+                    if val is not None:
+                        tm_values.append(val)
+        else:
+            for i, j in pair_indices:
+                try:
+                    result = tmscore_pdb_paths(valid_pdbs[i], valid_pdbs[j])
+                    tm_values.append(result["tms"])
+                except Exception as e:
+                    logger.warning(f"{protein_id}: TMscore failed for pair ({i},{j}): {e}")
+    else:
+        pairwise_mode = "usalign_dir"
 
     if not tm_values:
         logger.warning(f"{protein_id}: no successful pairwise TMscore computations")
@@ -159,6 +246,7 @@ def compute_pairwise_tm(
         "protein_id": protein_id,
         "n_samples": n,
         "n_pairs": len(tm_values),
+        "pairwise_tm_mode": pairwise_mode,
         "mean_tem_to_tem_tm": float(tm_arr.mean()),
         "std_tem_to_tem_tm": float(tm_arr.std()),
         "median_tem_to_tem_tm": float(np.median(tm_arr)),
@@ -224,6 +312,7 @@ def compute_diversity_for_proteins(
     output_subdir: str = "proteina_diversity",
     skip_existing: bool = True,
     num_workers: Optional[int] = None,
+    use_usalign_dir: bool = True,
 ) -> Dict[str, dict]:
     """
     Compute pairwise TM diversity for each protein.
@@ -255,6 +344,7 @@ def compute_diversity_for_proteins(
             output_subdir=output_subdir,
             skip_existing=skip_existing,
             pair_workers=inner,
+            use_usalign_dir=use_usalign_dir,
         )
         return protein_id, summary, None
 
@@ -280,6 +370,7 @@ def compute_diversity_for_proteins(
                 output_subdir=output_subdir,
                 skip_existing=skip_existing,
                 pair_workers=inner,
+                use_usalign_dir=use_usalign_dir,
             )
             if summary is not None:
                 results[protein_id] = summary
@@ -337,6 +428,11 @@ def main():
         default=None,
         help="Max parallel CPU workers (clamped 1–64); default is clamped os.cpu_count()",
     )
+    parser.add_argument(
+        "--no_usalign_dir",
+        action="store_true",
+        help="Disable USalign -dir all-against-all (use per-pair USalign on PDB files only)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -364,6 +460,7 @@ def main():
         output_subdir=args.output_subdir,
         skip_existing=not args.rerun,
         num_workers=args.num_workers,
+        use_usalign_dir=not args.no_usalign_dir,
     )
 
     logger.info(f"Done. {len(results)} proteins with diversity metrics.")
