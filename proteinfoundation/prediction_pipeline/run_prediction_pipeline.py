@@ -479,6 +479,13 @@ def main():
     parser.add_argument("--skip_inference", action="store_true", help="Skip Proteina inference step")
     parser.add_argument("--skip_diversity", action="store_true",
                         help="Skip Proteina sample diversity analysis (all-to-all TMscore)")
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=None,
+        help="Max parallel CPU workers for diversity (USalign) and future CPU-parallel steps; "
+             "default is clamped os.cpu_count() (1–64).",
+    )
     parser.add_argument("--skip_scoring", action="store_true", help="Skip ProteinEBM scoring step")
     parser.add_argument("--skip_af2rank", action="store_true", help="Skip AF2Rank step")
     parser.add_argument("--rerun_proteina", action="store_true",
@@ -527,6 +534,8 @@ def main():
     logger.info(f"Top-k: {args.top_k}")
     logger.info(f"Backend: {args.backend}")
     logger.info(f"Output: {args.output_dir}")
+    from proteinfoundation.af2rank_evaluation.proteina_diversity import resolve_num_workers
+    logger.info(f"num_workers (CPU, diversity etc.): {resolve_num_workers(args.num_workers)}")
 
     # ── Step 1: Parse input and create PT files ──
     logger.info("\n" + "=" * 60)
@@ -560,6 +569,7 @@ def main():
         inference_dir = os.path.join(PROTEINA_BASE_DIR, "inference", args.inference_config)
         diversity_results = compute_diversity_for_proteins(
             inference_dir, protein_ids, skip_existing=not args.rerun_proteina,
+            num_workers=args.num_workers,
         )
         logger.info(f"Diversity analysis completed for {len(diversity_results)} proteins")
     elif args.skip_diversity:

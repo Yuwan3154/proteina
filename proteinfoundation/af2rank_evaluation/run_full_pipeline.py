@@ -358,6 +358,13 @@ def main():
                        help='Skip Proteina inference (only run scoring stage)')
     parser.add_argument('--skip_diversity', action='store_true',
                        help='Skip Proteina sample diversity analysis (all-to-all TMscore)')
+    parser.add_argument(
+        '--num_workers',
+        type=int,
+        default=None,
+        help='Max parallel CPU workers for diversity (USalign) and future CPU-parallel steps; '
+             'default is clamped os.cpu_count() (1–64).',
+    )
     parser.add_argument('--skip_scoring', action='store_true',
                        help='Skip scoring stage (AF2Rank or ProteinEBM depending on --scorer)')
     parser.add_argument('--skip_af2rank_on_top_k', action='store_true',
@@ -451,6 +458,8 @@ def main():
     logger.info(f"🔑 ID column: {args.id_column}")
     logger.info(f"🔑 TM score column: {args.tms_column}")
     logger.info(f"🔧 AF2Rank backend: {args.af2rank_backend}")
+    from proteinfoundation.af2rank_evaluation.proteina_diversity import resolve_num_workers
+    logger.info(f"🔩 num_workers (CPU, diversity etc.): {resolve_num_workers(args.num_workers)}")
     
     success = True
     
@@ -496,6 +505,7 @@ def main():
 
         diversity_results = compute_diversity_for_proteins(
             inference_dir, diversity_protein_ids, skip_existing=not args.rerun_proteina,
+            num_workers=args.num_workers,
         )
         logger.info(f"✅ Diversity analysis completed for {len(diversity_results)} proteins")
     elif args.skip_diversity:

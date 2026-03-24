@@ -12,6 +12,7 @@ Usage (standalone):
 Usage (as library):
     from proteinfoundation.af2rank_evaluation.proteina_diversity import (
         compute_pairwise_tm, compute_diversity_for_proteins, load_diversity_data,
+        resolve_num_workers,
     )
 """
 
@@ -21,6 +22,8 @@ import json
 import logging
 import os
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import combinations
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -37,6 +40,28 @@ from proteinfoundation.af2rank_evaluation.proteinebm_scorer import (
 
 logger = logging.getLogger(__name__)
 
+# Matplotlib is not thread-safe; outer protein pool uses multiple threads.
+_plot_lock = threading.Lock()
+
+# Subprocess env for USalign when multiple USalign runs overlap (avoids OpenMP oversubscription).
+_USALIGN_PARALLEL_ENV = {
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+}
+
+
+def resolve_num_workers(explicit: Optional[int]) -> int:
+    """
+    Resolve CPU worker budget for diversity (and pipeline) CPU-parallel steps.
+
+    If explicit is None, uses clamp(os.cpu_count()). Otherwise clamps explicit to [1, 64].
+    """
+    if explicit is not None:
+        return max(1, min(64, int(explicit)))
+    n = os.cpu_count() or 1
+    return max(1, min(64, n))
+
 
 # ---------------------------------------------------------------------------
 # Per-protein diversity computation
@@ -47,12 +72,16 @@ def compute_pairwise_tm(
     protein_id: str,
     output_subdir: str = "proteina_diversity",
     skip_existing: bool = True,
+    pair_workers: int = 1,
 ) -> Optional[dict]:
     """
     Compute all-to-all pairwise TMscores for all Proteina samples of a protein.
 
     Since all samples share the same sequence length, TM1 == TM2 (symmetric),
     so we only run USalign once per unique pair (i < j) and take TM1.
+
+    pair_workers: max concurrent USalign subprocesses for this protein (>= 1).
+    When > 1, each subprocess uses OMP_NUM_THREADS=1 in its environment.
 
     Returns summary dict or None on failure.
     """
@@ -77,12 +106,10 @@ def compute_pairwise_tm(
 
     # Extract CA coordinates from each PDB
     ca_coords: List[np.ndarray] = []
-    valid_files: List[str] = []
     for pdb_path in pdb_files:
         try:
             coords = _extract_ca_coords(pdb_path, chain_id=None)
             ca_coords.append(coords)
-            valid_files.append(pdb_path)
         except Exception as e:
             logger.warning(f"{protein_id}: failed to extract CA coords from {os.path.basename(pdb_path)}: {e}")
 
@@ -92,16 +119,36 @@ def compute_pairwise_tm(
         return None
 
     # Compute pairwise TMscore for all unique pairs (i < j)
-    tm_values: List[float] = []
     n_pairs = n * (n - 1) // 2
-    logger.info(f"{protein_id}: computing {n_pairs} pairwise TMscores for {n} samples")
+    pw = max(1, int(pair_workers))
+    pair_indices = list(combinations(range(n), 2))
+    logger.info(f"{protein_id}: computing {n_pairs} pairwise TMscores for {n} samples (pair_workers={pw})")
 
-    for i, j in combinations(range(n), 2):
+    tm_values: List[float] = []
+    use_parallel = pw > 1 and n_pairs > 0
+    tm_env = _USALIGN_PARALLEL_ENV if use_parallel else None
+
+    def _pair_tm_safe(ij: tuple) -> Optional[float]:
+        i, j = ij
         try:
-            result = tmscore_ca_coords(ca_coords[i], ca_coords[j])
-            tm_values.append(result["tms"])
+            result = tmscore_ca_coords(ca_coords[i], ca_coords[j], env=tm_env)
+            return float(result["tms"])
         except Exception as e:
             logger.warning(f"{protein_id}: TMscore failed for pair ({i},{j}): {e}")
+            return None
+
+    if use_parallel:
+        with ThreadPoolExecutor(max_workers=pw) as ex:
+            for val in ex.map(_pair_tm_safe, pair_indices):
+                if val is not None:
+                    tm_values.append(val)
+    else:
+        for i, j in pair_indices:
+            try:
+                result = tmscore_ca_coords(ca_coords[i], ca_coords[j])
+                tm_values.append(result["tms"])
+            except Exception as e:
+                logger.warning(f"{protein_id}: TMscore failed for pair ({i},{j}): {e}")
 
     if not tm_values:
         logger.warning(f"{protein_id}: no successful pairwise TMscore computations")
@@ -138,31 +185,32 @@ def plot_pairwise_tm_histogram(
     protein_id: str,
 ) -> None:
     """Save histogram of pairwise TMscores."""
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.hist(tm_values, bins=30, edgecolor="black", alpha=0.7, color="#4C72B0")
-    ax.set_xlabel("Pairwise TM-score", fontsize=12)
-    ax.set_ylabel("Count", fontsize=12)
-    ax.set_title(f"Sample-to-Sample TM-score Distribution — {protein_id}", fontsize=13)
+    with _plot_lock:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.hist(tm_values, bins=30, edgecolor="black", alpha=0.7, color="#4C72B0")
+        ax.set_xlabel("Pairwise TM-score", fontsize=12)
+        ax.set_ylabel("Count", fontsize=12)
+        ax.set_title(f"Sample-to-Sample TM-score Distribution — {protein_id}", fontsize=13)
 
-    tm_arr = np.array(tm_values)
-    annotation = (
-        f"N={len(tm_values)} pairs\n"
-        f"mean={tm_arr.mean():.3f}, median={np.median(tm_arr):.3f}\n"
-        f"std={tm_arr.std():.3f}"
-    )
-    ax.annotate(
-        annotation,
-        xy=(0.02, 0.95),
-        xycoords="axes fraction",
-        ha="left",
-        va="top",
-        fontsize=10,
-        bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", edgecolor="gray"),
-    )
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close()
+        tm_arr = np.array(tm_values)
+        annotation = (
+            f"N={len(tm_values)} pairs\n"
+            f"mean={tm_arr.mean():.3f}, median={np.median(tm_arr):.3f}\n"
+            f"std={tm_arr.std():.3f}"
+        )
+        ax.annotate(
+            annotation,
+            xy=(0.02, 0.95),
+            xycoords="axes fraction",
+            ha="left",
+            va="top",
+            fontsize=10,
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", edgecolor="gray"),
+        )
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
     logger.info(f"Pairwise TM histogram saved to {output_path}")
 
 
@@ -175,24 +223,67 @@ def compute_diversity_for_proteins(
     protein_ids: List[str],
     output_subdir: str = "proteina_diversity",
     skip_existing: bool = True,
+    num_workers: Optional[int] = None,
 ) -> Dict[str, dict]:
     """
-    Compute pairwise TM diversity for each protein sequentially.
+    Compute pairwise TM diversity for each protein.
+
+    Uses nested ThreadPoolExecutors: outer proteins (up to outer workers) and
+    inner pair_workers per protein so outer * inner <= max_workers.
+
+    num_workers: optional explicit cap; if None, uses resolve_num_workers(None) (clamped os.cpu_count()).
 
     Returns {protein_id: summary_dict} for proteins with valid results.
     """
     results: Dict[str, dict] = {}
-    for idx, protein_id in enumerate(protein_ids, 1):
+    w = resolve_num_workers(num_workers)
+    n_list = len(protein_ids)
+    outer = min(w, max(1, n_list))
+    inner = max(1, w // outer)
+    logger.info(
+        f"Diversity: num_workers={w} outer={outer} inner={inner} "
+        f"(proteins={n_list})"
+    )
+
+    def _one_protein(protein_id: str) -> tuple:
         protein_dir = os.path.join(inference_dir, protein_id)
         if not os.path.isdir(protein_dir):
-            logger.warning(f"[{idx}/{len(protein_ids)}] {protein_id}: directory not found, skipping")
-            continue
-        logger.info(f"[{idx}/{len(protein_ids)}] Processing {protein_id}")
+            return protein_id, None, "missing_dir"
         summary = compute_pairwise_tm(
-            protein_dir, protein_id, output_subdir=output_subdir, skip_existing=skip_existing,
+            protein_dir,
+            protein_id,
+            output_subdir=output_subdir,
+            skip_existing=skip_existing,
+            pair_workers=inner,
         )
-        if summary is not None:
-            results[protein_id] = summary
+        return protein_id, summary, None
+
+    if outer > 1 and n_list > 1:
+        with ThreadPoolExecutor(max_workers=outer) as ex:
+            futures = {ex.submit(_one_protein, pid): pid for pid in protein_ids}
+            for fut in as_completed(futures):
+                pid, summary, err = fut.result()
+                if err == "missing_dir":
+                    logger.warning(f"{pid}: directory not found, skipping")
+                elif summary is not None:
+                    results[pid] = summary
+    else:
+        for idx, protein_id in enumerate(protein_ids, 1):
+            protein_dir = os.path.join(inference_dir, protein_id)
+            if not os.path.isdir(protein_dir):
+                logger.warning(f"[{idx}/{len(protein_ids)}] {protein_id}: directory not found, skipping")
+                continue
+            logger.info(f"[{idx}/{len(protein_ids)}] Processing {protein_id}")
+            summary = compute_pairwise_tm(
+                protein_dir,
+                protein_id,
+                output_subdir=output_subdir,
+                skip_existing=skip_existing,
+                pair_workers=inner,
+            )
+            if summary is not None:
+                results[protein_id] = summary
+
     logger.info(f"Diversity computed for {len(results)}/{len(protein_ids)} proteins")
     return results
 
@@ -240,6 +331,12 @@ def main():
     parser.add_argument("--output_subdir", default="proteina_diversity",
                         help="Per-protein subdirectory for outputs (default: proteina_diversity)")
     parser.add_argument("--rerun", action="store_true", help="Recompute even if results exist")
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=None,
+        help="Max parallel CPU workers (clamped 1–64); default is clamped os.cpu_count()",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -266,6 +363,7 @@ def main():
         args.inference_dir, protein_ids,
         output_subdir=args.output_subdir,
         skip_existing=not args.rerun,
+        num_workers=args.num_workers,
     )
 
     logger.info(f"Done. {len(results)} proteins with diversity metrics.")

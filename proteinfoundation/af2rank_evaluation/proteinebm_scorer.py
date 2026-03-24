@@ -18,7 +18,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import yaml
@@ -170,10 +170,18 @@ def _parse_usalign_output(lines: list[str]) -> Dict[str, float]:
     return out
 
 
-def tmscore_ca_coords(x: np.ndarray, y: np.ndarray, tmscore_exe: str = "USalign") -> Dict[str, float]:
+def tmscore_ca_coords(
+    x: np.ndarray,
+    y: np.ndarray,
+    tmscore_exe: str = "USalign",
+    env: Optional[Dict[str, str]] = None,
+) -> Dict[str, float]:
     """
     Compute TM-score / RMSD / GDT-TS for two CA-traces using USalign (preferred) or TMscore.
     Requires the executable to be available in PATH.
+
+    If env is set, it is merged into the subprocess environment (e.g. OMP_NUM_THREADS=1
+    when many USalign processes run in parallel).
     """
     exe = shutil.which(tmscore_exe) or shutil.which("USalign") or shutil.which("TMscore")
     if exe is None:
@@ -193,7 +201,12 @@ def tmscore_ca_coords(x: np.ndarray, y: np.ndarray, tmscore_exe: str = "USalign"
     if os.path.basename(exe) == "USalign":
         cmd += ["-TMscore", "5"]
 
-    output = subprocess.check_output(cmd, text=True)
+    subprocess_env = None
+    if env is not None:
+        subprocess_env = os.environ.copy()
+        subprocess_env.update(env)
+
+    output = subprocess.check_output(cmd, text=True, env=subprocess_env)
     os.unlink(f1.name)
     os.unlink(f2.name)
     return _parse_usalign_output(output.splitlines())

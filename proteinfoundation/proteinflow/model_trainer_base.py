@@ -609,15 +609,25 @@ class ModelTrainerBase(L.LightningModule):
             return torch.where(tokens == 1, contact, non_contact)
         return tokens.float()
 
-    def _set_contact_map_self_cond(self, batch: Dict, c_1: torch.Tensor, use_self_cond: bool):
-        # Always initialize to zeros so all feature params are exercised in SC forward
-        batch["contact_map_sc"] = torch.zeros_like(c_1)
+    def _set_self_cond(self, batch: Dict, target_clean: torch.Tensor,
+                       contact_map_mode: bool, use_self_cond: bool):
+        """Set self-conditioning input in batch (zeros or model prediction).
+
+        Initializes the SC key to zeros first so all feature params are exercised,
+        then optionally runs an SC forward to produce a prediction.
+        """
+        sc_key = "contact_map_sc" if contact_map_mode else "x_sc"
+        batch[sc_key] = torch.zeros_like(target_clean)
+
         if use_self_cond:
             with torch.no_grad():
-                nn_out_sc = self.nn._forward_impl(batch)
-                c_pred_sc = self._nn_out_to_c_clean(nn_out_sc, batch)
-            if c_pred_sc is not None:
-                batch["contact_map_sc"] = self.detach_gradients(c_pred_sc)
+                nn_out_sc = self.nn(batch)
+                if contact_map_mode:
+                    pred_sc = self._nn_out_to_c_clean(nn_out_sc, batch)
+                else:
+                    pred_sc = self._nn_out_to_x_clean(nn_out_sc, batch)
+            if pred_sc is not None:
+                batch[sc_key] = self.detach_gradients(pred_sc)
 
     def sample_t(self, shape):
         dist_name = self.cfg_exp.loss.t_distribution.name
@@ -822,29 +832,10 @@ class ModelTrainerBase(L.LightningModule):
         if self.cfg_exp.training.get("zero_sin_pos_emb", False):
             batch["_zero_idx_emb"] = True
 
-        # Prediction for self-conditioning
-        # Initialize SC inputs to zeros before the SC forward so that all feature
-        # creators (e.g. ContactMapScPairFeat.linear_embed) exercise their parameters
-        # even on the first pass.  This avoids DDP "unused parameters" errors when
-        # torch.compile is active.
-        if contact_map_mode:
-            batch["contact_map_sc"] = torch.zeros_like(c_1)
-        else:
-            batch["x_sc"] = torch.zeros_like(x_1)
-
-        if random.random() > 0.5 and self.cfg_exp.training.self_cond:
-            if contact_map_mode:
-                with torch.no_grad():
-                    nn_out_sc = self.nn._forward_impl(batch)
-                    c_pred_sc = self._nn_out_to_c_clean(nn_out_sc, batch)
-                if c_pred_sc is not None:
-                    batch["contact_map_sc"] = self.detach_gradients(c_pred_sc)
-            else:
-                with torch.no_grad():
-                    nn_out_sc = self.nn._forward_impl(batch)
-                    x_pred_sc = self._nn_out_to_x_clean(nn_out_sc, batch)
-                if x_pred_sc is not None:
-                    batch["x_sc"] = self.detach_gradients(x_pred_sc)
+        # Self-conditioning: initialize SC key to zeros, optionally run SC forward
+        target_clean = c_1 if contact_map_mode else x_1
+        use_sc = random.random() > 0.5 and self.cfg_exp.training.self_cond
+        self._set_self_cond(batch, target_clean, contact_map_mode, use_sc)
 
         # Main prediction
         nn_out = self.predict_clean(batch)
