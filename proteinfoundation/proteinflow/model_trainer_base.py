@@ -79,16 +79,12 @@ class ModelTrainerBase(L.LightningModule):
         # Lazy OpenFold template inference helper
         self._template_inference = None
         self._logged_val_traj_epoch = -1
-        self._self_cond_copy_last_step = None
 
     def configure_optimizers(self):
         if self.cfg_exp.training.finetune_seq_cond_lora_only:
             opt_params = []
             opt_params_names = []
             for name, param in self.named_parameters():
-                if name.startswith("nn_sc."):
-                    param.requires_grad = False
-                    continue
                 if "residue_type" in name or "lora" in name:
                     param.requires_grad = True
                     opt_params.append(param)
@@ -100,11 +96,8 @@ class ModelTrainerBase(L.LightningModule):
             )
             print(f"Finetuning {opt_params_names}")
         else:
-            for name, param in self.named_parameters():
-                if name.startswith("nn_sc."):
-                    param.requires_grad = False
-                else:
-                    param.requires_grad = True
+            for param in self.parameters():
+                param.requires_grad = True
             optimizer = torch.optim.Adam(
                 [p for p in self.parameters() if p.requires_grad],
                 lr=self.cfg_exp.opt.lr,
@@ -171,21 +164,6 @@ class ModelTrainerBase(L.LightningModule):
             }
         
         return optimizer
-
-    def _maybe_update_self_cond_copy(self) -> None:
-        """Optionally sync a frozen self-conditioning model copy from the main model."""
-        nn_sc = getattr(self, "nn_sc", None)
-        if nn_sc is None:
-            return
-        update_every = int(self.cfg_exp.training.get("self_cond_copy_update_every", 1))
-        if update_every <= 0:
-            return
-        step = int(getattr(self, "global_step", 0))
-        last = self._self_cond_copy_last_step
-        if last is None or (step - int(last)) >= update_every:
-            with torch.no_grad():
-                nn_sc.load_state_dict(self.nn.state_dict(), strict=True)
-            self._self_cond_copy_last_step = step
 
     def on_after_backward(self) -> None:
         """Clears gradients when a non-finite loss was detected for this backward."""
@@ -634,9 +612,7 @@ class ModelTrainerBase(L.LightningModule):
     def _set_contact_map_self_cond(self, batch: Dict, c_1: torch.Tensor, use_self_cond: bool):
         if use_self_cond:
             with torch.no_grad():
-                self._maybe_update_self_cond_copy()
-                sc_model = getattr(self, "nn_sc", None) or self.nn
-                nn_out_sc = sc_model(batch)
+                nn_out_sc = self.nn(batch)
                 c_pred_sc = self._nn_out_to_c_clean(nn_out_sc, batch)
             if c_pred_sc is not None:
                 batch["contact_map_sc"] = self.detach_gradients(c_pred_sc)
@@ -855,20 +831,15 @@ class ModelTrainerBase(L.LightningModule):
                 # coordinate path is not applicable. We only need the raw nn outputs
                 # to extract contact_map_pred for self-conditioning.
                 with torch.no_grad():
-                    self._maybe_update_self_cond_copy()
-                    sc_model = getattr(self, "nn_sc", None) or self.nn
-                    nn_out_sc = sc_model(batch)
+                    nn_out_sc = self.nn(batch)
                     c_pred_sc = self._nn_out_to_c_clean(nn_out_sc, batch)
                 if c_pred_sc is not None:
-                    # `c_pred_sc` is already activated in model/data space.
                     batch["contact_map_sc"] = self.detach_gradients(c_pred_sc)
                 else:
                     batch["contact_map_sc"] = torch.zeros_like(c_1)
             else:
-                with torch.no_grad(): 
-                    self._maybe_update_self_cond_copy()
-                    sc_model = getattr(self, "nn_sc", None) or self.nn
-                    nn_out_sc = sc_model(batch)
+                with torch.no_grad():
+                    nn_out_sc = self.nn(batch)
                     x_pred_sc = self._nn_out_to_x_clean(nn_out_sc, batch)
                 if x_pred_sc is not None:
                     batch["x_sc"] = self.detach_gradients(x_pred_sc)

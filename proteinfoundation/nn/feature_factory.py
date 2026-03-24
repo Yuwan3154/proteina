@@ -715,6 +715,7 @@ class FeatureFactory(torch.nn.Module):
                 self.ext_lig_feat_creator.get_dim(), dim_feats_out, bias=False
             )
     
+    @torch.compiler.disable
     def apply_padding_mask(self, feature_tensor, mask):
         """
         Applies mask to features.
@@ -851,6 +852,7 @@ class IndividualFeatureFactory(torch.nn.Module):
             torch.nn.LayerNorm(dim_feats_out) if use_ln_out else torch.nn.Identity()
         )
 
+    @torch.compiler.disable
     def _apply_padding_mask(self, feature_tensor, mask):
         if self.mode == "seq":
             return feature_tensor * mask[..., None]

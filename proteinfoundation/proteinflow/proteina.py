@@ -9,7 +9,6 @@
 # its affiliates is strictly prohibited.
 
 
-import copy
 import os
 import random
 from math import prod
@@ -22,7 +21,6 @@ from lightning.pytorch.utilities.rank_zero import rank_zero_only
 from omegaconf import open_dict
 from scipy.spatial.transform import Rotation as ScipyRotation
 from torch import Tensor
-from torch.nn.modules.module import _IncompatibleKeys
 
 from proteinfoundation.flow_matching.r3n_fm import FlowMatcher
 from proteinfoundation.nn.protein_transformer import ProteinTransformerAF3
@@ -139,11 +137,6 @@ class Proteina(ModelTrainerBase):
         # Pass the DictConfig through so OmegaConf interpolations (e.g. ${oc.env:DATA_PATH})
         # resolve correctly in the actual training environment.
         self.nn = ProteinTransformerAF3(**cfg_exp.model.nn)
-        self.nn_sc = None
-        if cfg_exp.training.get("self_cond_use_copy", False):
-            self.nn_sc = copy.deepcopy(self.nn)
-            for p in self.nn_sc.parameters():
-                p.requires_grad = False
         self.non_contact_value = cfg_exp.model.nn.get("non_contact_value", 0)
         if self.non_contact_value not in (0, -1):
             raise ValueError(f"non_contact_value must be 0 or -1, got {self.non_contact_value}")
@@ -151,38 +144,6 @@ class Proteina(ModelTrainerBase):
         self.nparams = sum(p.numel() for p in self.nn.parameters() if p.requires_grad)
 
         create_dir(self.val_path_tmp)
-
-    def state_dict(self, *args, **kwargs):
-        state = super().state_dict(*args, **kwargs)
-        if self.nn_sc is None:
-            return state
-        return {k: v for k, v in state.items() if not k.startswith("nn_sc.")}
-
-    def load_state_dict(self, state_dict, strict: bool = True):
-        if self.nn_sc is None:
-            return super().load_state_dict(state_dict, strict=strict)
-        filtered = {k: v for k, v in state_dict.items() if not k.startswith("nn_sc.")}
-        incompatible = super().load_state_dict(filtered, strict=False)
-        missing = [
-            k for k in incompatible.missing_keys if not k.startswith("nn_sc.")
-        ]
-        unexpected = [
-            k for k in incompatible.unexpected_keys if not k.startswith("nn_sc.")
-        ]
-        if strict and (missing or unexpected):
-            error_msgs = []
-            if missing:
-                missing_str = ", ".join([f'"{k}"' for k in missing])
-                error_msgs.append(f"Missing key(s) in state_dict: {missing_str}.")
-            if unexpected:
-                unexpected_str = ", ".join([f'"{k}"' for k in unexpected])
-                error_msgs.append(f"Unexpected key(s) in state_dict: {unexpected_str}.")
-            raise RuntimeError(
-                "Error(s) in loading state_dict for Proteina:\n\t"
-                + "\n\t".join(error_msgs)
-            )
-        self.nn_sc.load_state_dict(self.nn.state_dict(), strict=True)
-        return _IncompatibleKeys(missing, unexpected)
 
     def align_wrapper(self, x_0, x_1, mask):
         """Performs Kabsch on the translation component of x_0 and x_1."""
