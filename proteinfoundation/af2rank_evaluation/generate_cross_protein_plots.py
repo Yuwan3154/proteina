@@ -1336,6 +1336,109 @@ def save_summary_statistics(df: pd.DataFrame, output_dir: str, scorer: str) -> N
     logger.info(f"Saved summary statistics: {stats_path}")
 
 
+def load_diversity_summary_data(inference_dir: str, protein_ids: List[str] | None = None, subdir: str = "proteina_diversity") -> pd.DataFrame:
+    """
+    Load diversity summaries from per-protein directories and return a DataFrame.
+
+    Columns: protein_id, mean_tem_to_tem_tm, std_tem_to_tem_tm, median_tem_to_tem_tm,
+             min_tem_to_tem_tm, max_tem_to_tem_tm, n_samples, n_pairs
+    """
+    from proteinfoundation.af2rank_evaluation.proteina_diversity import find_diversity_summaries
+
+    summary_files = find_diversity_summaries(inference_dir, subdir)
+    data = []
+    for path in summary_files:
+        try:
+            with open(path, "r") as f:
+                s = json.load(f)
+            pid = s.get("protein_id") or Path(path).parent.parent.name
+            if protein_ids is not None and pid not in protein_ids:
+                continue
+            data.append({
+                "protein_id": pid,
+                "mean_tem_to_tem_tm": s.get("mean_tem_to_tem_tm"),
+                "std_tem_to_tem_tm": s.get("std_tem_to_tem_tm"),
+                "median_tem_to_tem_tm": s.get("median_tem_to_tem_tm"),
+                "min_tem_to_tem_tm": s.get("min_tem_to_tem_tm"),
+                "max_tem_to_tem_tm": s.get("max_tem_to_tem_tm"),
+                "n_samples": s.get("n_samples"),
+                "n_pairs": s.get("n_pairs"),
+            })
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f"Failed to load diversity summary {path}: {e}")
+
+    df = pd.DataFrame(data)
+    logger.info(f"Loaded diversity data for {len(df)} proteins")
+    return df
+
+
+def create_diversity_vs_quality_plot(
+    df: pd.DataFrame,
+    output_dir: str,
+    top1_tm_col: str,
+    top1_tm_label: str = "Top-1 Template TM (by scorer)",
+) -> None:
+    """
+    Scatter plot: median_tem_to_tem_tm (X) vs top-1 template TM by scorer (Y).
+    """
+    required = ["median_tem_to_tem_tm", top1_tm_col]
+    opt_cols = ["in_train", "length"]
+    drop_cols = [c for c in required + opt_cols if c in df.columns]
+    valid = df.dropna(subset=[c for c in required if c in df.columns])
+    if len(valid) == 0:
+        logger.warning("No valid data for diversity-vs-quality plot")
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    if "in_train" in valid.columns:
+        colors = valid["in_train"].map({True: "blue", False: "red"})
+    else:
+        colors = "#4C72B0"
+    sizes = valid["length"] / 1.5 if "length" in valid.columns else 20
+
+    ax.scatter(
+        valid["median_tem_to_tem_tm"],
+        valid[top1_tm_col],
+        alpha=0.3,
+        c=colors,
+        s=sizes,
+    )
+    ax.set_xlabel("Median Sample-to-Sample TM (diversity)", fontsize=12)
+    ax.set_ylabel(top1_tm_label, fontsize=12)
+    ax.set_title("Sample Diversity vs. Top-1 Quality", fontsize=13)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    out_path = os.path.join(output_dir, "cross_protein_diversity_vs_top1_tm.png")
+    plt.savefig(out_path, dpi=900, bbox_inches="tight")
+    logger.info(f"Saved diversity-vs-quality plot: {out_path}")
+    plt.close()
+
+
+def add_diversity_to_summary_statistics(stats: dict, df: pd.DataFrame) -> dict:
+    """Add diversity statistics to an existing summary statistics dict."""
+    div_cols = {
+        "mean_tem_to_tem_tm": "mean_tem_to_tem_tm",
+        "std_tem_to_tem_tm": "std_tem_to_tem_tm",
+        "median_tem_to_tem_tm": "median_tem_to_tem_tm",
+    }
+    div_stats = {}
+    for label, col in div_cols.items():
+        if col in df.columns:
+            vals = df[col].dropna()
+            if len(vals) > 0:
+                div_stats[label] = {
+                    "mean": float(vals.mean()),
+                    "median": float(vals.median()),
+                    "std": float(vals.std()),
+                    "min": float(vals.min()),
+                    "max": float(vals.max()),
+                }
+    if div_stats:
+        stats["diversity_statistics"] = div_stats
+        stats["diversity_statistics"]["num_proteins_with_diversity"] = int(df["median_tem_to_tem_tm"].notna().sum())
+    return stats
+
+
 def main():
     parser = argparse.ArgumentParser(description='Generate cross-protein scoring analysis plots')
     parser.add_argument('--inference_dir', required=True, 
@@ -1465,7 +1568,45 @@ def main():
             # Energy-based diagnostic plots.
             create_proteinebm_plots(df, args.output_dir, args.tms_column)
             save_proteinebm_statistics(df, args.output_dir, args.tms_column)
-    
+
+    # ── Diversity-vs-quality cross-protein plot ───────────────────────────────
+    protein_ids_in_df = set(df["protein_id"].tolist()) if "protein_id" in df.columns else None
+    div_df = load_diversity_summary_data(args.inference_dir, protein_ids=protein_ids_in_df)
+    if len(div_df) > 0:
+        df = df.merge(div_df[["protein_id", "mean_tem_to_tem_tm", "std_tem_to_tem_tm", "median_tem_to_tem_tm"]],
+                       on="protein_id", how="left")
+
+        # Determine the top-1 TM column based on scorer
+        top1_col = None
+        top1_label = "Top-1 Template TM (by scorer)"
+        if args.scorer == "af2rank":
+            top1_col = "top_1_tm_ref_template"
+            top1_label = "Top-1 Template TM (AF2Rank, by composite)"
+        elif args.scorer == "proteinebm":
+            top1_col = "top_1_tm_ref_template"
+            top1_label = "Top-1 Template TM (ProteinEBM, by energy)"
+        elif args.scorer == "af2rank_on_proteinebm_topk":
+            # Use min(pTM_1, pTM_2) top-1 prediction TM if available, else m1
+            top1_col = "min_top_1_tm_ref_pred" if "min_top_1_tm_ref_pred" in df.columns else "top_1_tm_ref_pred"
+            top1_label = "Top-1 Prediction TM (AF2Rank on ProteinEBM top-k)"
+
+        if top1_col and top1_col in df.columns:
+            create_diversity_vs_quality_plot(df, args.output_dir, top1_col, top1_label)
+        else:
+            logger.warning(f"Top-1 TM column '{top1_col}' not found in data, skipping diversity-vs-quality plot")
+
+        # Update summary statistics with diversity info
+        stats_path = os.path.join(args.output_dir, "cross_protein_statistics.json")
+        if os.path.exists(stats_path):
+            with open(stats_path, "r") as f:
+                stats = json.load(f)
+            stats = add_diversity_to_summary_statistics(stats, df)
+            with open(stats_path, "w") as f:
+                json.dump(stats, f, indent=2)
+            logger.info(f"Updated statistics with diversity metrics: {stats_path}")
+    else:
+        logger.info("No diversity data found, skipping diversity-vs-quality plot")
+
     logger.info("✅ Cross-protein analysis completed successfully!")
     logger.info(f"📈 Results saved to: {args.output_dir}")
 

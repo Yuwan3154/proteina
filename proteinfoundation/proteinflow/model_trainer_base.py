@@ -610,16 +610,14 @@ class ModelTrainerBase(L.LightningModule):
         return tokens.float()
 
     def _set_contact_map_self_cond(self, batch: Dict, c_1: torch.Tensor, use_self_cond: bool):
+        # Always initialize to zeros so all feature params are exercised in SC forward
+        batch["contact_map_sc"] = torch.zeros_like(c_1)
         if use_self_cond:
             with torch.no_grad():
-                nn_out_sc = self.nn(batch)
+                nn_out_sc = self.nn._forward_impl(batch)
                 c_pred_sc = self._nn_out_to_c_clean(nn_out_sc, batch)
             if c_pred_sc is not None:
                 batch["contact_map_sc"] = self.detach_gradients(c_pred_sc)
-            else:
-                batch["contact_map_sc"] = torch.zeros_like(c_1)
-        else:
-            batch["contact_map_sc"] = torch.zeros_like(c_1)
 
     def sample_t(self, shape):
         dist_name = self.cfg_exp.loss.t_distribution.name
@@ -825,31 +823,28 @@ class ModelTrainerBase(L.LightningModule):
             batch["_zero_idx_emb"] = True
 
         # Prediction for self-conditioning
+        # Initialize SC inputs to zeros before the SC forward so that all feature
+        # creators (e.g. ContactMapScPairFeat.linear_embed) exercise their parameters
+        # even on the first pass.  This avoids DDP "unused parameters" errors when
+        # torch.compile is active.
+        if contact_map_mode:
+            batch["contact_map_sc"] = torch.zeros_like(c_1)
+        else:
+            batch["x_sc"] = torch.zeros_like(x_1)
+
         if random.random() > 0.5 and self.cfg_exp.training.self_cond:
             if contact_map_mode:
-                # In contact-map mode, target_pred is 'c_1' and predict_clean()'s
-                # coordinate path is not applicable. We only need the raw nn outputs
-                # to extract contact_map_pred for self-conditioning.
                 with torch.no_grad():
-                    nn_out_sc = self.nn(batch)
+                    nn_out_sc = self.nn._forward_impl(batch)
                     c_pred_sc = self._nn_out_to_c_clean(nn_out_sc, batch)
                 if c_pred_sc is not None:
                     batch["contact_map_sc"] = self.detach_gradients(c_pred_sc)
-                else:
-                    batch["contact_map_sc"] = torch.zeros_like(c_1)
             else:
                 with torch.no_grad():
-                    nn_out_sc = self.nn(batch)
+                    nn_out_sc = self.nn._forward_impl(batch)
                     x_pred_sc = self._nn_out_to_x_clean(nn_out_sc, batch)
                 if x_pred_sc is not None:
                     batch["x_sc"] = self.detach_gradients(x_pred_sc)
-                else:
-                    batch["x_sc"] = torch.zeros_like(x_1)
-        else:
-            if contact_map_mode:
-                batch["contact_map_sc"] = torch.zeros_like(c_1)
-            else:
-                batch["x_sc"] = torch.zeros_like(x_1)
 
         # Main prediction
         nn_out = self.predict_clean(batch)

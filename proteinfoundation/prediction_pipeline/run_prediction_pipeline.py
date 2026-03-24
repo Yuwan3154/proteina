@@ -362,6 +362,33 @@ def step_collect_results(
         "ptm_min": float(np.min(ptm_values)) if ptm_values else None,
         "ptm_max": float(np.max(ptm_values)) if ptm_values else None,
     }
+
+    # Add diversity metrics if available
+    from proteinfoundation.af2rank_evaluation.proteina_diversity import load_diversity_data
+    inference_base = os.path.join(PROTEINA_BASE_DIR, "inference", inference_config)
+    diversity_data = load_diversity_data(inference_base)
+    if diversity_data:
+        div_medians = [v["median_tem_to_tem_tm"] for v in diversity_data.values()]
+        div_means = [v["mean_tem_to_tem_tm"] for v in diversity_data.values()]
+        div_stds = [v["std_tem_to_tem_tm"] for v in diversity_data.values()]
+        summary_json["diversity_statistics"] = {
+            "mean_tem_to_tem_tm": {
+                "mean": float(np.mean(div_means)),
+                "median": float(np.median(div_means)),
+                "std": float(np.std(div_means)),
+            },
+            "std_tem_to_tem_tm": {
+                "mean": float(np.mean(div_stds)),
+                "median": float(np.median(div_stds)),
+                "std": float(np.std(div_stds)),
+            },
+            "median_tem_to_tem_tm": {
+                "mean": float(np.mean(div_medians)),
+                "median": float(np.median(div_medians)),
+                "std": float(np.std(div_medians)),
+            },
+            "num_proteins_with_diversity": len(diversity_data),
+        }
     summary_json_path = os.path.join(output_dir, "prediction_summary.json")
     with open(summary_json_path, "w") as f:
         json.dump(summary_json, f, indent=2)
@@ -450,6 +477,8 @@ def main():
     parser.add_argument("--proteinebm_batch_size", type=int, default=32,
                         help="Batch size for ProteinEBM inference (default: 32). Auto-reduces on OOM.")
     parser.add_argument("--skip_inference", action="store_true", help="Skip Proteina inference step")
+    parser.add_argument("--skip_diversity", action="store_true",
+                        help="Skip Proteina sample diversity analysis (all-to-all TMscore)")
     parser.add_argument("--skip_scoring", action="store_true", help="Skip ProteinEBM scoring step")
     parser.add_argument("--skip_af2rank", action="store_true", help="Skip AF2Rank step")
     parser.add_argument("--rerun_proteina", action="store_true",
@@ -519,6 +548,22 @@ def main():
             logger.info("Proteina inference completed successfully")
     elif args.skip_inference:
         logger.info("Skipping Proteina inference")
+
+    # ── Step 2.5: Proteina sample diversity ──
+    if not args.skip_diversity and success:
+        logger.info("\n" + "=" * 60)
+        logger.info("STEP 2.5: PROTEINA SAMPLE DIVERSITY")
+        logger.info("=" * 60)
+
+        from proteinfoundation.af2rank_evaluation.proteina_diversity import compute_diversity_for_proteins
+
+        inference_dir = os.path.join(PROTEINA_BASE_DIR, "inference", args.inference_config)
+        diversity_results = compute_diversity_for_proteins(
+            inference_dir, protein_ids, skip_existing=not args.rerun_proteina,
+        )
+        logger.info(f"Diversity analysis completed for {len(diversity_results)} proteins")
+    elif args.skip_diversity:
+        logger.info("Skipping Proteina sample diversity analysis")
 
     # ── Step 3: ProteinEBM scoring ──
     if not args.skip_scoring and success:

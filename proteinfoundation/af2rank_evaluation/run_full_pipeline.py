@@ -356,6 +356,8 @@ def main():
     parser.add_argument('--usalign_path', help='Path to USalign executable')
     parser.add_argument('--skip_inference', action='store_true',
                        help='Skip Proteina inference (only run scoring stage)')
+    parser.add_argument('--skip_diversity', action='store_true',
+                       help='Skip Proteina sample diversity analysis (all-to-all TMscore)')
     parser.add_argument('--skip_scoring', action='store_true',
                        help='Skip scoring stage (AF2Rank or ProteinEBM depending on --scorer)')
     parser.add_argument('--skip_af2rank_on_top_k', action='store_true',
@@ -478,7 +480,27 @@ def main():
             success = False
     else:
         logger.info("⏭️  Skipping Proteina inference")
-    
+
+    # Step 1.5: Proteina sample diversity analysis (all-to-all TMscore)
+    if not args.skip_diversity and success:
+        logger.info("\n" + "="*60)
+        logger.info("STEP 1.5: PROTEINA SAMPLE DIVERSITY")
+        logger.info("="*60)
+
+        from proteinfoundation.af2rank_evaluation.proteina_diversity import compute_diversity_for_proteins
+
+        inference_dir = os.path.join(project_root, "inference", args.inference_config)
+        df_dataset = pd.read_csv(args.dataset_file)
+        diversity_protein_ids = df_dataset[args.id_column].dropna().astype(str).str.strip().unique().tolist()
+        diversity_protein_ids = [p for p in diversity_protein_ids if p]
+
+        diversity_results = compute_diversity_for_proteins(
+            inference_dir, diversity_protein_ids, skip_existing=not args.rerun_proteina,
+        )
+        logger.info(f"✅ Diversity analysis completed for {len(diversity_results)} proteins")
+    elif args.skip_diversity:
+        logger.info("⏭️  Skipping Proteina sample diversity analysis")
+
     # Step 2: Scoring (AF2Rank or ProteinEBM)
     if not args.skip_scoring and success:
         logger.info("\n" + "="*60)
