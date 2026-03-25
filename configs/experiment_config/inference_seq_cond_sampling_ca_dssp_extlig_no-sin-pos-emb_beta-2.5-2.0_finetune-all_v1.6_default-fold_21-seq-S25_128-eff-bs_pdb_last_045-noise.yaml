@@ -16,15 +16,13 @@ seq_cond: True
 zero_sin_pos_emb: True
 
 data_dir: ${oc.env:DATA_PATH}/pdb_train/
-# Create from train split after first run: dfs_splits["train"].to_csv("cath_codes_train_<file_id>.csv", columns=["cath_code"])
-cath_code_file: cath_codes_train_df_pdb_f1_minl50_maxl256_mtprotein_etdiffractionEM_minoNone_maxoNone_minr0.0_maxr5.0_hl_rl_rnsrTrue_rpuTrue_l_rcuFalse.csv
 
 # ext_lig inference default: "unknown" (default) or "absent"
 ext_lig_default: "unknown"
 
 # Sampling
 dt: 0.005
-nsamples_per_len: 256
+nsamples_per_len: 512
 max_nsamples: 4
 
 lora:
