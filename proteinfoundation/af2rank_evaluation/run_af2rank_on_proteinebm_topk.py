@@ -288,17 +288,12 @@ def _run_af2rank_subprocess(
     if backend == "openfold":
         wrapper_script = os.path.join(wrapper_dir, "run_with_proteina_env.sh")
         py = f"""
-import gc
 import os
 import sys
 import glob
-from concurrent.futures import ThreadPoolExecutor
 sys.path.append({wrapper_dir!r})
 
-import pandas as pd
-import torch
-
-from af2rank_openfold_scorer import OpenFoldAF2Rank, plot_af2rank_results, save_af2rank_scores, load_af2rank_scores_from_csv
+from af2rank_openfold_scorer import OpenFoldAF2Rank, save_af2rank_scores, load_af2rank_scores_from_csv
 
 {cuda_line}
 
@@ -307,6 +302,7 @@ reference_cif = {reference_cif!r}
 chain = {chain!r}
 inference_output_dir = {str(staged_templates_dir)!r}
 output_dir = {str(output_dir)!r}
+predicted_dir = os.path.join(output_dir, "predicted_structures")
 
 scores_csv_path = os.path.join(output_dir, f"af2rank_scores_{{protein_id}}.csv")
 
@@ -316,7 +312,8 @@ if os.path.exists(scores_csv_path):
   existing_scores = load_af2rank_scores_from_csv(scores_csv_path)
   for s in existing_scores:
     sf = s.get("structure_file")
-    if sf:
+    pred_path = s.get("predicted_structure_path") or (os.path.join(predicted_dir, str(sf)) if sf else "")
+    if sf and pred_path and os.path.exists(pred_path):
       processed_files.add(str(sf))
 
 pdb_files = sorted(glob.glob(os.path.join(inference_output_dir, "*.pdb")))
@@ -328,39 +325,29 @@ if len(to_score) > 0:
     use_deepspeed_evoformer_attention={use_deepspeed_evoformer_attention},
     use_cuequivariance_attention={use_cuequivariance_attention},
     use_cuequivariance_multiplicative_update={use_cuequivariance_multiplicative_update})
-  def _featurize_item(pdb_path):
-    batch, template_coords = scorer._featurize(pdb_path, decoy_chain="A")
-    return pdb_path, batch, template_coords
-  with ThreadPoolExecutor(max_workers=1) as executor:
-    future = executor.submit(_featurize_item, to_score[0])
-    for i, pdb_path in enumerate(to_score):
-      pdb_filename = os.path.basename(pdb_path)
-      if i + 1 < len(to_score):
-        next_future = executor.submit(_featurize_item, to_score[i + 1])
-      try:
-        _, batch, template_coords = future.result()
-        with torch.no_grad():
-          out = scorer.model.model(batch)
-        structure_scores = scorer._extract_scores(out, template_coords)
-        gc.collect()
-        torch.cuda.empty_cache()
-        structure_scores.update({{
-          "protein_id": protein_id,
-          "structure_file": pdb_filename,
-          "structure_path": pdb_path,
-        }})
-        structure_scores.pop("pred_coords", None)
-        new_scores.append(structure_scores)
-      except Exception as e:
-        print(f"Failed to score {{pdb_filename}}: {{e}}", flush=True)
-      if i + 1 < len(to_score):
-        future = next_future
+  os.makedirs(predicted_dir, exist_ok=True)
+  for pdb_path in to_score:
+    pdb_filename = os.path.basename(pdb_path)
+    real_pdb_path = os.path.realpath(pdb_path)
+    output_pdb = os.path.join(predicted_dir, pdb_filename)
+    structure_scores = scorer.score_structure(
+      real_pdb_path,
+      decoy_chain="A",
+      recycles={int(recycles)},
+      output_pdb=output_pdb,
+      verbose=False,
+    )
+    structure_scores.update({{
+      "protein_id": protein_id,
+      "structure_file": pdb_filename,
+      "structure_path": real_pdb_path,
+      "predicted_structure_path": output_pdb,
+      "predicted_structure_file": pdb_filename,
+    }})
+    new_scores.append(structure_scores)
 
 all_scores = existing_scores + new_scores
 save_af2rank_scores(all_scores, output_dir, protein_id)
-staged_filenames = set(os.path.basename(p) for p in pdb_files)
-plot_scores = [s for s in all_scores if s.get("structure_file") in staged_filenames]
-plot_af2rank_results(plot_scores, output_dir, protein_id)
 """
     else:
         wrapper_script = os.path.join(wrapper_dir, "run_with_colabdesign_env.sh")
@@ -371,9 +358,7 @@ import sys
 import glob
 sys.path.append({wrapper_dir!r})
 
-import pandas as pd
-
-from af2rank_scorer import ModernAF2Rank, plot_af2rank_results, save_af2rank_scores, suppress_stdout, load_af2rank_scores_from_csv
+from af2rank_scorer import ModernAF2Rank, save_af2rank_scores, suppress_stdout, load_af2rank_scores_from_csv
 
 {cuda_line}
 os.environ['ALPHAFOLD_DATA_DIR'] = os.path.expanduser('~/openfold/openfold/resources/params')
@@ -386,6 +371,7 @@ inference_output_dir = {str(staged_templates_dir)!r}
 output_dir = {str(output_dir)!r}
 # Pre-built cg2all reconstruction map (original_path -> allatom_path)
 allatom_map = {allatom_map_repr}
+predicted_dir = os.path.join(output_dir, "predicted_structures")
 
 scores_csv_path = os.path.join(output_dir, f"af2rank_scores_{{protein_id}}.csv")
 
@@ -395,7 +381,8 @@ if os.path.exists(scores_csv_path):
   existing_scores = load_af2rank_scores_from_csv(scores_csv_path)
   for s in existing_scores:
     sf = s.get("structure_file")
-    if sf:
+    pred_path = s.get("predicted_structure_path") or (os.path.join(predicted_dir, str(sf)) if sf else "")
+    if sf and pred_path and os.path.exists(pred_path):
       processed_files.add(str(sf))
 
 pdb_files = sorted(glob.glob(os.path.join(inference_output_dir, "*.pdb")))
@@ -405,30 +392,33 @@ new_scores = []
 if len(to_score) > 0:
   with suppress_stdout():
     scorer = ModernAF2Rank(reference_cif, chain=chain, model_name={model_name!r})
+  os.makedirs(predicted_dir, exist_ok=True)
   for pdb_path in to_score:
     pdb_filename = os.path.basename(pdb_path)
+    real_pdb_path = os.path.realpath(pdb_path)
+    allatom_pdb = allatom_map.get(real_pdb_path)
+    output_pdb = os.path.join(predicted_dir, pdb_filename)
     with suppress_stdout():
       structure_scores = scorer.score_structure(
-        pdb_path,
+        real_pdb_path,
         decoy_chain="A",
         recycles={int(recycles)},
+        output_pdb=output_pdb,
         verbose=False,
-        _allatom_pdb=allatom_map.get(pdb_path),
+        _allatom_pdb=allatom_pdb,
+        _original_pdb=real_pdb_path if allatom_pdb else None,
       )
     structure_scores.update({{
       "protein_id": protein_id,
       "structure_file": pdb_filename,
-      "structure_path": pdb_path,
+      "structure_path": real_pdb_path,
+      "predicted_structure_path": output_pdb,
+      "predicted_structure_file": pdb_filename,
     }})
-    if "pred_coords" in structure_scores:
-      del structure_scores["pred_coords"]
     new_scores.append(structure_scores)
 
 all_scores = existing_scores + new_scores
 save_af2rank_scores(all_scores, output_dir, protein_id)
-staged_filenames = set(os.path.basename(p) for p in pdb_files)
-plot_scores = [s for s in all_scores if s.get("structure_file") in staged_filenames]
-plot_af2rank_results(plot_scores, output_dir, protein_id)
 """
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -501,7 +491,16 @@ def _process_one_protein(
         for df, path in [(m1_df, af2rank_scores_csv_m1), (m2_df, af2rank_scores_csv_m2)]:
             if "structure_file" not in df.columns:
                 break
-            processed = set(df["structure_file"].dropna().astype(str).tolist())
+            predicted_dir = path.parent / "predicted_structures"
+            if "predicted_structure_path" not in df.columns:
+                df["predicted_structure_path"] = df["structure_file"].astype(str).apply(
+                    lambda name: str(predicted_dir / name)
+                )
+            processed = {
+                str(row["structure_file"])
+                for _, row in df.iterrows()
+                if pd.notna(row["structure_file"]) and Path(str(row["predicted_structure_path"])).exists()
+            }
             if not desired.issubset(processed):
                 break
         else:

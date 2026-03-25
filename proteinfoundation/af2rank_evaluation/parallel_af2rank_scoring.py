@@ -107,6 +107,24 @@ def find_reference_cif(protein_name, cif_dir):
     
     raise FileNotFoundError(f"CIF file not found for {pdb_id} in {cif_dir}")
 
+
+def _af2rank_csv_complete(af2rank_csv: Path, desired_files) -> bool:
+    if not af2rank_csv.exists():
+        return False
+    df = pd.read_csv(af2rank_csv)
+    if "structure_file" not in df.columns:
+        return False
+    predicted_dir = af2rank_csv.parent / "predicted_structures"
+    if "predicted_structure_path" not in df.columns:
+        df["predicted_structure_path"] = df["structure_file"].astype(str).apply(lambda name: str(predicted_dir / name))
+    completed = {
+        str(row["structure_file"])
+        for _, row in df.iterrows()
+        if pd.notna(row["structure_file"]) and Path(str(row["predicted_structure_path"])).exists()
+    }
+    desired = {Path(str(path)).name for path in desired_files}
+    return desired.issubset(completed)
+
 def process_single_protein_af2rank(args):
     """Process AF2Rank scoring for a single protein."""
     protein_name, cif_dir, inference_config, recycles, gpu_id, regenerate_plots, *rest = args
@@ -480,7 +498,7 @@ def find_proteins_needing_af2rank(csv_file, csv_column, inference_config, regene
                 af2rank_dir = protein_dir / "af2rank_analysis"
                 af2rank_csv = af2rank_dir / f"af2rank_scores_{protein_name}.csv"
                 
-                if not af2rank_csv.exists():
+                if not _af2rank_csv_complete(af2rank_csv, pdb_files):
                     # Has inference but no AF2Rank scoring
                     proteins_needing_work.append(protein_name)
                 elif regenerate_plots:
@@ -570,9 +588,10 @@ def main():
         protein_dir = Path(os.path.join(PROTEINA_BASE_DIR, 'inference', args.inference_config, protein_name))
         af2rank_csv = protein_dir / "af2rank_analysis" / f"af2rank_scores_{protein_name}.csv"
 
-        if af2rank_csv.exists() and args.regenerate_plots:
+        desired_files = list(protein_dir.glob(f"{protein_name}_*.pdb"))
+        if _af2rank_csv_complete(af2rank_csv, desired_files) and args.regenerate_plots:
             proteins_needing_plots.append(protein_name)
-        elif not af2rank_csv.exists():
+        elif not _af2rank_csv_complete(af2rank_csv, desired_files):
             proteins_needing_scoring.append(protein_name)
 
     logger.info(f"Proteins needing AF2Rank scoring: {len(proteins_needing_scoring)}")

@@ -1343,10 +1343,12 @@ def load_diversity_summary_data(inference_dir: str, protein_ids: List[str] | Non
     Columns: protein_id, mean_tem_to_tem_tm, std_tem_to_tem_tm, median_tem_to_tem_tm,
              min_tem_to_tem_tm, max_tem_to_tem_tm, n_samples, n_pairs
     """
+    from proteinfoundation.af2rank_evaluation.proteina_analysis import find_analysis_summaries
     from proteinfoundation.af2rank_evaluation.proteina_diversity import find_diversity_summaries
 
     summary_files = find_diversity_summaries(inference_dir, subdir)
-    data = []
+    summary_files += find_analysis_summaries(inference_dir, "proteina_analysis")
+    data_by_protein = {}
     for path in summary_files:
         try:
             with open(path, "r") as f:
@@ -1354,7 +1356,7 @@ def load_diversity_summary_data(inference_dir: str, protein_ids: List[str] | Non
             pid = s.get("protein_id") or Path(path).parent.parent.name
             if protein_ids is not None and pid not in protein_ids:
                 continue
-            data.append({
+            data_by_protein[pid] = {
                 "protein_id": pid,
                 "mean_tem_to_tem_tm": s.get("mean_tem_to_tem_tm"),
                 "std_tem_to_tem_tm": s.get("std_tem_to_tem_tm"),
@@ -1363,11 +1365,11 @@ def load_diversity_summary_data(inference_dir: str, protein_ids: List[str] | Non
                 "max_tem_to_tem_tm": s.get("max_tem_to_tem_tm"),
                 "n_samples": s.get("n_samples"),
                 "n_pairs": s.get("n_pairs"),
-            })
+            }
         except (json.JSONDecodeError, OSError) as e:
             logger.warning(f"Failed to load diversity summary {path}: {e}")
 
-    df = pd.DataFrame(data)
+    df = pd.DataFrame(list(data_by_protein.values()))
     logger.info(f"Loaded diversity data for {len(df)} proteins")
     return df
 

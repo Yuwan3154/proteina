@@ -35,6 +35,8 @@ from protein_ebm.model.boltz_utils import center_random_augmentation
 from protein_ebm.model.ebm import ProteinEBM
 from protein_ebm.model.r3_diffuser import R3Diffuser
 
+from proteinfoundation.af2rank_evaluation.usalign_tabular import parse_usalign_pair_outfmt2
+
 
 _USALIGN_PARALLEL_ENV = {
     "OMP_NUM_THREADS": "1",
@@ -44,7 +46,7 @@ _USALIGN_PARALLEL_ENV = {
 
 
 def _resolve_tm_workers(explicit: Optional[int]) -> int:
-    """Clamp CPU worker count for parallel USalign (1–64); mirrors proteina_diversity.resolve_num_workers."""
+    """Clamp CPU worker count for parallel USalign (1-64); mirrors proteina_diversity.resolve_num_workers."""
     if explicit is not None:
         return max(1, min(64, int(explicit)))
     n = os.cpu_count() or 1
@@ -215,7 +217,7 @@ def tmscore_ca_coords(
 
     cmd = [exe, f1.name, f2.name]
     if os.path.basename(exe) == "USalign":
-        cmd += ["-TMscore", "5"]
+        cmd += ["-TMscore", "5", "-outfmt", "2"]
 
     subprocess_env = None
     if env is not None:
@@ -225,6 +227,8 @@ def tmscore_ca_coords(
     output = subprocess.check_output(cmd, text=True, env=subprocess_env)
     os.unlink(f1.name)
     os.unlink(f2.name)
+    if os.path.basename(exe) == "USalign":
+        return parse_usalign_pair_outfmt2(output)
     return _parse_usalign_output(output.splitlines())
 
 
@@ -233,22 +237,33 @@ def tmscore_pdb_paths(
     path_b: str,
     tmscore_exe: str = "USalign",
     env: Optional[Dict[str, str]] = None,
+    chain1: Optional[str] = None,
+    chain2: Optional[str] = None,
 ) -> Dict[str, float]:
     """
-    Run USalign (or TMscore) on two existing PDB files. Same -TMscore 5 mode as
-    tmscore_ca_coords when the executable is USalign. Avoids writing temporary PDBs.
+    Run USalign (or TMscore) on two existing structure files (PDB/mmCIF per USalign auto-detect).
+    Same -TMscore 5 mode as tmscore_ca_coords when the executable is USalign.
+    Uses -outfmt 2 for USalign; GDT-TS is not in tabular output (set to NaN).
+
+    Optional chain1/chain2: passed as USalign -chain1 / -chain2 when set.
     """
     exe = shutil.which(tmscore_exe) or shutil.which("USalign") or shutil.which("TMscore")
     if exe is None:
         raise FileNotFoundError("Neither USalign nor TMscore found in PATH")
     cmd = [exe, path_a, path_b]
     if os.path.basename(exe) == "USalign":
-        cmd += ["-TMscore", "5"]
+        if chain1 is not None:
+            cmd += ["-chain1", chain1]
+        if chain2 is not None:
+            cmd += ["-chain2", chain2]
+        cmd += ["-TMscore", "5", "-outfmt", "2"]
     subprocess_env = None
     if env is not None:
         subprocess_env = os.environ.copy()
         subprocess_env.update(env)
     output = subprocess.check_output(cmd, text=True, env=subprocess_env)
+    if os.path.basename(exe) == "USalign":
+        return parse_usalign_pair_outfmt2(output)
     return _parse_usalign_output(output.splitlines())
 
 
@@ -601,9 +616,10 @@ def run_proteinebm_scoring_for_protein(
     scores_csv_path = os.path.join(output_dir, f"proteinebm_scores_{protein_id}.csv")
     summary_path = os.path.join(output_dir, f"proteinebm_summary_{protein_id}.json")
 
-    ref_coords = None
+    del num_workers
+    ref_cif_abs: Optional[str] = None
     if reference_cif is not None:
-        ref_coords = _extract_ca_coords(reference_cif, chain_id=reference_chain)
+        ref_cif_abs = os.path.abspath(os.path.expanduser(reference_cif))
 
     start_time = time.time()
 
@@ -620,40 +636,11 @@ def run_proteinebm_scoring_for_protein(
         verbose=verbose,
     )
 
-    # Build results with optional TM-score computation (CPU-bound; parallel USalign when num_workers>1)
-    tm_by_index: Dict[int, Dict[str, float]] = {}
-    if ref_coords is not None:
-        indices_with_energy = [i for i in range(len(pdb_files)) if i in energy_map]
-        workers = _resolve_tm_workers(num_workers)
-
-        def _tm_for_index(ii: int) -> Tuple[int, Dict[str, float]]:
-            decoy_coords = _extract_ca_coords(str(pdb_files[ii]), chain_id=None)
-            env = _USALIGN_PARALLEL_ENV if workers > 1 else None
-            return ii, tmscore_ca_coords(ref_coords, decoy_coords, env=env)
-
-        if workers <= 1:
-            for ii in indices_with_energy:
-                i, tm_out = _tm_for_index(ii)
-                tm_by_index[i] = tm_out
-        else:
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                for i, tm_out in ex.map(_tm_for_index, indices_with_energy):
-                    tm_by_index[i] = tm_out
-
     results: List[Dict[str, object]] = []
     for i, pdb_path in enumerate(pdb_files):
         if i not in energy_map:
             continue
         energy = energy_map[i]
-        if ref_coords is not None:
-            tm_out = tm_by_index[i]
-            tm_ref = tm_out["tms"]
-            rmsd_ref = tm_out["rms"]
-            gdt_ref = tm_out["gdt"]
-        else:
-            tm_ref = float("nan")
-            rmsd_ref = float("nan")
-            gdt_ref = float("nan")
         results.append(
             {
                 "protein_id": protein_id,
@@ -661,9 +648,6 @@ def run_proteinebm_scoring_for_protein(
                 "structure_path": str(pdb_path),
                 "t": t,
                 "energy": energy,
-                "tm_ref_template": tm_ref,
-                "rmsd_ref_template": rmsd_ref,
-                "gdt_ref_template": gdt_ref,
             }
         )
 
@@ -673,16 +657,6 @@ def run_proteinebm_scoring_for_protein(
             f,
             fieldnames=["protein_id", "structure_file", "structure_path", "t", "energy"],
         )
-        writer.fieldnames = [
-            "protein_id",
-            "structure_file",
-            "structure_path",
-            "t",
-            "energy",
-            "tm_ref_template",
-            "rmsd_ref_template",
-            "gdt_ref_template",
-        ]
         writer.writeheader()
         writer.writerows(results)
 
@@ -690,30 +664,7 @@ def run_proteinebm_scoring_for_protein(
     if n_nan > 0:
         print(f"  WARNING: {n_nan}/{len(results)} energies are NaN for {protein_id}!", flush=True)
 
-    successful = results
-    spearman_rho_energy = None
-    max_tm_ref_template = None
-    tm_ref_template_at_min_energy = None
-    top_1_tm_ref_template = None
-    top_5_tm_ref_template = None
-
-    if ref_coords is not None and len(successful) > 1:
-        tm_vals = [float(r["tm_ref_template"]) for r in successful]
-        score_vals = [-float(r["energy"]) for r in successful]  # higher is better
-
-        spearman_rho_energy = _spearmanr(tm_vals, score_vals)
-        max_tm_ref_template = float(max(tm_vals))
-
-        energies = [float(r["energy"]) for r in successful]
-        best_idx = int(np.argmin(np.asarray(energies)))
-        tm_ref_template_at_min_energy = float(tm_vals[best_idx])
-        top_1_tm_ref_template = tm_ref_template_at_min_energy
-
-        top5_idx = np.argsort(np.asarray(energies))[:5]
-        top_5_tm_ref_template = float(max([tm_vals[int(i)] for i in top5_idx]))
-
     runtime_s = time.time() - start_time
-    plot_paths = plot_proteinebm_results(results, output_dir=output_dir, protein_id=protein_id)
     summary = {
         "protein_id": protein_id,
         "total_structures": len(results),
@@ -726,16 +677,7 @@ def run_proteinebm_scoring_for_protein(
         "proteinebm_checkpoint": os.path.abspath(os.path.expanduser(proteinebm_checkpoint)),
         "template_self_condition": template_self_condition,
         "scores_csv": os.path.abspath(scores_csv_path),
-        "plots": plot_paths,
-        # AF2Rank-compatible summary fields (template-quality style)
-        "spearman_correlation_rho_composite": spearman_rho_energy,  # (-energy) vs tm_ref_template
-        "spearman_correlation_rho_energy": spearman_rho_energy,
-        "max_tm_ref_template": max_tm_ref_template,
-        "tm_ref_template_at_max_composite": tm_ref_template_at_min_energy,  # best score == min energy
-        "tm_ref_template_at_min_energy": tm_ref_template_at_min_energy,
-        "top_1_tm_ref_template": top_1_tm_ref_template,
-        "top_5_tm_ref_template": top_5_tm_ref_template,
-        "status": "completed",
+        "status": "scored_energy_only",
     }
 
     with open(summary_path, "w") as f:

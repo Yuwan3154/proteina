@@ -86,18 +86,22 @@ def _get_chain(protein_name: str) -> str:
 
 
 def _all_scored(scores_csv: Path, pdb_files: List[str]) -> bool:
-    """Return True if scores_csv exists and covers all pdb_files."""
+    """Return True if scores_csv exists, covers all pdb_files, and saved predictions exist."""
     if not scores_csv.exists():
         return False
-    try:
-        df = pd.read_csv(scores_csv)
-        if "structure_file" not in df.columns:
-            return False
-        existing = set(df["structure_file"].dropna().astype(str))
-        desired = {Path(p).name for p in pdb_files}
-        return desired.issubset(existing)
-    except Exception:
+    df = pd.read_csv(scores_csv)
+    if "structure_file" not in df.columns:
         return False
+    predicted_dir = scores_csv.parent / "predicted_structures"
+    if "predicted_structure_path" not in df.columns:
+        df["predicted_structure_path"] = df["structure_file"].astype(str).apply(lambda name: str(predicted_dir / name))
+    existing = {
+        str(row["structure_file"])
+        for _, row in df.iterrows()
+        if pd.notna(row["structure_file"]) and Path(str(row["predicted_structure_path"])).exists()
+    }
+    desired = {Path(p).name for p in pdb_files}
+    return desired.issubset(existing)
 
 
 # ---------------------------------------------------------------------------

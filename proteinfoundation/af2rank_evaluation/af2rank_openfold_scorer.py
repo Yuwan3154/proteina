@@ -31,6 +31,8 @@ from tqdm import tqdm
 import openfold.np.residue_constants as rc
 from openfold.np import protein as openfold_protein
 from proteinfoundation.utils.openfold_inference import OpenFoldTemplateInference
+from proteinfoundation.utils.ff_utils.pdb_utils import write_prot_to_pdb
+from proteinfoundation.af2rank_evaluation.usalign_tabular import parse_usalign_pair_outfmt2
 from scipy.stats import spearmanr
 
 
@@ -59,17 +61,18 @@ def tmscore(x, y, tmscore_exe="USalign", env=None):
                         % (k + 1, "CA", "ALA", "A", k + 1, c[0], c[1], c[2], 1, 0))
             f.flush()
 
-    output_lines = None
+    output_text = None
+    used_exe = None
     for exe in [tmscore_exe, "./TMscore", "TMscore", "/usr/local/bin/TMscore"]:
         if os.path.exists(exe) or os.system(f"which {exe} > /dev/null 2>&1") == 0:
             cmd = [exe, f1.name, f2.name]
-            if exe == "USalign":
-                cmd += ["-TMscore", "5"]
+            if os.path.basename(exe) == "USalign":
+                cmd += ["-TMscore", "5", "-outfmt", "2"]
             subprocess_env = os.environ.copy()
             if env is not None:
                 subprocess_env.update(env)
-            out = subprocess.check_output(cmd, text=True, env=subprocess_env)
-            output_lines = out.splitlines()
+            output_text = subprocess.check_output(cmd, text=True, env=subprocess_env)
+            used_exe = exe
             break
     else:
         x_np = x if isinstance(x, np.ndarray) else x.detach().cpu().numpy()
@@ -79,9 +82,15 @@ def tmscore(x, y, tmscore_exe="USalign", env=None):
         os.unlink(f2.name)
         return {"rms": float(rmsd), "tms": 0.0, "gdt": 0.0}
 
+    os.unlink(f1.name)
+    os.unlink(f2.name)
+
+    if os.path.basename(used_exe) == "USalign":
+        return parse_usalign_pair_outfmt2(output_text)
+
     parse_float = lambda s: float(s.split("=")[1].split()[0])
     o = {"rms": 0.0, "tms": 0.0, "gdt": 0.0}
-    for line in output_lines:
+    for line in output_text.splitlines():
         line = line.rstrip()
         if line.startswith("RMSD"):
             o["rms"] = parse_float(line)
@@ -89,10 +98,26 @@ def tmscore(x, y, tmscore_exe="USalign", env=None):
             o["tms"] = parse_float(line)
         elif line.startswith("GDT-TS-score"):
             o["gdt"] = parse_float(line)
-
-    os.unlink(f1.name)
-    os.unlink(f2.name)
     return o
+
+
+def _save_openfold_prediction_pdb(reference_sequence: str, out: dict, output_pdb: str) -> None:
+    atom37 = out["final_atom_positions"].detach().cpu().numpy()
+    atom37_mask = out["final_atom_mask"].detach().cpu().numpy() if "final_atom_mask" in out else None
+    aatype = np.array([rc.restype_order.get(aa, rc.restype_num) for aa in reference_sequence], dtype=np.int32)
+    residue_index = np.arange(atom37.shape[0], dtype=np.int32) + 1
+    chain_index = np.zeros(atom37.shape[0], dtype=np.int32)
+    os.makedirs(os.path.dirname(output_pdb), exist_ok=True)
+    write_prot_to_pdb(
+        atom37,
+        output_pdb,
+        aatype=aatype,
+        atom37_mask=atom37_mask,
+        residue_index=residue_index,
+        chain_index=chain_index,
+        overwrite=True,
+        no_indexing=True,
+    )
 
 
 def _is_ca_only_pdb(pdb_file):
@@ -706,7 +731,7 @@ class OpenFoldAF2Rank:
         if verbose:
             logger.debug(f"Scoring {decoy_pdb} with OpenFold AF2Rank")
 
-        batch, template_coords = self._featurize(
+        batch, _template_coords = self._featurize(
             decoy_pdb,
             decoy_chain=decoy_chain,
             rm_seq=rm_seq,
@@ -718,7 +743,11 @@ class OpenFoldAF2Rank:
         with torch.no_grad():
             out = self.model.model(batch)
 
-        scores = self._extract_scores(out, template_coords)
+        scores = self._extract_scores(out)
+        if output_pdb is not None:
+            _save_openfold_prediction_pdb(self.reference_sequence, out, output_pdb)
+            scores["predicted_structure_path"] = output_pdb
+            scores["predicted_structure_file"] = os.path.basename(output_pdb)
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -731,8 +760,8 @@ class OpenFoldAF2Rank:
 
         return scores
 
-    def _extract_scores(self, out: dict, template_coords: np.ndarray) -> Dict:
-        """Extract AF2Rank scoring metrics from OpenFold output."""
+    def _extract_scores(self, out: dict) -> Dict:
+        """Extract AF2 confidence metrics from OpenFold output."""
         scores = {}
 
         # pTM score (0-1)
@@ -751,60 +780,8 @@ class OpenFoldAF2Rank:
         else:
             scores["pae_mean"] = 0.0
 
-        # Predicted coordinates (CA atoms from atom37)
-        # final_atom_positions: [N_res, 37, 3]
-        if "final_atom_positions" in out:
-            ca_idx = rc.atom_order["CA"]  # Should be 1
-            pred_coords = out["final_atom_positions"][:, ca_idx, :].detach().cpu().numpy()
-        else:
-            pred_coords = np.zeros((len(self.reference_sequence), 3), dtype=np.float32)
-
-        # TMscore calculations (USalign subprocess; overlap up to 3 calls when all are needed)
-        n_tm = (
-            (self.reference_coords is not None)
-            + (template_coords is not None and self.reference_coords is not None)
-            + (template_coords is not None)
-        )
-        env = _USALIGN_PARALLEL_ENV if n_tm > 1 else None
-        fut_by_key = {}
-        with ThreadPoolExecutor(max_workers=3) as ex:
-            if self.reference_coords is not None:
-                fut_by_key["ref_pred"] = ex.submit(
-                    tmscore, self.reference_coords, pred_coords, "USalign", env
-                )
-            if template_coords is not None and self.reference_coords is not None:
-                fut_by_key["ref_template"] = ex.submit(
-                    tmscore, self.reference_coords, template_coords, "USalign", env
-                )
-            if template_coords is not None:
-                fut_by_key["template_pred"] = ex.submit(
-                    tmscore, template_coords, pred_coords, "USalign", env
-                )
-            tm_by_key = {k: fut.result() for k, fut in fut_by_key.items()}
-
-        if "ref_pred" in tm_by_key:
-            tm_ref_pred = tm_by_key["ref_pred"]
-            scores["tm_ref_pred"] = tm_ref_pred["tms"]
-            scores["rmsd_ref_pred"] = tm_ref_pred["rms"]
-            scores["gdt_ref_pred"] = tm_ref_pred.get("gdt", 0.0)
-
-        if "ref_template" in tm_by_key:
-            tm_ref_template = tm_by_key["ref_template"]
-            scores["tm_ref_template"] = tm_ref_template["tms"]
-            scores["rmsd_ref_template"] = tm_ref_template["rms"]
-            scores["gdt_ref_template"] = tm_ref_template.get("gdt", 0.0)
-
-        if "template_pred" in tm_by_key:
-            tm_template_pred = tm_by_key["template_pred"]
-            scores["tm_template_pred"] = tm_template_pred["tms"]
-            scores["rmsd_template_pred"] = tm_template_pred["rms"]
-            scores["gdt_template_pred"] = tm_template_pred.get("gdt", 0.0)
-
         # Composite score
         scores["composite"] = scores["ptm"] * scores["plddt"]
-
-        # Store coordinates for external analysis
-        scores["pred_coords"] = pred_coords
 
         return scores
 
@@ -821,6 +798,7 @@ def score_proteina_structures_openfold(
     use_cuequivariance_attention: bool = False,
     use_cuequivariance_multiplicative_update: bool = True,
     scorer: Optional["OpenFoldAF2Rank"] = None,
+    predicted_structure_dir: Optional[str] = None,
 ) -> List[Dict]:
     """Score all Proteina-generated structures using AF2Rank with OpenFold backend.
 
@@ -876,6 +854,10 @@ def score_proteina_structures_openfold(
 
         for i, pdb_path in enumerate(tqdm(pdb_files, desc=f"AF2Rank-OpenFold scoring {protein_id}")):
             pdb_filename = os.path.basename(pdb_path)
+            output_pdb = None
+            if predicted_structure_dir is not None:
+                os.makedirs(predicted_structure_dir, exist_ok=True)
+                output_pdb = os.path.join(predicted_structure_dir, pdb_filename)
 
             # Submit featurization for the next decoy before waiting for the
             # current one — this is the overlap that hides featurization latency.
@@ -888,7 +870,11 @@ def score_proteina_structures_openfold(
                 with torch.no_grad():
                     out = scorer.model.model(batch)
 
-                structure_scores = scorer._extract_scores(out, template_coords)
+                structure_scores = scorer._extract_scores(out)
+                if output_pdb is not None:
+                    _save_openfold_prediction_pdb(scorer.reference_sequence, out, output_pdb)
+                    structure_scores["predicted_structure_path"] = output_pdb
+                    structure_scores["predicted_structure_file"] = os.path.basename(output_pdb)
                 gc.collect()
                 torch.cuda.empty_cache()
 
@@ -897,8 +883,6 @@ def score_proteina_structures_openfold(
                     "structure_file": pdb_filename,
                     "structure_path": pdb_path,
                 })
-                if "pred_coords" in structure_scores:
-                    del structure_scores["pred_coords"]
                 scores.append(structure_scores)
             except Exception as e:
                 logger.error(f"Failed to score {pdb_filename}: {e}")
@@ -964,76 +948,17 @@ def run_af2rank_analysis_openfold(
             use_cuequivariance_attention=use_cuequivariance_attention,
             use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
             scorer=scorer,
+            predicted_structure_dir=os.path.join(output_dir, "predicted_structures"),
         )
         if not scores:
             logger.warning(f"No scores generated for {protein_id}")
             return None
         scores_csv_path = save_af2rank_scores(scores, output_dir, protein_id)
 
-    # Generate plots
-    if regenerate_summary or not os.path.exists(
-        os.path.join(output_dir, f"af2rank_{protein_id}_template_quality_vs_composite.png")
-    ):
-        plot_af2rank_results(scores, output_dir, protein_id)
-
-    # Calculate summary metrics
-    successful_scores = [s for s in scores if "error" not in s]
-
-    spearman_rho_composite = None
-    spearman_rho_ptm = None
-    max_tm_ref_template = None
-    max_tm_ref_pred = None
-    tm_ref_template_at_max_composite = None
-    tm_ref_pred_at_max_composite = None
-    tm_ref_pred_at_max_ptm = None
-    top_1_tm_ref_template = None
-    top_5_tm_ref_template = None
-    top_1_tm_ref_pred = None
-    top_5_tm_ref_pred = None
-
-    if len(successful_scores) > 1:
-        tm_ref_template_scores = []
-        tm_ref_pred_scores = []
-        composite_scores = []
-        ptm_scores = []
-
-        for score in successful_scores:
-            if all(k in score for k in ('tm_ref_template', 'composite', 'tm_ref_pred', 'ptm')):
-                tm_ref_template_scores.append(score['tm_ref_template'])
-                tm_ref_pred_scores.append(score['tm_ref_pred'])
-                composite_scores.append(score['composite'])
-                ptm_scores.append(score['ptm'])
-
-        if len(tm_ref_template_scores) > 1:
-            correlation_result = spearmanr(tm_ref_template_scores, composite_scores)
-            spearman_rho_composite = correlation_result.correlation
-
-            correlation_result_ptm = spearmanr(tm_ref_pred_scores, ptm_scores)
-            spearman_rho_ptm = correlation_result_ptm.correlation
-
-            max_tm_ref_template = max(tm_ref_template_scores)
-            max_tm_ref_pred = max(tm_ref_pred_scores)
-
-            max_composite_idx = composite_scores.index(max(composite_scores))
-            tm_ref_template_at_max_composite = tm_ref_template_scores[max_composite_idx]
-            tm_ref_pred_at_max_composite = tm_ref_pred_scores[max_composite_idx]
-
-            max_ptm_idx = ptm_scores.index(max(ptm_scores))
-            tm_ref_pred_at_max_ptm = tm_ref_pred_scores[max_ptm_idx]
-
-            top_1_tm_ref_template = tm_ref_template_scores[np.argmax(composite_scores)]
-            top_5_tm_ref_template = max(
-                [tm_ref_template_scores[i] for i in np.argsort(-np.array(composite_scores))[:5]]
-            )
-            top_1_tm_ref_pred = tm_ref_pred_scores[np.argmax(ptm_scores)]
-            top_5_tm_ref_pred = max(
-                [tm_ref_pred_scores[i] for i in np.argsort(-np.array(ptm_scores))[:5]]
-            )
-
     summary = {
         "protein_id": protein_id,
         "total_structures": len(scores),
-        "successful_scores": len(successful_scores),
+        "successful_scores": len([s for s in scores if "error" not in s]),
         "failed_scores": len([s for s in scores if "error" in s]),
         "reference_structure": reference_cif,
         "inference_directory": inference_output_dir,
@@ -1041,18 +966,8 @@ def run_af2rank_analysis_openfold(
         "af2rank_directory": output_dir,
         "chain": chain,
         "recycles": recycles,
-        "spearman_correlation_rho_composite": spearman_rho_composite,
-        "spearman_correlation_rho_ptm": spearman_rho_ptm,
-        "max_tm_ref_template": max_tm_ref_template,
-        "max_tm_ref_pred": max_tm_ref_pred,
-        "tm_ref_template_at_max_composite": tm_ref_template_at_max_composite,
-        "tm_ref_pred_at_max_composite": tm_ref_pred_at_max_composite,
-        "tm_ref_pred_at_max_ptm": tm_ref_pred_at_max_ptm,
         "scores_csv": scores_csv_path,
-        "top_1_tm_ref_template": top_1_tm_ref_template,
-        "top_5_tm_ref_template": top_5_tm_ref_template,
-        "top_1_tm_ref_pred": top_1_tm_ref_pred,
-        "top_5_tm_ref_pred": top_5_tm_ref_pred,
+        "status": "scored_metrics_only",
     }
 
     summary_path = os.path.join(output_dir, f"af2rank_summary_{protein_id}.json")

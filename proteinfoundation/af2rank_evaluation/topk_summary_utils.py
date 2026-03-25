@@ -220,7 +220,19 @@ def generate_topk_summary_csv(
     staged_filenames = set(topk_df["template_file"].astype(str))
 
     # ── Merge AF2Rank metrics per template ──────────────────────────────────
-    metric_cols = ["structure_file", "ptm", "plddt", "composite", "tm_ref_pred", "tm_ref_template", "rmsd_ref_template"]
+    metric_cols = [
+        "structure_file",
+        "predicted_structure_file",
+        "predicted_structure_path",
+        "ptm",
+        "plddt",
+        "composite",
+        "tm_ref_pred",
+        "tm_ref_template",
+        "rmsd_ref_template",
+        "tm_template_pred",
+        "rmsd_template_pred",
+    ]
 
     def _safe_cols(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
         present = [c for c in cols if c in df.columns]
@@ -284,7 +296,13 @@ def generate_topk_summary_csv(
         "cg2all_tm_to_original",
         "m1_tm_ref_template",
         "m1_rmsd_ref_template",
+        "m1_predicted_structure_path",
+        "m1_tm_template_pred",
+        "m1_rmsd_template_pred",
         "m1_ptm", "m1_plddt", "m1_composite", "m1_tm_ref_pred",
+        "m2_predicted_structure_path",
+        "m2_tm_template_pred",
+        "m2_rmsd_template_pred",
         "m2_ptm", "m2_plddt", "m2_composite", "m2_tm_ref_pred",
         "min_ptm", "min_plddt", "min_composite", "min_tm_ref_pred",
     ]

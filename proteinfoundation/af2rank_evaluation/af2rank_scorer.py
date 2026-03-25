@@ -48,6 +48,8 @@ from colabdesign.shared.utils import copy_dict
 from colabdesign.af.alphafold.common import residue_constants
 from loguru import logger
 from tqdm import tqdm
+
+from proteinfoundation.af2rank_evaluation.usalign_tabular import parse_usalign_pair_outfmt2
 from scipy.stats import spearmanr
 
 
@@ -355,17 +357,18 @@ def tmscore(x, y, tmscore_exe="USalign", env=None):
                           % (k+1, "CA", "ALA", "A", k+1, c[0], c[1], c[2], 1, 0))
             f.flush()
 
-    output_lines = None
+    output_text = None
+    used_exe = None
     for exe in [tmscore_exe, "./TMscore", "TMscore", "/usr/local/bin/TMscore"]:
         if os.path.exists(exe) or os.system(f"which {exe} > /dev/null 2>&1") == 0:
             cmd = [exe, f1.name, f2.name]
-            if exe == "USalign":
-                cmd += ["-TMscore", "5"]
+            if os.path.basename(exe) == "USalign":
+                cmd += ["-TMscore", "5", "-outfmt", "2"]
             subprocess_env = os.environ.copy()
             if env is not None:
                 subprocess_env.update(env)
-            out = subprocess.check_output(cmd, text=True, env=subprocess_env)
-            output_lines = out.splitlines()
+            output_text = subprocess.check_output(cmd, text=True, env=subprocess_env)
+            used_exe = exe
             break
     else:
         print("Warning: TMscore executable not found. Using RMSD calculation.")
@@ -374,9 +377,15 @@ def tmscore(x, y, tmscore_exe="USalign", env=None):
             os.unlink(temp_file)
         return {"rms": rmsd, "tms": 0.0, "gdt": 0.0}
 
+    for temp_file in [f1.name, f2.name]:
+        os.unlink(temp_file)
+
+    if os.path.basename(used_exe) == "USalign":
+        return parse_usalign_pair_outfmt2(output_text)
+
     parse_float = lambda s: float(s.split("=")[1].split()[0])
     o = {"rms": 0.0, "tms": 0.0, "gdt": 0.0}
-    for line in output_lines:
+    for line in output_text.splitlines():
         line = line.rstrip()
         if line.startswith("RMSD"):
             o["rms"] = parse_float(line)
@@ -384,10 +393,6 @@ def tmscore(x, y, tmscore_exe="USalign", env=None):
             o["tms"] = parse_float(line)
         elif line.startswith("GDT-TS-score"):
             o["gdt"] = parse_float(line)
-
-    for temp_file in [f1.name, f2.name]:
-        os.unlink(temp_file)
-
     return o
 
 
@@ -801,12 +806,6 @@ class ModernAF2Rank:
         if verbose:
             logger.debug(f"Recycles set to {recycles}")
         
-        # Get template coordinates for TMscore analysis (use original CA-only PDB if provided)
-        if verbose:
-            logger.debug("Getting template coordinates")
-        ca_source = _original_pdb if _original_pdb else decoy_pdb
-        template_coords = self._get_coords_from_pdb(ca_source, decoy_chain)
-        
         # Run prediction exactly like predict.ipynb
         if verbose:
             logger.debug("Starting AF2 prediction...")
@@ -818,14 +817,17 @@ class ModernAF2Rank:
         if verbose:
             logger.debug("AF2 prediction completed successfully")
         
-        # Calculate scores using AF2 outputs including TMscore analysis
+        # Calculate scores using AF2 outputs only; TM enrichment is post-hoc.
         if verbose:
             logger.debug("Calculating scores")
-        scores = self._calculate_scores(template_coords=template_coords)
+        scores = self._calculate_scores()
         
         # Save output PDB if requested
         if output_pdb:
+            os.makedirs(os.path.dirname(output_pdb), exist_ok=True)
             self.af.save_pdb(output_pdb)
+            scores["predicted_structure_path"] = output_pdb
+            scores["predicted_structure_file"] = os.path.basename(output_pdb)
 
         # Clean up auto-reconstructed all-atom temp file
         if _tmp_allatom and os.path.exists(_tmp_allatom):
@@ -839,8 +841,8 @@ class ModernAF2Rank:
 
         return scores
     
-    def _calculate_scores(self, template_coords=None):
-        """Calculate scoring metrics from AF2 outputs including TMscore analysis."""
+    def _calculate_scores(self):
+        """Calculate AF2 confidence metrics only; TM enrichment happens later."""
         aux = self.af.aux
         scores = {}
         
@@ -849,61 +851,20 @@ class ModernAF2Rank:
         scores["ptm"] = float(aux["log"]["ptm"])
         scores["pae_mean"] = float(aux["log"]["pae"]) * 31.0  # Convert to Angstroms
         
-        # Get predicted coordinates (CA atoms)
-        pred_coords = aux["atom_positions"][:, 1]
-
-        # TMscore calculations (USalign subprocess; overlap up to 3 calls when all are needed)
-        n_tm = (
-            (self.reference_coords is not None)
-            + (template_coords is not None and self.reference_coords is not None)
-            + (template_coords is not None)
-        )
-        env = _USALIGN_PARALLEL_ENV if n_tm > 1 else None
-        fut_by_key = {}
-        with ThreadPoolExecutor(max_workers=3) as ex:
-            if self.reference_coords is not None:
-                fut_by_key["ref_pred"] = ex.submit(
-                    tmscore, self.reference_coords, pred_coords, "USalign", env
-                )
-            if template_coords is not None and self.reference_coords is not None:
-                fut_by_key["ref_template"] = ex.submit(
-                    tmscore, self.reference_coords, template_coords, "USalign", env
-                )
-            if template_coords is not None:
-                fut_by_key["template_pred"] = ex.submit(
-                    tmscore, template_coords, pred_coords, "USalign", env
-                )
-            tm_by_key = {k: fut.result() for k, fut in fut_by_key.items()}
-
-        if "ref_pred" in tm_by_key:
-            tm_ref_pred = tm_by_key["ref_pred"]
-            scores["tm_ref_pred"] = tm_ref_pred["tms"]
-            scores["rmsd_ref_pred"] = tm_ref_pred["rms"]
-            scores["gdt_ref_pred"] = tm_ref_pred.get("gdt", 0.0)
-
-        if "ref_template" in tm_by_key:
-            tm_ref_template = tm_by_key["ref_template"]
-            scores["tm_ref_template"] = tm_ref_template["tms"]
-            scores["rmsd_ref_template"] = tm_ref_template["rms"]
-            scores["gdt_ref_template"] = tm_ref_template.get("gdt", 0.0)
-
-        if "template_pred" in tm_by_key:
-            tm_template_pred = tm_by_key["template_pred"]
-            scores["tm_template_pred"] = tm_template_pred["tms"]
-            scores["rmsd_template_pred"] = tm_template_pred["rms"]
-            scores["gdt_template_pred"] = tm_template_pred.get("gdt", 0.0)
-        
         # AF2Rank composite score (key metric)
         scores["composite"] = scores["ptm"] * scores["plddt"]
-        
-        # Store coordinates for external analysis
-        scores["pred_coords"] = pred_coords
-        
         return scores
 
 
-def score_proteina_structures(protein_id: str, reference_cif: str, inference_output_dir: str, 
-                             chain: str = "A", recycles: int = 3, verbose: bool = False) -> List[Dict]:
+def score_proteina_structures(
+    protein_id: str,
+    reference_cif: str,
+    inference_output_dir: str,
+    chain: str = "A",
+    recycles: int = 3,
+    verbose: bool = False,
+    predicted_structure_dir: Optional[str] = None,
+) -> List[Dict]:
     """
     Score all Proteina-generated structures using AF2Rank.
     
@@ -954,6 +915,10 @@ def score_proteina_structures(protein_id: str, reference_cif: str, inference_out
     # Score each structure (suppress noisy ColabDesign stdout)
     for pdb_path in tqdm(pdb_files, desc=f"AF2Rank scoring {protein_id}"):
         pdb_filename = os.path.basename(pdb_path)
+        output_pdb = None
+        if predicted_structure_dir is not None:
+            os.makedirs(predicted_structure_dir, exist_ok=True)
+            output_pdb = os.path.join(predicted_structure_dir, pdb_filename)
 
         try:
             # Use pre-reconstructed all-atom PDB for template if available
@@ -965,6 +930,7 @@ def score_proteina_structures(protein_id: str, reference_cif: str, inference_out
                     pdb_path,
                     decoy_chain="A",  # Force chain A since Proteina generates chain A
                     recycles=recycles,
+                    output_pdb=output_pdb,
                     verbose=verbose,
                     _allatom_pdb=allatom_pdb,
                     _original_pdb=pdb_path if allatom_pdb else None,
@@ -974,12 +940,11 @@ def score_proteina_structures(protein_id: str, reference_cif: str, inference_out
             structure_scores.update({
                 "protein_id": protein_id,
                 "structure_file": pdb_filename,
-                "structure_path": pdb_path
+                "structure_path": pdb_path,
             })
-
-            # Remove coordinates from output (too large for CSV)
-            if "pred_coords" in structure_scores:
-                del structure_scores["pred_coords"]
+            if output_pdb is not None:
+                structure_scores["predicted_structure_path"] = output_pdb
+                structure_scores["predicted_structure_file"] = os.path.basename(output_pdb)
 
             scores.append(structure_scores)
 
@@ -1033,7 +998,8 @@ def run_af2rank_analysis(protein_id: str, reference_cif: str, inference_output_d
             inference_output_dir=inference_output_dir,
             chain=chain,
             recycles=recycles,
-            verbose=verbose
+            verbose=verbose,
+            predicted_structure_dir=os.path.join(output_dir, "predicted_structures"),
         )
         
         if not scores:
@@ -1042,73 +1008,10 @@ def run_af2rank_analysis(protein_id: str, reference_cif: str, inference_output_d
         
         # Save scores to CSV
         scores_csv_path = save_af2rank_scores(scores, output_dir, protein_id)
-    
-    # Generate plots (if regenerate_summary is True, this will regenerate plots)
-    if regenerate_summary or not os.path.exists(os.path.join(output_dir, f"af2rank_template_quality_vs_composite_{protein_id}.png")):
-        plot_af2rank_results(scores, output_dir, protein_id)
-    
-    # Calculate additional metrics for successful scores
-    successful_scores = [s for s in scores if "error" not in s]
-    
-    # Initialize additional metrics
-    spearman_rho_composite = None
-    spearman_rho_ptm = None  # NEW: pTM vs tm_ref_pred correlation
-    max_tm_ref_template = None
-    max_tm_ref_pred = None
-    tm_ref_template_at_max_composite = None
-    tm_ref_pred_at_max_composite = None
-    tm_ref_pred_at_max_ptm = None  # NEW: Prediction quality at highest pTM
-    
-    if len(successful_scores) > 1:
-        # Extract metrics
-        tm_ref_template_scores = []
-        tm_ref_pred_scores = []
-        composite_scores = []
-        ptm_scores = []
-        
-        for score in successful_scores:
-            if ('tm_ref_template' in score and 'composite' in score and 
-                'tm_ref_pred' in score and 'ptm' in score):
-                tm_ref_template_scores.append(score['tm_ref_template'])
-                tm_ref_pred_scores.append(score['tm_ref_pred'])
-                composite_scores.append(score['composite'])
-                ptm_scores.append(score['ptm'])
-        
-        if len(tm_ref_template_scores) > 1:
-            # Correlation 1: composite vs tm_ref_template (template quality)
-            correlation_result = spearmanr(tm_ref_template_scores, composite_scores)
-            spearman_rho_composite = correlation_result.correlation
-            
-            # Correlation 2: pTM vs tm_ref_pred (prediction quality)
-            correlation_result_ptm = spearmanr(tm_ref_pred_scores, ptm_scores)
-            spearman_rho_ptm = correlation_result_ptm.correlation
-            
-            # Find maximum tm_ref_template score
-            max_tm_ref_template = max(tm_ref_template_scores)
-            
-            # Find scores for sample with highest composite score
-            max_composite_idx = composite_scores.index(max(composite_scores))
-            max_tm_ref_pred = max(tm_ref_pred_scores)
-            tm_ref_template_at_max_composite = tm_ref_template_scores[max_composite_idx]
-            tm_ref_pred_at_max_composite = tm_ref_pred_scores[max_composite_idx]
-            
-            # Find scores for sample with highest pTM
-            max_ptm_idx = ptm_scores.index(max(ptm_scores))
-            tm_ref_pred_at_max_ptm = tm_ref_pred_scores[max_ptm_idx]
-    
-            # Find scores for top 1 and top 5 tm_ref_template
-            top_1_tm_ref_template = tm_ref_template_scores[np.argmax(composite_scores)]
-            top_5_tm_ref_template = max([tm_ref_template_scores[index] for index in np.argsort(-np.array(composite_scores))[:5]])
-            
-            # Find scores for top 1 and top 5 tm_ref_pred
-            top_1_tm_ref_pred = tm_ref_pred_scores[np.argmax(ptm_scores)]
-            top_5_tm_ref_pred = max([tm_ref_pred_scores[index] for index in np.argsort(-np.array(ptm_scores))[:5]])
-    
-    # Save summary
     summary = {
         "protein_id": protein_id,
         "total_structures": len(scores),
-        "successful_scores": len(successful_scores),
+        "successful_scores": len([s for s in scores if "error" not in s]),
         "failed_scores": len([s for s in scores if "error" in s]),
         "reference_structure": reference_cif,
         "inference_directory": inference_output_dir,
@@ -1116,19 +1019,8 @@ def run_af2rank_analysis(protein_id: str, reference_cif: str, inference_output_d
         "af2rank_directory": output_dir,
         "chain": chain,
         "recycles": recycles,
-        "spearman_correlation_rho_composite": spearman_rho_composite,  # composite vs tm_ref_template
-        "spearman_correlation_rho_ptm": spearman_rho_ptm,  # NEW: pTM vs tm_ref_pred
-        "max_tm_ref_template": max_tm_ref_template,
-        "max_tm_ref_pred": max_tm_ref_pred,
-        
-        "tm_ref_template_at_max_composite": tm_ref_template_at_max_composite,
-        "tm_ref_pred_at_max_composite": tm_ref_pred_at_max_composite,
-        "tm_ref_pred_at_max_ptm": tm_ref_pred_at_max_ptm,  # NEW: prediction quality at best pTM
         "scores_csv": scores_csv_path,
-        "top_1_tm_ref_template": top_1_tm_ref_template,
-        "top_5_tm_ref_template": top_5_tm_ref_template,
-        "top_1_tm_ref_pred": top_1_tm_ref_pred,
-        "top_5_tm_ref_pred": top_5_tm_ref_pred,
+        "status": "scored_metrics_only",
     }
     
     summary_path = os.path.join(output_dir, f"af2rank_summary_{protein_id}.json")

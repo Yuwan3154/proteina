@@ -240,17 +240,24 @@ def _score_protein_with_scorer(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     scores_csv = output_dir / f"af2rank_scores_{protein_id}.csv"
+    predicted_dir = output_dir / "predicted_structures"
 
     existing_files: set = set()
     existing_scores: List[Dict] = []
     if filter_existing and scores_csv.exists():
-        try:
-            ex_df = pd.read_csv(scores_csv)
-            if "structure_file" in ex_df.columns:
-                existing_files = set(ex_df["structure_file"].dropna().astype(str))
-                existing_scores = ex_df.to_dict("records")
-        except Exception:
-            pass
+        ex_df = pd.read_csv(scores_csv)
+        if "predicted_structure_path" not in ex_df.columns and "structure_file" in ex_df.columns:
+            ex_df["predicted_structure_path"] = ex_df["structure_file"].astype(str).apply(
+                lambda name: str(predicted_dir / name)
+            )
+        if "predicted_structure_file" not in ex_df.columns and "structure_file" in ex_df.columns:
+            ex_df["predicted_structure_file"] = ex_df["structure_file"].astype(str)
+        existing_scores = ex_df.to_dict("records")
+        for row in existing_scores:
+            structure_file = str(row.get("structure_file", ""))
+            predicted_path = str(row.get("predicted_structure_path", ""))
+            if structure_file and predicted_path and Path(predicted_path).exists():
+                existing_files.add(structure_file)
 
     desired_files = set(Path(str(p)).name for p in topk_df["structure_path"].tolist())
     to_score = [
@@ -262,49 +269,31 @@ def _score_protein_with_scorer(
         logger.info(f"  {protein_id}: all {len(desired_files)} templates already scored, skipping")
         return
 
-    # Build items list: (ca_pdb_path, scored_pdb, orig_pdb_for_ca_extraction)
-    # Use pre-reconstructed all-atom PDB when available (avoids cg2all in background thread).
-    items = []
-    for row in to_score:
+    new_scores: List[Dict] = []
+    predicted_dir.mkdir(parents=True, exist_ok=True)
+    for _, row in pd.DataFrame(to_score).iterrows():
         ca_pdb_path = str(row["structure_path"])
         prebuilt_allatom = allatom_map.get(ca_pdb_path)
-        if prebuilt_allatom and Path(prebuilt_allatom).exists():
-            items.append((ca_pdb_path, prebuilt_allatom, ca_pdb_path))
-        else:
-            items.append((ca_pdb_path, ca_pdb_path, None))
-
-    def _featurize_item(item):
-        ca_pdb_path, scored_pdb, orig_pdb = item
-        if not Path(ca_pdb_path).exists():
-            raise FileNotFoundError(f"Template not found: {ca_pdb_path}")
-        batch, template_coords = scorer._featurize(scored_pdb, decoy_chain="A", _original_pdb=orig_pdb)
-        return ca_pdb_path, batch, template_coords
-
-    new_scores: List[Dict] = []
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(_featurize_item, items[0])
-        for i, (ca_pdb_path, scored_pdb, orig_pdb) in enumerate(items):
-            pdb_filename = Path(ca_pdb_path).name
-            if i + 1 < len(items):
-                next_future = executor.submit(_featurize_item, items[i + 1])
-            try:
-                _, batch, template_coords = future.result()
-                with torch.no_grad():
-                    out = scorer.model.model(batch)
-                structure_scores = scorer._extract_scores(out, template_coords)
-                gc.collect()
-                torch.cuda.empty_cache()
-                structure_scores.update({
-                    "protein_id": protein_id,
-                    "structure_file": pdb_filename,
-                    "structure_path": ca_pdb_path,
-                })
-                structure_scores.pop("pred_coords", None)
-                new_scores.append(structure_scores)
-            except Exception as e:
-                logger.error(f"  {protein_id}: failed to score {pdb_filename}: {e}")
-            if i + 1 < len(items):
-                future = next_future
+        scored_pdb = prebuilt_allatom if prebuilt_allatom and Path(prebuilt_allatom).exists() else ca_pdb_path
+        original_pdb = ca_pdb_path if scored_pdb != ca_pdb_path else None
+        pdb_filename = Path(ca_pdb_path).name
+        output_pdb = str(predicted_dir / pdb_filename)
+        structure_scores = scorer.score_structure(
+            scored_pdb,
+            decoy_chain="A",
+            recycles=recycles,
+            output_pdb=output_pdb,
+            verbose=False,
+            _original_pdb=original_pdb,
+        )
+        structure_scores.update({
+            "protein_id": protein_id,
+            "structure_file": pdb_filename,
+            "structure_path": ca_pdb_path,
+            "predicted_structure_path": output_pdb,
+            "predicted_structure_file": pdb_filename,
+        })
+        new_scores.append(structure_scores)
 
     all_scores = existing_scores + new_scores
     if not all_scores:
@@ -467,16 +456,21 @@ def main() -> None:
 
 
 def _all_scored(scores_csv: Path, desired_files: set) -> bool:
-    """Return True if scores_csv exists and covers every file in desired_files."""
+    """Return True if scores_csv exists, covers desired_files, and prediction PDBs exist."""
     if not scores_csv.exists():
         return False
-    try:
-        df = pd.read_csv(scores_csv)
-        if "structure_file" not in df.columns:
-            return False
-        return desired_files.issubset(set(df["structure_file"].dropna().astype(str)))
-    except Exception:
+    df = pd.read_csv(scores_csv)
+    if "structure_file" not in df.columns:
         return False
+    predicted_dir = scores_csv.parent / "predicted_structures"
+    if "predicted_structure_path" not in df.columns:
+        df["predicted_structure_path"] = df["structure_file"].astype(str).apply(lambda name: str(predicted_dir / name))
+    completed = {
+        str(row["structure_file"])
+        for _, row in df.iterrows()
+        if pd.notna(row.get("structure_file")) and Path(str(row["predicted_structure_path"])).exists()
+    }
+    return desired_files.issubset(completed)
 
 
 def _run_model_pass(

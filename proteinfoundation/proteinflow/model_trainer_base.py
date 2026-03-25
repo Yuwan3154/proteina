@@ -79,6 +79,7 @@ class ModelTrainerBase(L.LightningModule):
         # Lazy OpenFold template inference helper
         self._template_inference = None
         self._logged_val_traj_epoch = -1
+        self._self_cond_copy_last_step = None
 
     def configure_optimizers(self):
         if self.cfg_exp.training.finetune_seq_cond_lora_only:
@@ -96,8 +97,11 @@ class ModelTrainerBase(L.LightningModule):
             )
             print(f"Finetuning {opt_params_names}")
         else:
-            for param in self.parameters():
-                param.requires_grad = True
+            for name, param in self.named_parameters():
+                if name.startswith("nn_sc."):
+                    param.requires_grad = False
+                else:
+                    param.requires_grad = True
             optimizer = torch.optim.Adam(
                 [p for p in self.parameters() if p.requires_grad],
                 lr=self.cfg_exp.opt.lr,
@@ -164,6 +168,21 @@ class ModelTrainerBase(L.LightningModule):
             }
         
         return optimizer
+
+    def _maybe_update_self_cond_copy(self) -> None:
+        """Optionally sync a frozen self-conditioning model copy from the main model."""
+        nn_sc = getattr(self, "nn_sc", None)
+        if nn_sc is None:
+            return
+        update_every = int(self.cfg_exp.training.get("self_cond_copy_update_every", 1))
+        if update_every <= 0:
+            return
+        step = int(getattr(self, "global_step", 0))
+        last = self._self_cond_copy_last_step
+        if last is None or (step - int(last)) >= update_every:
+            with torch.no_grad():
+                nn_sc.load_state_dict(self.nn.state_dict(), strict=True)
+            self._self_cond_copy_last_step = step
 
     def on_after_backward(self) -> None:
         """Clears gradients when a non-finite loss was detected for this backward."""
@@ -621,7 +640,9 @@ class ModelTrainerBase(L.LightningModule):
 
         if use_self_cond:
             with torch.no_grad():
-                nn_out_sc = self.nn(batch)
+                self._maybe_update_self_cond_copy()
+                sc_model = getattr(self, "nn_sc", None) or self.nn
+                nn_out_sc = sc_model(batch)
                 if contact_map_mode:
                     pred_sc = self._nn_out_to_c_clean(nn_out_sc, batch)
                 else:

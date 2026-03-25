@@ -223,6 +223,36 @@ def step_af2rank_topk(
     return run_with_conda_env("proteina", cmd, direct_python=direct_python)
 
 
+def step_central_analysis(
+    inference_config: str,
+    csv_file: str,
+    csv_column: str = "id",
+    proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
+    num_workers: int | None = None,
+    direct_python: bool = False,
+    rerun: bool = False,
+) -> bool:
+    """Run centralized TM analysis after scorer outputs and prediction PDBs exist."""
+    inference_dir = os.path.join(PROTEINA_BASE_DIR, "inference", inference_config)
+    cmd = [
+        "python",
+        os.path.join(AF2RANK_EVAL_DIR, "proteina_analysis.py"),
+        "--inference_dir",
+        inference_dir,
+        "--csv_file",
+        csv_file,
+        "--csv_column",
+        csv_column,
+        "--proteinebm_analysis_subdir",
+        proteinebm_analysis_subdir,
+    ]
+    if num_workers is not None:
+        cmd.extend(["--num_workers", str(num_workers)])
+    if rerun:
+        cmd.append("--rerun")
+    return run_with_conda_env("proteina", cmd, direct_python=direct_python)
+
+
 # ── Step 5: Collect results ───────────────────────────────────────────────────
 
 def step_collect_results(
@@ -366,15 +396,15 @@ def step_collect_results(
         "ptm_max": float(np.max(ptm_values)) if ptm_values else None,
     }
 
-    # Add diversity metrics if available
-    from proteinfoundation.af2rank_evaluation.proteina_diversity import load_diversity_data
+    # Add analysis pairwise TM metrics if available
+    from proteinfoundation.af2rank_evaluation.proteina_analysis import load_analysis_data
     inference_base = os.path.join(PROTEINA_BASE_DIR, "inference", inference_config)
-    diversity_data = load_diversity_data(inference_base)
-    if diversity_data:
-        div_medians = [v["median_tem_to_tem_tm"] for v in diversity_data.values()]
-        div_means = [v["mean_tem_to_tem_tm"] for v in diversity_data.values()]
-        div_stds = [v["std_tem_to_tem_tm"] for v in diversity_data.values()]
-        summary_json["diversity_statistics"] = {
+    analysis_data = load_analysis_data(inference_base)
+    if analysis_data:
+        div_medians = [v["median_tem_to_tem_tm"] for v in analysis_data.values()]
+        div_means = [v["mean_tem_to_tem_tm"] for v in analysis_data.values()]
+        div_stds = [v["std_tem_to_tem_tm"] for v in analysis_data.values()]
+        analysis_stats = {
             "mean_tem_to_tem_tm": {
                 "mean": float(np.mean(div_means)),
                 "median": float(np.median(div_means)),
@@ -390,8 +420,10 @@ def step_collect_results(
                 "median": float(np.median(div_medians)),
                 "std": float(np.std(div_medians)),
             },
-            "num_proteins_with_diversity": len(diversity_data),
+            "num_proteins_with_analysis": len(analysis_data),
         }
+        summary_json["analysis_statistics"] = analysis_stats
+        summary_json["diversity_statistics"] = analysis_stats
     summary_json_path = os.path.join(output_dir, "prediction_summary.json")
     with open(summary_json_path, "w") as f:
         json.dump(summary_json, f, indent=2)
@@ -481,13 +513,15 @@ def main():
                         help="Batch size for ProteinEBM inference (default: 32). Auto-reduces on OOM.")
     parser.add_argument("--skip_inference", action="store_true", help="Skip Proteina inference step")
     parser.add_argument("--skip_diversity", action="store_true",
-                        help="Skip Proteina sample diversity analysis (all-to-all TMscore)")
+                        help="Alias for --skip_analysis during the migration to central analysis")
+    parser.add_argument("--skip_analysis", action="store_true",
+                        help="Skip the central post-scoring TM analysis stage")
     parser.add_argument(
         "--num_workers",
         type=int,
         default=None,
-        help="Max parallel CPU workers for diversity (USalign), ProteinEBM reference TM (when CIF/TM is used), "
-             "and similar steps; default is clamped os.cpu_count() (1–64).",
+        help="Max parallel CPU workers for central analysis and similar CPU-bound steps; "
+             "default is clamped os.cpu_count() (1–64).",
     )
     parser.add_argument("--skip_scoring", action="store_true", help="Skip ProteinEBM scoring step")
     parser.add_argument("--skip_af2rank", action="store_true", help="Skip AF2Rank step")
@@ -537,8 +571,9 @@ def main():
     logger.info(f"Top-k: {args.top_k}")
     logger.info(f"Backend: {args.backend}")
     logger.info(f"Output: {args.output_dir}")
-    from proteinfoundation.af2rank_evaluation.proteina_diversity import resolve_num_workers
-    logger.info(f"num_workers (CPU, diversity etc.): {resolve_num_workers(args.num_workers)}")
+    from proteinfoundation.af2rank_evaluation.proteina_analysis import resolve_num_workers
+    logger.info(f"num_workers (CPU, analysis etc.): {resolve_num_workers(args.num_workers)}")
+    skip_analysis = args.skip_analysis or args.skip_diversity
 
     # ── Step 1: Parse input and create PT files ──
     logger.info("\n" + "=" * 60)
@@ -560,23 +595,6 @@ def main():
             logger.info("Proteina inference completed successfully")
     elif args.skip_inference:
         logger.info("Skipping Proteina inference")
-
-    # ── Step 2.5: Proteina sample diversity ──
-    if not args.skip_diversity and success:
-        logger.info("\n" + "=" * 60)
-        logger.info("STEP 2.5: PROTEINA SAMPLE DIVERSITY")
-        logger.info("=" * 60)
-
-        from proteinfoundation.af2rank_evaluation.proteina_diversity import compute_diversity_for_proteins
-
-        inference_dir = os.path.join(PROTEINA_BASE_DIR, "inference", args.inference_config)
-        diversity_results = compute_diversity_for_proteins(
-            inference_dir, protein_ids, skip_existing=not args.rerun_proteina,
-            num_workers=args.num_workers,
-        )
-        logger.info(f"Diversity analysis completed for {len(diversity_results)} proteins")
-    elif args.skip_diversity:
-        logger.info("Skipping Proteina sample diversity analysis")
 
     # ── Step 3: ProteinEBM scoring ──
     if not args.skip_scoring and success:
@@ -628,12 +646,12 @@ def main():
     elif args.skip_af2rank:
         logger.info("Skipping AF2Rank step")
 
-    # Non-zero shards exit after step 4; only shard 0 continues to steps 5-6
+    # Non-zero shards exit after step 4; only shard 0 continues to post-scoring analysis
     if shard_index is not None and shard_index != 0:
         logger.info("Per-protein work complete (non-zero shard), exiting.")
         sys.exit(0 if success else 1)
 
-    # ── Step 5: Collect results (shard 0 only; waits for all shards if sharded) ──
+    # ── Step 5: Central analysis (shard 0 only; waits for all shards if sharded) ──
     if success:
         if shard_index is not None:
             def _check_af2rank_done(protein_id):
@@ -651,18 +669,38 @@ def main():
 
         if success:
             logger.info("\n" + "=" * 60)
-            logger.info("STEP 5: COLLECT RESULTS")
+            logger.info("STEP 5: CENTRAL ANALYSIS")
             logger.info("=" * 60)
-            results = step_collect_results(
-                protein_ids, args.inference_config, args.output_dir,
-                args.ptm_cutoff, args.proteinebm_analysis_subdir,
-            )
+            if not skip_analysis:
+                if not step_central_analysis(
+                    inference_config=args.inference_config,
+                    csv_file=working_csv,
+                    csv_column="id",
+                    proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
+                    num_workers=args.num_workers,
+                    direct_python=args.direct_python,
+                    rerun=args.rerun_proteina or args.rerun_score or args.rerun_af2rank_on_top_k,
+                ):
+                    logger.error("Central analysis failed")
+                    success = False
+            else:
+                logger.info("Skipping central analysis")
 
-            # ── Step 6: Plot distribution ──
-            logger.info("\n" + "=" * 60)
-            logger.info("STEP 6: PTM DISTRIBUTION PLOT")
-            logger.info("=" * 60)
-            step_plot_distribution(results, args.output_dir, args.ptm_cutoff)
+    # ── Step 6: Collect results ──
+    if success:
+        logger.info("\n" + "=" * 60)
+        logger.info("STEP 6: COLLECT RESULTS")
+        logger.info("=" * 60)
+        results = step_collect_results(
+            protein_ids, args.inference_config, args.output_dir,
+            args.ptm_cutoff, args.proteinebm_analysis_subdir,
+        )
+
+        # ── Step 7: Plot distribution ──
+        logger.info("\n" + "=" * 60)
+        logger.info("STEP 7: PTM DISTRIBUTION PLOT")
+        logger.info("=" * 60)
+        step_plot_distribution(results, args.output_dir, args.ptm_cutoff)
 
     # ── Summary ──
     total_time = time.time() - start_time

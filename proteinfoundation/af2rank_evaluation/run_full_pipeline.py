@@ -321,6 +321,37 @@ def run_af2rank_on_proteinebm_topk(
     return run_with_conda_env("proteina", cmd, cwd=os.path.dirname(os.path.abspath(__file__)), direct_python=direct_python)
 
 
+def run_central_analysis(
+    inference_dir: str,
+    dataset_file: str,
+    id_column: str,
+    cif_dir: str,
+    proteinebm_analysis_subdir: str,
+    num_workers: int | None = None,
+    direct_python: bool = False,
+    rerun: bool = False,
+) -> bool:
+    cmd = [
+        "python",
+        "proteina_analysis.py",
+        "--inference_dir",
+        inference_dir,
+        "--csv_file",
+        dataset_file,
+        "--csv_column",
+        id_column,
+        "--cif_dir",
+        cif_dir,
+        "--proteinebm_analysis_subdir",
+        proteinebm_analysis_subdir,
+    ]
+    if num_workers is not None:
+        cmd.extend(["--num_workers", str(num_workers)])
+    if rerun:
+        cmd.append("--rerun")
+    return run_with_conda_env("proteina", cmd, cwd=os.path.dirname(os.path.abspath(__file__)), direct_python=direct_python)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Complete AF2Rank Evaluation Pipeline')
     # Prefer consistent naming: dataset_file + id_column.
@@ -359,12 +390,14 @@ def main():
     parser.add_argument('--skip_inference', action='store_true',
                        help='Skip Proteina inference (only run scoring stage)')
     parser.add_argument('--skip_diversity', action='store_true',
-                       help='Skip Proteina sample diversity analysis (all-to-all TMscore)')
+                       help='Alias for --skip_analysis during the migration to central analysis')
+    parser.add_argument('--skip_analysis', action='store_true',
+                       help='Skip the central post-scoring TM analysis stage')
     parser.add_argument(
         '--num_workers',
         type=int,
         default=None,
-        help='Max parallel CPU workers for diversity (USalign) and future CPU-parallel steps; '
+        help='Max parallel CPU workers for central analysis and future CPU-parallel steps; '
              'default is clamped os.cpu_count() (1–64).',
     )
     parser.add_argument('--skip_scoring', action='store_true',
@@ -460,8 +493,9 @@ def main():
     logger.info(f"🔑 ID column: {args.id_column}")
     logger.info(f"🔑 TM score column: {args.tms_column}")
     logger.info(f"🔧 AF2Rank backend: {args.af2rank_backend}")
-    from proteinfoundation.af2rank_evaluation.proteina_diversity import resolve_num_workers
-    logger.info(f"🔩 num_workers (CPU, diversity etc.): {resolve_num_workers(args.num_workers)}")
+    from proteinfoundation.af2rank_evaluation.proteina_analysis import resolve_num_workers
+    logger.info(f"🔩 num_workers (CPU, analysis etc.): {resolve_num_workers(args.num_workers)}")
+    skip_analysis = args.skip_analysis or args.skip_diversity
     
     success = True
     
@@ -491,27 +525,6 @@ def main():
             success = False
     else:
         logger.info("⏭️  Skipping Proteina inference")
-
-    # Step 1.5: Proteina sample diversity analysis (all-to-all TMscore)
-    if not args.skip_diversity and success:
-        logger.info("\n" + "="*60)
-        logger.info("STEP 1.5: PROTEINA SAMPLE DIVERSITY")
-        logger.info("="*60)
-
-        from proteinfoundation.af2rank_evaluation.proteina_diversity import compute_diversity_for_proteins
-
-        inference_dir = os.path.join(project_root, "inference", args.inference_config)
-        df_dataset = pd.read_csv(args.dataset_file)
-        diversity_protein_ids = df_dataset[args.id_column].dropna().astype(str).str.strip().unique().tolist()
-        diversity_protein_ids = [p for p in diversity_protein_ids if p]
-
-        diversity_results = compute_diversity_for_proteins(
-            inference_dir, diversity_protein_ids, skip_existing=not args.rerun_proteina,
-            num_workers=args.num_workers,
-        )
-        logger.info(f"✅ Diversity analysis completed for {len(diversity_results)} proteins")
-    elif args.skip_diversity:
-        logger.info("⏭️  Skipping Proteina sample diversity analysis")
 
     # Step 2: Scoring (AF2Rank or ProteinEBM)
     if not args.skip_scoring and success:
@@ -597,14 +610,14 @@ def main():
             logger.error("❌ AF2Rank-on-ProteinEBM-topk failed")
             success = False
 
-    # Step 4: Cross-protein plots (only shard 0 when sharded; non-zero shards exit early)
+    # Step 4: Central analysis (only shard 0 when sharded; non-zero shards exit early)
     if shard_index is not None and shard_index != 0:
         logger.info("Per-protein work complete (non-zero shard), exiting.")
         sys.exit(0 if success else 1)
 
     if success:
         logger.info("\n" + "="*60)
-        logger.info("STEP 4: CROSS-PROTEIN PLOTS")
+        logger.info("STEP 4: CENTRAL ANALYSIS")
         logger.info("="*60)
 
         inference_dir = os.path.join(project_root, "inference", args.inference_config)
@@ -640,6 +653,38 @@ def main():
                                       timeout=args.shard_timeout):
                 logger.error("Timeout waiting for all shards to complete")
                 success = False
+
+        if success:
+            if not skip_analysis:
+                analysis_success = run_central_analysis(
+                    inference_dir=inference_dir,
+                    dataset_file=args.dataset_file,
+                    id_column=args.id_column,
+                    cif_dir=args.cif_dir,
+                    proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
+                    num_workers=args.num_workers,
+                    direct_python=args.direct_python,
+                    rerun=args.rerun_proteina or args.rerun_score or args.rerun_af2rank_on_top_k,
+                )
+                if analysis_success:
+                    logger.info("✅ Central analysis completed successfully")
+                else:
+                    logger.error("❌ Central analysis failed")
+                    success = False
+            else:
+                logger.info("⏭️  Skipping central analysis")
+
+    # Step 5: Cross-protein plots
+    if success:
+        logger.info("\n" + "="*60)
+        logger.info("STEP 5: CROSS-PROTEIN PLOTS")
+        logger.info("="*60)
+
+        inference_dir = os.path.join(project_root, "inference", args.inference_config)
+        if args.cross_protein_output_dir:
+            cross_out_dir = os.path.abspath(os.path.expanduser(args.cross_protein_output_dir))
+        else:
+            cross_out_dir = os.path.join(inference_dir, f"{Path(args.dataset_file).stem}_cross_protein_analysis")
 
         if success:
             plot_success = run_cross_protein_plots(

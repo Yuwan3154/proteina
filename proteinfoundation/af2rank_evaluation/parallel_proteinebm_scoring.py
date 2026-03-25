@@ -144,10 +144,10 @@ def find_proteins_needing_proteinebm(csv_file: str, csv_column: str, inference_c
         if not scores_csv.exists():
             proteins_needing_work.append(protein_name)
         else:
-            # Treat old outputs (missing TM columns) as incomplete so we can regenerate summaries.
             with open(scores_csv, "r") as f:
                 header = (f.readline() or "").strip()
-            if "tm_ref_template" not in header:
+            required_cols = ["protein_id", "structure_file", "structure_path", "t", "energy"]
+            if not all(col in header for col in required_cols):
                 proteins_needing_work.append(protein_name)
             else:
                 logger.info(f"ProteinEBM scoring already completed for {protein_name}, skipping")
