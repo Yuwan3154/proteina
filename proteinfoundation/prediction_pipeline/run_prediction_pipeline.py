@@ -229,6 +229,7 @@ def step_central_analysis(
     csv_column: str = "id",
     proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
     num_workers: int | None = None,
+    shard_args: list | None = None,
     direct_python: bool = False,
     rerun: bool = False,
 ) -> bool:
@@ -248,6 +249,8 @@ def step_central_analysis(
     ]
     if num_workers is not None:
         cmd.extend(["--num_workers", str(num_workers)])
+    if shard_args:
+        cmd.extend(shard_args)
     if rerun:
         cmd.append("--rerun")
     return run_with_conda_env("proteina", cmd, direct_python=direct_python)
@@ -646,45 +649,52 @@ def main():
     elif args.skip_af2rank:
         logger.info("Skipping AF2Rank step")
 
-    # Non-zero shards exit after step 4; only shard 0 continues to post-scoring analysis
+    # ── Step 5: Central analysis (every shard runs its own subset) ──
+    if success:
+        logger.info("\n" + "=" * 60)
+        logger.info("STEP 5: CENTRAL ANALYSIS")
+        logger.info("=" * 60)
+        if not skip_analysis:
+            if not step_central_analysis(
+                inference_config=args.inference_config,
+                csv_file=working_csv,
+                csv_column="id",
+                proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
+                num_workers=args.num_workers,
+                shard_args=shard_cli_args,
+                direct_python=args.direct_python,
+                rerun=args.rerun_proteina or args.rerun_score or args.rerun_af2rank_on_top_k,
+            ):
+                logger.error("Central analysis failed")
+                success = False
+        else:
+            logger.info("Skipping central analysis")
+
     if shard_index is not None and shard_index != 0:
-        logger.info("Per-protein work complete (non-zero shard), exiting.")
+        logger.info("Per-protein work complete (after central analysis), exiting.")
         sys.exit(0 if success else 1)
 
-    # ── Step 5: Central analysis (shard 0 only; waits for all shards if sharded) ──
-    if success:
-        if shard_index is not None:
-            def _check_af2rank_done(protein_id):
-                inference_base = os.path.join(PROTEINA_BASE_DIR, "inference", args.inference_config)
+    if success and shard_index is not None:
+        inference_base = os.path.join(PROTEINA_BASE_DIR, "inference", args.inference_config)
+        if skip_analysis:
+            def _check_global_ready(protein_id):
                 protein_dir = Path(inference_base) / protein_id
                 m1 = protein_dir / "af2rank_on_proteinebm_top_k" / "af2rank_analysis" / f"af2rank_scores_{protein_id}.csv"
                 m2 = protein_dir / "af2rank_on_proteinebm_top_k" / "af2rank_analysis_model_2_ptm" / f"af2rank_scores_{protein_id}.csv"
                 return m1.exists() and m2.exists()
+        else:
+            def _check_global_ready(protein_id):
+                summary_path = Path(inference_base) / protein_id / "proteina_analysis" / f"analysis_summary_{protein_id}.json"
+                return summary_path.exists()
 
-            if not wait_for_completion(protein_ids, _check_af2rank_done,
-                                      poll_interval=args.shard_poll_interval,
-                                      timeout=args.shard_timeout):
-                logger.error("Timeout waiting for all shards to complete")
-                success = False
-
-        if success:
-            logger.info("\n" + "=" * 60)
-            logger.info("STEP 5: CENTRAL ANALYSIS")
-            logger.info("=" * 60)
-            if not skip_analysis:
-                if not step_central_analysis(
-                    inference_config=args.inference_config,
-                    csv_file=working_csv,
-                    csv_column="id",
-                    proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
-                    num_workers=args.num_workers,
-                    direct_python=args.direct_python,
-                    rerun=args.rerun_proteina or args.rerun_score or args.rerun_af2rank_on_top_k,
-                ):
-                    logger.error("Central analysis failed")
-                    success = False
-            else:
-                logger.info("Skipping central analysis")
+        if not wait_for_completion(
+            protein_ids,
+            _check_global_ready,
+            poll_interval=args.shard_poll_interval,
+            timeout=args.shard_timeout,
+        ):
+            logger.error("Timeout waiting for all shards to complete")
+            success = False
 
     # ── Step 6: Collect results ──
     if success:
