@@ -1,4 +1,5 @@
-run_name_: ca_motif_no-sin-idx_beta-2.5-2.0_default-fold_21-seq-S25_512-eff-bs_purge-test_warmup_cutoff-190828
+run_name_: ca_motif_80M_no-tri_individual-embed_dssp_beta-1.9-1.0_default-fold_21-seq-S25_512-eff-bs_purge-test_warmup_cutoff-190828
+pretrain_ckpt_path: /orcd/pool/006/chenxiou/proteina/store/ca_motif_80M_tri_individual-embed_dssp_beta-1.9-1.0_default-fold_21-seq-S25_512-eff-bs_purge-test_warmup_cutoff-190828/checkpoints/last.ckpt
 
 hardware:
   ncpus_per_task_train_: 16  # Number of CPUs per task during training
@@ -14,8 +15,8 @@ hardware:
 loss:
   t_distribution:
     name: mix_up02_beta
-    p1: 2.5
-    p2: 2.0
+    p1: 1.9
+    p2: 1.0
   loss_t_clamp: 0.9  # Used for loss stability in frameflow, 1. for no clamping
   use_aux_loss: True  # Whether to use auxiliary loss
   aux_loss_t_lim: 0.3  # Time limit to apply auxiliary loss
@@ -25,11 +26,12 @@ loss:
   max_dist_boundary: 1.0  # Given by nanometer
   motif_aux_loss_weight: 5.0
   scaffold_aux_loss_weight: 0
+  dssp_aux_loss_weight: 1.0
 
 
 defaults:
   - model: caflow_motif
-  - override model/nn: ca_af3_200M_no_tri_motif_no-sin-idx-emb
+  - override model/nn: ca_af3_80M_no-tri_individual-embed_dssp
   - _self_
 
 model:
@@ -73,11 +75,11 @@ lora:
 
 opt:
   lr: 0.0001
-  max_epochs: 5000
-  batch_size: 8  # Per-GPU batch size for dataloader; effective = ngpus * batch_size * accumulate_grad_batches
-  accumulate_grad_batches: 16  # effective batch size = 4(ngpus)*8(batch_size)*16(accumulate_grad_batches) = 512
+  max_epochs: 2000
+  batch_size: 4  # Per-GPU batch size for dataloader; effective = ngpus * batch_size * accumulate_grad_batches
+  accumulate_grad_batches: 32  # effective batch size = 4(ngpus)*4(batch_size)*32(accumulate_grad_batches) = 512
   val_check_interval: 1000  # Number of training batches after which we check validation loss
-  skip_nan_grad: True  # Skip updates with nan gradient
+  skip_nan_grad: False  # Skip updates with nan gradient
   grad_and_weight_analysis: False  # Log some statistics of gradients and weights
   dist_strategy: ddp  # For multi GPU training, do not change
   dist_backend: nccl  # For multi GPU training, applicable when using ddp strategy [nccl, gloo]

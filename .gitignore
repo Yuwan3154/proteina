@@ -29,3 +29,6 @@ store/
 prediction/
 
 af2rank_evaluation/params
+proteina_additional_files/
+proteina_training_data_indices/
+

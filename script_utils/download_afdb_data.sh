@@ -47,7 +47,8 @@ if command_exists aria2c; then
         --max-tries=3 \
         --console-log-level=warn \
         --optimize-concurrent-downloads=true \
-        --file-allocation=none
+        --file-allocation=none \
+	--auto-file-renaming=false
 
     rm -f "$temp_input"
 else
@@ -56,7 +57,7 @@ else
     if command_exists curl; then
         download_cmd="curl -L --retry 3 --retry-delay 1 --progress-bar --continue-at - --output"
     elif command_exists wget; then
-        download_cmd="wget --quiet --show-progress --progress=bar:force --continue --retry-connrefused --waitretry=1 --tries=3 -O"
+        download_cmd="wget --quiet --show-progress --progress=bar:force --continue --retry-connrefused --waitretry=1 --tries=3 -N -O"
     else
         echo "Error: Neither aria2c, curl, nor wget found. Please install one of them."
         exit 1
