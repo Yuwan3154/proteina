@@ -706,8 +706,14 @@ def main() -> None:
     parser.add_argument("--cuda_visible_devices", default="", help="Comma-separated GPU ids to use (e.g. '0,1,2'). If empty, uses 0..num_gpus-1.")
     parser.add_argument("--dry_run", action="store_true", help="Validate top-k selection and dataset joins without running AF2Rank (no pTM plot)")
     parser.add_argument("--proteinebm_analysis_subdir", default="proteinebm_v2_cathmd_analysis", help="Per-protein subdir containing ProteinEBM scores (default: proteinebm_v2_cathmd_analysis)")
-    parser.add_argument("--backend", choices=["colabdesign", "openfold"], default="colabdesign",
-                       help="AF2Rank backend: colabdesign (JAX) or openfold (PyTorch)")
+    parser.add_argument(
+        "--backend",
+        "--af2rank_backend",
+        dest="backend",
+        choices=["colabdesign", "openfold"],
+        default="colabdesign",
+        help="AF2Rank backend: colabdesign (JAX) or openfold (PyTorch). Alias: --af2rank_backend.",
+    )
     parser.add_argument("--use_deepspeed_evoformer_attention", action=argparse.BooleanOptionalAction, default=True,
                        help="Use DeepSpeed evoformer attention (openfold backend, default: True)")
     parser.add_argument("--use_cuequivariance_attention", action=argparse.BooleanOptionalAction, default=True,

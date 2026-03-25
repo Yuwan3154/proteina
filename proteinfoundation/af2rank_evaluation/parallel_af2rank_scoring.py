@@ -522,8 +522,14 @@ def main():
                        help='Only process proteins that have completed inference')
     parser.add_argument('--regenerate_plots', action='store_true',
                        help='Regenerate plots even if AF2Rank CSV already exists')
-    parser.add_argument('--backend', choices=['colabdesign', 'openfold'], default='colabdesign',
-                       help='AF2Rank backend: colabdesign (JAX) or openfold (PyTorch)')
+    parser.add_argument(
+        '--backend',
+        '--af2rank_backend',
+        dest='backend',
+        choices=['colabdesign', 'openfold'],
+        default='colabdesign',
+        help='AF2Rank backend: colabdesign (JAX) or openfold (PyTorch). Alias: --af2rank_backend.',
+    )
     parser.add_argument('--use_deepspeed_evoformer_attention', action=argparse.BooleanOptionalAction, default=True,
                        help='Use DeepSpeed evoformer attention (openfold backend, default: True)')
     parser.add_argument('--use_cuequivariance_attention', action=argparse.BooleanOptionalAction, default=True,

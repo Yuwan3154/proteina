@@ -9,7 +9,11 @@ This script runs the complete pipeline:
 4. Cross-protein plots (always)
 
 Usage:
-    python run_full_pipeline.py --csv_file data.csv --cif_dir /path/to/cif --inference_config config_name --num_gpus 4
+    python run_full_pipeline.py --dataset_file data.csv --id_column pdb --cif_dir /path/to/cif \\
+        --inference_config config_name --num_gpus 4 --tms_column tms_single --cross_protein_output_dir out/
+
+Shared flags with run_prediction_pipeline.py include --af2rank_backend, --af2rank_top_k, --proteina_force_compile,
+--proteinebm_batch_size, --proteinebm_template_self_condition, and sharding options.
 """
 
 import os
@@ -23,6 +27,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from proteinfoundation.af2rank_evaluation.pipeline_cli_utils import parallel_incremental_filter_args
 from proteinfoundation.af2rank_evaluation.sharding_utils import (
     add_shard_args,
     build_shard_cli_args,
@@ -161,8 +166,8 @@ def run_af2rank_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpu
         '--inference_config', inference_config,
         '--num_gpus', str(num_gpus),
         '--recycles', str(recycles),
-        '--no-filter_existing' if rerun else '--filter_existing',
-        '--backend', backend,
+        *parallel_incremental_filter_args(not rerun),
+        '--af2rank_backend', backend,
     ]
     if regenerate_plots:
         cmd.append('--regenerate_plots')
@@ -179,7 +184,23 @@ def run_af2rank_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpu
     env_name = 'proteina' if backend == 'openfold' else 'colabdesign'
     return run_with_conda_env(env_name, cmd, direct_python=direct_python)
 
-def run_proteinebm_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpus, proteinebm_config, proteinebm_checkpoint, proteinebm_template_self_condition=True, proteinebm_analysis_subdir='proteinebm_v2_cathmd_analysis', proteinebm_t=0.05, num_workers=None, shard_args=None, direct_python: bool = False, rerun: bool = False):
+def run_proteinebm_scoring(
+    csv_file,
+    csv_column,
+    cif_dir,
+    inference_config,
+    num_gpus,
+    proteinebm_config,
+    proteinebm_checkpoint,
+    proteinebm_template_self_condition=True,
+    proteinebm_analysis_subdir='proteinebm_v2_cathmd_analysis',
+    proteinebm_t=0.05,
+    proteinebm_batch_size: int = 32,
+    num_workers=None,
+    shard_args=None,
+    direct_python: bool = False,
+    rerun: bool = False,
+):
     """Run the ProteinEBM scoring pipeline."""
     logger.info("💸 Starting ProteinEBM scoring pipeline...")
 
@@ -190,11 +211,12 @@ def run_proteinebm_scoring(csv_file, csv_column, cif_dir, inference_config, num_
         '--cif_dir', cif_dir,
         '--inference_config', inference_config,
         '--num_gpus', str(num_gpus),
-        '--no-filter_existing' if rerun else '--filter_existing',
+        *parallel_incremental_filter_args(not rerun),
         '--proteinebm_config', proteinebm_config,
         '--proteinebm_checkpoint', proteinebm_checkpoint,
         '--proteinebm_analysis_subdir', proteinebm_analysis_subdir,
         '--proteinebm_t', str(proteinebm_t),
+        '--proteinebm_batch_size', str(proteinebm_batch_size),
     ]
     if num_workers is not None:
         cmd.extend(['--num_workers', str(num_workers)])
@@ -286,7 +308,7 @@ def run_af2rank_on_proteinebm_topk(
         str(int(num_gpus)),
         "--proteinebm_analysis_subdir",
         proteinebm_analysis_subdir,
-        "--backend",
+        "--af2rank_backend",
         backend,
     ]
     if backend == "openfold":
@@ -355,7 +377,8 @@ def run_central_analysis(
     return run_with_conda_env("proteina", cmd, cwd=os.path.dirname(os.path.abspath(__file__)), direct_python=direct_python)
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
+    """CLI for the full AF2Rank evaluation pipeline (shared flag names align with run_prediction_pipeline)."""
     parser = argparse.ArgumentParser(description='Complete AF2Rank Evaluation Pipeline')
     # Prefer consistent naming: dataset_file + id_column.
     # Keep --csv_file/--csv_column as hidden aliases for backward compatibility.
@@ -442,7 +465,7 @@ def main():
         default='tm',
         help='When --scorer=proteinebm, which ProteinEBM cross-protein plot mode to run in the final plotting step',
     )
-    
+
     # ProteinEBM scoring options
     parser.add_argument('--proteinebm_checkpoint', default='/home/ubuntu/ProteinEBM/weights/model_1_frozen_1m_md.pt',
                        help='Path to ProteinEBM checkpoint to use for scoring')
@@ -454,8 +477,17 @@ def main():
                        help='Per-protein subdir for ProteinEBM outputs (default: proteinebm_v2_cathmd_analysis; use proteinebm_analysis for legacy)')
     parser.add_argument('--proteinebm_t', type=float, default=0.05,
                        help='Diffusion time t for ProteinEBM scoring (default: 0.05)')
-    
-    args = parser.parse_args()
+    parser.add_argument(
+        '--proteinebm_batch_size',
+        type=int,
+        default=32,
+        help='Batch size for ProteinEBM inference (default: 32). Passed to parallel_proteinebm_scoring.',
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None):
+    args = build_parser().parse_args(argv)
 
     shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
     shard_cli_args = build_shard_cli_args(shard_index, num_shards)
@@ -496,6 +528,7 @@ def main():
     logger.info(f"🔑 ID column: {args.id_column}")
     logger.info(f"🔑 TM score column: {args.tms_column}")
     logger.info(f"🔧 AF2Rank backend: {args.af2rank_backend}")
+    logger.info(f"📦 ProteinEBM batch size: {args.proteinebm_batch_size}")
     from proteinfoundation.af2rank_evaluation.proteina_analysis import resolve_num_workers
     logger.info(f"🔩 num_workers (CPU, analysis etc.): {resolve_num_workers(args.num_workers)}")
     skip_analysis = args.skip_analysis or args.skip_diversity
@@ -567,6 +600,7 @@ def main():
                 proteinebm_template_self_condition=args.proteinebm_template_self_condition,
                 proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
                 proteinebm_t=args.proteinebm_t,
+                proteinebm_batch_size=args.proteinebm_batch_size,
                 num_workers=args.num_workers,
                 shard_args=shard_cli_args,
                 direct_python=args.direct_python,

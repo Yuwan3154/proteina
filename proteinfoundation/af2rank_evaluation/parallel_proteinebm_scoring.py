@@ -283,9 +283,12 @@ def main():
     )
     parser.add_argument(
         "--batch_size",
+        "--proteinebm_batch_size",
+        dest="batch_size",
         type=int,
         default=32,
-        help="Batch size for ProteinEBM inference per protein (default: 32). Auto-reduces on OOM.",
+        help="Batch size for ProteinEBM inference per protein (default: 32). Auto-reduces on OOM. "
+        "Alias: --proteinebm_batch_size.",
     )
     parser.add_argument(
         "--num_workers",

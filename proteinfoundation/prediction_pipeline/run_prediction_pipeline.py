@@ -11,11 +11,15 @@ Given protein sequences (CSV or FASTA), this pipeline:
 6. Plots pTM distribution across all proteins
 
 Usage:
-    python run_prediction_pipeline.py \
-        --input sequences.fasta \
-        --inference_config config_name \
-        --output_dir /path/to/output \
+    python run_prediction_pipeline.py \\
+        --input sequences.fasta \\
+        --inference_config config_name \\
+        --output_dir /path/to/output \\
         --num_gpus 4
+
+Shared flags with run_full_pipeline.py include --af2rank_backend, --af2rank_top_k, --proteina_force_compile,
+--proteinebm_batch_size, --proteinebm_template_self_condition, --af2rank_topk_filter_existing, and sharding options.
+The AF2Rank refinement step uses OpenFold only (run_af2rank_prediction.py); only --af2rank_backend openfold is effective.
 """
 
 import argparse
@@ -37,6 +41,7 @@ import numpy as np
 import pandas as pd
 import torch
 
+from proteinfoundation.af2rank_evaluation.pipeline_cli_utils import parallel_incremental_filter_args
 from proteinfoundation.af2rank_evaluation.sharding_utils import (
     add_shard_args,
     build_shard_cli_args,
@@ -109,7 +114,7 @@ def step_proteina_inference(
     working_csv: str,
     inference_config: str,
     num_gpus: int,
-    force_compile: bool = True,
+    proteina_force_compile: bool = True,
     shard_args: list | None = None,
     direct_python: bool = False,
     rerun: bool = False,
@@ -126,7 +131,7 @@ def step_proteina_inference(
     ]
     if not rerun:
         cmd.append("--skip_existing")
-    if force_compile:
+    if proteina_force_compile:
         cmd.append("--force_compile")
     if shard_args:
         cmd.extend(shard_args)
@@ -143,7 +148,8 @@ def step_proteinebm_scoring(
     proteinebm_checkpoint: str,
     proteinebm_t: float = 0.05,
     proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
-    batch_size: int = 32,
+    proteinebm_batch_size: int = 32,
+    proteinebm_template_self_condition: bool = True,
     num_workers: int | None = None,
     shard_args: list | None = None,
     direct_python: bool = False,
@@ -157,16 +163,18 @@ def step_proteinebm_scoring(
         "--csv_column", "id",
         "--inference_config", inference_config,
         "--num_gpus", str(num_gpus),
-        "--no-filter_existing" if rerun else "--filter_existing",
+        *parallel_incremental_filter_args(not rerun),
         "--proteinebm_config", proteinebm_config,
         "--proteinebm_checkpoint", proteinebm_checkpoint,
         "--proteinebm_t", str(proteinebm_t),
         "--proteinebm_analysis_subdir", proteinebm_analysis_subdir,
-        "--batch_size", str(batch_size),
+        "--proteinebm_batch_size", str(proteinebm_batch_size),
         # No --cif_dir: skips TM-score computation
     ]
     if num_workers is not None:
         cmd.extend(["--num_workers", str(num_workers)])
+    if not proteinebm_template_self_condition:
+        cmd.append("--no-proteinebm_template_self_condition")
     if direct_python:
         cmd.append("--direct_python")
     if shard_args:
@@ -178,12 +186,11 @@ def step_proteinebm_scoring(
 
 def step_af2rank_topk(
     inference_config: str,
-    top_k: int,
+    af2rank_top_k: int,
     recycles: int,
     num_gpus: int,
     csv_file: str,
     csv_column: str = "id",
-    backend: str = "colabdesign",
     proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
     use_deepspeed_evoformer_attention: bool = True,
     use_cuequivariance_attention: bool = True,
@@ -191,6 +198,7 @@ def step_af2rank_topk(
     shard_args: list | None = None,
     direct_python: bool = False,
     rerun: bool = False,
+    filter_existing: bool = True,
 ) -> bool:
     """Run AF2Rank on ProteinEBM top-k templates.
 
@@ -199,7 +207,7 @@ def step_af2rank_topk(
     top-k templates directly from the ProteinEBM scores CSV without requiring
     a summary JSON file.
     """
-    logger.info(f"Starting AF2Rank on ProteinEBM top-{top_k} ...")
+    logger.info(f"Starting AF2Rank on ProteinEBM top-{af2rank_top_k} ...")
     inference_dir = os.path.join(PROTEINA_BASE_DIR, "inference", inference_config)
     prediction_pipeline_dir = os.path.dirname(os.path.abspath(__file__))
     cmd = [
@@ -207,11 +215,14 @@ def step_af2rank_topk(
         "--inference_dir", inference_dir,
         "--csv_file", csv_file,
         "--csv_column", csv_column,
-        "--top_k", str(top_k),
+        "--top_k", str(af2rank_top_k),
         "--recycles", str(recycles),
         "--proteinebm_analysis_subdir", proteinebm_analysis_subdir,
-        "--no-filter_existing" if rerun else "--filter_existing",
     ]
+    if filter_existing:
+        cmd.append("--filter_existing")
+    else:
+        cmd.append("--no-filter_existing")
     if not use_deepspeed_evoformer_attention:
         cmd.append("--no-use_deepspeed_evoformer_attention")
     if not use_cuequivariance_attention:
@@ -486,7 +497,9 @@ def step_plot_distribution(results: list, output_dir: str, ptm_cutoff: float) ->
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main():
+
+def build_parser() -> argparse.ArgumentParser:
+    """CLI aligned with run_full_pipeline.py for shared options."""
     parser = argparse.ArgumentParser(description="Prediction Pipeline (No Ground-Truth)")
     parser.add_argument("--input", required=True, help="Input CSV or FASTA file with protein sequences")
     parser.add_argument("--id_column", default="id", help="Column name for protein ID in CSV (default: id)")
@@ -495,9 +508,23 @@ def main():
     parser.add_argument("--num_gpus", type=int, default=1, help="Number of GPUs to use")
     parser.add_argument("--output_dir", required=True, help="Output directory for predictions and summary")
     parser.add_argument("--ptm_cutoff", type=float, default=0.7, help="pTM threshold for filtering (default: 0.7)")
-    parser.add_argument("--top_k", type=int, default=5, help="Number of top ProteinEBM templates for AF2Rank (default: 5)")
-    parser.add_argument("--backend", choices=["colabdesign", "openfold"], default="colabdesign",
-                        help="AF2Rank backend: colabdesign (JAX) or openfold (PyTorch)")
+    parser.add_argument(
+        "--af2rank_top_k",
+        "--top_k",
+        dest="af2rank_top_k",
+        type=int,
+        default=5,
+        help="Number of top ProteinEBM templates for AF2Rank (default: 5). Alias: --top_k.",
+    )
+    parser.add_argument(
+        "--af2rank_backend",
+        "--backend",
+        dest="af2rank_backend",
+        choices=["colabdesign", "openfold"],
+        default="colabdesign",
+        help="AF2Rank backend name (shared with full pipeline). The prediction AF2Rank step is OpenFold-only; "
+        "only openfold is used. Alias: --backend.",
+    )
     parser.add_argument("--use_deepspeed_evoformer_attention", action=argparse.BooleanOptionalAction, default=False,
                         help="Use DeepSpeed evoformer attention (openfold backend, default: False)")
     parser.add_argument("--use_cuequivariance_attention", action=argparse.BooleanOptionalAction, default=False,
@@ -512,8 +539,20 @@ def main():
     parser.add_argument("--proteinebm_t", type=float, default=0.05, help="Diffusion time for ProteinEBM (default: 0.05)")
     parser.add_argument("--proteinebm_analysis_subdir", default="proteinebm_v2_cathmd_analysis",
                         help="Per-protein subdir for ProteinEBM outputs")
+    parser.add_argument(
+        "--proteinebm_template_self_condition",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use template coordinates for self-conditioning (matches parallel_proteinebm_scoring).",
+    )
     parser.add_argument("--proteinebm_batch_size", type=int, default=32,
                         help="Batch size for ProteinEBM inference (default: 32). Auto-reduces on OOM.")
+    parser.add_argument(
+        "--af2rank_topk_filter_existing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip AF2Rank top-k work when outputs already cover all desired templates (default: True).",
+    )
     parser.add_argument("--skip_inference", action="store_true", help="Skip Proteina inference step")
     parser.add_argument("--skip_diversity", action="store_true",
                         help="Alias for --skip_analysis during the migration to central analysis")
@@ -527,7 +566,13 @@ def main():
              "default is clamped os.cpu_count() (1–64).",
     )
     parser.add_argument("--skip_scoring", action="store_true", help="Skip ProteinEBM scoring step")
-    parser.add_argument("--skip_af2rank", action="store_true", help="Skip AF2Rank step")
+    parser.add_argument(
+        "--skip_af2rank_on_top_k",
+        "--skip_af2rank",
+        dest="skip_af2rank_on_top_k",
+        action="store_true",
+        help="Skip AF2Rank-on-ProteinEBM-top-k step. Alias: --skip_af2rank.",
+    )
     parser.add_argument("--rerun_proteina", action="store_true",
                         help="Force re-run Proteina inference even if outputs already exist")
     parser.add_argument("--rerun_score", action="store_true",
@@ -535,10 +580,12 @@ def main():
     parser.add_argument("--rerun_af2rank_on_top_k", action="store_true",
                         help="Force re-run AF2Rank on ProteinEBM top-k even if outputs already exist")
     parser.add_argument(
+        "--proteina_force_compile",
         "--force_compile",
+        dest="proteina_force_compile",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="torch.compile for Proteina inference (default: True)",
+        help="torch.compile for Proteina inference (default: True). Alias: --force_compile.",
     )
     add_shard_args(parser)
     parser.add_argument("--shard_poll_interval", type=int, default=60,
@@ -548,8 +595,11 @@ def main():
     parser.add_argument("--direct_python", action="store_true",
                         help="Use current Python interpreter for subprocesses instead of shell script wrappers. "
                              "Useful on HPC where conda env activation is slow; requires all deps in current env.")
+    return parser
 
-    args = parser.parse_args()
+
+def main(argv: list[str] | None = None):
+    args = build_parser().parse_args(argv)
 
     shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
     shard_cli_args = build_shard_cli_args(shard_index, num_shards)
@@ -571,8 +621,8 @@ def main():
     logger.info(f"Inference config: {args.inference_config}")
     logger.info(f"GPUs: {args.num_gpus}")
     logger.info(f"pTM cutoff: {args.ptm_cutoff}")
-    logger.info(f"Top-k: {args.top_k}")
-    logger.info(f"Backend: {args.backend}")
+    logger.info(f"AF2Rank top-k: {args.af2rank_top_k}")
+    logger.info(f"AF2Rank backend (prediction step is openfold-only): {args.af2rank_backend}")
     logger.info(f"Output: {args.output_dir}")
     from proteinfoundation.af2rank_evaluation.proteina_analysis import resolve_num_workers
     logger.info(f"num_workers (CPU, analysis etc.): {resolve_num_workers(args.num_workers)}")
@@ -591,7 +641,15 @@ def main():
         logger.info("\n" + "=" * 60)
         logger.info("STEP 2: PROTEINA INFERENCE")
         logger.info("=" * 60)
-        if not step_proteina_inference(working_csv, args.inference_config, args.num_gpus, args.force_compile, shard_cli_args, args.direct_python, rerun=args.rerun_proteina):
+        if not step_proteina_inference(
+            working_csv,
+            args.inference_config,
+            args.num_gpus,
+            args.proteina_force_compile,
+            shard_cli_args,
+            args.direct_python,
+            rerun=args.rerun_proteina,
+        ):
             logger.error("Proteina inference failed")
             success = False
         else:
@@ -605,10 +663,15 @@ def main():
         logger.info("STEP 3: PROTEINEBM SCORING")
         logger.info("=" * 60)
         if not step_proteinebm_scoring(
-            working_csv, args.inference_config, args.num_gpus,
-            args.proteinebm_config, args.proteinebm_checkpoint,
-            args.proteinebm_t, args.proteinebm_analysis_subdir,
-            args.proteinebm_batch_size,
+            working_csv,
+            args.inference_config,
+            args.num_gpus,
+            args.proteinebm_config,
+            args.proteinebm_checkpoint,
+            args.proteinebm_t,
+            args.proteinebm_analysis_subdir,
+            proteinebm_batch_size=args.proteinebm_batch_size,
+            proteinebm_template_self_condition=args.proteinebm_template_self_condition,
             num_workers=args.num_workers,
             shard_args=shard_cli_args,
             direct_python=args.direct_python,
@@ -622,31 +685,36 @@ def main():
         logger.info("Skipping ProteinEBM scoring")
 
     # ── Step 4: AF2Rank on ProteinEBM top-k ──
-    if not args.skip_af2rank and success:
+    if not args.skip_af2rank_on_top_k and success:
         logger.info("\n" + "=" * 60)
         logger.info("STEP 4: AF2RANK ON PROTEINEBM TOP-K")
         logger.info("=" * 60)
-        if args.backend != "openfold":
+        if args.af2rank_backend != "openfold":
             logger.warning(
-                f"--backend {args.backend!r} is ignored: the prediction pipeline always uses "
+                f"--af2rank_backend {args.af2rank_backend!r} is ignored: the prediction pipeline always uses "
                 "run_af2rank_prediction.py which is openfold-only."
             )
         if not step_af2rank_topk(
-            args.inference_config, args.top_k, args.recycles,
-            args.num_gpus, working_csv, "id",  # working_csv always uses normalized "id" column
-            args.backend, args.proteinebm_analysis_subdir,
+            args.inference_config,
+            args.af2rank_top_k,
+            args.recycles,
+            args.num_gpus,
+            working_csv,
+            "id",
+            proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
             use_deepspeed_evoformer_attention=args.use_deepspeed_evoformer_attention,
             use_cuequivariance_attention=args.use_cuequivariance_attention,
             use_cuequivariance_multiplicative_update=args.use_cuequivariance_multiplicative_update,
             shard_args=shard_cli_args,
             direct_python=args.direct_python,
             rerun=args.rerun_af2rank_on_top_k,
+            filter_existing=bool(args.af2rank_topk_filter_existing) and not args.rerun_af2rank_on_top_k,
         ):
             logger.error("AF2Rank step failed")
             success = False
         else:
             logger.info("AF2Rank step completed successfully")
-    elif args.skip_af2rank:
+    elif args.skip_af2rank_on_top_k:
         logger.info("Skipping AF2Rank step")
 
     # ── Step 5: Central analysis (every shard runs its own subset) ──
