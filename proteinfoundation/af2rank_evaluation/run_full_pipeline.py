@@ -328,6 +328,7 @@ def run_central_analysis(
     cif_dir: str,
     proteinebm_analysis_subdir: str,
     num_workers: int | None = None,
+    shard_args: list | None = None,
     direct_python: bool = False,
     rerun: bool = False,
 ) -> bool:
@@ -347,6 +348,8 @@ def run_central_analysis(
     ]
     if num_workers is not None:
         cmd.extend(["--num_workers", str(num_workers)])
+    if shard_args:
+        cmd.extend(shard_args)
     if rerun:
         cmd.append("--rerun")
     return run_with_conda_env("proteina", cmd, cwd=os.path.dirname(os.path.abspath(__file__)), direct_python=direct_python)
@@ -610,11 +613,7 @@ def main():
             logger.error("❌ AF2Rank-on-ProteinEBM-topk failed")
             success = False
 
-    # Step 4: Central analysis (only shard 0 when sharded; non-zero shards exit early)
-    if shard_index is not None and shard_index != 0:
-        logger.info("Per-protein work complete (non-zero shard), exiting.")
-        sys.exit(0 if success else 1)
-
+    # Step 4: Central analysis (every shard runs its own subset)
     if success:
         logger.info("\n" + "="*60)
         logger.info("STEP 4: CENTRAL ANALYSIS")
@@ -626,11 +625,37 @@ def main():
         else:
             cross_out_dir = os.path.join(inference_dir, f"{Path(args.dataset_file).stem}_cross_protein_analysis")
 
-        if shard_index is not None:
-            df = pd.read_csv(args.dataset_file)
-            all_protein_names = df[args.id_column].dropna().astype(str).str.strip().unique().tolist()
-            all_protein_names = [p for p in all_protein_names if p]
+        if success:
+            if not skip_analysis:
+                analysis_success = run_central_analysis(
+                    inference_dir=inference_dir,
+                    dataset_file=args.dataset_file,
+                    id_column=args.id_column,
+                    cif_dir=args.cif_dir,
+                    proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
+                    num_workers=args.num_workers,
+                    shard_args=shard_cli_args,
+                    direct_python=args.direct_python,
+                    rerun=args.rerun_proteina or args.rerun_score or args.rerun_af2rank_on_top_k,
+                )
+                if analysis_success:
+                    logger.info("✅ Central analysis completed successfully")
+                else:
+                    logger.error("❌ Central analysis failed")
+                    success = False
+            else:
+                logger.info("⏭️  Skipping central analysis")
 
+    if shard_index is not None and shard_index != 0:
+        logger.info("Per-protein work complete (after central analysis), exiting.")
+        sys.exit(0 if success else 1)
+
+    if success and shard_index is not None:
+        df = pd.read_csv(args.dataset_file)
+        all_protein_names = df[args.id_column].dropna().astype(str).str.strip().unique().tolist()
+        all_protein_names = [p for p in all_protein_names if p]
+
+        if skip_analysis:
             def _check_complete(protein_name):
                 protein_dir = Path(inference_dir) / protein_name
                 if args.scorer == "af2rank":
@@ -647,32 +672,19 @@ def main():
                     if not topk_m1.exists() or not topk_m2.exists():
                         return False
                 return True
+        else:
+            def _check_complete(protein_name):
+                summary_path = Path(inference_dir) / protein_name / "proteina_analysis" / f"analysis_summary_{protein_name}.json"
+                return summary_path.exists()
 
-            if not wait_for_completion(all_protein_names, _check_complete,
-                                      poll_interval=args.shard_poll_interval,
-                                      timeout=args.shard_timeout):
-                logger.error("Timeout waiting for all shards to complete")
-                success = False
-
-        if success:
-            if not skip_analysis:
-                analysis_success = run_central_analysis(
-                    inference_dir=inference_dir,
-                    dataset_file=args.dataset_file,
-                    id_column=args.id_column,
-                    cif_dir=args.cif_dir,
-                    proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
-                    num_workers=args.num_workers,
-                    direct_python=args.direct_python,
-                    rerun=args.rerun_proteina or args.rerun_score or args.rerun_af2rank_on_top_k,
-                )
-                if analysis_success:
-                    logger.info("✅ Central analysis completed successfully")
-                else:
-                    logger.error("❌ Central analysis failed")
-                    success = False
-            else:
-                logger.info("⏭️  Skipping central analysis")
+        if not wait_for_completion(
+            all_protein_names,
+            _check_complete,
+            poll_interval=args.shard_poll_interval,
+            timeout=args.shard_timeout,
+        ):
+            logger.error("Timeout waiting for all shards to complete")
+            success = False
 
     # Step 5: Cross-protein plots
     if success:
