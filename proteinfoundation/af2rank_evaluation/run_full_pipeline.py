@@ -399,6 +399,13 @@ def build_parser() -> argparse.ArgumentParser:
         help='If > 0 and --scorer=proteinebm, run AF2Rank on the ProteinEBM top-k templates per protein (rank by energy, then AF2Rank ranks by pTM)',
     )
     parser.add_argument(
+        '--top_k',
+        dest='af2rank_top_k',
+        type=int,
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         '--af2rank_topk_filter_existing',
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -406,6 +413,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument('--af2rank_backend', choices=['colabdesign', 'openfold'], default='colabdesign',
                        help='AF2Rank backend: colabdesign (JAX) or openfold (PyTorch)')
+    parser.add_argument(
+        '--backend',
+        dest='af2rank_backend',
+        choices=['colabdesign', 'openfold'],
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument('--use_deepspeed_evoformer_attention', action=argparse.BooleanOptionalAction, default=False,
                        help='Use DeepSpeed evoformer attention (openfold backend, default: False)')
     parser.add_argument('--use_cuequivariance_attention', action=argparse.BooleanOptionalAction, default=False,
@@ -430,6 +444,13 @@ def build_parser() -> argparse.ArgumentParser:
                        help='Skip scoring stage (AF2Rank or ProteinEBM depending on --scorer)')
     parser.add_argument('--skip_af2rank_on_top_k', action='store_true',
                        help='Skip AF2Rank-on-ProteinEBM-top-k step even if --af2rank_top_k > 0')
+    parser.add_argument(
+        '--skip_af2rank',
+        dest='skip_af2rank_on_top_k',
+        action='store_true',
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument('--regenerate_plots', action='store_true',
                        help='Regenerate AF2Rank plots even if scoring already completed')
     parser.add_argument('--rerun_proteina', action='store_true',
@@ -443,6 +464,13 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help='Pass --force_compile to Proteina inference (torch.compile even in eval/no_grad).',
+    )
+    parser.add_argument(
+        '--force_compile',
+        dest='proteina_force_compile',
+        action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
     )
     add_shard_args(parser)
     parser.add_argument('--shard_poll_interval', type=int, default=60,

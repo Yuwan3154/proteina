@@ -32,12 +32,22 @@ def test_full_pipeline_parser_aliases_and_proteinebm_batch_size():
             "legacy.csv",
             "--csv_column",
             "legacy_id",
+            "--top_k",
+            "8",
+            "--backend",
+            "openfold",
+            "--force_compile",
+            "--skip_af2rank",
             "--proteinebm_batch_size",
             "64",
         ]
     )
     assert a.dataset_file == "legacy.csv"
     assert a.id_column == "legacy_id"
+    assert a.af2rank_top_k == 8
+    assert a.af2rank_backend == "openfold"
+    assert a.proteina_force_compile is True
+    assert a.skip_af2rank_on_top_k is True
     assert a.proteinebm_batch_size == 64
 
 
