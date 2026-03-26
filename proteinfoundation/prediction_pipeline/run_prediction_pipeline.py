@@ -243,6 +243,7 @@ def step_central_analysis(
     shard_args: list | None = None,
     direct_python: bool = False,
     rerun: bool = False,
+    skip_diversity: bool = False,
 ) -> bool:
     """Run centralized TM analysis after scorer outputs and prediction PDBs exist."""
     inference_dir = os.path.join(PROTEINA_BASE_DIR, "inference", inference_config)
@@ -264,6 +265,8 @@ def step_central_analysis(
         cmd.extend(shard_args)
     if rerun:
         cmd.append("--rerun")
+    if skip_diversity:
+        cmd.append("--skip_diversity")
     return run_with_conda_env("proteina", cmd, direct_python=direct_python)
 
 
@@ -415,27 +418,29 @@ def step_collect_results(
     inference_base = os.path.join(PROTEINA_BASE_DIR, "inference", inference_config)
     analysis_data = load_analysis_data(inference_base)
     if analysis_data:
-        div_medians = [v["median_tem_to_tem_tm"] for v in analysis_data.values()]
-        div_means = [v["mean_tem_to_tem_tm"] for v in analysis_data.values()]
-        div_stds = [v["std_tem_to_tem_tm"] for v in analysis_data.values()]
-        analysis_stats = {
-            "mean_tem_to_tem_tm": {
-                "mean": float(np.mean(div_means)),
-                "median": float(np.median(div_means)),
-                "std": float(np.std(div_means)),
-            },
-            "std_tem_to_tem_tm": {
-                "mean": float(np.mean(div_stds)),
-                "median": float(np.median(div_stds)),
-                "std": float(np.std(div_stds)),
-            },
-            "median_tem_to_tem_tm": {
-                "mean": float(np.mean(div_medians)),
-                "median": float(np.median(div_medians)),
-                "std": float(np.std(div_medians)),
-            },
-            "num_proteins_with_analysis": len(analysis_data),
-        }
+        div_medians = [v["median_tem_to_tem_tm"] for v in analysis_data.values() if v.get("median_tem_to_tem_tm") is not None]
+        div_means = [v["mean_tem_to_tem_tm"] for v in analysis_data.values() if v.get("mean_tem_to_tem_tm") is not None]
+        div_stds = [v["std_tem_to_tem_tm"] for v in analysis_data.values() if v.get("std_tem_to_tem_tm") is not None]
+        analysis_stats = {"num_proteins_with_analysis": len(analysis_data)}
+        if div_medians:
+            analysis_stats.update({
+                "mean_tem_to_tem_tm": {
+                    "mean": float(np.mean(div_means)),
+                    "median": float(np.median(div_means)),
+                    "std": float(np.std(div_means)),
+                },
+                "std_tem_to_tem_tm": {
+                    "mean": float(np.mean(div_stds)),
+                    "median": float(np.median(div_stds)),
+                    "std": float(np.std(div_stds)),
+                },
+                "median_tem_to_tem_tm": {
+                    "mean": float(np.mean(div_medians)),
+                    "median": float(np.median(div_medians)),
+                    "std": float(np.std(div_medians)),
+                },
+                "num_proteins_with_diversity": len(div_medians),
+            })
         summary_json["analysis_statistics"] = analysis_stats
         summary_json["diversity_statistics"] = analysis_stats
     summary_json_path = os.path.join(output_dir, "prediction_summary.json")
@@ -555,7 +560,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--skip_inference", action="store_true", help="Skip Proteina inference step")
     parser.add_argument("--skip_diversity", action="store_true",
-                        help="Alias for --skip_analysis during the migration to central analysis")
+                        help="Skip template-to-template diversity computation in central analysis")
     parser.add_argument("--skip_analysis", action="store_true",
                         help="Skip the central post-scoring TM analysis stage")
     parser.add_argument(
@@ -626,7 +631,7 @@ def main(argv: list[str] | None = None):
     logger.info(f"Output: {args.output_dir}")
     from proteinfoundation.af2rank_evaluation.proteina_analysis import resolve_num_workers
     logger.info(f"num_workers (CPU, analysis etc.): {resolve_num_workers(args.num_workers)}")
-    skip_analysis = args.skip_analysis or args.skip_diversity
+    skip_analysis = args.skip_analysis
 
     # ── Step 1: Parse input and create PT files ──
     logger.info("\n" + "=" * 60)
@@ -732,6 +737,7 @@ def main(argv: list[str] | None = None):
                 shard_args=shard_cli_args,
                 direct_python=args.direct_python,
                 rerun=args.rerun_proteina or args.rerun_score or args.rerun_af2rank_on_top_k,
+                skip_diversity=args.skip_diversity,
             ):
                 logger.error("Central analysis failed")
                 success = False

@@ -353,6 +353,7 @@ def run_central_analysis(
     shard_args: list | None = None,
     direct_python: bool = False,
     rerun: bool = False,
+    skip_diversity: bool = False,
 ) -> bool:
     cmd = [
         "python",
@@ -374,6 +375,8 @@ def run_central_analysis(
         cmd.extend(shard_args)
     if rerun:
         cmd.append("--rerun")
+    if skip_diversity:
+        cmd.append("--skip_diversity")
     return run_with_conda_env("proteina", cmd, cwd=os.path.dirname(os.path.abspath(__file__)), direct_python=direct_python)
 
 
@@ -430,7 +433,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--skip_inference', action='store_true',
                        help='Skip Proteina inference (only run scoring stage)')
     parser.add_argument('--skip_diversity', action='store_true',
-                       help='Alias for --skip_analysis during the migration to central analysis')
+                       help='Skip template-to-template diversity computation in central analysis')
     parser.add_argument('--skip_analysis', action='store_true',
                        help='Skip the central post-scoring TM analysis stage')
     parser.add_argument(
@@ -559,7 +562,7 @@ def main(argv: list[str] | None = None):
     logger.info(f"📦 ProteinEBM batch size: {args.proteinebm_batch_size}")
     from proteinfoundation.af2rank_evaluation.proteina_analysis import resolve_num_workers
     logger.info(f"🔩 num_workers (CPU, analysis etc.): {resolve_num_workers(args.num_workers)}")
-    skip_analysis = args.skip_analysis or args.skip_diversity
+    skip_analysis = args.skip_analysis
     
     success = True
     
@@ -699,6 +702,7 @@ def main(argv: list[str] | None = None):
                     shard_args=shard_cli_args,
                     direct_python=args.direct_python,
                     rerun=args.rerun_proteina or args.rerun_score or args.rerun_af2rank_on_top_k,
+                    skip_diversity=args.skip_diversity,
                 )
                 if analysis_success:
                     logger.info("✅ Central analysis completed successfully")

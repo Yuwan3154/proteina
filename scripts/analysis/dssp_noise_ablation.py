@@ -25,6 +25,9 @@ import gzip
 import os
 import sys
 
+# Disable torch.compile/dynamo to avoid bool mask issues in pair_bias_attn
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+
 root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 sys.path.insert(0, root)
 
@@ -84,9 +87,9 @@ def build_batch(pt_data, t_val, x_0, model, device,
     residue_type = torch.as_tensor(pt_data.residue_type, dtype=torch.long)  # [n]
     n = residue_type.shape[0]
 
-    # Mask
+    # Mask (must be bool for pair_bias_attn)
     coord_mask = torch.as_tensor(pt_data.coord_mask)  # [n, 37]
-    mask = (coord_mask.sum(dim=-1) > 0).float()  # [n]
+    mask = (coord_mask.sum(dim=-1) > 0)  # [n] bool
 
     # Clean CA in nm
     x_1 = ang_to_nm(coords[:, 1, :])  # [n, 3]
@@ -95,12 +98,12 @@ def build_batch(pt_data, t_val, x_0, model, device,
     valid = mask.bool()
     com = x_1[valid].mean(dim=0, keepdim=True)
     x_1 = x_1 - com
-    x_1 = x_1 * mask[:, None]
+    x_1 = x_1 * mask[:, None].float()
 
     # Interpolation: x_t = (1-t)*x_0 + t*x_1
     t_tensor = torch.tensor([t_val], dtype=torch.float32)
     x_t = (1.0 - t_val) * x_0[:n, :] + t_val * x_1  # [n, 3]
-    x_t = x_t * mask[:, None]
+    x_t = x_t * mask[:, None].float()
 
     # Self-conditioning: zeros
     x_sc = torch.zeros_like(x_t)  # [n, 3]
@@ -255,7 +258,7 @@ def main():
         coord_mask_full = torch.as_tensor(pt_data.coord_mask).unsqueeze(0)  # [1, n, 37]
         res_mask = (coord_mask_full.sum(dim=-1) > 0).squeeze(0)  # [n]
         dssp_target = compute_dssp_target(
-            coords_full, res_mask.unsqueeze(0).float(), coord_mask_full.bool()
+            coords_full, res_mask.unsqueeze(0), coord_mask_full.bool()
         )
         if dssp_target is None:
             print(f"  Skipping {protein_id}: DSSP target is None (CA-only data?)")
