@@ -549,17 +549,12 @@ def main():
         logger.error(f"CIF directory not found: {args.cif_dir}")
         sys.exit(1)
     
-    # Get protein names
-    if args.filter_existing:
-        protein_names = find_proteins_needing_af2rank(args.csv_file, args.csv_column, args.inference_config, args.regenerate_plots)
-        if args.regenerate_plots:
-            logger.info(f"Found {len(protein_names)} proteins needing AF2Rank scoring or plot regeneration (from CSV file)")
-        else:
-            logger.info(f"Found {len(protein_names)} proteins needing AF2Rank scoring (from CSV file)")
-    else:
-        protein_names = get_protein_names(args.csv_file, args.csv_column)
-        logger.info(f"Found {len(protein_names)} proteins in CSV file")
-    
+    # Always shard the full protein list for consistent cross-step assignment.
+    # Applying the already-done filter BEFORE sharding causes different steps to shard
+    # different subsets, resulting in the same shard index owning different proteins per step.
+    protein_names = get_protein_names(args.csv_file, args.csv_column)
+    logger.info(f"Found {len(protein_names)} proteins in CSV file")
+
     if not protein_names:
         logger.warning("No proteins to process")
         sys.exit(0)
@@ -568,6 +563,15 @@ def main():
     if shard_index is not None:
         data_dir = os.environ.get("DATA_PATH", os.path.join(PROTEINA_BASE_DIR, "data"))
         protein_names = shard_proteins(protein_names, shard_index, num_shards, data_dir=data_dir)
+
+    # Now apply the already-done filter to this shard's proteins only
+    if args.filter_existing:
+        needing_work = set(find_proteins_needing_af2rank(args.csv_file, args.csv_column, args.inference_config, args.regenerate_plots))
+        protein_names = [p for p in protein_names if p in needing_work]
+        if args.regenerate_plots:
+            logger.info(f"Found {len(protein_names)} proteins in this shard needing AF2Rank scoring or plot regeneration")
+        else:
+            logger.info(f"Found {len(protein_names)} proteins in this shard needing AF2Rank scoring")
 
     # Note: Multi-character chain IDs are now supported via chain extraction and renaming
     # No need to filter them out anymore!

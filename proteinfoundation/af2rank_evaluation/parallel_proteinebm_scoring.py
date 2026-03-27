@@ -306,12 +306,11 @@ def main():
 
     args = parser.parse_args()
 
-    if args.filter_existing:
-        protein_names = find_proteins_needing_proteinebm(args.csv_file, args.csv_column, args.inference_config, args.proteinebm_analysis_subdir)
-        logger.info(f"Found {len(protein_names)} proteins needing ProteinEBM scoring (from CSV file)")
-    else:
-        protein_names = get_protein_names(args.csv_file, args.csv_column)
-        logger.info(f"Found {len(protein_names)} proteins in CSV file")
+    # Always shard the full protein list for consistent cross-step assignment.
+    # Applying the already-done filter BEFORE sharding causes different steps to shard
+    # different subsets, resulting in the same shard index owning different proteins per step.
+    protein_names = get_protein_names(args.csv_file, args.csv_column)
+    logger.info(f"Found {len(protein_names)} proteins in CSV file")
 
     if not protein_names:
         logger.warning("No proteins to process")
@@ -321,6 +320,12 @@ def main():
     if shard_index is not None:
         data_dir = os.environ.get("DATA_PATH", os.path.join(PROTEINA_BASE_DIR, "data"))
         protein_names = shard_proteins(protein_names, shard_index, num_shards, data_dir=data_dir)
+
+    # Now apply the already-done filter to this shard's proteins only
+    if args.filter_existing:
+        needing_work = set(find_proteins_needing_proteinebm(args.csv_file, args.csv_column, args.inference_config, args.proteinebm_analysis_subdir))
+        protein_names = [p for p in protein_names if p in needing_work]
+        logger.info(f"Found {len(protein_names)} proteins in this shard needing ProteinEBM scoring")
 
     logger.info(f"Using {args.num_gpus} GPU(s) for parallel ProteinEBM scoring")
     logger.info("Sorting proteins by sequence length and building per-GPU work lists...")

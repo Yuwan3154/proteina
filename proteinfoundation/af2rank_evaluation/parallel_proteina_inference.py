@@ -402,14 +402,12 @@ def main():
             logger.error(f"CIF directory not found: {args.cif_dir}")
             sys.exit(1)
     
-    # Get protein names
-    if args.skip_existing:
-        protein_names = find_proteins_needing_inference(args.csv_file, args.csv_column, args.inference_config)
-        logger.info(f"Found {len(protein_names)} proteins needing inference (from CSV file)")
-    else:
-        protein_names = get_protein_names(args.csv_file, args.csv_column)
-        logger.info(f"Found {len(protein_names)} proteins to process")
-    
+    # Always shard the full protein list for consistent cross-step assignment.
+    # Applying the already-done filter BEFORE sharding causes different steps to shard
+    # different subsets, resulting in the same shard index owning different proteins per step.
+    protein_names = get_protein_names(args.csv_file, args.csv_column)
+    logger.info(f"Found {len(protein_names)} proteins in CSV file")
+
     # Note: Multi-character chain IDs are now supported in AF2Rank via chain extraction
     # Proteina PT conversion also handles them correctly
 
@@ -417,6 +415,14 @@ def main():
     if shard_index is not None:
         data_dir = os.environ.get("DATA_PATH", os.path.join(PROTEINA_BASE_DIR, "data"))
         protein_names = shard_proteins(protein_names, shard_index, num_shards, data_dir=data_dir)
+
+    # Now apply the already-done filter to this shard's proteins only
+    if args.skip_existing:
+        needing_inference = set(find_proteins_needing_inference(args.csv_file, args.csv_column, args.inference_config))
+        protein_names = [p for p in protein_names if p in needing_inference]
+        logger.info(f"Found {len(protein_names)} proteins in this shard needing inference")
+    else:
+        logger.info(f"Found {len(protein_names)} proteins in this shard to process")
 
     logger.info(f"Proteins: {protein_names}")
     
