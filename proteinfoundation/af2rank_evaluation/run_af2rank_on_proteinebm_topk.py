@@ -883,8 +883,8 @@ def main() -> None:
             sys.exit(1)
         return
 
-    if shard_index is not None and shard_index != 0:
-        logger.info("Per-protein work complete (non-zero shard), skipping cross-protein summary/plots.")
+    if shard_index is not None:
+        logger.info("Per-protein work complete (sharded run) — cross-protein summary will be aggregated by shard 0 after all shards finish.")
         return
 
     summary_df = pd.DataFrame(rows)

@@ -105,8 +105,8 @@ def build_batch(pt_data, t_val, x_0, model, device,
     x_t = (1.0 - t_val) * x_0[:n, :] + t_val * x_1  # [n, 3]
     x_t = x_t * mask[:, None].float()
 
-    # Self-conditioning: zeros
-    x_sc = torch.zeros_like(x_t)  # [n, 3]
+    # Self-conditioning: oracle clean coordinates (x_1 already centered, in nm)
+    x_sc = x_1.clone()  # [n, 3]
 
     # Sequence
     if seq_provided:
@@ -227,7 +227,7 @@ def main():
     print(f"Selected {len(pt_files)} proteins for evaluation")
 
     # Noise levels: t=0 (pure noise) to t=0.95 (mostly clean)
-    t_values = [0.0] + [round(0.05 * i, 2) for i in range(1, 20)]  # 0.0, 0.05, ..., 0.95
+    t_values = [0.0] + [round(0.05 * i, 2) for i in range(1, 21)]  # 0.0, 0.05, ..., 1.0
 
     # Conditions: (name, seq_provided, cath_provided)
     conditions = [

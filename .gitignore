@@ -27,6 +27,7 @@ data/
 proteinfoundation.egg-info/
 store/
 prediction/
+results/
 
 af2rank_evaluation/params
 proteina_additional_files/

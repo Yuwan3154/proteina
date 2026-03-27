@@ -456,9 +456,13 @@ def compute_diversity_for_proteins(
             if os.path.isdir(os.path.join(inference_dir, protein_id))
         }
         for future in as_completed(futures):
-            summary = future.result()
-            if summary is not None:
-                results[str(summary["protein_id"])] = summary
+            pid = futures[future]
+            try:
+                summary = future.result()
+                if summary is not None:
+                    results[str(summary["protein_id"])] = summary
+            except Exception as e:
+                logger.error("Analysis failed for %s: %s", pid, e)
     return results
 
 
@@ -1060,13 +1064,21 @@ def run_analysis_for_protein(
             use_usalign_dir=use_usalign_dir,
         )
         if not tm_values:
-            return None
-        pairwise_arr = np.array(tm_values, dtype=np.float64)
+            logger.warning(
+                "[%s] Pairwise diversity computation yielded no values (insufficient templates or "
+                "USalign failure). Proceeding without diversity metrics.",
+                protein_id,
+            )
+            pairwise_arr = None
+        else:
+            pairwise_arr = np.array(tm_values, dtype=np.float64)
 
     os.makedirs(analysis_dir, exist_ok=True)
+    pairwise_hist_path = None
     if not skip_diversity:
         pairwise_hist_path = os.path.join(analysis_dir, f"pairwise_tm_histogram_{protein_id}.png")
-        plot_pairwise_tm_histogram(tm_values, pairwise_hist_path, protein_id)
+        if tm_values:
+            plot_pairwise_tm_histogram(tm_values, pairwise_hist_path, protein_id)
 
     proteinebm_summary = enrich_proteinebm_outputs(
         protein_id=protein_id,
@@ -1112,7 +1124,7 @@ def run_analysis_for_protein(
         "median_tem_to_tem_tm": float(np.median(pairwise_arr)) if pairwise_arr is not None else None,
         "min_tem_to_tem_tm": float(pairwise_arr.min()) if pairwise_arr is not None else None,
         "max_tem_to_tem_tm": float(pairwise_arr.max()) if pairwise_arr is not None else None,
-        "pairwise_tm_histogram": os.path.abspath(pairwise_hist_path) if not skip_diversity else None,
+        "pairwise_tm_histogram": os.path.abspath(pairwise_hist_path) if pairwise_hist_path else None,
         "proteinebm_summary": proteinebm_summary,
         "af2rank_summaries": af2rank_summaries,
         "af2rank_topk_summary_csv": topk_summary_csv,
@@ -1169,9 +1181,13 @@ def compute_analysis_for_proteins(
             for protein_id in protein_ids
         }
         for future in as_completed(futures):
-            summary = future.result()
-            if summary is not None:
-                results[str(summary["protein_id"])] = summary
+            pid = futures[future]
+            try:
+                summary = future.result()
+                if summary is not None:
+                    results[str(summary["protein_id"])] = summary
+            except Exception as e:
+                logger.error("Analysis failed for %s: %s", pid, e)
     return results
 
 

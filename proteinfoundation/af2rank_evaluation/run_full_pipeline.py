@@ -462,6 +462,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help='Force re-run scoring (AF2Rank or ProteinEBM) even if outputs already exist')
     parser.add_argument('--rerun_af2rank_on_top_k', action='store_true',
                        help='Force re-run AF2Rank on ProteinEBM top-k even if outputs already exist')
+    parser.add_argument('--rerun_analysis', action='store_true',
+                       help='Force re-run central analysis even if analysis summaries already exist')
     parser.add_argument(
         '--proteina_force_compile',
         action=argparse.BooleanOptionalAction,
@@ -701,11 +703,12 @@ def main(argv: list[str] | None = None):
                     num_workers=args.num_workers,
                     shard_args=shard_cli_args,
                     direct_python=args.direct_python,
-                    rerun=args.rerun_proteina or args.rerun_score or args.rerun_af2rank_on_top_k,
+                    rerun=args.rerun_proteina or args.rerun_score or args.rerun_af2rank_on_top_k or args.rerun_analysis,
                     skip_diversity=args.skip_diversity,
                 )
                 if analysis_success:
-                    logger.info("✅ Central analysis completed successfully")
+                    shard_desc = f" (shard {shard_index})" if shard_index is not None else ""
+                    logger.info(f"✅ Central analysis{shard_desc} completed successfully")
                 else:
                     logger.error("❌ Central analysis failed")
                     success = False
@@ -751,6 +754,31 @@ def main(argv: list[str] | None = None):
         ):
             logger.error("Timeout waiting for all shards to complete")
             success = False
+
+        # Aggregate AF2Rank-on-topk per-protein results into the cross-protein summary CSV.
+        # During the sharded Step 3, each shard suppressed summary writing; now that all
+        # per-protein CSVs exist, one aggregation pass (filter_existing=True, no shard_args)
+        # reads them and writes the combined summary.
+        if success and not args.skip_af2rank_on_top_k and args.scorer == "proteinebm" and int(args.af2rank_top_k) > 0:
+            logger.info("Aggregating AF2Rank-on-topk per-protein results into cross-protein summary CSV...")
+            run_af2rank_on_proteinebm_topk(
+                inference_dir=inference_dir,
+                dataset_file=args.dataset_file,
+                id_column=args.id_column,
+                tms_column=args.tms_column,
+                top_k=int(args.af2rank_top_k),
+                recycles=int(args.recycles),
+                num_gpus=int(args.num_gpus),
+                filter_existing=True,
+                proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
+                backend=args.af2rank_backend,
+                use_deepspeed_evoformer_attention=args.use_deepspeed_evoformer_attention,
+                use_cuequivariance_attention=args.use_cuequivariance_attention,
+                use_cuequivariance_multiplicative_update=args.use_cuequivariance_multiplicative_update,
+                shard_args=None,
+                direct_python=args.direct_python,
+                cif_dir=args.cif_dir,
+            )
 
     # Step 5: Cross-protein plots
     if success:

@@ -197,7 +197,6 @@ def step_af2rank_topk(
     use_cuequivariance_multiplicative_update: bool = True,
     shard_args: list | None = None,
     direct_python: bool = False,
-    rerun: bool = False,
     filter_existing: bool = True,
 ) -> bool:
     """Run AF2Rank on ProteinEBM top-k templates.
@@ -584,6 +583,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Force re-run ProteinEBM scoring even if outputs already exist")
     parser.add_argument("--rerun_af2rank_on_top_k", action="store_true",
                         help="Force re-run AF2Rank on ProteinEBM top-k even if outputs already exist")
+    parser.add_argument("--rerun_analysis", action="store_true",
+                        help="Force re-run central analysis even if analysis summaries already exist")
     parser.add_argument(
         "--proteina_force_compile",
         "--force_compile",
@@ -712,7 +713,6 @@ def main(argv: list[str] | None = None):
             use_cuequivariance_multiplicative_update=args.use_cuequivariance_multiplicative_update,
             shard_args=shard_cli_args,
             direct_python=args.direct_python,
-            rerun=args.rerun_af2rank_on_top_k,
             filter_existing=bool(args.af2rank_topk_filter_existing) and not args.rerun_af2rank_on_top_k,
         ):
             logger.error("AF2Rank step failed")
@@ -736,7 +736,7 @@ def main(argv: list[str] | None = None):
                 num_workers=args.num_workers,
                 shard_args=shard_cli_args,
                 direct_python=args.direct_python,
-                rerun=args.rerun_proteina or args.rerun_score or args.rerun_af2rank_on_top_k,
+                rerun=args.rerun_proteina or args.rerun_score or args.rerun_af2rank_on_top_k or args.rerun_analysis,
                 skip_diversity=args.skip_diversity,
             ):
                 logger.error("Central analysis failed")
