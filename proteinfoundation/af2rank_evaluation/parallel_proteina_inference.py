@@ -338,31 +338,74 @@ def get_protein_names(csv_file, csv_column):
     return [p for p in proteins if p.strip()]
 
 
+def _get_expected_nsamples(inference_config):
+    """Read the expected nsamples_per_len from the inference config YAML.
+
+    Tries to load the Hydra config (with its defaults chain) so that values
+    defined in inference_base.yaml are inherited.  Falls back to a direct
+    YAML read and finally to a safe default.
+    """
+    try:
+        from omegaconf import OmegaConf
+        config_dir = os.path.join(PROTEINA_BASE_DIR, 'configs', 'experiment_config')
+        yaml_path = os.path.join(config_dir, f"{inference_config}.yaml")
+        if os.path.exists(yaml_path):
+            cfg = OmegaConf.load(yaml_path)
+            if "nsamples_per_len" in cfg:
+                return int(cfg.nsamples_per_len)
+            # Fall through to base config
+            defaults = cfg.get("defaults", [])
+            for d in defaults:
+                if isinstance(d, str):
+                    base_path = os.path.join(config_dir, f"{d}.yaml")
+                    if os.path.exists(base_path):
+                        base_cfg = OmegaConf.load(base_path)
+                        if "nsamples_per_len" in base_cfg:
+                            return int(base_cfg.nsamples_per_len)
+    except Exception as e:
+        logger.warning(f"Could not read nsamples_per_len from config: {e}")
+    return None  # Unknown — caller decides policy
+
+
 def find_proteins_needing_inference(csv_file, csv_column, inference_config):
-    """Find proteins from CSV that need inference (no PDB files generated yet)."""
+    """Find proteins from CSV that need inference (incomplete or missing).
+
+    A protein is skipped only when it already has at least ``nsamples_per_len``
+    PDB files (i.e. fully completed).  Partially completed proteins are
+    included so that ``inference.py`` can resume from where they left off.
+    """
     # Get proteins from CSV file
     csv_proteins = get_protein_names(csv_file, csv_column)
-    
+
     inference_base_dir = os.path.join(PROTEINA_BASE_DIR, 'inference', inference_config)
-    
+
+    expected_nsamples = _get_expected_nsamples(inference_config)
+    if expected_nsamples is not None:
+        logger.info(f"Expected nsamples_per_len from config: {expected_nsamples}")
+
     proteins_needing_inference = []
-    
+
     for protein_name in csv_proteins:
         protein_dir = Path(inference_base_dir) / protein_name
-        
+
         if protein_dir.exists() and protein_dir.is_dir():
             # Check if there are PDB files (inference completed)
             pdb_files = list(protein_dir.glob(f"{protein_name}_*.pdb"))
-            
-            if not pdb_files:
+            n_existing = len(pdb_files)
+
+            if n_existing == 0:
                 # Directory exists but no PDB files
                 proteins_needing_inference.append(protein_name)
+            elif expected_nsamples is not None and n_existing < expected_nsamples:
+                # Partially completed — needs more samples
+                logger.info(f"Partial inference for {protein_name} ({n_existing}/{expected_nsamples} PDB files), will resume")
+                proteins_needing_inference.append(protein_name)
             else:
-                logger.info(f"Inference already completed for {protein_name} ({len(pdb_files)} PDB files), skipping")
+                logger.info(f"Inference already completed for {protein_name} ({n_existing} PDB files), skipping")
         else:
             # Directory doesn't exist, needs inference
             proteins_needing_inference.append(protein_name)
-    
+
     return proteins_needing_inference
 
 def main():

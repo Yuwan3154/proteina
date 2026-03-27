@@ -12,10 +12,10 @@
 
 # Load your shell environment to activate your Conda environment
 source /etc/profile
-module load conda/Python-ML-2025b-pytorch
+module load conda/Python-ML-2025b-pytorch cuda/12.6
 
 # Then use the module command to load the module needed for your work
-source activate
+source activate cue_openfold
 # 40 cores / 2 GPUs = 20 threads per GPU worker
 export OMP_NUM_THREADS=20
 

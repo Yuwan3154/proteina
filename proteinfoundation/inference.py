@@ -330,14 +330,25 @@ if __name__ == "__main__":
     root_path = f"./inference/{config_name}"
     if cfg.seq_cond:
         root_path = os.path.join(root_path, args.pt)
+
+    # --- Resume-aware setup ---
+    # Count existing PDB files to determine where to resume from.
+    # Instead of deleting everything on partial completion, we keep existing
+    # samples and only generate the missing ones.
+    rng_state_path = os.path.join(root_path, "_rng_state.pt") if os.path.exists(root_path) else None
+    existing_sample_count = 0
     if os.path.exists(root_path):
-        # Skip cleanup if all samples already exist
         existing_pdbs = [f for f in os.listdir(root_path) if f.endswith('.pdb')]
-        if len(existing_pdbs) >= cfg.nsamples_per_len:
-            logger.info(f"Output already complete ({len(existing_pdbs)} PDB files found), skipping inference")
+        existing_sample_count = len(existing_pdbs)
+        if existing_sample_count >= cfg.nsamples_per_len:
+            logger.info(f"Output already complete ({existing_sample_count} PDB files found), skipping inference")
             sys.exit(0)
-        shutil.rmtree(root_path)
+        if existing_sample_count > 0:
+            logger.info(f"Found {existing_sample_count} existing PDB files, will resume from sample {existing_sample_count}")
+        rng_state_path = os.path.join(root_path, "_rng_state.pt")
     os.makedirs(root_path, exist_ok=True)
+    if rng_state_path is None:
+        rng_state_path = os.path.join(root_path, "_rng_state.pt")
 
     # Load model from checkpoint
     ckpt_path = os.path.join(os.getenv("DATA_PATH"), "weights")
@@ -362,9 +373,25 @@ if __name__ == "__main__":
         ckpt = torch.load(ckpt_file, map_location="cpu", weights_only=False)
         model.load_state_dict(ckpt["state_dict"])
 
-    # Set seed
-    logger.info(f"Seeding everything to seed {cfg.seed}")
-    L.seed_everything(cfg.seed)
+    # Set seed / restore RNG state for resuming
+    if existing_sample_count > 0 and os.path.exists(rng_state_path):
+        logger.info(f"Restoring RNG state from {rng_state_path} (resuming from sample {existing_sample_count})")
+        saved_rng = torch.load(rng_state_path, weights_only=False)
+        torch.set_rng_state(saved_rng["torch_rng_state"])
+        if torch.cuda.is_available() and "cuda_rng_state" in saved_rng:
+            torch.cuda.set_rng_state(saved_rng["cuda_rng_state"])
+        np.random.set_state(saved_rng["numpy_rng_state"])
+        random.setstate(saved_rng["python_rng_state"])
+    elif existing_sample_count > 0:
+        logger.warning(
+            f"Resuming from {existing_sample_count} existing samples but no RNG state file found at {rng_state_path}. "
+            f"This may happen when resuming from a run made before resume support was added. "
+            f"Using fresh seed {cfg.seed} — new samples will be valid but RNG continuity is not guaranteed."
+        )
+        L.seed_everything(cfg.seed)
+    else:
+        logger.info(f"Seeding everything to seed {cfg.seed}")
+        L.seed_everything(cfg.seed)
 
     # Set inference variables and potentially load autoguidance
     nn_ag = None
@@ -406,11 +433,13 @@ if __name__ == "__main__":
         elif residue_type_tensor is not None:
             mask_tensor = torch.ones_like(residue_type_tensor, dtype=torch.float32)
 
+    # When resuming, only generate the remaining samples
+    remaining_samples = cfg.nsamples_per_len - existing_sample_count
     dataset = GenDatasetWithSeqCath(
         pt=pt,
         cath_codes=cath_codes if cfg.fold_cond else ["x.x.x.x"],
         dt=cfg.dt,
-        nsamples_per_len=cfg.nsamples_per_len,
+        nsamples_per_len=remaining_samples,
         max_nsamples=cfg.max_nsamples
     )
     # nlens_dict = parse_nlens_cfg(cfg)
@@ -446,11 +475,26 @@ if __name__ == "__main__":
     model._force_compile = bool(args.force_compile)
     predictions = trainer.predict(model, dataloader)
 
+    # Save RNG state after prediction so future runs can resume from here
+    rng_state_to_save = {
+        "torch_rng_state": torch.get_rng_state(),
+        "numpy_rng_state": np.random.get_state(),
+        "python_rng_state": random.getstate(),
+        "total_samples_completed": existing_sample_count + remaining_samples,
+        "seed": cfg.seed,
+    }
+    if torch.cuda.is_available():
+        rng_state_to_save["cuda_rng_state"] = torch.cuda.get_rng_state()
+    torch.save(rng_state_to_save, rng_state_path)
+    logger.info(f"Saved RNG state to {rng_state_path} (total samples completed: {cfg.nsamples_per_len})")
+
     if pt is not None:
         aatype = np.array(pt.residue_type).astype(int)
     else:
         aatype = None
     
+    # Start sample counter from the number of existing samples so filenames
+    # continue from where the previous run left off (e.g., 256, 257, ...)
     samples_per_length = {}
     openfold_infer = None
     openfold_residue_type = None
@@ -475,7 +519,7 @@ if __name__ == "__main__":
             # Initialize counter for this pt and cath_code if not present
             sample_key = (args.pt, current_cath_code)
             if sample_key not in samples_per_length:
-                samples_per_length[sample_key] = 0
+                samples_per_length[sample_key] = existing_sample_count
             
             sample_idx = samples_per_length[sample_key]
             

@@ -19,12 +19,12 @@ import torch
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
-DEFAULT_CONFIG     = "/home/ubuntu/ProteinEBM/protein_ebm/config/proteinebm_v2_cathmd_config.yaml"
-DEFAULT_CHECKPOINT = "/home/ubuntu/ProteinEBM/weights/proteinebm_v2_cathmd_weights.pt"
+DEFAULT_CONFIG     = "/home/gridsan/cou/ProteinEBM/protein_ebm/config/proteinebm_v2_cathmd_config.yaml"
+DEFAULT_CHECKPOINT = "/home/gridsan/cou/ProteinEBM/weights/proteinebm_v2_cathmd_weights.pt"
 DEFAULT_PDB = (
-    "/home/ubuntu/proteina/inference/"
-    "inference_seq_cond_sampling_ca_beta-2.5-2.0_finetune-all_v1.4_default-fold_4-seq-S25_64-eff-bs_purge-test_warmup_cutoff-190828_last_045-noise/"
-    "1a2y_C/1a2y_C_0.pdb"
+    "/home/gridsan/cou/proteina/inference/"
+    "inference_seq_cond_sampling_ca_dssp_beta-2.5-2.0_finetune-all_v1.6_default-fold_21-seq-S25_128-eff-bs_purge-test_warmup_cutoff-190828_last_045-noise/"
+    "A0A0N7KF74-F1/A0A0N7KF74-F1_0.pdb"
 )
 
 
@@ -98,7 +98,7 @@ def main() -> None:
 
     # ── Load model ──────────────────────────────────────────────────────────
     banner("Loading ProteinEBM model")
-    sys.path.insert(0, "/home/ubuntu/ProteinEBM")
+    sys.path.insert(0, "/home/gridsan/cou/ProteinEBM")
     from proteinfoundation.af2rank_evaluation.proteinebm_scorer import (
         load_proteinebm_model,
         build_input_feats_from_pdb,
