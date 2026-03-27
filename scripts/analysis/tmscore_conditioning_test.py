@@ -187,6 +187,7 @@ def main():
     model = Proteina.load_from_checkpoint(args.ckpt, strict=False)
     model.eval()
     model.to(device)
+    model._inf_zero_sin_pos_emb = True  # checkpoint trained with zero_sin_pos_emb=True
     print(f"Model loaded on {device}")
 
     cath_code_dir = model.cfg_exp.model.nn.get("cath_code_dir", "")

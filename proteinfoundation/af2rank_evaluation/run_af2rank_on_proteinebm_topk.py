@@ -279,11 +279,6 @@ def _run_af2rank_subprocess(
     use_cuequivariance_attention: bool = True,
     use_cuequivariance_multiplicative_update: bool = True,
 ) -> None:
-    # Ensure each subprocess is pinned to a single GPU when requested.
-    cuda_line = ""
-    if cuda_visible_devices.strip():
-        cuda_line = f"os.environ['CUDA_VISIBLE_DEVICES'] = {cuda_visible_devices!r}\n"
-
     wrapper_dir = str(Path(__file__).parent)
     if backend == "openfold":
         wrapper_script = os.path.join(wrapper_dir, "run_with_proteina_env.sh")
@@ -294,8 +289,6 @@ import glob
 sys.path.append({wrapper_dir!r})
 
 from af2rank_openfold_scorer import OpenFoldAF2Rank, save_af2rank_scores, load_af2rank_scores_from_csv
-
-{cuda_line}
 
 protein_id = {protein_id!r}
 reference_cif = {reference_cif!r}
@@ -360,7 +353,6 @@ sys.path.append({wrapper_dir!r})
 
 from af2rank_scorer import ModernAF2Rank, save_af2rank_scores, suppress_stdout, load_af2rank_scores_from_csv
 
-{cuda_line}
 os.environ['ALPHAFOLD_DATA_DIR'] = os.path.expanduser('~/openfold/openfold/resources/params')
 os.environ['AF_PARAMS_DIR'] = os.path.expanduser('~/openfold/openfold/resources/params')
 
@@ -426,8 +418,11 @@ save_af2rank_scores(all_scores, output_dir, protein_id)
         cmd = [sys.executable, "-c", py]
     else:
         cmd = [wrapper_script, "python", "-c", py]
+    env = os.environ.copy()
+    if cuda_visible_devices.strip():
+        env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
     logger.info(f"Running AF2Rank subprocess for {protein_id} ({model_name}): {cmd[0]}")
-    result = subprocess.run(cmd, cwd=wrapper_dir, capture_output=True, text=True)
+    result = subprocess.run(cmd, env=env, cwd=wrapper_dir, capture_output=True, text=True)
     if result.returncode != 0:
         err_tail = result.stderr[-3000:] if result.stderr else "(no stderr)"
         out_tail = result.stdout[-1000:] if result.stdout else "(no stdout)"
