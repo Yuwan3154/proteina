@@ -549,7 +549,13 @@ def main(argv: list[str] | None = None):
     
     start_time = time.time()
     project_root = os.getcwd()
-    
+    base_inference_dir = os.path.join(project_root, "inference", args.inference_config)
+    if shard_index is not None and num_shards is not None:
+        os.makedirs(base_inference_dir, exist_ok=True)
+        _own_sentinel = Path(base_inference_dir) / f".shard_{shard_index}_of_{num_shards}_complete"
+        _own_sentinel.unlink(missing_ok=True)
+        logger.info(f"Cleared own shard completion sentinel (shard {shard_index}/{num_shards}).")
+
     logger.info(f"🚀 Starting complete AF2Rank evaluation pipeline")
     logger.info(f"📊 Dataset file: {args.dataset_file}")
     logger.info(f"📂 CIF directory: {args.cif_dir}")
@@ -715,45 +721,32 @@ def main(argv: list[str] | None = None):
             else:
                 logger.info("⏭️  Skipping central analysis")
 
+    # Write per-shard sentinel so shard 0 can reliably know when all shards' per-protein work
+    # is done — even on re-runs where stale per-protein output files may already exist.
+    if shard_index is not None and num_shards is not None:
+        _sentinel = Path(base_inference_dir) / f".shard_{shard_index}_of_{num_shards}_complete"
+        _sentinel.touch()
+        logger.info(f"Wrote shard {shard_index} completion sentinel.")
+
     if shard_index is not None and shard_index != 0:
         logger.info("Per-protein work complete (after central analysis), exiting.")
         sys.exit(0 if success else 1)
 
     if success and shard_index is not None:
-        df = pd.read_csv(args.dataset_file)
-        all_protein_names = df[args.id_column].dropna().astype(str).str.strip().unique().tolist()
-        all_protein_names = [p for p in all_protein_names if p]
+        other_shard_indices = list(range(1, num_shards))
+        if other_shard_indices:
+            def _check_shard_done(shard_idx):
+                sentinel = Path(base_inference_dir) / f".shard_{shard_idx}_of_{num_shards}_complete"
+                return sentinel.exists()
 
-        if skip_analysis:
-            def _check_complete(protein_name):
-                protein_dir = Path(inference_dir) / protein_name
-                if args.scorer == "af2rank":
-                    csv_path = protein_dir / "af2rank_analysis" / f"af2rank_scores_{protein_name}.csv"
-                    if not csv_path.exists():
-                        return False
-                else:
-                    csv_path = protein_dir / args.proteinebm_analysis_subdir / f"proteinebm_scores_{protein_name}.csv"
-                    if not csv_path.exists():
-                        return False
-                if args.scorer == "proteinebm" and int(args.af2rank_top_k) > 0 and not args.skip_af2rank_on_top_k:
-                    topk_m1 = protein_dir / "af2rank_on_proteinebm_top_k" / "af2rank_analysis" / f"af2rank_scores_{protein_name}.csv"
-                    topk_m2 = protein_dir / "af2rank_on_proteinebm_top_k" / "af2rank_analysis_model_2_ptm" / f"af2rank_scores_{protein_name}.csv"
-                    if not topk_m1.exists() or not topk_m2.exists():
-                        return False
-                return True
-        else:
-            def _check_complete(protein_name):
-                summary_path = Path(inference_dir) / protein_name / "proteina_analysis" / f"analysis_summary_{protein_name}.json"
-                return summary_path.exists()
-
-        if not wait_for_completion(
-            all_protein_names,
-            _check_complete,
-            poll_interval=args.shard_poll_interval,
-            timeout=args.shard_timeout,
-        ):
-            logger.error("Timeout waiting for all shards to complete")
-            success = False
+            if not wait_for_completion(
+                other_shard_indices,
+                _check_shard_done,
+                poll_interval=args.shard_poll_interval,
+                timeout=args.shard_timeout,
+            ):
+                logger.error("Timeout waiting for all shards to complete")
+                success = False
 
         # Aggregate AF2Rank-on-topk per-protein results into the cross-protein summary CSV.
         # During the sharded Step 3, each shard suppressed summary writing; now that all
