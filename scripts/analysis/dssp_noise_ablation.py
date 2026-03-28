@@ -81,8 +81,12 @@ def load_cath_code_lookup(cathdata_dir):
 
 
 def build_batch(pt_data, t_val, x_0, model, device,
-                seq_provided, cath_indices, cath_mask, ext_lig_provided):
-    """Build a batch dictionary for a single protein at a given noise level."""
+                seq_provided, cath_indices, cath_mask, ext_lig_provided,
+                zero_sin_pos_emb=False):
+    """Build a batch dictionary for a single protein at a given noise level.
+
+    Returns (batch, mask_cpu, x_1) where x_1 is the centered clean CA coords in nm.
+    """
     coords = torch.as_tensor(pt_data.coords, dtype=torch.float32)  # [n, 37, 3] in Å
     residue_type = torch.as_tensor(pt_data.residue_type, dtype=torch.long)  # [n]
     n = residue_type.shape[0]
@@ -123,15 +127,8 @@ def build_batch(pt_data, t_val, x_0, model, device,
     else:
         ext_lig = torch.full((n,), 2, dtype=torch.long)  # All unknown
 
-    # Sequence position
-    if hasattr(pt_data, "seq_pos"):
-        seq_pos = torch.as_tensor(pt_data.seq_pos, dtype=torch.long)
-        if seq_pos.dim() == 1:
-            seq_pos = seq_pos.unsqueeze(-1)
-    else:
-        seq_pos = torch.arange(n, dtype=torch.long).unsqueeze(-1)
-
-    # Build batch (add batch dim)
+    # Build batch (add batch dim). seq_pos is NOT included: the model reads
+    # batch["residue_pdb_idx"] (not seq_pos) for positional embeddings.
     batch = {
         "x_t": x_t.unsqueeze(0).to(device),
         "t": t_tensor.to(device),
@@ -139,9 +136,12 @@ def build_batch(pt_data, t_val, x_0, model, device,
         "x_sc": x_sc.unsqueeze(0).to(device),
         "residue_type": seq.unsqueeze(0).to(device),
         "ext_lig": ext_lig.unsqueeze(0).to(device),
-        "seq_pos": seq_pos.unsqueeze(0).to(device),
-        "_zero_idx_emb": True,
     }
+    # Only zero out positional embedding if the checkpoint was trained that way.
+    # Hardcoding True here would incorrectly ablate positional info for checkpoints
+    # that were NOT trained with zero_sin_pos_emb.
+    if zero_sin_pos_emb:
+        batch["_zero_idx_emb"] = True
 
     # CATH indices
     if cath_indices is not None:
@@ -149,7 +149,7 @@ def build_batch(pt_data, t_val, x_0, model, device,
         if cath_mask is not None:
             batch["cath_code_indices_mask"] = cath_mask.to(device)
 
-    return batch, mask
+    return batch, mask, x_1
 
 
 def get_cath_indices_for_protein(protein_id, cath_lookup, cath_code_dir, multilabel_mode, device):
@@ -202,6 +202,19 @@ def main():
     model.eval()
     model.to(device)
     print(f"Model loaded on {device}")
+
+    # --- Diagnostic A: Verify dssp_head is trained (not randomly initialized) ---
+    zero_sin_pos_emb_flag = bool(model.cfg_exp.training.get("zero_sin_pos_emb", False))
+    print(f"  Checkpoint zero_sin_pos_emb: {zero_sin_pos_emb_flag}")
+    print(f"  Checkpoint seq_emb_dim: {model.cfg_exp.model.nn.get('seq_emb_dim', 'N/A')}")
+    if hasattr(model.nn, 'dssp_head') and model.nn.dssp_head is not None:
+        ln_mod = model.nn.dssp_head[0]   # LayerNorm(768)
+        lin_mod = model.nn.dssp_head[1]  # Linear(768, 3, bias=True)
+        print(f"  dssp_head LN weight norm: {ln_mod.weight.norm().item():.4f}")
+        print(f"  dssp_head Linear weight norm: {lin_mod.weight.norm().item():.4f}")
+        print(f"  dssp_head Linear bias (L/H/E): {[round(b, 4) for b in lin_mod.bias.tolist()]}")
+    else:
+        print("  WARNING: dssp_head is None — predict_dssp=False in this checkpoint!")
 
     # Get model config
     cath_code_dir = model.cfg_exp.model.nn.get("cath_code_dir", "")
@@ -286,12 +299,13 @@ def main():
                 cath_idx = protein_cath_indices if cath_on else null_cath_indices
                 cath_msk = protein_cath_mask if cath_on else null_cath_mask
 
-                batch, mask_cpu = build_batch(
+                batch, mask_cpu, x_1_centered = build_batch(
                     pt_data, t_val, x_0, model, device,
                     seq_provided=seq_on,
                     cath_indices=cath_idx,
                     cath_mask=cath_msk,
                     ext_lig_provided=True,
+                    zero_sin_pos_emb=zero_sin_pos_emb_flag,
                 )
 
                 with torch.no_grad():
@@ -316,6 +330,30 @@ def main():
                     print(f"  [t=1.0 GT  ] {gt_str[:100]}")
                     print(f"  [t=1.0 Pred] {pr_str[:100]}")
                     print(f"  [t=1.0 Acc ] {float(acc.item()):.4f} over {int(valid.sum())} valid residues")
+
+                    # --- Diagnostic B: Logit statistics ---
+                    valid_logits = dssp_logits.squeeze(0)[valid]  # [n_valid, 3]
+                    print(f"  [t=1.0] logit stats: min={valid_logits.min():.3f} "
+                          f"max={valid_logits.max():.3f} std={valid_logits.std():.3f}")
+                    print(f"  [t=1.0] mean per class: L={valid_logits[:,0].mean():.3f} "
+                          f"H={valid_logits[:,1].mean():.3f} E={valid_logits[:,2].mean():.3f}")
+                    pred_v = dssp_pred[valid]
+                    tgt_v = dssp_target[valid]
+                    print(f"  [t=1.0] pred: L={int((pred_v==0).sum())} "
+                          f"H={int((pred_v==1).sum())} E={int((pred_v==2).sum())}")
+                    print(f"  [t=1.0] gt:   L={int((tgt_v==0).sum())} "
+                          f"H={int((tgt_v==1).sum())} E={int((tgt_v==2).sum())}")
+
+                    # --- Diagnostic C: Oracle x_sc=x_1 positive control ---
+                    oracle_batch = {k: v for k, v in batch.items()}
+                    oracle_batch["x_sc"] = x_1_centered.unsqueeze(0).to(device)
+                    with torch.no_grad():
+                        oracle_out = model.nn(oracle_batch)
+                    oracle_logits = oracle_out.get("dssp_logits")
+                    if oracle_logits is not None:
+                        oracle_pred = oracle_logits.squeeze(0).argmax(dim=-1)
+                        oracle_acc = ((oracle_pred == dssp_target) & valid).float().sum() / valid.float().sum()
+                        print(f"  [t=1.0 ORACLE x_sc=x_1] Acc: {oracle_acc.item():.4f}")
 
                 results.append({
                     "protein_id": protein_id,

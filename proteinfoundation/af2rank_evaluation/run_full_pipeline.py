@@ -287,6 +287,7 @@ def run_af2rank_on_proteinebm_topk(
     shard_args=None,
     direct_python: bool = False,
     cif_dir: str = "",
+    output_dir: str = "",
 ) -> bool:
     """Run AF2Rank scoring on the ProteinEBM top-k templates per protein."""
     logger.info(f"🧪 Starting AF2Rank-on-ProteinEBM-topk step (backend={backend})...")
@@ -339,6 +340,8 @@ def run_af2rank_on_proteinebm_topk(
         cmd.append("--direct_python")
     if shard_args:
         cmd.extend(shard_args)
+    if output_dir:
+        cmd.extend(["--output_dir", output_dir])
 
     return run_with_conda_env("proteina", cmd, cwd=os.path.dirname(os.path.abspath(__file__)), direct_python=direct_python)
 
@@ -550,6 +553,10 @@ def main(argv: list[str] | None = None):
     start_time = time.time()
     project_root = os.getcwd()
     base_inference_dir = os.path.join(project_root, "inference", args.inference_config)
+    if args.cross_protein_output_dir:
+        cross_out_dir = os.path.abspath(os.path.expanduser(args.cross_protein_output_dir))
+    else:
+        cross_out_dir = os.path.join(base_inference_dir, f"{Path(args.dataset_file).stem}_cross_protein_analysis")
     if shard_index is not None and num_shards is not None:
         os.makedirs(base_inference_dir, exist_ok=True)
         _own_sentinel = Path(base_inference_dir) / f".shard_{shard_index}_of_{num_shards}_complete"
@@ -678,6 +685,7 @@ def main(argv: list[str] | None = None):
             shard_args=shard_cli_args,
             direct_python=args.direct_python,
             cif_dir=args.cif_dir,
+            output_dir=cross_out_dir,
         )
 
         if topk_success:
@@ -693,10 +701,6 @@ def main(argv: list[str] | None = None):
         logger.info("="*60)
 
         inference_dir = os.path.join(project_root, "inference", args.inference_config)
-        if args.cross_protein_output_dir:
-            cross_out_dir = os.path.abspath(os.path.expanduser(args.cross_protein_output_dir))
-        else:
-            cross_out_dir = os.path.join(inference_dir, f"{Path(args.dataset_file).stem}_cross_protein_analysis")
 
         if success:
             if not skip_analysis:
@@ -771,6 +775,7 @@ def main(argv: list[str] | None = None):
                 shard_args=None,
                 direct_python=args.direct_python,
                 cif_dir=args.cif_dir,
+                output_dir=cross_out_dir,
             )
 
     # Step 5: Cross-protein plots
@@ -780,10 +785,6 @@ def main(argv: list[str] | None = None):
         logger.info("="*60)
 
         inference_dir = os.path.join(project_root, "inference", args.inference_config)
-        if args.cross_protein_output_dir:
-            cross_out_dir = os.path.abspath(os.path.expanduser(args.cross_protein_output_dir))
-        else:
-            cross_out_dir = os.path.join(inference_dir, f"{Path(args.dataset_file).stem}_cross_protein_analysis")
 
         if success:
             plot_success = run_cross_protein_plots(
