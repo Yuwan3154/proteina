@@ -717,6 +717,7 @@ class OpenFoldAF2Rank:
         output_pdb: Optional[str] = None,
         verbose: bool = False,
         _original_pdb: Optional[str] = None,
+        no_template: bool = False,
     ) -> Dict:
         """Score a single decoy structure using AF2Rank protocol via OpenFold.
 
@@ -724,6 +725,9 @@ class OpenFoldAF2Rank:
             _original_pdb: If provided, use this for TMscore CA extraction instead
                 of decoy_pdb (useful when decoy_pdb is already a cg2all-reconstructed
                 all-atom PDB and we want TMscore against the original CA trace).
+            no_template: If True, zero out backbone template coordinates
+                (template_all_atom_positions, template_pseudo_beta) after featurization.
+                Useful for testing whether template backbone actually affects predictions.
         """
         if decoy_chain is None:
             decoy_chain = "A"
@@ -731,7 +735,7 @@ class OpenFoldAF2Rank:
         if verbose:
             logger.debug(f"Scoring {decoy_pdb} with OpenFold AF2Rank")
 
-        batch, _template_coords = self._featurize(
+        batch, template_coords = self._featurize(
             decoy_pdb,
             decoy_chain=decoy_chain,
             rm_seq=rm_seq,
@@ -739,6 +743,11 @@ class OpenFoldAF2Rank:
             seed=seed,
             _original_pdb=_original_pdb,
         )
+
+        if no_template:
+            for key in ("template_all_atom_positions", "template_pseudo_beta"):
+                if key in batch:
+                    batch[key] = torch.zeros_like(batch[key])
 
         with torch.no_grad():
             out = self.model.model(batch)
@@ -748,6 +757,19 @@ class OpenFoldAF2Rank:
             _save_openfold_prediction_pdb(self.reference_sequence, out, output_pdb)
             scores["predicted_structure_path"] = output_pdb
             scores["predicted_structure_file"] = os.path.basename(output_pdb)
+
+        # TM scores: reference vs template/prediction, template vs prediction
+        scores["tm_ref_template"] = tmscore(
+            self.reference_coords, template_coords, env=_USALIGN_PARALLEL_ENV
+        ).get("tms", 0.0)
+        if "final_atom_positions" in out:
+            pred_ca = out["final_atom_positions"][:, 1, :].detach().cpu().numpy()
+            scores["tm_ref_pred"] = tmscore(
+                self.reference_coords, pred_ca, env=_USALIGN_PARALLEL_ENV
+            ).get("tms", 0.0)
+            scores["tm_template_pred"] = tmscore(
+                template_coords, pred_ca, env=_USALIGN_PARALLEL_ENV
+            ).get("tms", 0.0)
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -875,6 +897,20 @@ def score_proteina_structures_openfold(
                     _save_openfold_prediction_pdb(scorer.reference_sequence, out, output_pdb)
                     structure_scores["predicted_structure_path"] = output_pdb
                     structure_scores["predicted_structure_file"] = os.path.basename(output_pdb)
+
+                # TM scores: reference vs template/prediction, template vs prediction
+                structure_scores["tm_ref_template"] = tmscore(
+                    scorer.reference_coords, template_coords, env=_USALIGN_PARALLEL_ENV
+                ).get("tms", 0.0)
+                if "final_atom_positions" in out:
+                    pred_ca = out["final_atom_positions"][:, 1, :].detach().cpu().numpy()
+                    structure_scores["tm_ref_pred"] = tmscore(
+                        scorer.reference_coords, pred_ca, env=_USALIGN_PARALLEL_ENV
+                    ).get("tms", 0.0)
+                    structure_scores["tm_template_pred"] = tmscore(
+                        template_coords, pred_ca, env=_USALIGN_PARALLEL_ENV
+                    ).get("tms", 0.0)
+
                 gc.collect()
                 torch.cuda.empty_cache()
 

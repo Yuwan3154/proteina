@@ -105,8 +105,10 @@ def build_batch(pt_data, t_val, x_0, model, device,
     x_t = (1.0 - t_val) * x_0[:n, :] + t_val * x_1  # [n, 3]
     x_t = x_t * mask[:, None].float()
 
-    # Self-conditioning: oracle clean coordinates (x_1 already centered, in nm)
-    x_sc = x_1.clone()  # [n, 3]
+    # Self-conditioning: zeros (no oracle). Model was trained with x_sc=zeros for 50%
+    # of batches, so this is in-distribution. At t=1.0 the positive control comes from
+    # clean x_t (via xt_pair_dists), NOT from oracle x_sc.
+    x_sc = torch.zeros_like(x_t)  # [n, 3]
 
     # Sequence
     if seq_provided:
@@ -240,30 +242,29 @@ def main():
     # Results storage
     results = []
 
-    # Pre-sample a large Gaussian reference for reuse (largest possible protein)
-    max_n = 768
-    x_0_base = torch.randn(max_n, 3, dtype=torch.float32)
-    # Center it
-    x_0_base = x_0_base - x_0_base.mean(dim=0, keepdim=True)
-
     for pi, pt_file in enumerate(pt_files):
         protein_id = os.path.basename(pt_file).replace(".pt", "")
         print(f"\n[{pi+1}/{len(pt_files)}] Processing {protein_id}")
 
         pt_data = torch.load(pt_file, weights_only=False)
         n = pt_data.residue_type.shape[0]
+        coord_mask = torch.as_tensor(pt_data.coord_mask)  # [n, 37] bool
+        res_mask = (coord_mask.sum(dim=-1) > 0)  # [n] bool
 
-        # Ground-truth DSSP from full backbone coordinates
-        coords_full = torch.as_tensor(pt_data.coords, dtype=torch.float32).unsqueeze(0)  # [1, n, 37, 3]
-        coord_mask_full = torch.as_tensor(pt_data.coord_mask).unsqueeze(0)  # [1, n, 37]
-        res_mask = (coord_mask_full.sum(dim=-1) > 0).squeeze(0)  # [n]
-        dssp_target = compute_dssp_target(
-            coords_full, res_mask.unsqueeze(0), coord_mask_full.bool()
-        )
-        if dssp_target is None:
-            print(f"  Skipping {protein_id}: DSSP target is None (CA-only data?)")
-            continue
-        dssp_target = dssp_target.squeeze(0).to(device)  # [n]
+        # Ground-truth DSSP: use pre-stored target (from DSSPTargetTransform) for
+        # exact consistency with training targets; fall back to on-the-fly computation.
+        if hasattr(pt_data, 'dssp_target'):
+            dssp_target = torch.as_tensor(pt_data.dssp_target, dtype=torch.long).to(device)  # [n]
+        else:
+            coords_full = torch.as_tensor(pt_data.coords, dtype=torch.float32).unsqueeze(0)  # [1, n, 37, 3]
+            coord_mask_full = coord_mask.unsqueeze(0)  # [1, n, 37]
+            dssp_target = compute_dssp_target(
+                coords_full, res_mask.unsqueeze(0).bool(), coord_mask_full.bool()
+            )
+            if dssp_target is None:
+                print(f"  Skipping {protein_id}: DSSP target is None (CA-only data?)")
+                continue
+            dssp_target = dssp_target.squeeze(0).to(device)  # [n]
         valid = dssp_target >= 0
 
         if valid.sum() == 0:
@@ -275,10 +276,9 @@ def main():
             protein_id, cath_lookup, cath_code_dir, multilabel_mode, device
         )
 
-        # Gaussian reference x_0 for this protein (take first n coords, recenter)
-        x_0 = x_0_base[:n].clone()
-        x_0_valid = x_0[res_mask.bool()]
-        x_0 = x_0 - x_0_valid.mean(dim=0, keepdim=True)
+        # Fresh independent Gaussian reference x_0 per protein (matches training behavior)
+        x_0 = torch.randn(n, 3, dtype=torch.float32)
+        x_0 = x_0 - x_0[res_mask.bool()].mean(dim=0, keepdim=True)
         x_0 = x_0 * res_mask[:, None].float()
 
         for t_val in t_values:
@@ -305,6 +305,17 @@ def main():
                 dssp_pred = dssp_logits.squeeze(0).argmax(dim=-1)  # [n]
                 correct = (dssp_pred == dssp_target) & valid
                 acc = correct.sum().float() / valid.sum().float()
+
+                # At t=1.0, print GT vs predicted DSSP for visual inspection
+                if abs(t_val - 1.0) < 1e-6 and cond_name == "seq+CATH":
+                    _sym = ['L', 'H', 'E']
+                    gt_list = dssp_target.cpu().tolist()
+                    pr_list = dssp_pred.cpu().tolist()
+                    gt_str = ''.join(_sym[v] if v >= 0 else '?' for v in gt_list)
+                    pr_str = ''.join(_sym[v] for v in pr_list)
+                    print(f"  [t=1.0 GT  ] {gt_str[:100]}")
+                    print(f"  [t=1.0 Pred] {pr_str[:100]}")
+                    print(f"  [t=1.0 Acc ] {float(acc.item()):.4f} over {int(valid.sum())} valid residues")
 
                 results.append({
                     "protein_id": protein_id,
