@@ -115,6 +115,7 @@ def wait_for_completion(
     check_fn: Callable[[str], bool],
     poll_interval: int = 60,
     timeout: int = 86400,
+    item_name: str = "items",
 ) -> bool:
     """
     Poll until check_fn(name) returns True for all names.
@@ -122,10 +123,11 @@ def wait_for_completion(
     Intended for shard 0 to wait for all shards to finish before running aggregation.
 
     Args:
-        names: Full list of protein names (all shards).
-        check_fn: Function that returns True when a protein is complete.
+        names: Full list of names to wait for (e.g. shard indices or protein IDs).
+        check_fn: Function that returns True when an item is complete.
         poll_interval: Seconds between polls.
         timeout: Max seconds to wait.
+        item_name: Human-readable label used in log messages (e.g. "shards", "proteins").
 
     Returns:
         True if all complete within timeout, False otherwise.
@@ -138,10 +140,10 @@ def wait_for_completion(
         for n in done:
             remaining.discard(n)
         if remaining:
-            logger.info(f"Waiting for {len(remaining)} proteins... ({len(names) - len(remaining)}/{len(names)} done)")
+            logger.info(f"Waiting for {len(remaining)} {item_name}... ({len(names) - len(remaining)}/{len(names)} done)")
             time.sleep(poll_interval)
     if remaining:
-        logger.error(f"Timeout: {len(remaining)} proteins still incomplete: {list(remaining)[:5]}...")
+        logger.error(f"Timeout: {len(remaining)} {item_name} still incomplete: {list(remaining)[:5]}...")
         return False
-    logger.info("All proteins complete.")
+    logger.info(f"All {item_name} complete.")
     return True

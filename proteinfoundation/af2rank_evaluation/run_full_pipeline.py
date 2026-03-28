@@ -93,16 +93,25 @@ def get_conda_env_path(conda_exe, env_name):
         logger.error(f"❌ Failed to get conda environment info: {e}")
         return None
 
+_SHARD_ENV_VARS = ("SLURM_ARRAY_TASK_ID", "SLURM_ARRAY_TASK_COUNT", "LLSUB_RANK", "LLSUB_SIZE")
+
+
 def run_with_conda_env(env_name, command_list, cwd=None, direct_python: bool = False):
-    """Run a command. If direct_python, use current Python; else use shell script wrappers."""
+    """Run a command. If direct_python, use current Python; else use shell script wrappers.
+
+    SLURM/LLsub sharding env vars are always stripped from child subprocess env so that
+    children receive sharding instructions only via explicit CLI args (--shard_index /
+    --num_shards), never via env var inheritance from this orchestrator process.
+    """
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    child_env = {k: v for k, v in os.environ.items() if k not in _SHARD_ENV_VARS}
 
     if direct_python:
         cmd = [sys.executable] + command_list[1:]
         effective_cwd = cwd if cwd is not None else script_dir
         logger.info(f"🚀 Running with current Python: {' '.join(cmd)}")
         try:
-            result = subprocess.run(cmd, cwd=effective_cwd, check=False)
+            result = subprocess.run(cmd, cwd=effective_cwd, check=False, env=child_env)
             return result.returncode == 0
         except Exception as e:
             logger.error(f"❌ Failed to run command: {e}")
@@ -126,7 +135,7 @@ def run_with_conda_env(env_name, command_list, cwd=None, direct_python: bool = F
     logger.info(f"🚀 Running in {env_name} environment: {' '.join(command_list)}")
     effective_cwd = cwd if cwd is not None else script_dir
     try:
-        result = subprocess.run(cmd, cwd=effective_cwd, check=False)
+        result = subprocess.run(cmd, cwd=effective_cwd, check=False, env=child_env)
         return result.returncode == 0
     except Exception as e:
         logger.error(f"❌ Failed to run command: {e}")
@@ -558,8 +567,8 @@ def main(argv: list[str] | None = None):
     else:
         cross_out_dir = os.path.join(base_inference_dir, f"{Path(args.dataset_file).stem}_cross_protein_analysis")
     if shard_index is not None and num_shards is not None:
-        os.makedirs(base_inference_dir, exist_ok=True)
-        _own_sentinel = Path(base_inference_dir) / f".shard_{shard_index}_of_{num_shards}_complete"
+        os.makedirs(cross_out_dir, exist_ok=True)
+        _own_sentinel = Path(cross_out_dir) / f".shard_{shard_index}_of_{num_shards}_complete"
         _own_sentinel.unlink(missing_ok=True)
         logger.info(f"Cleared own shard completion sentinel (shard {shard_index}/{num_shards}).")
 
@@ -718,7 +727,8 @@ def main(argv: list[str] | None = None):
                 )
                 if analysis_success:
                     shard_desc = f" (shard {shard_index})" if shard_index is not None else ""
-                    logger.info(f"✅ Central analysis{shard_desc} completed successfully")
+                    _done_note = "; waiting for other shards..." if shard_index is not None else ""
+                    logger.info(f"✅ Central analysis{shard_desc} completed successfully{_done_note}")
                 else:
                     logger.error("❌ Central analysis failed")
                     success = False
@@ -727,10 +737,12 @@ def main(argv: list[str] | None = None):
 
     # Write per-shard sentinel so shard 0 can reliably know when all shards' per-protein work
     # is done — even on re-runs where stale per-protein output files may already exist.
+    # Sentinels live in cross_out_dir (dataset-specific) rather than base_inference_dir so
+    # concurrent runs on different datasets sharing the same inference config don't collide.
     if shard_index is not None and num_shards is not None:
-        _sentinel = Path(base_inference_dir) / f".shard_{shard_index}_of_{num_shards}_complete"
-        _sentinel.touch()
-        logger.info(f"Wrote shard {shard_index} completion sentinel.")
+        _sentinel = Path(cross_out_dir) / f".shard_{shard_index}_of_{num_shards}_complete"
+        _sentinel.write_text("0" if success else "1")
+        logger.info(f"Wrote shard {shard_index} completion sentinel ({'success' if success else 'failure'}).")
 
     if shard_index is not None and shard_index != 0:
         logger.info("Per-protein work complete (after central analysis), exiting.")
@@ -740,7 +752,7 @@ def main(argv: list[str] | None = None):
         other_shard_indices = list(range(1, num_shards))
         if other_shard_indices:
             def _check_shard_done(shard_idx):
-                sentinel = Path(base_inference_dir) / f".shard_{shard_idx}_of_{num_shards}_complete"
+                sentinel = Path(cross_out_dir) / f".shard_{shard_idx}_of_{num_shards}_complete"
                 return sentinel.exists()
 
             if not wait_for_completion(
@@ -748,9 +760,20 @@ def main(argv: list[str] | None = None):
                 _check_shard_done,
                 poll_interval=args.shard_poll_interval,
                 timeout=args.shard_timeout,
+                item_name="shards",
             ):
                 logger.error("Timeout waiting for all shards to complete")
                 success = False
+
+            # Report any shards that completed but flagged failure
+            failed_shards = []
+            for idx in other_shard_indices:
+                s = Path(cross_out_dir) / f".shard_{idx}_of_{num_shards}_complete"
+                if s.exists() and s.read_text().strip() != "0":
+                    failed_shards.append(idx)
+            if failed_shards:
+                logger.error(f"⚠️  {len(failed_shards)} shard(s) reported failure: {failed_shards}")
+                logger.error("Aggregation will proceed but results may be incomplete.")
 
         # Aggregate AF2Rank-on-topk per-protein results into the cross-protein summary CSV.
         # During the sharded Step 3, each shard suppressed summary writing; now that all
