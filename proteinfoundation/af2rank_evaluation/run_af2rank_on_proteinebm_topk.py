@@ -486,6 +486,10 @@ def _process_one_protein(
         for df, path in [(m1_df, af2rank_scores_csv_m1), (m2_df, af2rank_scores_csv_m2)]:
             if "structure_file" not in df.columns:
                 break
+            # Stale CSVs from pre-fix code lack TM columns — treat as incomplete and re-score.
+            if not {"tm_ref_pred", "tm_ref_template"}.issubset(df.columns):
+                logger.info(f"{protein_id}: TM columns missing in {path.name} (old format) — will re-score")
+                break
             predicted_dir = path.parent / "predicted_structures"
             if "predicted_structure_path" not in df.columns:
                 df["predicted_structure_path"] = df["structure_file"].astype(str).apply(

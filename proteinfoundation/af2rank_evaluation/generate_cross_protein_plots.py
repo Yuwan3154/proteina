@@ -192,7 +192,12 @@ def load_af2rank_on_proteinebm_topk_data(
         needed = {"ptm", "tm_ref_pred", "tm_ref_template", "structure_file"}
         missing = sorted([c for c in needed if c not in m1_df.columns])
         if missing:
-            raise KeyError(f"Missing columns {missing} in {score_file}. Columns: {m1_df.columns.tolist()}")
+            logger.warning(
+                f"Skipping {protein_id}: missing columns {missing} in {score_file} "
+                f"(stale pre-fix CSV — re-run AF2Rank scoring to populate TM metrics). "
+                f"Columns present: {m1_df.columns.tolist()}"
+            )
+            continue
 
         staged_dir = Path(score_file).parent.parent / "staged_topk_templates"
         staged_names = set(f.name for f in staged_dir.iterdir() if f.is_file() or f.is_symlink()) if staged_dir.exists() else set()
