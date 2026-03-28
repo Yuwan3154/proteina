@@ -607,7 +607,6 @@ class OpenFoldAF2Rank:
         self.model = OpenFoldTemplateInference(
             model_name=model_name,
             jax_params_path=jax_params_path,
-            rm_template_sequence=True,  # AF2Rank protocol: remove template sequence
             skip_template_alignment=True,  # No alignment needed (sequences match)
             max_recycling_iters=recycles,
             use_deepspeed_evoformer_attention=use_deepspeed_evoformer_attention,
@@ -648,8 +647,6 @@ class OpenFoldAF2Rank:
         self,
         decoy_pdb: str,
         decoy_chain: Optional[str] = None,
-        rm_seq: bool = True,
-        rm_sc: bool = True,
         seed: int = 0,
         _original_pdb: Optional[str] = None,
     ) -> tuple:
@@ -693,9 +690,7 @@ class OpenFoldAF2Rank:
                 template_mmcif_path=temp_cif,
                 template_chain_id=cif_chain,
                 kalign_binary_path=KALIGN_BINARY_PATH,
-                mask_template_aatype=rm_seq,
-                zero_template_unit_vector=rm_sc,
-                zero_template_torsion_angles=rm_sc,
+                mask_template_aatype=True,  # AF2Rank: mask template sequence to all-X post-pipeline
             )
         finally:
             if os.path.exists(temp_cif):
@@ -709,15 +704,11 @@ class OpenFoldAF2Rank:
         self,
         decoy_pdb: str,
         decoy_chain: Optional[str] = None,
-        rm_seq: bool = True,
-        rm_sc: bool = True,
-        rm_ic: bool = False,
         recycles: int = 3,
         seed: int = 0,
         output_pdb: Optional[str] = None,
         verbose: bool = False,
         _original_pdb: Optional[str] = None,
-        no_template: bool = False,
     ) -> Dict:
         """Score a single decoy structure using AF2Rank protocol via OpenFold.
 
@@ -725,9 +716,6 @@ class OpenFoldAF2Rank:
             _original_pdb: If provided, use this for TMscore CA extraction instead
                 of decoy_pdb (useful when decoy_pdb is already a cg2all-reconstructed
                 all-atom PDB and we want TMscore against the original CA trace).
-            no_template: If True, zero out backbone template coordinates
-                (template_all_atom_positions, template_pseudo_beta) after featurization.
-                Useful for testing whether template backbone actually affects predictions.
         """
         if decoy_chain is None:
             decoy_chain = "A"
@@ -738,16 +726,9 @@ class OpenFoldAF2Rank:
         batch, template_coords = self._featurize(
             decoy_pdb,
             decoy_chain=decoy_chain,
-            rm_seq=rm_seq,
-            rm_sc=rm_sc,
             seed=seed,
             _original_pdb=_original_pdb,
         )
-
-        if no_template:
-            for key in ("template_all_atom_positions", "template_pseudo_beta"):
-                if key in batch:
-                    batch[key] = torch.zeros_like(batch[key])
 
         with torch.no_grad():
             out = self.model.model(batch)

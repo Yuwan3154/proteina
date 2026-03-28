@@ -99,7 +99,6 @@ def profile_build_batch_stages(infer, seq_len, n_repeats=5,
             raw = infer._make_template_stub_features(
                 sequence=seq,
                 mask=mask_np,
-                rm_template_sequence=False,
             )
         times_raw.append(time.time() - t0)
 
@@ -122,7 +121,6 @@ def profile_build_batch_stages(infer, seq_len, n_repeats=5,
             raw = infer._make_template_stub_features(
                 sequence=seq,
                 mask=mask_np,
-                rm_template_sequence=False,
             )
         t0 = time.time()
         feats = infer.feature_pipeline.process_features(raw, mode="predict", is_multimer=False)

@@ -46,7 +46,6 @@ class OpenFoldTemplateInference(nn.Module):
         model_name: str = "model_1_ptm",
         jax_params_path: str = None,
         device: Optional[torch.device] = None,
-        rm_template_sequence: Optional[bool] = False,
         skip_template_alignment: bool = False,
         max_recycling_iters: Optional[int] = None,
         compile_model: bool = False,
@@ -103,7 +102,6 @@ class OpenFoldTemplateInference(nn.Module):
         self.device = device
         self.model = self.model.to(self.device)
         self.feature_pipeline = FeaturePipeline(self.cfg.data)
-        self.rm_template_sequence = rm_template_sequence
         self.skip_template_alignment = skip_template_alignment
         self._template_use_unit_vector_default = None
         if hasattr(self.model, "template_embedder") and hasattr(self.model.template_embedder, "config"):
@@ -343,7 +341,6 @@ class OpenFoldTemplateInference(nn.Module):
     def _make_template_stub_features(
         sequence: str,
         mask: np.ndarray,
-        rm_template_sequence: bool,
     ) -> dict:
         num_res = len(sequence)
         sequence_features = make_sequence_features(
@@ -352,7 +349,7 @@ class OpenFoldTemplateInference(nn.Module):
             num_res=num_res,
         )
         msa_features = make_dummy_msa_feats(sequence)
-        template_seq = ("X" * num_res) if rm_template_sequence else sequence
+        template_seq = sequence
         template_aatype_one_hot = rc.sequence_to_onehot(
             sequence=template_seq,
             mapping=rc.restype_order_with_x,
@@ -513,14 +510,13 @@ class OpenFoldTemplateInference(nn.Module):
                     pdb_id=pdb_id,
                     chain_id=template_chain_id,
                     kalign_binary_path=kalign_binary_path,
-                    rm_template_sequence=self.rm_template_sequence,
+                    rm_template_sequence=False,
                     skip_alignment=self.skip_template_alignment,
                 )
             else:
                 raw = self._make_template_stub_features(
                     sequence=seq,
                     mask=mask_np,
-                    rm_template_sequence=self.rm_template_sequence,
                 )
             zero_template_unit_vector = True
             zero_template_torsion_angles = True
@@ -538,7 +534,7 @@ class OpenFoldTemplateInference(nn.Module):
                 pdb_id=pdb_id,
                 chain_id=template_chain_id,
                 kalign_binary_path=kalign_binary_path,
-                rm_template_sequence=self.rm_template_sequence,
+                rm_template_sequence=False,
                 skip_alignment=self.skip_template_alignment,
             )
         else:

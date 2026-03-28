@@ -272,7 +272,6 @@ def main() -> None:
         model_name=args.model_name,
         jax_params_path=args.jax_params,
         device=device,
-        rm_template_sequence=args.template_all_x,
         max_recycling_iters=args.recycles,
     )
     template_chain_id = args.template_chain_id or parsed.chain_id
