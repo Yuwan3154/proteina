@@ -278,6 +278,7 @@ def _run_af2rank_subprocess(
     use_deepspeed_evoformer_attention: bool = True,
     use_cuequivariance_attention: bool = True,
     use_cuequivariance_multiplicative_update: bool = True,
+    filter_existing: bool = True,
 ) -> None:
     wrapper_dir = str(Path(__file__).parent)
     if backend == "openfold":
@@ -299,9 +300,10 @@ predicted_dir = os.path.join(output_dir, "predicted_structures")
 
 scores_csv_path = os.path.join(output_dir, f"af2rank_scores_{{protein_id}}.csv")
 
+filter_existing = {filter_existing!r}
 existing_scores = []
 processed_files = set()
-if os.path.exists(scores_csv_path):
+if filter_existing and os.path.exists(scores_csv_path):
   existing_scores = load_af2rank_scores_from_csv(scores_csv_path)
   for s in existing_scores:
     sf = s.get("structure_file")
@@ -367,9 +369,10 @@ predicted_dir = os.path.join(output_dir, "predicted_structures")
 
 scores_csv_path = os.path.join(output_dir, f"af2rank_scores_{{protein_id}}.csv")
 
+filter_existing = {filter_existing!r}
 existing_scores = []
 processed_files = set()
-if os.path.exists(scores_csv_path):
+if filter_existing and os.path.exists(scores_csv_path):
   existing_scores = load_af2rank_scores_from_csv(scores_csv_path)
   for s in existing_scores:
     sf = s.get("structure_file")
@@ -609,6 +612,7 @@ def _process_one_protein(
             use_deepspeed_evoformer_attention=use_deepspeed_evoformer_attention,
             use_cuequivariance_attention=use_cuequivariance_attention,
             use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
+            filter_existing=filter_existing,
         )
         _run_af2rank_subprocess(
             protein_id=protein_id,
@@ -625,6 +629,7 @@ def _process_one_protein(
             use_deepspeed_evoformer_attention=use_deepspeed_evoformer_attention,
             use_cuequivariance_attention=use_cuequivariance_attention,
             use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
+            filter_existing=filter_existing,
         )
 
         m1_df = pd.read_csv(af2rank_scores_csv_m1)

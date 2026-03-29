@@ -728,7 +728,7 @@ class ModernAF2Rank:
                     os.unlink(temp_pdb_file)
         
     def score_structure(self, decoy_pdb, decoy_chain=None,
-                rm_seq=True, rm_sc=True, rm_ic=False,
+                rm_seq=True, rm_sc=False, rm_ic=False,
                       recycles=3, seed=0,
                       output_pdb=None, verbose=False,
                       _allatom_pdb=None, _original_pdb=None):
