@@ -337,6 +337,9 @@ def main():
                           f"max={valid_logits.max():.3f} std={valid_logits.std():.3f}")
                     print(f"  [t=1.0] mean per class: L={valid_logits[:,0].mean():.3f} "
                           f"H={valid_logits[:,1].mean():.3f} E={valid_logits[:,2].mean():.3f}")
+                    # Per-class std tells us if residues differ (large) or all same (near-zero)
+                    print(f"  [t=1.0] std per class:  L={valid_logits[:,0].std():.3f} "
+                          f"H={valid_logits[:,1].std():.3f} E={valid_logits[:,2].std():.3f}")
                     pred_v = dssp_pred[valid]
                     tgt_v = dssp_target[valid]
                     print(f"  [t=1.0] pred: L={int((pred_v==0).sum())} "
