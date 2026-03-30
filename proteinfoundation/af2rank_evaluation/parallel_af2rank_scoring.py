@@ -24,7 +24,7 @@ import pandas as pd
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
-from sharding_utils import add_shard_args, resolve_shard_args, shard_proteins
+from sharding_utils import add_shard_args, lengths_from_csv, resolve_shard_args, shard_proteins
 
 try:
     from dotenv import load_dotenv
@@ -561,8 +561,12 @@ def main():
 
     shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
     if shard_index is not None:
-        data_dir = os.environ.get("DATA_PATH", os.path.join(PROTEINA_BASE_DIR, "data"))
-        protein_names = shard_proteins(protein_names, shard_index, num_shards, data_dir=data_dir)
+        lengths = lengths_from_csv(args.csv_file, args.csv_column, args.len_col)
+        if lengths is not None:
+            protein_names = shard_proteins(protein_names, shard_index, num_shards, lengths=lengths)
+        else:
+            data_dir = os.environ.get("DATA_PATH", os.path.join(PROTEINA_BASE_DIR, "data"))
+            protein_names = shard_proteins(protein_names, shard_index, num_shards, data_dir=data_dir)
 
     # Now apply the already-done filter to this shard's proteins only
     if args.filter_existing:

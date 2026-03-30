@@ -12,7 +12,7 @@ Provides:
 
 import logging
 import os
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,7 @@ def resolve_shard_args(shard_index: Optional[int], num_shards: Optional[int]) ->
 
 
 def add_shard_args(parser) -> None:
-    """Add --shard_index and --num_shards to an argparse parser."""
+    """Add --shard_index, --num_shards, and --len_col to an argparse parser."""
     parser.add_argument(
         "--shard_index",
         type=int,
@@ -54,6 +54,38 @@ def add_shard_args(parser) -> None:
         default=None,
         help="Total number of shards. Auto-detected from SLURM_ARRAY_TASK_COUNT or LLSUB_SIZE if not set.",
     )
+    parser.add_argument(
+        "--len_col",
+        type=str,
+        default="length",
+        help="CSV column name for protein length used in shard load-balancing (default: length).",
+    )
+
+
+def lengths_from_csv(csv_path: str, id_col: str, len_col: str) -> Optional[Dict[str, int]]:
+    """
+    Extract a {protein_id: length} mapping from a CSV file.
+
+    Returns None when csv_path is empty/None or len_col is not present in the file,
+    allowing callers to fall back to .pt-file-based length loading.
+    """
+    if not csv_path:
+        return None
+    try:
+        import pandas as pd
+        df = pd.read_csv(csv_path)
+        df.columns = df.columns.str.strip()
+        id_col_stripped = id_col.strip()
+        if len_col not in df.columns or id_col_stripped not in df.columns:
+            return None
+        return dict(
+            zip(
+                df[id_col_stripped].astype(str).str.strip(),
+                df[len_col].fillna(0).astype(int),
+            )
+        )
+    except Exception:
+        return None
 
 
 def shard_proteins(
@@ -99,15 +131,22 @@ def shard_proteins(
     return shard_names
 
 
-def build_shard_cli_args(shard_index: Optional[int], num_shards: Optional[int]) -> List[str]:
+def build_shard_cli_args(
+    shard_index: Optional[int],
+    num_shards: Optional[int],
+    len_col: str = "length",
+) -> List[str]:
     """
     Build CLI args for propagation to sub-scripts.
 
-    Returns ['--shard_index', '0', '--num_shards', '4'] when sharding active, else [].
+    Returns ['--shard_index', '0', '--num_shards', '4', '--len_col', 'length']
+    when sharding active, else [].  len_col is always included so sub-scripts
+    use the same length column even when sharding is inactive.
     """
+    args = ["--len_col", len_col]
     if shard_index is None or num_shards is None:
-        return []
-    return ["--shard_index", str(shard_index), "--num_shards", str(num_shards)]
+        return args
+    return ["--shard_index", str(shard_index), "--num_shards", str(num_shards)] + args
 
 
 def wait_for_completion(

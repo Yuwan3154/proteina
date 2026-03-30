@@ -48,7 +48,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from sharding_utils import add_shard_args, resolve_shard_args, shard_proteins
+from sharding_utils import add_shard_args, lengths_from_csv, resolve_shard_args, shard_proteins
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +216,11 @@ def main() -> None:
     logger.info(f"Loaded {len(all_protein_ids)} proteins from {args.csv_file}")
 
     if shard_index is not None and num_shards is not None:
-        protein_ids = shard_proteins(all_protein_ids, shard_index, num_shards)
+        lengths = lengths_from_csv(args.csv_file, args.csv_column, args.len_col)
+        if lengths is not None:
+            protein_ids = shard_proteins(all_protein_ids, shard_index, num_shards, lengths=lengths)
+        else:
+            protein_ids = shard_proteins(all_protein_ids, shard_index, num_shards)
         logger.info(f"Shard {shard_index}/{num_shards}: {len(protein_ids)} proteins assigned")
     else:
         protein_ids = all_protein_ids

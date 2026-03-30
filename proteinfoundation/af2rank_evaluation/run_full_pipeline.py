@@ -535,7 +535,7 @@ def main(argv: list[str] | None = None):
     args = build_parser().parse_args(argv)
 
     shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
-    shard_cli_args = build_shard_cli_args(shard_index, num_shards)
+    shard_cli_args = build_shard_cli_args(shard_index, num_shards, len_col=args.len_col)
     if shard_index is not None:
         logger.info(f"Sharding enabled: shard {shard_index} of {num_shards}")
 

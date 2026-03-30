@@ -26,6 +26,7 @@ from tqdm import tqdm
 
 from proteinfoundation.af2rank_evaluation.sharding_utils import (
     add_shard_args,
+    lengths_from_csv,
     resolve_shard_args,
     shard_proteins,
 )
@@ -43,9 +44,9 @@ def _load_protein_ids_from_csv(csv_file: str, id_column: str) -> List[str]:
     return [str(p).strip() for p in df[id_column].dropna().unique().tolist() if p and str(p).strip()]
 
 
-def _load_dataset_map(dataset_file: str, id_column: str, tms_column: str) -> Dict[str, Dict[str, float]]:
+def _load_dataset_map(dataset_file: str, id_column: str, tms_column: str, len_col: str = "length") -> Dict[str, Dict[str, float]]:
     df = pd.read_csv(dataset_file)
-    needed = {id_column, tms_column, "in_train", "length"}
+    needed = {id_column, tms_column, "in_train", len_col}
     missing = sorted([c for c in needed if c not in df.columns])
     if missing:
         raise KeyError(f"Dataset missing columns {missing}. Columns: {sorted(df.columns.tolist())}")
@@ -56,7 +57,7 @@ def _load_dataset_map(dataset_file: str, id_column: str, tms_column: str) -> Dic
         out[protein_id] = {
             "reference_tm": float(row[tms_column]),
             "in_train": bool(row["in_train"]),
-            "length": float(row["length"]),
+            "length": float(row[len_col]),
         }
     return out
 
@@ -752,7 +753,7 @@ def main() -> None:
     has_csv = bool(args.csv_file.strip())
     dataset_map: Dict[str, Dict[str, float]] = {}
     if has_dataset:
-        dataset_map = _load_dataset_map(args.dataset_file, args.id_column, args.tms_column)
+        dataset_map = _load_dataset_map(args.dataset_file, args.id_column, args.tms_column, len_col=args.len_col)
         logger.info(f"Loaded {len(dataset_map)} proteins from dataset CSV")
 
     scores_by_protein: Dict[str, Path] = {p.parent.parent.name: p for p in score_csvs}
@@ -776,9 +777,16 @@ def main() -> None:
 
     shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
     if shard_index is not None:
-        data_dir = os.environ.get("DATA_PATH", os.path.join(Path(__file__).resolve().parents[2], "data"))
-        logger.info(f"Sharding {len(candidate_ids_raw)} proteins into shard {shard_index}/{num_shards} (data_dir={data_dir})")
-        shard_ids = set(shard_proteins(candidate_ids_raw, shard_index, num_shards, data_dir=data_dir))
+        logger.info(f"Sharding {len(candidate_ids_raw)} proteins into shard {shard_index}/{num_shards}")
+        if dataset_map:
+            lengths = {pid: int(info["length"]) for pid, info in dataset_map.items()}
+        else:
+            lengths = lengths_from_csv(args.csv_file, args.csv_column, args.len_col)
+        if lengths is not None:
+            shard_ids = set(shard_proteins(candidate_ids_raw, shard_index, num_shards, lengths=lengths))
+        else:
+            data_dir = os.environ.get("DATA_PATH", os.path.join(Path(__file__).resolve().parents[2], "data"))
+            shard_ids = set(shard_proteins(candidate_ids_raw, shard_index, num_shards, data_dir=data_dir))
         logger.info(f"Shard {shard_index} assigned {len(shard_ids)} proteins")
     else:
         shard_ids = None

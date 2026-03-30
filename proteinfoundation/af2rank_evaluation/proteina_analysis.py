@@ -38,7 +38,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from proteinfoundation.af2rank_evaluation.sharding_utils import add_shard_args, resolve_shard_args, shard_proteins
+from proteinfoundation.af2rank_evaluation.sharding_utils import add_shard_args, lengths_from_csv, resolve_shard_args, shard_proteins
 from proteinfoundation.af2rank_evaluation.topk_summary_utils import generate_topk_summary_csv
 from proteinfoundation.af2rank_evaluation.usalign_tabular import (
     normalize_usalign_structure_name,
@@ -1275,8 +1275,12 @@ def main() -> None:
 
     shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
     if shard_index is not None:
-        data_dir = os.environ.get("DATA_PATH", str(Path(__file__).resolve().parents[2] / "data"))
-        protein_ids = shard_proteins(protein_ids, shard_index, num_shards, data_dir=data_dir)
+        lengths = lengths_from_csv(getattr(args, "csv_file", None) or "", args.csv_column, args.len_col)
+        if lengths is not None:
+            protein_ids = shard_proteins(protein_ids, shard_index, num_shards, lengths=lengths)
+        else:
+            data_dir = os.environ.get("DATA_PATH", str(Path(__file__).resolve().parents[2] / "data"))
+            protein_ids = shard_proteins(protein_ids, shard_index, num_shards, data_dir=data_dir)
         logger.info(f"Central analysis shard {shard_index}/{num_shards}: {len(protein_ids)} proteins selected")
 
     results = compute_analysis_for_proteins(
