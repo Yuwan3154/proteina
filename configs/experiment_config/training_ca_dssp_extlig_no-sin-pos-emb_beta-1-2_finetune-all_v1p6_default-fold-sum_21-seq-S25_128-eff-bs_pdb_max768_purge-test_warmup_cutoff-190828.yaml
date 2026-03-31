@@ -1,0 +1,107 @@
+run_name_: ca_dssp_extlig_no-sin-pos-emb_beta-1-2_finetune-all_v1p6_default-fold-sum_21-seq-S25_128-eff-bs_pdb_max768_purge-test_warmup_cutoff-190828
+pretrain_ckpt_path: ~/proteina/data/weights/ca_dssp_extlig_no-sin-pos-emb_beta-2.5-2.0_finetune-all_v1.6_default-fold-sum_21-seq-S25_128-eff-bs_pdb_max768_purge-test_cutoff-190828_last.ckpt
+
+hardware:
+  ncpus_per_task_train_: 48
+  ncpus_per_task_prepro_: 48
+  accelerator: gpu
+  ngpus_per_node_: 4
+  nnodes_: 1
+
+loss:
+  t_distribution:
+    name: mix_up02_beta
+    p1: 1.0
+    p2: 2.0
+  loss_t_clamp: 0.9
+  use_aux_loss: True
+  aux_loss_t_lim: 0.3
+  thres_aux_2d_loss: 0.6
+  aux_loss_weight: 1.0
+  dssp_aux_loss_weight: 1.0
+  num_dist_buckets: 64
+  max_dist_boundary: 1.0
+
+defaults:
+  - model: caflow
+  - override model/nn: ca_af3_200M_no_tri
+  - _self_
+
+model:
+  nn:
+    multilabel_mode: sum
+    residue_type_emb_init_seq: True
+    residue_type_emb_cond_seq: True
+    residue_type_emb_init_pair: True
+    residue_type_emb_cond_pair: True
+    seq_emb_dim: 21
+    predict_dssp: true
+    ext_lig_emb_init_seq: True
+    ext_lig_emb_cond_seq: True
+    ext_lig_emb_dim: 3
+
+# Dataset: PDB only (purge-test, no mixed d_FS)
+dataset: pdb_train_S25_max768_purge-test_cutoff-190828
+dataset_config_subdir: pdb
+
+force_precision_f32: False
+
+training:
+  self_cond: True
+  seq_cond: True
+  fold_cond: True
+  mask_T_prob: 0.5
+  mask_A_prob: 0.5
+  mask_C_prob: 0.5
+  fold_label_sample_ratio: [0.5, 0.1, 0.15, 0.25]
+  mask_seq_proportion: 0.15
+  mask_extlig_proportion: 0.3
+  finetune_seq_cond_lora_only: False
+  self_cond_use_copy: True
+  self_cond_copy_update_every: 10
+  zero_sin_pos_emb: True
+
+lora:
+  use: False
+  lora_alpha: 32.0
+  lora_dropout: 0.0
+  r: 0
+  train_bias: none
+
+opt:
+  lr: 0.0001
+  max_epochs: 200
+  batch_size: 1
+  accumulate_grad_batches: 32
+  optimizer: muon
+  val_check_interval: 1000
+  skip_nan_grad: False
+  grad_and_weight_analysis: False
+  dist_strategy: ddp
+  dist_backend: gloo
+  use_lr_warmup: True
+  warmup_steps: 3000
+  warmup_start_lr_ratio: 0.0
+  lr_scheduler_type: cosine
+  use_cueq: False
+
+log:
+  wandb_project: protein_transformer_big_runs
+  log_wandb: True
+  log_every_n_steps: 1
+  log_structure_every_n_steps: 100
+  checkpoint: True
+  last_ckpt_every_n_steps: 1000
+
+validation_sampling:
+  dt: 0.005
+  sampling_mode: sc
+  sc_scale_noise: 0.45
+
+seed: 42
+
+ema:
+  decay: 0.999
+  validate_original_weights: False
+  every_n_steps: 1
+  cpu_offload: False
