@@ -25,7 +25,7 @@ ext_lig_default: "unknown"
 # Sampling
 dt: 0.005
 nsamples_per_len: 512
-max_nsamples: 4
+max_nsamples: 32
 
 lora:
   use: False
