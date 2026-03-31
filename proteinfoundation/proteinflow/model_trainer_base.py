@@ -81,7 +81,51 @@ class ModelTrainerBase(L.LightningModule):
         self._logged_val_traj_epoch = -1
         self._self_cond_copy_last_step = None
 
+    def _create_optimizer(self, params, optimizer_type=None):
+        """Create an optimizer instance based on the configured type.
+
+        Args:
+            params: Parameter list or iterable for Adam/AdamW.  Ignored when
+                ``optimizer_type="muon"`` (parameter partitioning is done
+                internally).
+            optimizer_type: One of ``"adam"``, ``"adamw"``, ``"muon"``.
+                If ``None``, read from ``self.cfg_exp.opt.optimizer``
+                (default ``"adam"``).
+
+        Returns:
+            A ``torch.optim.Optimizer`` instance.
+        """
+        if optimizer_type is None:
+            optimizer_type = self.cfg_exp.opt.get("optimizer", "adam")
+
+        lr = self.cfg_exp.opt.lr
+
+        if optimizer_type == "muon":
+            from proteinfoundation.optim.param_groups import build_optimizer_param_groups
+            from proteinfoundation.optim.muon import HybridMuonAdamW
+
+            param_groups = build_optimizer_param_groups(self, self.cfg_exp.opt)
+            optimizer = HybridMuonAdamW(param_groups)
+        elif optimizer_type == "adamw":
+            weight_decay = float(self.cfg_exp.opt.get("weight_decay", 0.0))
+            adam_betas_raw = self.cfg_exp.opt.get("adam_betas", [0.9, 0.999])
+            adam_betas = tuple(float(b) for b in adam_betas_raw)
+            adam_eps = float(self.cfg_exp.opt.get("adam_eps", 1e-8))
+            optimizer = torch.optim.AdamW(
+                params,
+                lr=lr,
+                weight_decay=weight_decay,
+                betas=adam_betas,
+                eps=adam_eps,
+            )
+        else:  # "adam" (default — preserves original behaviour)
+            optimizer = torch.optim.Adam(params, lr=lr)
+
+        return optimizer
+
     def configure_optimizers(self):
+        optimizer_type = self.cfg_exp.opt.get("optimizer", "adam")
+
         if self.cfg_exp.training.finetune_seq_cond_lora_only:
             opt_params = []
             opt_params_names = []
@@ -92,9 +136,10 @@ class ModelTrainerBase(L.LightningModule):
                     opt_params_names.append(name)
                 else:
                     param.requires_grad = False
-            optimizer = torch.optim.Adam(
-                opt_params, lr=self.cfg_exp.opt.lr
-            )
+            # LoRA finetune: always use Adam/AdamW (Muon not beneficial
+            # for the small/1-D LoRA params).
+            finetune_opt_type = optimizer_type if optimizer_type != "muon" else "adamw"
+            optimizer = self._create_optimizer(opt_params, finetune_opt_type)
             print(f"Finetuning {opt_params_names}")
         else:
             for name, param in self.named_parameters():
@@ -102,10 +147,8 @@ class ModelTrainerBase(L.LightningModule):
                     param.requires_grad = False
                 else:
                     param.requires_grad = True
-            optimizer = torch.optim.Adam(
-                [p for p in self.parameters() if p.requires_grad],
-                lr=self.cfg_exp.opt.lr,
-            )
+            trainable_params = [p for p in self.parameters() if p.requires_grad]
+            optimizer = self._create_optimizer(trainable_params, optimizer_type)
         
         # Check if learning rate warmup is enabled
         if self.cfg_exp.opt.get("use_lr_warmup", False):
