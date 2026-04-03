@@ -1239,7 +1239,7 @@ def main() -> None:
     parser.add_argument("--inference_dir", required=True, help="Base inference directory")
     parser.add_argument("--protein_ids", nargs="*", help="Protein IDs to process")
     parser.add_argument("--csv_file", help="CSV file with protein IDs")
-    parser.add_argument("--csv_column", default="id", help="Protein ID column in CSV (default: id)")
+    parser.add_argument("--csv_col", default="id", help="Protein ID column in CSV (default: id)")
     parser.add_argument("--cif_dir", default="", help="Optional directory with reference CIF files")
     parser.add_argument("--output_subdir", default="proteina_analysis", help="Per-protein analysis output subdir")
     parser.add_argument(
@@ -1260,7 +1260,7 @@ def main() -> None:
         protein_ids = args.protein_ids
     elif args.csv_file:
         df = pd.read_csv(args.csv_file)
-        protein_ids = df[args.csv_column].dropna().astype(str).str.strip().unique().tolist()
+        protein_ids = df[args.csv_col].dropna().astype(str).str.strip().unique().tolist()
     else:
         protein_ids = sorted(
             [
@@ -1275,7 +1275,7 @@ def main() -> None:
 
     shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
     if shard_index is not None:
-        lengths = lengths_from_csv(getattr(args, "csv_file", None) or "", args.csv_column, args.len_col)
+        lengths = lengths_from_csv(getattr(args, "csv_file", None) or "", args.csv_col, args.len_col)
         if lengths is not None:
             protein_ids = shard_proteins(protein_ids, shard_index, num_shards, lengths=lengths)
         else:

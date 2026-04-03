@@ -92,8 +92,8 @@ def find_af2rank_on_proteinebm_topk_score_files(inference_base_dir: str, top_k: 
 def load_af2rank_on_proteinebm_topk_data(
     score_files: List[str],
     dataset_file: str,
-    id_column: str,
-    tms_column: str,
+    id_col: str,
+    tms_col: str,
     top_k: int,
     proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
 ) -> pd.DataFrame:
@@ -115,7 +115,7 @@ def load_af2rank_on_proteinebm_topk_data(
     data = []
 
     dataset_df = pd.read_csv(dataset_file)
-    dataset_proteins = set(dataset_df[id_column].tolist())
+    dataset_proteins = set(dataset_df[id_col].tolist())
     logger.info(f"Dataset contains {len(dataset_proteins)} proteins")
 
     def _extract_metrics(df: pd.DataFrame, staged_names: set, top_k: int) -> dict:
@@ -266,7 +266,7 @@ def load_af2rank_on_proteinebm_topk_data(
             "protein_id", "n_scored",
             "top_1_tm_ref_pred", "top_5_tm_ref_pred", "top_1_tm_ref_template", "top_5_tm_ref_template",
             "top_1_ptm", "top_5_ptm", "top_1_composite", "top_5_composite", "top_1_plddt", "top_5_plddt",
-            "scores_csv", tms_column, "in_train", "length",
+            "scores_csv", tms_col, "in_train", "length",
         ]
         for prefix in ["m2", "min"]:
             for k in ["top_1_ptm", "top_5_ptm", "top_1_tm_ref_pred", "top_5_tm_ref_pred", "top_1_composite", "top_5_composite", "top_1_plddt", "top_5_plddt"]:
@@ -277,16 +277,16 @@ def load_af2rank_on_proteinebm_topk_data(
     logger.info(f"Loaded {len(out)} proteins from AF2Rank-on-ProteinEBM-topk results (filtered by dataset)")
 
     out = out.merge(
-        dataset_df[[id_column, tms_column, "in_train", "length"]],
+        dataset_df[[id_col, tms_col, "in_train", "length"]],
         left_on="protein_id",
-        right_on=id_column,
+        right_on=id_col,
         how="left",
     )
-    out.drop(columns=[id_column], inplace=True)
+    out.drop(columns=[id_col], inplace=True)
     return out
 
 
-def create_af2rank_on_proteinebm_topk_plots(df: pd.DataFrame, output_dir: str, tms_column: str, top_k: int) -> None:
+def create_af2rank_on_proteinebm_topk_plots(df: pd.DataFrame, output_dir: str, tms_col: str, top_k: int) -> None:
     """
     Create cross-protein plots for AF2Rank-on-ProteinEBM-topk:
       - Reference TM vs ProteinEBM energy (min energy among top-k)
@@ -320,10 +320,10 @@ def create_af2rank_on_proteinebm_topk_plots(df: pd.DataFrame, output_dir: str, t
 
     # ── Figure 0a: Reference TM vs ProteinEBM energy ─────────────────────────
     if "min_energy_topk" in df.columns:
-        valid_e = df.dropna(subset=[tms_column, "min_energy_topk", "in_train", "length"])
+        valid_e = df.dropna(subset=[tms_col, "min_energy_topk", "in_train", "length"])
         if len(valid_e) > 0:
             _scatter_single(
-                valid_e[tms_column], valid_e["min_energy_topk"], valid_e,
+                valid_e[tms_col], valid_e["min_energy_topk"], valid_e,
                 f"Reference TM vs ProteinEBM energy (top-{int(top_k)} templates by min energy)",
                 "Reference TM score", "ProteinEBM energy (lower is better)",
                 os.path.join(output_dir, f"cross_protein_af2rank_on_proteinebm_top_k_ref_tm_vs_energy_top{int(top_k)}.png"),
@@ -336,10 +336,10 @@ def create_af2rank_on_proteinebm_topk_plots(df: pd.DataFrame, output_dir: str, t
         ("min_max_ptm_topk", "min(pTM_1, pTM_2)", "_min"),
     ]:
         if ptm_col in df.columns:
-            valid_p = df.dropna(subset=[tms_column, ptm_col, "in_train", "length"])
+            valid_p = df.dropna(subset=[tms_col, ptm_col, "in_train", "length"])
             if len(valid_p) > 0:
                 _scatter_single(
-                    valid_p[tms_column], valid_p[ptm_col], valid_p,
+                    valid_p[tms_col], valid_p[ptm_col], valid_p,
                     f"Reference TM vs AF2Rank pTM ({label}, top-{int(top_k)})",
                     "Reference TM score", f"AF2Rank pTM ({label})",
                     os.path.join(output_dir, f"cross_protein_af2rank_on_proteinebm_top_k_ref_tm_vs_ptm_top{int(top_k)}{suffix}.png"),
@@ -348,10 +348,10 @@ def create_af2rank_on_proteinebm_topk_plots(df: pd.DataFrame, output_dir: str, t
     # ── Figure 1: reference TM vs prediction TM (top-1/top-5) ────────────────
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 8))
 
-    valid_1 = df.dropna(subset=[tms_column, "top_1_tm_ref_pred", "in_train", "length"])
+    valid_1 = df.dropna(subset=[tms_col, "top_1_tm_ref_pred", "in_train", "length"])
     if len(valid_1) > 0:
         ax1.scatter(
-            valid_1[tms_column],
+            valid_1[tms_col],
             valid_1["top_1_tm_ref_pred"],
             alpha=0.3,
             c=valid_1["in_train"].map({True: "blue", False: "red"}),
@@ -363,10 +363,10 @@ def create_af2rank_on_proteinebm_topk_plots(df: pd.DataFrame, output_dir: str, t
         ax1.set_title(f"Reference TM vs Top-1 prediction TM\n(AF2Rank on ProteinEBM top-{int(top_k)} templates; rank by pTM)", fontsize=13)
         ax1.grid(True, alpha=0.3)
 
-    valid_2 = df.dropna(subset=[tms_column, "top_5_tm_ref_pred", "in_train", "length"])
+    valid_2 = df.dropna(subset=[tms_col, "top_5_tm_ref_pred", "in_train", "length"])
     if len(valid_2) > 0:
         ax2.scatter(
-            valid_2[tms_column],
+            valid_2[tms_col],
             valid_2["top_5_tm_ref_pred"],
             alpha=0.3,
             c=valid_2["in_train"].map({True: "blue", False: "red"}),
@@ -597,15 +597,15 @@ def create_af2rank_on_proteinebm_topk_plots(df: pd.DataFrame, output_dir: str, t
         _plot_variant(df, "min", "min", {"ptm": "min(pTM)", "composite": "min(composite)", "plddt": "min(pLDDT)"})
 
 
-def load_summary_data(summary_files: List[str], dataset_file: str, id_column: str, tms_column: str) -> pd.DataFrame:
+def load_summary_data(summary_files: List[str], dataset_file: str, id_col: str, tms_col: str) -> pd.DataFrame:
     """
     Load and compile summary data from all AF2Rank JSON files.
     
     Args:
         summary_files: List of paths to summary JSON files
         dataset_file: Name of the dataset file to analyze
-        id_column: Column to use as the protein ID
-        tms_column: Column to use as the TM score
+        id_col: Column to use as the protein ID
+        tms_col: Column to use as the TM score
     Returns:
         DataFrame with compiled summary data
     """
@@ -613,7 +613,7 @@ def load_summary_data(summary_files: List[str], dataset_file: str, id_column: st
     
     # Load dataset file
     dataset_df = pd.read_csv(dataset_file)
-    dataset_proteins = set(dataset_df[id_column].tolist())
+    dataset_proteins = set(dataset_df[id_col].tolist())
     
     logger.info(f"Dataset contains {len(dataset_proteins)} proteins")
     
@@ -666,14 +666,14 @@ def load_summary_data(summary_files: List[str], dataset_file: str, id_column: st
     logger.info(f"Loaded {len(df)} proteins from AF2Rank results (filtered by dataset)")
     
     # Merge with dataset
-    df = df.merge(dataset_df[[id_column, tms_column, 'in_train', 'length']], left_on='protein_id', right_on=id_column, how='left')
-    df.drop(columns=[id_column], inplace=True)
+    df = df.merge(dataset_df[[id_col, tms_col, 'in_train', 'length']], left_on='protein_id', right_on=id_col, how='left')
+    df.drop(columns=[id_col], inplace=True)
     
     logger.info(f"Final dataset: {len(df)} proteins with complete metrics")
     return df
 
 
-def load_proteinebm_data(score_files: List[str], dataset_file: str, id_column: str, tms_column: str) -> pd.DataFrame:
+def load_proteinebm_data(score_files: List[str], dataset_file: str, id_col: str, tms_col: str) -> pd.DataFrame:
     """
     Load and compile per-protein energy statistics from ProteinEBM score CSVs.
 
@@ -682,7 +682,7 @@ def load_proteinebm_data(score_files: List[str], dataset_file: str, id_column: s
     data = []
 
     dataset_df = pd.read_csv(dataset_file)
-    dataset_proteins = set(dataset_df[id_column].tolist())
+    dataset_proteins = set(dataset_df[id_col].tolist())
     logger.info(f"Dataset contains {len(dataset_proteins)} proteins")
 
     for score_file in score_files:
@@ -718,14 +718,14 @@ def load_proteinebm_data(score_files: List[str], dataset_file: str, id_column: s
     df = pd.DataFrame(data)
     logger.info(f"Loaded {len(df)} proteins from ProteinEBM results (filtered by dataset)")
 
-    df = df.merge(dataset_df[[id_column, tms_column, "in_train", "length"]], left_on="protein_id", right_on=id_column, how="left")
-    df.drop(columns=[id_column], inplace=True)
+    df = df.merge(dataset_df[[id_col, tms_col, "in_train", "length"]], left_on="protein_id", right_on=id_col, how="left")
+    df.drop(columns=[id_col], inplace=True)
 
     logger.info(f"Final dataset: {len(df)} proteins with complete metrics")
     return df
 
 
-def load_proteinebm_summary_data(summary_files: List[str], dataset_file: str, id_column: str, tms_column: str) -> pd.DataFrame:
+def load_proteinebm_summary_data(summary_files: List[str], dataset_file: str, id_col: str, tms_col: str) -> pd.DataFrame:
     """
     Load and compile AF2Rank-style summary metrics from ProteinEBM summaries.
     This expects `proteinebm_scorer.py` to have populated the same keys used in AF2Rank plots:
@@ -737,7 +737,7 @@ def load_proteinebm_summary_data(summary_files: List[str], dataset_file: str, id
     data = []
 
     dataset_df = pd.read_csv(dataset_file)
-    dataset_proteins = set(dataset_df[id_column].tolist())
+    dataset_proteins = set(dataset_df[id_col].tolist())
     logger.info(f"Dataset contains {len(dataset_proteins)} proteins")
 
     for summary_file in summary_files:
@@ -771,12 +771,12 @@ def load_proteinebm_summary_data(summary_files: List[str], dataset_file: str, id
     df = pd.DataFrame(data)
     logger.info(f"Loaded {len(df)} proteins from ProteinEBM summary files (filtered by dataset)")
 
-    df = df.merge(dataset_df[[id_column, tms_column, "in_train", "length"]], left_on="protein_id", right_on=id_column, how="left")
-    df.drop(columns=[id_column], inplace=True)
+    df = df.merge(dataset_df[[id_col, tms_col, "in_train", "length"]], left_on="protein_id", right_on=id_col, how="left")
+    df.drop(columns=[id_col], inplace=True)
     return df
 
 
-def create_proteinebm_plots(df: pd.DataFrame, output_dir: str, tms_column: str) -> None:
+def create_proteinebm_plots(df: pd.DataFrame, output_dir: str, tms_col: str) -> None:
     """
     Create cross-protein ProteinEBM plots (energy statistics vs dataset metadata).
     """
@@ -786,10 +786,10 @@ def create_proteinebm_plots(df: pd.DataFrame, output_dir: str, tms_column: str) 
     fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(18, 18))
 
     # Plot 1: Reference TM score vs min energy
-    valid_1 = df.dropna(subset=[tms_column, "min_energy", "in_train", "length"])
+    valid_1 = df.dropna(subset=[tms_col, "min_energy", "in_train", "length"])
     if len(valid_1) > 0:
         ax1.scatter(
-            valid_1[tms_column],
+            valid_1[tms_col],
             valid_1["min_energy"],
             alpha=0.3,
             c=valid_1["in_train"].map({True: "blue", False: "red"}),
@@ -801,7 +801,7 @@ def create_proteinebm_plots(df: pd.DataFrame, output_dir: str, tms_column: str) 
         ax1.grid(True, alpha=0.3)
 
         if len(valid_1) > 2:
-            corr = np.corrcoef(valid_1[tms_column], valid_1["min_energy"])[0, 1]
+            corr = np.corrcoef(valid_1[tms_col], valid_1["min_energy"])[0, 1]
             ax1.text(
                 0.05,
                 0.95,
@@ -811,10 +811,10 @@ def create_proteinebm_plots(df: pd.DataFrame, output_dir: str, tms_column: str) 
             )
 
     # Plot 2: Reference TM score vs mean energy
-    valid_2 = df.dropna(subset=[tms_column, "mean_energy", "in_train", "length"])
+    valid_2 = df.dropna(subset=[tms_col, "mean_energy", "in_train", "length"])
     if len(valid_2) > 0:
         ax2.scatter(
-            valid_2[tms_column],
+            valid_2[tms_col],
             valid_2["mean_energy"],
             alpha=0.3,
             c=valid_2["in_train"].map({True: "blue", False: "red"}),
@@ -826,7 +826,7 @@ def create_proteinebm_plots(df: pd.DataFrame, output_dir: str, tms_column: str) 
         ax2.grid(True, alpha=0.3)
 
         if len(valid_2) > 2:
-            corr = np.corrcoef(valid_2[tms_column], valid_2["mean_energy"])[0, 1]
+            corr = np.corrcoef(valid_2[tms_col], valid_2["mean_energy"])[0, 1]
             ax2.text(
                 0.05,
                 0.95,
@@ -872,7 +872,7 @@ def create_proteinebm_plots(df: pd.DataFrame, output_dir: str, tms_column: str) 
     plt.close()
 
 
-def save_proteinebm_statistics(df: pd.DataFrame, output_dir: str, tms_column: str) -> None:
+def save_proteinebm_statistics(df: pd.DataFrame, output_dir: str, tms_col: str) -> None:
     """
     Save ProteinEBM cross-protein summary dataset and aggregate statistics.
     """
@@ -907,12 +907,12 @@ def save_proteinebm_statistics(df: pd.DataFrame, output_dir: str, tms_column: st
         },
     }
 
-    if tms_column in df.columns:
-        valid = df.dropna(subset=[tms_column, "min_energy", "mean_energy"])
+    if tms_col in df.columns:
+        valid = df.dropna(subset=[tms_col, "min_energy", "mean_energy"])
         if len(valid) > 1:
             stats["correlations"] = {
-                "reference_tms_vs_min_energy": float(np.corrcoef(valid[tms_column], valid["min_energy"])[0, 1]),
-                "reference_tms_vs_mean_energy": float(np.corrcoef(valid[tms_column], valid["mean_energy"])[0, 1]),
+                "reference_tms_vs_min_energy": float(np.corrcoef(valid[tms_col], valid["min_energy"])[0, 1]),
+                "reference_tms_vs_mean_energy": float(np.corrcoef(valid[tms_col], valid["mean_energy"])[0, 1]),
             }
 
     stats_path = os.path.join(output_dir, "cross_protein_statistics.json")
@@ -921,14 +921,14 @@ def save_proteinebm_statistics(df: pd.DataFrame, output_dir: str, tms_column: st
     logger.info(f"Saved summary statistics: {stats_path}")
 
 
-def create_summary_plots(df: pd.DataFrame, output_dir: str, tms_column: str, scorer: str) -> None:
+def create_summary_plots(df: pd.DataFrame, output_dir: str, tms_col: str, scorer: str) -> None:
     """
     Create cross-protein summary plots.
     
     Args:
         df: DataFrame with compiled summary data
         output_dir: Directory to save plots
-        tms_column: Column to use as the TM score
+        tms_col: Column to use as the TM score
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -1008,18 +1008,18 @@ def create_summary_plots(df: pd.DataFrame, output_dir: str, tms_column: str, sco
             ax6.set_title(f'{max_tm_label} vs {top5_label}', fontsize=15)
             ax6.grid(True, alpha=0.3)
 
-        valid_data_9 = df.dropna(subset=[tms_column, 'top_1_tm_ref_template'])
+        valid_data_9 = df.dropna(subset=[tms_col, 'top_1_tm_ref_template'])
         if len(valid_data_9) > 0:
-            ax9.scatter(valid_data_9[tms_column], valid_data_9['top_1_tm_ref_template'], alpha=0.3, c=valid_data_9['in_train'].map({True: 'blue', False: 'red'}), s=valid_data_9['length'] / 1.5)
+            ax9.scatter(valid_data_9[tms_col], valid_data_9['top_1_tm_ref_template'], alpha=0.3, c=valid_data_9['in_train'].map({True: 'blue', False: 'red'}), s=valid_data_9['length'] / 1.5)
             ax9.plot([0, 1], [0, 1], 'r--', alpha=0.75, linewidth=2)
             ax9.set_xlabel('Reference TM Score', fontsize=12)
             ax9.set_ylabel(top1_label, fontsize=12)
             ax9.set_title(f'Reference TM vs {top1_label}', fontsize=15)
             ax9.grid(True, alpha=0.3)
 
-        valid_data_10 = df.dropna(subset=[tms_column, 'top_5_tm_ref_template'])
+        valid_data_10 = df.dropna(subset=[tms_col, 'top_5_tm_ref_template'])
         if len(valid_data_10) > 0:
-            ax10.scatter(valid_data_10[tms_column], valid_data_10['top_5_tm_ref_template'], alpha=0.3, c=valid_data_10['in_train'].map({True: 'blue', False: 'red'}), s=valid_data_10['length'] / 1.5)
+            ax10.scatter(valid_data_10[tms_col], valid_data_10['top_5_tm_ref_template'], alpha=0.3, c=valid_data_10['in_train'].map({True: 'blue', False: 'red'}), s=valid_data_10['length'] / 1.5)
             ax10.plot([0, 1], [0, 1], 'r--', alpha=0.75, linewidth=2)
             ax10.set_xlabel('Reference TM Score', fontsize=12)
             ax10.set_ylabel(top5_label, fontsize=12)
@@ -1178,11 +1178,11 @@ def create_summary_plots(df: pd.DataFrame, output_dir: str, tms_column: str, sco
             ax8.grid(True, alpha=0.3)
     
     # Plot 9: Reference TM score vs. Top 1 Template TM-score By Composite
-    valid_data_9 = df.dropna(subset=[tms_column, 'top_1_tm_ref_template'])
+    valid_data_9 = df.dropna(subset=[tms_col, 'top_1_tm_ref_template'])
     
     if len(valid_data_9) > 0:
         scatter9 = ax9.scatter(
-            valid_data_9[tms_column], 
+            valid_data_9[tms_col], 
             valid_data_9['top_1_tm_ref_template'],
             alpha=0.3,
             c=valid_data_9['in_train'].map({True: 'blue', False: 'red'}),
@@ -1195,11 +1195,11 @@ def create_summary_plots(df: pd.DataFrame, output_dir: str, tms_column: str, sco
         ax9.grid(True, alpha=0.3)
     
     # Plot 10: Reference TM score vs. Top 5 Template TM-score By Composite
-    valid_data_10 = df.dropna(subset=[tms_column, 'top_5_tm_ref_template'])
+    valid_data_10 = df.dropna(subset=[tms_col, 'top_5_tm_ref_template'])
     
     if len(valid_data_10) > 0:
         scatter10 = ax10.scatter(
-            valid_data_10[tms_column], 
+            valid_data_10[tms_col], 
             valid_data_10['top_5_tm_ref_template'],
             alpha=0.3,
             c=valid_data_10['in_train'].map({True: 'blue', False: 'red'}),
@@ -1213,10 +1213,10 @@ def create_summary_plots(df: pd.DataFrame, output_dir: str, tms_column: str, sco
     
     # Plot 11: Reference TM score vs. Top 1 Prediction TM-score By pTM (AF2Rank only)
     if scorer == "af2rank" and "top_1_tm_ref_pred" in df.columns:
-        valid_data_11 = df.dropna(subset=[tms_column, 'top_1_tm_ref_pred'])
+        valid_data_11 = df.dropna(subset=[tms_col, 'top_1_tm_ref_pred'])
         if len(valid_data_11) > 0:
             ax11.scatter(
-                valid_data_11[tms_column],
+                valid_data_11[tms_col],
                 valid_data_11['top_1_tm_ref_pred'],
                 alpha=0.3,
                 c=valid_data_11['in_train'].map({True: 'blue', False: 'red'}),
@@ -1230,10 +1230,10 @@ def create_summary_plots(df: pd.DataFrame, output_dir: str, tms_column: str, sco
     
     # Plot 12: Reference TM score vs. Top 5 Prediction TM-score By pTM (AF2Rank only)
     if scorer == "af2rank" and "top_5_tm_ref_pred" in df.columns:
-        valid_data_12 = df.dropna(subset=[tms_column, 'top_5_tm_ref_pred'])
+        valid_data_12 = df.dropna(subset=[tms_col, 'top_5_tm_ref_pred'])
         if len(valid_data_12) > 0:
             ax12.scatter(
-                valid_data_12[tms_column],
+                valid_data_12[tms_col],
                 valid_data_12['top_5_tm_ref_pred'],
                 alpha=0.3,
                 c=valid_data_12['in_train'].map({True: 'blue', False: 'red'}),
@@ -1477,9 +1477,9 @@ def main():
     )
     parser.add_argument('--dataset_file', required=True,
                        help='Name of the dataset file to analyze')
-    parser.add_argument('--id_column', default='natives_rcsb',
+    parser.add_argument('--id_col', default='natives_rcsb',
                        help='Column name to use as protein ID (default: natives_rcsb)')
-    parser.add_argument('--tms_column', default='tms_single',
+    parser.add_argument('--tms_col', default='tms_single',
                        help='Column name to use as TM score (default: tms_single)')
     parser.add_argument('--verbose', action='store_true',
                        help='Enable verbose logging')
@@ -1494,8 +1494,8 @@ def main():
     logger.info(f"📂 Inference directory: {args.inference_dir}")
     logger.info(f"📁 Output directory: {args.output_dir}")
     logger.info(f"📄 Dataset file: {args.dataset_file}")
-    logger.info(f"🔑 ID column: {args.id_column}")
-    logger.info(f"🔑 TM score column: {args.tms_column}")
+    logger.info(f"🔑 ID column: {args.id_col}")
+    logger.info(f"🔑 TM score column: {args.tms_col}")
 
     # Validate input directory
     if not os.path.exists(args.inference_dir):
@@ -1515,7 +1515,7 @@ def main():
             sys.exit(1)
 
         # Load and compile data
-        df = load_summary_data(summary_files, args.dataset_file, args.id_column, args.tms_column)
+        df = load_summary_data(summary_files, args.dataset_file, args.id_col, args.tms_col)
     elif args.scorer == "af2rank_on_proteinebm_topk":
         if int(args.af2rank_top_k) <= 0:
             logger.error("--af2rank_top_k must be > 0 when --scorer=af2rank_on_proteinebm_topk")
@@ -1527,8 +1527,8 @@ def main():
         df = load_af2rank_on_proteinebm_topk_data(
             score_files,
             args.dataset_file,
-            args.id_column,
-            args.tms_column,
+            args.id_col,
+            args.tms_col,
             top_k=int(args.af2rank_top_k),
             proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
         )
@@ -1538,13 +1538,13 @@ def main():
             if not summary_files:
                 logger.error("No ProteinEBM summary files found")
                 sys.exit(1)
-            df = load_proteinebm_summary_data(summary_files, args.dataset_file, args.id_column, args.tms_column)
+            df = load_proteinebm_summary_data(summary_files, args.dataset_file, args.id_col, args.tms_col)
         else:
             score_files = find_proteinebm_score_files(args.inference_dir, args.proteinebm_analysis_subdir)
             if not score_files:
                 logger.error("No ProteinEBM score files found")
                 sys.exit(1)
-            df = load_proteinebm_data(score_files, args.dataset_file, args.id_column, args.tms_column)
+            df = load_proteinebm_data(score_files, args.dataset_file, args.id_col, args.tms_col)
     
     if len(df) == 0:
         logger.error("No valid data found in scoring outputs")
@@ -1557,11 +1557,11 @@ def main():
     
     if args.scorer == "af2rank":
         # Generate plots
-        create_summary_plots(df, args.output_dir, args.tms_column, scorer=args.scorer)
+        create_summary_plots(df, args.output_dir, args.tms_col, scorer=args.scorer)
         # Save summary statistics
         save_summary_statistics(df, args.output_dir, scorer=args.scorer)
     elif args.scorer == "af2rank_on_proteinebm_topk":
-        create_af2rank_on_proteinebm_topk_plots(df, args.output_dir, args.tms_column, int(args.af2rank_top_k))
+        create_af2rank_on_proteinebm_topk_plots(df, args.output_dir, args.tms_col, int(args.af2rank_top_k))
         # Save the full dataset for debugging/inspection.
         csv_path = os.path.join(args.output_dir, "cross_protein_summary_data.csv")
         df.to_csv(csv_path, index=False)
@@ -1569,12 +1569,12 @@ def main():
     else:
         if args.proteinebm_plot_mode == "tm":
             # TM-based (AF2Rank-style) summaries.
-            create_summary_plots(df, args.output_dir, args.tms_column, scorer=args.scorer)
+            create_summary_plots(df, args.output_dir, args.tms_col, scorer=args.scorer)
             save_summary_statistics(df, args.output_dir, scorer=args.scorer)
         else:
             # Energy-based diagnostic plots.
-            create_proteinebm_plots(df, args.output_dir, args.tms_column)
-            save_proteinebm_statistics(df, args.output_dir, args.tms_column)
+            create_proteinebm_plots(df, args.output_dir, args.tms_col)
+            save_proteinebm_statistics(df, args.output_dir, args.tms_col)
 
     # ── Diversity-vs-quality cross-protein plot ───────────────────────────────
     protein_ids_in_df = set(df["protein_id"].tolist()) if "protein_id" in df.columns else None

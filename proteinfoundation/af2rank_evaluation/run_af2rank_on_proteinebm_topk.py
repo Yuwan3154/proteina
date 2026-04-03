@@ -36,26 +36,26 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
-def _load_protein_ids_from_csv(csv_file: str, id_column: str) -> List[str]:
+def _load_protein_ids_from_csv(csv_file: str, id_col: str) -> List[str]:
     """Load protein IDs from a CSV (e.g. working_proteins.csv for prediction pipeline)."""
     df = pd.read_csv(csv_file)
-    if id_column not in df.columns:
-        raise KeyError(f"CSV missing column {id_column}. Columns: {sorted(df.columns.tolist())}")
-    return [str(p).strip() for p in df[id_column].dropna().unique().tolist() if p and str(p).strip()]
+    if id_col not in df.columns:
+        raise KeyError(f"CSV missing column {id_col}. Columns: {sorted(df.columns.tolist())}")
+    return [str(p).strip() for p in df[id_col].dropna().unique().tolist() if p and str(p).strip()]
 
 
-def _load_dataset_map(dataset_file: str, id_column: str, tms_column: str, len_col: str = "length") -> Dict[str, Dict[str, float]]:
+def _load_dataset_map(dataset_file: str, id_col: str, tms_col: str, len_col: str = "length") -> Dict[str, Dict[str, float]]:
     df = pd.read_csv(dataset_file)
-    needed = {id_column, tms_column, "in_train", len_col}
+    needed = {id_col, tms_col, "in_train", len_col}
     missing = sorted([c for c in needed if c not in df.columns])
     if missing:
         raise KeyError(f"Dataset missing columns {missing}. Columns: {sorted(df.columns.tolist())}")
 
     out: Dict[str, Dict[str, float]] = {}
     for _, row in df.iterrows():
-        protein_id = str(row[id_column])
+        protein_id = str(row[id_col])
         out[protein_id] = {
-            "reference_tm": float(row[tms_column]),
+            "reference_tm": float(row[tms_col]),
             "in_train": bool(row["in_train"]),
             "length": float(row[len_col]),
         }
@@ -696,12 +696,12 @@ def _process_one_protein(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run AF2Rank on ProteinEBM top-k templates and plot cross-protein diagnostics")
     parser.add_argument("--inference_dir", required=True, help="Base inference directory containing per-protein folders")
-    parser.add_argument("--csv_file", default="", help="CSV with protein IDs to process (restricts to current run; use with --csv_column). If omitted and --dataset_file provided, uses dataset. If both omitted, processes all proteins with ProteinEBM scores.")
-    parser.add_argument("--csv_column", default="id", help="Column in --csv_file for protein ID (default: id)")
+    parser.add_argument("--csv_file", default="", help="CSV with protein IDs to process (restricts to current run; use with --csv_col). If omitted and --dataset_file provided, uses dataset. If both omitted, processes all proteins with ProteinEBM scores.")
+    parser.add_argument("--csv_col", default="id", help="Column in --csv_file for protein ID (default: id)")
     parser.add_argument("--cif_dir", default="", help="Directory containing reference CIF files (resolves hardcoded paths from ProteinEBM summary)")
     parser.add_argument("--dataset_file", default="", help="Optional dataset CSV used for cross-protein plots (reference TM / in_train / length). When --csv_file omitted, also used as protein list.")
-    parser.add_argument("--id_column", default="natives_rcsb", help="Dataset column for protein ID (used with --dataset_file)")
-    parser.add_argument("--tms_column", default="tms_single", help="Dataset column for reference TM score")
+    parser.add_argument("--id_col", default="natives_rcsb", help="Dataset column for protein ID (used with --dataset_file)")
+    parser.add_argument("--tms_col", default="tms_single", help="Dataset column for reference TM score")
     parser.add_argument("--top_k", type=int, default=5, help="Number of top templates to select by ProteinEBM (min energy)")
     parser.add_argument("--recycles", type=int, default=3, help="AF2 recycles for AF2Rank runs")
     parser.add_argument("--output_dir", default="", help="Directory to write cross-protein outputs (default: <inference_dir>/af2rank_on_proteinebm_top_k_cross_protein_analysis)")
@@ -753,7 +753,7 @@ def main() -> None:
     has_csv = bool(args.csv_file.strip())
     dataset_map: Dict[str, Dict[str, float]] = {}
     if has_dataset:
-        dataset_map = _load_dataset_map(args.dataset_file, args.id_column, args.tms_column, len_col=args.len_col)
+        dataset_map = _load_dataset_map(args.dataset_file, args.id_col, args.tms_col, len_col=args.len_col)
         logger.info(f"Loaded {len(dataset_map)} proteins from dataset CSV")
 
     scores_by_protein: Dict[str, Path] = {p.parent.parent.name: p for p in score_csvs}
@@ -761,7 +761,7 @@ def main() -> None:
 
     # Protein list: --csv_file (current run) > --dataset_file > all with scores
     if has_csv:
-        candidate_ids_raw = _load_protein_ids_from_csv(args.csv_file, args.csv_column)
+        candidate_ids_raw = _load_protein_ids_from_csv(args.csv_file, args.csv_col)
         logger.info(f"Restricting to {len(candidate_ids_raw)} proteins from --csv_file {args.csv_file}")
     elif has_dataset:
         candidate_ids_raw = list(dataset_map.keys())
@@ -781,7 +781,7 @@ def main() -> None:
         if dataset_map:
             lengths = {pid: int(info["length"]) for pid, info in dataset_map.items()}
         else:
-            lengths = lengths_from_csv(args.csv_file, args.csv_column, args.len_col)
+            lengths = lengths_from_csv(args.csv_file, args.csv_col, args.len_col)
         if lengths is not None:
             shard_ids = set(shard_proteins(candidate_ids_raw, shard_index, num_shards, lengths=lengths))
         else:

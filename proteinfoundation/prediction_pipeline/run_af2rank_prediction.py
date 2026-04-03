@@ -52,11 +52,11 @@ logger = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _load_protein_ids(csv_file: str, id_column: str) -> List[str]:
+def _load_protein_ids(csv_file: str, id_col: str) -> List[str]:
     df = pd.read_csv(csv_file)
-    if id_column not in df.columns:
-        raise KeyError(f"CSV missing column '{id_column}'. Available: {sorted(df.columns)}")
-    return [str(v).strip() for v in df[id_column].dropna().unique() if str(v).strip()]
+    if id_col not in df.columns:
+        raise KeyError(f"CSV missing column '{id_col}'. Available: {sorted(df.columns)}")
+    return [str(v).strip() for v in df[id_col].dropna().unique() if str(v).strip()]
 
 
 def _select_topk(scores_csv: Path, top_k: int) -> pd.DataFrame:
@@ -316,7 +316,7 @@ def main() -> None:
                         help="Base inference directory (contains per-protein folders)")
     parser.add_argument("--csv_file", required=True,
                         help="CSV file listing proteins to score")
-    parser.add_argument("--csv_column", default="id",
+    parser.add_argument("--csv_col", default="id",
                         help="Column name in --csv_file for protein IDs (default: id)")
     parser.add_argument("--top_k", type=int, default=5,
                         help="Number of top ProteinEBM templates per protein (default: 5)")
@@ -343,7 +343,7 @@ def main() -> None:
     cif_dir = args.cif_dir.strip() or None
 
     # ── Build per-protein work list ──────────────────────────────────────────
-    protein_ids = _load_protein_ids(args.csv_file, args.csv_column)
+    protein_ids = _load_protein_ids(args.csv_file, args.csv_col)
     logger.info(f"Loaded {len(protein_ids)} proteins from {args.csv_file}")
 
     shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)

@@ -28,8 +28,8 @@ cd /home/gridsan/cou/proteina
 # OOM errors automatically halve max_nsamples and retry.
 python proteinfoundation/af2rank_evaluation/run_full_pipeline.py \
     --dataset_file /home/gridsan/cou/data/af2rank_single/af2rank_single_set_combined_tms_cutoff-190828_in_train_length.csv \
-    --id_column natives_rcsb \
-    --tms_column tms_single \
+    --id_col natives_rcsb \
+    --tms_col tms_single \
     --cif_dir /home/gridsan/cou/data/af2rank_single/pdb \
     --cross_protein_output_dir /home/gridsan/cou/proteina/inference/inference_seq_cond_sampling_ca_dssp_extlig_no-sin-pos-emb_beta-2.5-2.0_finetune-all_v1.6_default-fold_21-seq-S25_128-eff-bs_pdb_last_045-noise/rosetta_decoys_cross_protein_analysis \
     --inference_config inference_seq_cond_sampling_ca_dssp_extlig_no-sin-pos-emb_beta-2.5-2.0_finetune-all_v1.6_default-fold_21-seq-S25_128-eff-bs_pdb_last_045-noise \

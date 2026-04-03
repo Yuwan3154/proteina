@@ -55,11 +55,11 @@ from sharding_utils import add_shard_args, lengths_from_csv, resolve_shard_args,
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _load_protein_ids(csv_file: str, id_column: str) -> List[str]:
+def _load_protein_ids(csv_file: str, id_col: str) -> List[str]:
     df = pd.read_csv(csv_file)
-    if id_column not in df.columns:
-        raise KeyError(f"CSV missing column '{id_column}'. Available: {sorted(df.columns)}")
-    return [str(v).strip() for v in df[id_column].dropna().unique() if str(v).strip()]
+    if id_col not in df.columns:
+        raise KeyError(f"CSV missing column '{id_col}'. Available: {sorted(df.columns)}")
+    return [str(v).strip() for v in df[id_col].dropna().unique() if str(v).strip()]
 
 
 def _find_reference_cif(protein_name: str, cif_dir: str) -> Optional[str]:
@@ -186,7 +186,7 @@ def main() -> None:
                         help="Base inference directory (contains per-protein subdirs)")
     parser.add_argument("--csv_file", required=True,
                         help="CSV file listing proteins to score")
-    parser.add_argument("--csv_column", default="id",
+    parser.add_argument("--csv_col", default="id",
                         help="Column name in --csv_file for protein IDs (default: id)")
     parser.add_argument("--cif_dir", required=True,
                         help="Directory with ground-truth CIF files (searched recursively by PDB ID)")
@@ -212,11 +212,11 @@ def main() -> None:
     shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
 
     # ── Build protein list ────────────────────────────────────────────────────
-    all_protein_ids = _load_protein_ids(args.csv_file, args.csv_column)
+    all_protein_ids = _load_protein_ids(args.csv_file, args.csv_col)
     logger.info(f"Loaded {len(all_protein_ids)} proteins from {args.csv_file}")
 
     if shard_index is not None and num_shards is not None:
-        lengths = lengths_from_csv(args.csv_file, args.csv_column, args.len_col)
+        lengths = lengths_from_csv(args.csv_file, args.csv_col, args.len_col)
         if lengths is not None:
             protein_ids = shard_proteins(all_protein_ids, shard_index, num_shards, lengths=lengths)
         else:
