@@ -1,18 +1,18 @@
-run_name_: ca_dssp_extlig_no-sin-pos-emb_beta-1-1p9_finetune-all_v1p6_default-fold-sum_4-seq-S25_128-eff-bs_pdb_max512_purge-test_cutoff-190828
-pretrain_ckpt_path: ~/proteina/data/weights/ca_dssp_extlig_no-sin-pos-emb_beta-2.5-2.0_finetune-all_v1.6_default-fold_4-seq-S25_128-eff-bs_pdb_purge-test_warmup_cutoff-190828_last.ckpt
+run_name_: ca_dssp_extlig_no-sin-pos-emb_beta-2-4_finetune-all_v1p6_default-fold-sum_21-seq-S25_128-eff-bs_pdb_max768_purge-test_warmup_cutoff-190828
+pretrain_ckpt_path: ~/proteina/data/weights/ca_dssp_extlig_no-sin-pos-emb_beta-2.5-2.0_finetune-all_v1.6_default-fold-sum_21-seq-S25_128-eff-bs_pdb_max768_purge-test_cutoff-190828_last.ckpt
 
 hardware:
   ncpus_per_task_train_: 32
   ncpus_per_task_prepro_: 32
   accelerator: gpu
-  ngpus_per_node_: 2
+  ngpus_per_node_: 4
   nnodes_: 1
 
 loss:
   t_distribution:
     name: mix_up02_beta
-    p1: 1.0
-    p2: 1.9
+    p1: 2.0
+    p2: 4.0
   loss_t_clamp: 0.9
   use_aux_loss: True
   aux_loss_t_lim: 0.3
@@ -34,14 +34,14 @@ model:
     residue_type_emb_cond_seq: True
     residue_type_emb_init_pair: True
     residue_type_emb_cond_pair: True
-    seq_emb_dim: 4
+    seq_emb_dim: 21
     predict_dssp: true
     ext_lig_emb_init_seq: True
     ext_lig_emb_cond_seq: True
     ext_lig_emb_dim: 3
 
 # Dataset: PDB only (purge-test, no mixed d_FS)
-dataset: pdb_train_S25_max512_purge-test_cutoff-190828
+dataset: pdb_train_S25_max768_purge-test_cutoff-190828
 dataset_config_subdir: pdb
 
 force_precision_f32: False
@@ -72,7 +72,7 @@ opt:
   lr: 0.0001
   max_epochs: 200
   batch_size: 1
-  accumulate_grad_batches: 64
+  accumulate_grad_batches: 32
   optimizer: muon
   val_check_interval: 1000
   skip_nan_grad: False
