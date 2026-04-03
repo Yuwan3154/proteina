@@ -91,7 +91,7 @@ log:
   log_every_n_steps: 1
   log_structure_every_n_steps: 100
   checkpoint: True
-  last_ckpt_every_n_steps: 1000
+  last_ckpt_every_n_steps: 200
 
 validation_sampling:
   dt: 0.005
