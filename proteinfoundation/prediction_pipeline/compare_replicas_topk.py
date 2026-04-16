@@ -448,7 +448,7 @@ def main() -> int:
         ("unfiltered", False, ok_all,
          out_dir / "compare_replicas_summary.json",
          out_dir / "compare_replicas_tm_distribution.png",
-         f"[all ok, n={len(ok_all)}]"),
+         f"n={len(ok_all)}]"),
         ("passing", True, ok_passing,
          out_dir / "compare_replicas_summary_passing.json",
          out_dir / "compare_replicas_tm_distribution_passing.png",
