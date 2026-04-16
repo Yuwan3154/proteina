@@ -452,7 +452,7 @@ def main() -> int:
         ("passing", True, ok_passing,
          out_dir / "compare_replicas_summary_passing.json",
          out_dir / "compare_replicas_tm_distribution_passing.png",
-         f"[pTM>={args.ptm_cutoff}, n={len(ok_passing)}]"),
+         f"n={len(ok_passing)}]"),
     ]
     for name, passing_only, subset_df, json_path, plot_path, extra_title in variants:
         summary = _aggregate_stats(df, args, passing_only=passing_only)
