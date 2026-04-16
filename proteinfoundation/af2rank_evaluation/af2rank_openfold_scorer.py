@@ -569,6 +569,7 @@ class OpenFoldAF2Rank:
         use_deepspeed_evoformer_attention: bool = False,
         use_cuequivariance_attention: bool = False,
         use_cuequivariance_multiplicative_update: bool = False,
+        skip_ref_metrics: bool = False,
     ):
         if chain is None:
             chain = "A"
@@ -576,6 +577,7 @@ class OpenFoldAF2Rank:
         self.model_name = model_name
         self.debug = debug
         self.recycles = recycles
+        self.skip_ref_metrics = skip_ref_metrics
 
         # Detect correct chain in reference CIF
         is_cif = reference_pdb.lower().endswith('.cif')
@@ -740,14 +742,16 @@ class OpenFoldAF2Rank:
             scores["predicted_structure_file"] = os.path.basename(output_pdb)
 
         # TM scores: reference vs template/prediction, template vs prediction
-        scores["tm_ref_template"] = tmscore(
-            self.reference_coords, template_coords, env=_USALIGN_PARALLEL_ENV
-        ).get("tms", 0.0)
+        if not self.skip_ref_metrics:
+            scores["tm_ref_template"] = tmscore(
+                self.reference_coords, template_coords, env=_USALIGN_PARALLEL_ENV
+            ).get("tms", 0.0)
         if "final_atom_positions" in out:
             pred_ca = out["final_atom_positions"][:, 1, :].detach().cpu().numpy()
-            scores["tm_ref_pred"] = tmscore(
-                self.reference_coords, pred_ca, env=_USALIGN_PARALLEL_ENV
-            ).get("tms", 0.0)
+            if not self.skip_ref_metrics:
+                scores["tm_ref_pred"] = tmscore(
+                    self.reference_coords, pred_ca, env=_USALIGN_PARALLEL_ENV
+                ).get("tms", 0.0)
             scores["tm_template_pred"] = tmscore(
                 template_coords, pred_ca, env=_USALIGN_PARALLEL_ENV
             ).get("tms", 0.0)

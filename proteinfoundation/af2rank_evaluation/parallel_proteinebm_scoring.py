@@ -125,6 +125,23 @@ def get_protein_names(csv_file: str, csv_col: str):
     return proteins
 
 
+def _proteinebm_csv_complete(scores_csv: Path, pdb_files: list) -> bool:
+    """Check whether a ProteinEBM scores CSV covers all PDB files on disk.
+
+    Uses lightweight line counting instead of pandas for performance when
+    scanning thousands of proteins.
+    """
+    if not scores_csv.exists():
+        return False
+    with open(scores_csv, "r") as f:
+        header = (f.readline() or "").strip()
+        required_cols = ["protein_id", "structure_file", "structure_path", "t", "energy"]
+        if not all(col in header for col in required_cols):
+            return False
+        n_scored = sum(1 for line in f if line.strip())
+    return n_scored >= len(pdb_files)
+
+
 def find_proteins_needing_proteinebm(csv_file: str, csv_col: str, inference_config: str, analysis_subdir: str = "proteinebm_v2_cathmd_analysis"):
     csv_proteins = get_protein_names(csv_file, csv_col)
     inference_base_dir = os.path.join(PROTEINA_BASE_DIR, "inference", inference_config)
@@ -142,16 +159,10 @@ def find_proteins_needing_proteinebm(csv_file: str, csv_col: str, inference_conf
             continue
 
         scores_csv = protein_dir / analysis_subdir / f"proteinebm_scores_{protein_name}.csv"
-        if not scores_csv.exists():
-            proteins_needing_work.append(protein_name)
+        if _proteinebm_csv_complete(scores_csv, pdb_files):
+            logger.info(f"ProteinEBM scoring already completed for {protein_name} ({len(pdb_files)} structures), skipping")
         else:
-            with open(scores_csv, "r") as f:
-                header = (f.readline() or "").strip()
-            required_cols = ["protein_id", "structure_file", "structure_path", "t", "energy"]
-            if not all(col in header for col in required_cols):
-                proteins_needing_work.append(protein_name)
-            else:
-                logger.info(f"ProteinEBM scoring already completed for {protein_name}, skipping")
+            proteins_needing_work.append(protein_name)
 
     return proteins_needing_work
 

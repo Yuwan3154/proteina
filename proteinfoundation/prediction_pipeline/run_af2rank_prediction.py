@@ -405,6 +405,8 @@ def main() -> None:
     # Temp files are moved to persistent locations; any leftover temps are cleaned up.
     allatom_map = _persist_allatom_files(allatom_map, protein_configs, inference_base)
 
+    has_ground_truth = cif_dir is not None
+
     # ── Model 1: model_1_ptm ─────────────────────────────────────────────────
     _run_model_pass(
         protein_configs=protein_configs,
@@ -417,6 +419,7 @@ def main() -> None:
         use_cuequivariance_multiplicative_update=args.use_cuequivariance_multiplicative_update,
         OpenFoldAF2Rank=OpenFoldAF2Rank,
         allatom_map=allatom_map,
+        has_ground_truth=has_ground_truth,
     )
 
     # ── Model 2: model_2_ptm ─────────────────────────────────────────────────
@@ -431,6 +434,7 @@ def main() -> None:
         use_cuequivariance_multiplicative_update=args.use_cuequivariance_multiplicative_update,
         OpenFoldAF2Rank=OpenFoldAF2Rank,
         allatom_map=allatom_map,
+        has_ground_truth=has_ground_truth,
     )
 
     # ── Generate per-protein summary CSVs ────────────────────────────────────
@@ -484,6 +488,7 @@ def _run_model_pass(
     use_cuequivariance_multiplicative_update: bool,
     OpenFoldAF2Rank,
     allatom_map: Dict[str, str],
+    has_ground_truth: bool = True,
 ) -> None:
     """Load model_name ONCE, then iterate over all proteins.
 
@@ -504,6 +509,7 @@ def _run_model_pass(
         use_deepspeed_evoformer_attention=use_deepspeed_evoformer_attention,
         use_cuequivariance_attention=use_cuequivariance_attention,
         use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
+        skip_ref_metrics=not has_ground_truth,
     )
     logger.info(f"{model_name} loaded. Scoring {len(protein_configs)} proteins ...")
 
