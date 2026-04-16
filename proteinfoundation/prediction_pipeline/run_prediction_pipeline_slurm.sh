@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:volta:2
 #SBATCH --cpus-per-task=40
 #SBATCH --time=4-00:00:00
-#SBATCH --array=0-23
+#SBATCH --array=0-11
 #SBATCH --output=/home/gridsan/cou/logs/slurm-%A_%a.out
 #SBATCH --error=/home/gridsan/cou/logs/slurm-%A_%a.err
 
@@ -36,7 +36,7 @@ python proteinfoundation/prediction_pipeline/run_prediction_pipeline.py \
     --proteinebm_checkpoint /home/gridsan/cou/ProteinEBM/weights/proteinebm_v2_cathmd_weights.pt \
     --proteinebm_config /home/gridsan/cou/ProteinEBM/protein_ebm/config/proteinebm_v2_cathmd_config.yaml \
     --proteinebm_t 0.05 \
-    --top_k 8 \
+    --top_k 16 \
     --no-use_deepspeed_evoformer_attention \
     --use_cuequivariance_attention \
     --use_cuequivariance_multiplicative_update \
@@ -47,4 +47,4 @@ python proteinfoundation/prediction_pipeline/run_prediction_pipeline.py \
     --direct_python \
     --num_gpus 2 \
     --num_workers 40 \
-    --skip_diversity
+    --skip_diversity 

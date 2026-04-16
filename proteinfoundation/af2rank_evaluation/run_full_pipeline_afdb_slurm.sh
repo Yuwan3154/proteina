@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:volta:2
 #SBATCH --cpus-per-task=40
 #SBATCH --time=4-00:00:00
-#SBATCH --array=0-23
+#SBATCH --array=0-11
 #SBATCH --output=/home/gridsan/cou/logs/slurm-%A_%a.out
 #SBATCH --error=/home/gridsan/cou/logs/slurm-%A_%a.err
 
@@ -31,12 +31,13 @@ python proteinfoundation/af2rank_evaluation/run_full_pipeline.py \
     --id_column pdb \
     --tms_column tm_score \
     --cif_dir /home/gridsan/cou/data/bad_afdb/pdb \
-    --cross_protein_output_dir /home/gridsan/cou/proteina/inference/inference_seq_cond_sampling_ca_dssp_extlig_no-sin-pos-emb_beta-2.5-2.0_finetune-all_v1.6_default-fold_21-seq-S25_128-eff-bs_pdb_last_045-noise/failed_afdb_cross_protein_analysis \
-    --inference_config inference_seq_cond_sampling_ca_dssp_extlig_no-sin-pos-emb_beta-2.5-2.0_finetune-all_v1.6_default-fold_21-seq-S25_128-eff-bs_pdb_last_045-noise \
+    --cross_protein_output_dir /home/gridsan/cou/proteina/inference/inference_seq_cond_sampling_ca_dssp_extlig_no-sin-pos-emb_beta-2.5-2.0_finetune-all_v1.6_default-fold_4-seq-S25_128-eff-bs_pdb_last_045-noise/failed_afdb_cross_protein_analysis \
+    --inference_config inference_seq_cond_sampling_ca_dssp_extlig_no-sin-pos-emb_beta-2.5-2.0_finetune-all_v1.6_default-fold_4-seq-S25_128-eff-bs_pdb_last_045-noise \
     --scorer proteinebm \
     --proteinebm_checkpoint /home/gridsan/cou/ProteinEBM/weights/proteinebm_v2_cathmd_weights.pt \
     --proteinebm_config /home/gridsan/cou/ProteinEBM/protein_ebm/config/proteinebm_v2_cathmd_config.yaml \
     --proteinebm_t 0.05 \
+    --skip_diversity \
     --top_k 8 \
     --no-use_deepspeed_evoformer_attention \
     --use_cuequivariance_attention \
