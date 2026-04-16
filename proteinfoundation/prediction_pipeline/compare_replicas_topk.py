@@ -28,6 +28,9 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -305,10 +308,65 @@ def _aggregate_stats(df: pd.DataFrame, args: argparse.Namespace) -> Dict[str, ob
         summary[f"stats_{col}"] = _stats(col)
 
     summary["fraction_same_sample_index"] = float(ok["same_sample_index"].mean()) if len(ok) else None
-    for thresh in (0.7, 0.8, 0.9):
+    for thresh in (0.5, 0.6, 0.7, 0.8, 0.9):
         summary[f"fraction_tm_templates_ge_{thresh}"] = float((ok["tm_templates_TM1"] >= thresh).mean())
         summary[f"fraction_tm_predictions_ge_{thresh}"] = float((ok["tm_predictions_TM1"] >= thresh).mean())
     return summary
+
+
+def _plot_tm_distribution(
+    tm_templates: np.ndarray,
+    tm_predictions: np.ndarray,
+    output_path: Path,
+    replica_a_label: str,
+    replica_b_label: str,
+) -> None:
+    """Histogram + CDF for TM-score of templates and predictions, side by side."""
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    bins = np.linspace(0.0, 1.0, 41)
+    thresholds = [0.5, 0.6, 0.7, 0.8, 0.9]
+    title_suffix = f"{replica_a_label} vs {replica_b_label}"
+
+    datasets = [
+        ("Templates (top-1)", tm_templates, "tab:blue"),
+        ("Predictions (top-1)", tm_predictions, "tab:orange"),
+    ]
+    for col, (label, arr, color) in enumerate(datasets):
+        ax_hist = axes[0, col]
+        ax_cdf = axes[1, col]
+        if arr.size == 0:
+            for ax in (ax_hist, ax_cdf):
+                ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
+                ax.set_xlim(0, 1)
+            ax_hist.set_title(f"{label}: TM1 histogram ({title_suffix})")
+            ax_cdf.set_title(f"{label}: TM1 CDF ({title_suffix})")
+            continue
+
+        ax_hist.hist(arr, bins=bins, color=color, edgecolor="black", alpha=0.85)
+        ax_hist.axvline(float(np.mean(arr)), linestyle="--", color="black", linewidth=1, label=f"mean={np.mean(arr):.3f}")
+        ax_hist.axvline(float(np.median(arr)), linestyle=":", color="black", linewidth=1, label=f"median={np.median(arr):.3f}")
+        ax_hist.set_title(f"{label}: TM1 histogram ({title_suffix})")
+        ax_hist.set_xlabel("TM-score (TM1)")
+        ax_hist.set_ylabel("count")
+        ax_hist.set_xlim(0, 1)
+        ax_hist.legend(loc="upper right", fontsize=8)
+
+        sorted_arr = np.sort(arr)
+        cdf = np.arange(1, len(sorted_arr) + 1) / len(sorted_arr)
+        ax_cdf.plot(sorted_arr, cdf, color=color, linewidth=2)
+        for t in thresholds:
+            frac_ge = float((arr >= t).mean())
+            ax_cdf.axvline(t, color="gray", linestyle=":", linewidth=0.8)
+            ax_cdf.text(t, 0.02, f"≥{t}\n{frac_ge:.2f}", ha="center", va="bottom", fontsize=7, color="gray")
+        ax_cdf.set_title(f"{label}: TM1 CDF ({title_suffix})")
+        ax_cdf.set_xlabel("TM-score (TM1)")
+        ax_cdf.set_ylabel("cumulative fraction")
+        ax_cdf.set_xlim(0, 1)
+        ax_cdf.set_ylim(0, 1)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
 
 
 def main() -> int:
@@ -367,6 +425,13 @@ def main() -> int:
     with open(json_path, "w") as f:
         json.dump(summary, f, indent=2)
     logger.info("Wrote %s", json_path)
+
+    ok = df[df["status"] == "ok"]
+    tm_templates = _finite_series(ok["tm_templates_TM1"].tolist())
+    tm_predictions = _finite_series(ok["tm_predictions_TM1"].tolist())
+    plot_path = out_dir / "compare_replicas_tm_distribution.png"
+    _plot_tm_distribution(tm_templates, tm_predictions, plot_path, args.replica_a_label, args.replica_b_label)
+    logger.info("Wrote %s", plot_path)
 
     logger.info("Summary: compared=%d skipped=%d", summary["num_targets_compared"], summary["num_skipped"])
     if summary.get("stats_tm_templates_TM1", {}).get("n", 0):
