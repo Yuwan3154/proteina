@@ -261,19 +261,12 @@ def compare_protein(
     return row
 
 
-def _enumerate_protein_ids(
-    replica_a_dir: Path, replica_b_dir: Path,
-    dataset_csv: Optional[str], id_column: str,
-) -> List[str]:
-    if dataset_csv:
-        df = pd.read_csv(dataset_csv)
-        if id_column not in df.columns:
-            raise ValueError(f"Column '{id_column}' not in {dataset_csv}")
-        ids = [str(x).strip() for x in df[id_column].dropna().tolist() if str(x).strip()]
-        return sorted(set(ids))
-    a_ids = {p.name for p in replica_a_dir.iterdir() if p.is_dir()} if replica_a_dir.exists() else set()
-    b_ids = {p.name for p in replica_b_dir.iterdir() if p.is_dir()} if replica_b_dir.exists() else set()
-    return sorted(a_ids & b_ids)
+def _load_protein_ids_from_input(input_path: str, id_col: str) -> List[str]:
+    df = pd.read_csv(input_path)
+    if id_col not in df.columns:
+        raise ValueError(f"Column '{id_col}' not in {input_path}; columns present: {list(df.columns)}")
+    ids = [str(x).strip() for x in df[id_col].dropna().tolist() if str(x).strip()]
+    return sorted(set(ids))
 
 
 def _finite_series(values: List[float]) -> np.ndarray:
@@ -281,7 +274,7 @@ def _finite_series(values: List[float]) -> np.ndarray:
     return arr
 
 
-def _aggregate_stats(df: pd.DataFrame, args: argparse.Namespace) -> Dict[str, object]:
+def _aggregate_stats(df: pd.DataFrame, args: argparse.Namespace, passing_only: bool) -> Dict[str, object]:
     ok_all = df[df["status"] == "ok"].copy()
     skipped_counts = df[df["status"] != "ok"]["status"].value_counts().to_dict()
     num_pass_a = int(ok_all["passes_cutoff_a"].sum()) if len(ok_all) else 0
@@ -289,7 +282,7 @@ def _aggregate_stats(df: pd.DataFrame, args: argparse.Namespace) -> Dict[str, ob
     num_pass_either = int(ok_all["passes_cutoff_either"].sum()) if len(ok_all) else 0
     num_pass_both = int((ok_all["passes_cutoff_a"] & ok_all["passes_cutoff_b"]).sum()) if len(ok_all) else 0
 
-    ok = ok_all[ok_all["passes_cutoff_either"]].copy() if args.filter_passing_either else ok_all
+    ok = ok_all[ok_all["passes_cutoff_either"]].copy() if passing_only else ok_all
 
     summary: Dict[str, object] = {
         "replica_a_dir": args.replica_a_dir,
@@ -299,7 +292,7 @@ def _aggregate_stats(df: pd.DataFrame, args: argparse.Namespace) -> Dict[str, ob
         "max_sample_index": args.max_sample_index,
         "tmscore_mode": args.tmscore_mode,
         "ptm_cutoff": args.ptm_cutoff,
-        "filter_passing_either": bool(args.filter_passing_either),
+        "filter_passing_either": bool(passing_only),
         "num_targets_total": int(len(df)),
         "num_targets_ok": int(len(ok_all)),
         "num_targets_compared": int(len(ok)),
@@ -400,16 +393,14 @@ def main() -> int:
     parser.add_argument("--replica_b_dir", required=True)
     parser.add_argument("--replica_a_label", default="a")
     parser.add_argument("--replica_b_label", default="b")
-    parser.add_argument("--dataset_csv", default=None)
-    parser.add_argument("--id_column", default="id")
+    parser.add_argument("--input", required=True, help="Input CSV with protein IDs to analyze")
+    parser.add_argument("--id_col", default="id", help="Column name for protein ID in --input CSV (default: id)")
     parser.add_argument("--max_sample_index", type=int, default=512)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--num_workers", type=int, default=min(os.cpu_count() or 1, 16))
     parser.add_argument("--tmscore_mode", type=int, default=5)
     parser.add_argument("--ptm_cutoff", type=float, default=0.7,
                         help="pTM cutoff (default 0.7); used to flag passes_cutoff_a/b/either columns")
-    parser.add_argument("--filter_passing_either", action="store_true",
-                        help="Restrict aggregate summary JSON and distribution plot to targets where passes_cutoff_either is True")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -419,11 +410,12 @@ def main() -> int:
     out_dir = Path(args.output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    protein_ids = _enumerate_protein_ids(a_dir, b_dir, args.dataset_csv, args.id_column)
+    protein_ids = _load_protein_ids_from_input(args.input, args.id_col)
     if not protein_ids:
-        logger.error("No protein IDs enumerated; nothing to do.")
+        logger.error("No protein IDs found in %s[%s]; nothing to do.", args.input, args.id_col)
         return 1
-    logger.info("Comparing %d proteins across replicas (labels: %s vs %s)", len(protein_ids), args.replica_a_label, args.replica_b_label)
+    logger.info("Comparing %d proteins from %s across replicas (labels: %s vs %s)",
+                len(protein_ids), args.input, args.replica_a_label, args.replica_b_label)
 
     results: List[Dict[str, object]] = []
     if args.num_workers > 1 and len(protein_ids) > 1:
@@ -449,34 +441,41 @@ def main() -> int:
     df.to_csv(csv_path, index=False)
     logger.info("Wrote %s (%d rows)", csv_path, len(df))
 
-    summary = _aggregate_stats(df, args)
-    json_path = out_dir / "compare_replicas_summary.json"
-    with open(json_path, "w") as f:
-        json.dump(summary, f, indent=2)
-    logger.info("Wrote %s", json_path)
+    ok_all = df[df["status"] == "ok"]
+    ok_passing = ok_all[ok_all["passes_cutoff_either"]]
 
-    ok = df[df["status"] == "ok"]
-    if args.filter_passing_either:
-        ok = ok[ok["passes_cutoff_either"]]
-        extra_title = f"[n={len(ok)}]"
-        plot_path = out_dir / "compare_replicas_tm_distribution_passing.png"
-    else:
-        extra_title = f"[n={len(ok)}]"
-        plot_path = out_dir / "compare_replicas_tm_distribution.png"
-    tm_templates = _finite_series(ok["tm_templates_TM1"].tolist())
-    tm_predictions = _finite_series(ok["tm_predictions_TM1"].tolist())
-    _plot_tm_distribution(
-        tm_templates, tm_predictions, plot_path,
-        args.replica_a_label, args.replica_b_label,
-        extra_title=extra_title,
-    )
-    logger.info("Wrote %s", plot_path)
+    variants = [
+        ("unfiltered", False, ok_all,
+         out_dir / "compare_replicas_summary.json",
+         out_dir / "compare_replicas_tm_distribution.png",
+         f"[all ok, n={len(ok_all)}]"),
+        ("passing", True, ok_passing,
+         out_dir / "compare_replicas_summary_passing.json",
+         out_dir / "compare_replicas_tm_distribution_passing.png",
+         f"[pTM>={args.ptm_cutoff} in >=1 replica, n={len(ok_passing)}]"),
+    ]
+    for name, passing_only, subset_df, json_path, plot_path, extra_title in variants:
+        summary = _aggregate_stats(df, args, passing_only=passing_only)
+        with open(json_path, "w") as f:
+            json.dump(summary, f, indent=2)
+        logger.info("Wrote %s", json_path)
 
-    logger.info("Summary: compared=%d skipped=%d", summary["num_targets_compared"], summary["num_skipped"])
-    if summary.get("stats_tm_templates_TM1", {}).get("n", 0):
-        logger.info("tm_templates_TM1 mean=%.4f median=%.4f", summary["stats_tm_templates_TM1"]["mean"], summary["stats_tm_templates_TM1"]["median"])
-    if summary.get("stats_tm_predictions_TM1", {}).get("n", 0):
-        logger.info("tm_predictions_TM1 mean=%.4f median=%.4f", summary["stats_tm_predictions_TM1"]["mean"], summary["stats_tm_predictions_TM1"]["median"])
+        tm_templates = _finite_series(subset_df["tm_templates_TM1"].tolist())
+        tm_predictions = _finite_series(subset_df["tm_predictions_TM1"].tolist())
+        _plot_tm_distribution(
+            tm_templates, tm_predictions, plot_path,
+            args.replica_a_label, args.replica_b_label,
+            extra_title=extra_title,
+        )
+        logger.info("Wrote %s", plot_path)
+
+        logger.info("[%s] compared=%d skipped=%d", name, summary["num_targets_compared"], summary["num_skipped"])
+        if summary.get("stats_tm_templates_TM1", {}).get("n", 0):
+            logger.info("[%s] tm_templates_TM1 mean=%.4f median=%.4f",
+                        name, summary["stats_tm_templates_TM1"]["mean"], summary["stats_tm_templates_TM1"]["median"])
+        if summary.get("stats_tm_predictions_TM1", {}).get("n", 0):
+            logger.info("[%s] tm_predictions_TM1 mean=%.4f median=%.4f",
+                        name, summary["stats_tm_predictions_TM1"]["mean"], summary["stats_tm_predictions_TM1"]["median"])
     return 0
 
 
