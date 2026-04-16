@@ -19,7 +19,7 @@ from proteinfoundation.utils.cluster_utils import fasta_to_df
 logger = logging.getLogger(__name__)
 
 
-def parse_input(input_file: str, id_column: str = "id", sequence_column: str = "sequence") -> pd.DataFrame:
+def parse_input(input_file: str, id_col: str = "id", sequence_col: str = "sequence") -> pd.DataFrame:
     """
     Parse input file (CSV or FASTA) and return DataFrame with 'id' and 'sequence' columns.
 
@@ -29,8 +29,8 @@ def parse_input(input_file: str, id_column: str = "id", sequence_column: str = "
 
     Args:
         input_file: Path to input CSV or FASTA file.
-        id_column: Column name for protein ID in CSV (ignored for FASTA).
-        sequence_column: Column name for sequence in CSV (ignored for FASTA).
+        id_col: Column name for protein ID in CSV (ignored for FASTA).
+        sequence_col: Column name for sequence in CSV (ignored for FASTA).
 
     Returns:
         DataFrame with columns ['id', 'sequence'].
@@ -43,11 +43,11 @@ def parse_input(input_file: str, id_column: str = "id", sequence_column: str = "
     elif ext in (".csv", ".tsv"):
         sep = "\t" if ext == ".tsv" else ","
         df = pd.read_csv(input_file, sep=sep)
-        if id_column not in df.columns:
-            raise KeyError(f"Column '{id_column}' not found in {input_file}. Available: {list(df.columns)}")
-        if sequence_column not in df.columns:
-            raise KeyError(f"Column '{sequence_column}' not found in {input_file}. Available: {list(df.columns)}")
-        df = df[[id_column, sequence_column]].rename(columns={id_column: "id", sequence_column: "sequence"})
+        if id_col not in df.columns:
+            raise KeyError(f"Column '{id_col}' not found in {input_file}. Available: {list(df.columns)}")
+        if sequence_col not in df.columns:
+            raise KeyError(f"Column '{sequence_col}' not found in {input_file}. Available: {list(df.columns)}")
+        df = df[[id_col, sequence_col]].rename(columns={id_col: "id", sequence_col: "sequence"})
     else:
         raise ValueError(f"Unsupported file extension '{ext}'. Use .csv, .tsv, .fasta, .fa, or .faa")
 

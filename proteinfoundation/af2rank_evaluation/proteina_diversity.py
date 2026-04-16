@@ -38,7 +38,7 @@ def main() -> None:
     parser.add_argument("--inference_dir", required=True, help="Base inference directory")
     parser.add_argument("--protein_ids", nargs="*", help="Protein IDs to process")
     parser.add_argument("--csv_file", help="CSV file with protein IDs (alternative to --protein_ids)")
-    parser.add_argument("--csv_column", default="id", help="Column name for protein ID in CSV (default: id)")
+    parser.add_argument("--csv_col", default="id", help="Column name for protein ID in CSV (default: id)")
     parser.add_argument("--output_subdir", default="proteina_diversity", help="Per-protein subdirectory for outputs")
     parser.add_argument("--rerun", action="store_true", help="Recompute even if results exist")
     parser.add_argument("--num_workers", type=int, default=None, help="Max parallel worker count")
@@ -51,7 +51,7 @@ def main() -> None:
         protein_ids = args.protein_ids
     elif args.csv_file:
         df = pd.read_csv(args.csv_file)
-        protein_ids = df[args.csv_column].dropna().astype(str).str.strip().unique().tolist()
+        protein_ids = df[args.csv_col].dropna().astype(str).str.strip().unique().tolist()
     else:
         protein_ids = sorted(
             [

@@ -100,9 +100,9 @@ def run_with_conda_env(env_name: str, command_list: list, cwd: str | None = None
 
 # ── Step 1: Parse input and create PT files ──────────────────────────────────
 
-def step_parse_input(input_file: str, id_column: str, sequence_column: str, output_dir: str):
+def step_parse_input(input_file: str, id_col: str, sequence_col: str, output_dir: str):
     """Parse input file, create PT files, and write working CSV."""
-    df = parse_input(input_file, id_column=id_column, sequence_column=sequence_column)
+    df = parse_input(input_file, id_col=id_col, sequence_col=sequence_col)
     create_pt_files(df)
     working_csv = create_working_csv(df, os.path.join(output_dir, "working_proteins.csv"))
     return df, working_csv
@@ -124,7 +124,7 @@ def step_proteina_inference(
     cmd = [
         "python", os.path.join(AF2RANK_EVAL_DIR, "parallel_proteina_inference.py"),
         "--csv_file", working_csv,
-        "--csv_column", "id",
+        "--csv_col", "id",
         "--inference_config", inference_config,
         "--num_gpus", str(num_gpus),
         "--skip_pt_conversion",
@@ -160,7 +160,7 @@ def step_proteinebm_scoring(
     cmd = [
         "python", os.path.join(AF2RANK_EVAL_DIR, "parallel_proteinebm_scoring.py"),
         "--csv_file", working_csv,
-        "--csv_column", "id",
+        "--csv_col", "id",
         "--inference_config", inference_config,
         "--num_gpus", str(num_gpus),
         *parallel_incremental_filter_args(not rerun),
@@ -190,7 +190,7 @@ def step_af2rank_topk(
     recycles: int,
     num_gpus: int,
     csv_file: str,
-    csv_column: str = "id",
+    csv_col: str = "id",
     proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
     use_deepspeed_evoformer_attention: bool = True,
     use_cuequivariance_attention: bool = True,
@@ -213,7 +213,7 @@ def step_af2rank_topk(
         "python", os.path.join(prediction_pipeline_dir, "run_af2rank_prediction.py"),
         "--inference_dir", inference_dir,
         "--csv_file", csv_file,
-        "--csv_column", csv_column,
+        "--csv_col", csv_col,
         "--top_k", str(af2rank_top_k),
         "--recycles", str(recycles),
         "--proteinebm_analysis_subdir", proteinebm_analysis_subdir,
@@ -236,7 +236,7 @@ def step_af2rank_topk(
 def step_central_analysis(
     inference_config: str,
     csv_file: str,
-    csv_column: str = "id",
+    csv_col: str = "id",
     proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
     num_workers: int | None = None,
     shard_args: list | None = None,
@@ -253,8 +253,8 @@ def step_central_analysis(
         inference_dir,
         "--csv_file",
         csv_file,
-        "--csv_column",
-        csv_column,
+        "--csv_col",
+        csv_col,
         "--proteinebm_analysis_subdir",
         proteinebm_analysis_subdir,
     ]
@@ -285,8 +285,10 @@ def step_collect_results(
     """
     logger.info("Collecting results...")
     inference_base = os.path.join(PROTEINA_BASE_DIR, "inference", inference_config)
-    structures_dir = os.path.join(output_dir, "structures")
-    os.makedirs(structures_dir, exist_ok=True)
+    best_templates_dir = os.path.join(output_dir, "best_templates")
+    best_predictions_dir = os.path.join(output_dir, "best_predictions")
+    os.makedirs(best_templates_dir, exist_ok=True)
+    os.makedirs(best_predictions_dir, exist_ok=True)
 
     results = []
 
@@ -317,7 +319,8 @@ def step_collect_results(
                 "best_ptm": float("nan"),
                 "best_plddt": float("nan"),
                 "best_energy": float("nan"),
-                "best_structure": "",
+                "best_template": "",
+                "best_prediction": "",
                 "passes_cutoff": False,
             })
             continue
@@ -348,7 +351,8 @@ def step_collect_results(
                 "best_ptm": float("nan"),
                 "best_plddt": float("nan"),
                 "best_energy": float("nan"),
-                "best_structure": "",
+                "best_template": "",
+                "best_prediction": "",
                 "passes_cutoff": False,
             })
             continue
@@ -362,20 +366,41 @@ def step_collect_results(
         best_file = str(best_row["structure_file"])
         passes = best_ptm >= ptm_cutoff
 
-        # Find and copy the best structure file
-        # The structure is in the staged_topk_templates directory
-        staged_pdb = topk_dir / "staged_topk_templates" / best_file
-        dest_pdb = os.path.join(structures_dir, f"{protein_id}.pdb")
-        if staged_pdb.exists():
-            shutil.copy2(str(staged_pdb), dest_pdb)
+        # ── Save best cg2all template ──────────────────────────────────────────
+        best_stem = Path(best_file).stem
+        cg2all_pdb = topk_dir / "cg2all_topk_structures" / f"{best_stem}_allatom.pdb"
+        dest_template = os.path.join(best_templates_dir, f"{protein_id}.pdb")
+        if cg2all_pdb.exists():
+            shutil.copy2(str(cg2all_pdb), dest_template)
         else:
-            # Fallback: look in inference dir
+            # Fallback: staged CA template or raw inference dir
+            staged_pdb = topk_dir / "staged_topk_templates" / best_file
             fallback = protein_dir / best_file
-            if fallback.exists():
-                shutil.copy2(str(fallback), dest_pdb)
+            if staged_pdb.exists():
+                shutil.copy2(str(staged_pdb), dest_template)
+                logger.warning(f"{protein_id}: cg2all template not found, fell back to staged CA template")
+            elif fallback.exists():
+                shutil.copy2(str(fallback), dest_template)
+                logger.warning(f"{protein_id}: cg2all template not found, fell back to raw inference PDB")
             else:
-                logger.warning(f"Could not find structure file {best_file} for {protein_id}")
-                dest_pdb = ""
+                logger.warning(f"{protein_id}: could not find any template for {best_file}")
+                dest_template = ""
+
+        # ── Save best AF2Rank prediction ──────────────────────────────────────
+        # Pick the model with the higher individual pTM for the best template
+        ptm_m1 = float(best_row.get("ptm_m1", float("nan")))
+        ptm_m2 = float(best_row.get("ptm_m2", float("nan")))
+        use_m1 = (not math.isnan(ptm_m1)) and (math.isnan(ptm_m2) or ptm_m1 >= ptm_m2)
+        if use_m1:
+            pred_src = topk_dir / "af2rank_analysis" / "predicted_structures" / best_file
+        else:
+            pred_src = topk_dir / "af2rank_analysis_model_2_ptm" / "predicted_structures" / best_file
+        dest_prediction = os.path.join(best_predictions_dir, f"{protein_id}.pdb")
+        if pred_src.exists():
+            shutil.copy2(str(pred_src), dest_prediction)
+        else:
+            logger.warning(f"{protein_id}: AF2Rank prediction not found at {pred_src}")
+            dest_prediction = ""
 
         results.append({
             "protein_id": protein_id,
@@ -384,13 +409,14 @@ def step_collect_results(
             "best_ptm": best_ptm,
             "best_plddt": best_plddt,
             "best_energy": best_energy,
-            "best_structure": os.path.basename(dest_pdb) if dest_pdb else "",
+            "best_template": os.path.basename(dest_template) if dest_template else "",
+            "best_prediction": os.path.basename(dest_prediction) if dest_prediction else "",
             "passes_cutoff": passes,
         })
 
     # Write prediction_summary.csv
     summary_csv_path = os.path.join(output_dir, "prediction_summary.csv")
-    fieldnames = ["protein_id", "sequence_length", "num_generated", "best_ptm", "best_plddt", "best_energy", "best_structure", "passes_cutoff"]
+    fieldnames = ["protein_id", "sequence_length", "num_generated", "best_ptm", "best_plddt", "best_energy", "best_template", "best_prediction", "passes_cutoff"]
     with open(summary_csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -506,8 +532,8 @@ def build_parser() -> argparse.ArgumentParser:
     """CLI aligned with run_full_pipeline.py for shared options."""
     parser = argparse.ArgumentParser(description="Prediction Pipeline (No Ground-Truth)")
     parser.add_argument("--input", required=True, help="Input CSV or FASTA file with protein sequences")
-    parser.add_argument("--id_column", default="id", help="Column name for protein ID in CSV (default: id)")
-    parser.add_argument("--sequence_column", default="sequence", help="Column name for sequence in CSV (default: sequence)")
+    parser.add_argument("--id_col", default="id", help="Column name for protein ID in CSV (default: id)")
+    parser.add_argument("--sequence_col", default="sequence", help="Column name for sequence in CSV (default: sequence)")
     parser.add_argument("--inference_config", required=True, help="Proteina inference configuration name")
     parser.add_argument("--num_gpus", type=int, default=1, help="Number of GPUs to use")
     parser.add_argument("--output_dir", required=True, help="Output directory for predictions and summary")
@@ -525,7 +551,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--backend",
         dest="af2rank_backend",
         choices=["colabdesign", "openfold"],
-        default="colabdesign",
+        default="openfold",
         help="AF2Rank backend name (shared with full pipeline). The prediction AF2Rank step is OpenFold-only; "
         "only openfold is used. Alias: --backend.",
     )
@@ -608,7 +634,7 @@ def main(argv: list[str] | None = None):
     args = build_parser().parse_args(argv)
 
     shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
-    shard_cli_args = build_shard_cli_args(shard_index, num_shards)
+    shard_cli_args = build_shard_cli_args(shard_index, num_shards, len_col=args.len_col)
     if shard_index is not None:
         logger.info(f"Sharding enabled: shard {shard_index} of {num_shards}")
 
@@ -638,7 +664,7 @@ def main(argv: list[str] | None = None):
     logger.info("\n" + "=" * 60)
     logger.info("STEP 1: PARSE INPUT & CREATE PT FILES")
     logger.info("=" * 60)
-    df, working_csv = step_parse_input(args.input, args.id_column, args.sequence_column, args.output_dir)
+    df, working_csv = step_parse_input(args.input, args.id_col, args.sequence_col, args.output_dir)
     protein_ids = df["id"].tolist()
     logger.info(f"Parsed {len(protein_ids)} proteins")
 
@@ -731,7 +757,7 @@ def main(argv: list[str] | None = None):
             if not step_central_analysis(
                 inference_config=args.inference_config,
                 csv_file=working_csv,
-                csv_column="id",
+                csv_col="id",
                 proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
                 num_workers=args.num_workers,
                 shard_args=shard_cli_args,

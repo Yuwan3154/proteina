@@ -88,6 +88,26 @@ def lengths_from_csv(csv_path: str, id_col: str, len_col: str) -> Optional[Dict[
         return None
 
 
+def load_lengths_from_pt(names: List[str], data_dir: str) -> Dict[str, int]:
+    """
+    Load protein lengths from pdb_train/processed/{name}.pt files.
+
+    Returns a {name: length} dict; missing entries are silently omitted (length=0 at lookup time).
+    """
+    import torch
+    lengths: Dict[str, int] = {}
+    pt_dir = os.path.join(data_dir, "pdb_train", "processed")
+    for name in names:
+        pt_path = os.path.join(pt_dir, f"{name}.pt")
+        if os.path.exists(pt_path):
+            try:
+                pt = torch.load(pt_path, weights_only=False, map_location="cpu")
+                lengths[name] = len(pt.residue_type)
+            except Exception:
+                pass
+    return lengths
+
+
 def shard_proteins(
     names: List[str],
     shard_index: int,
@@ -109,17 +129,8 @@ def shard_proteins(
         Subset of names assigned to this shard.
     """
     if lengths is None and data_dir:
-        import torch
-        lengths = {}
-        pt_dir = os.path.join(data_dir, "pdb_train", "processed")
-        for name in names:
-            pt_path = os.path.join(pt_dir, f"{name}.pt")
-            if os.path.exists(pt_path):
-                pt = torch.load(pt_path, weights_only=False, map_location="cpu")
-                lengths[name] = len(pt.residue_type)
-            else:
-                lengths[name] = 0
-    elif lengths is None:
+        lengths = load_lengths_from_pt(names, data_dir)
+    if lengths is None:
         lengths = {n: 0 for n in names}
 
     sorted_names = sorted(names, key=lambda p: lengths.get(p, 0))

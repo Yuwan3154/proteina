@@ -30,7 +30,7 @@ cd /home/gridsan/cou/proteina
 # OOM errors automatically halve max_nsamples and retry.
 python proteinfoundation/prediction_pipeline/run_prediction_pipeline.py \
     --input /home/gridsan/cou/data/afdb/afdb_model_org_plddt-05_aiupred-02_max768.csv \
-    --id_column accession_id \
+    --id_col accession_id \
     --inference_config inference_seq_cond_sampling_ca_dssp_extlig_no-sin-pos-emb_beta-2.5-2.0_finetune-all_v1.6_default-fold_21-seq-S25_128-eff-bs_pdb_last_045-noise \
     --output_dir /home/gridsan/cou/proteina/prediction/inference_seq_cond_sampling_ca_dssp_extlig_no-sin-pos-emb_beta-2.5-2.0_finetune-all_v1.6_default-fold_21-seq-S25_128-eff-bs_pdb_last_045-noise/ \
     --proteinebm_checkpoint /home/gridsan/cou/ProteinEBM/weights/proteinebm_v2_cathmd_weights.pt \

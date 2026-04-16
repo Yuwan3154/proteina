@@ -101,7 +101,7 @@ def find_reference_cif(protein_name: str, cif_dir: str) -> str:
     raise FileNotFoundError(f"CIF file not found for {pdb_id} in {cif_dir}")
 
 
-def get_protein_names(csv_file: str, csv_column: str):
+def get_protein_names(csv_file: str, csv_col: str):
     """Extract protein names from CSV file without pandas dependency."""
     proteins = []
     seen = set()
@@ -112,9 +112,9 @@ def get_protein_names(csv_file: str, csv_column: str):
             return []
 
         field_map = {name.strip(): name for name in reader.fieldnames}
-        actual_col = field_map.get(csv_column.strip())
+        actual_col = field_map.get(csv_col.strip())
         if actual_col is None:
-            raise KeyError(f"Column '{csv_column}' not found in CSV header: {reader.fieldnames}")
+            raise KeyError(f"Column '{csv_col}' not found in CSV header: {reader.fieldnames}")
 
         for row in reader:
             val = (row.get(actual_col) or "").strip()
@@ -125,8 +125,25 @@ def get_protein_names(csv_file: str, csv_column: str):
     return proteins
 
 
-def find_proteins_needing_proteinebm(csv_file: str, csv_column: str, inference_config: str, analysis_subdir: str = "proteinebm_v2_cathmd_analysis"):
-    csv_proteins = get_protein_names(csv_file, csv_column)
+def _proteinebm_csv_complete(scores_csv: Path, pdb_files: list) -> bool:
+    """Check whether a ProteinEBM scores CSV covers all PDB files on disk.
+
+    Uses lightweight line counting instead of pandas for performance when
+    scanning thousands of proteins.
+    """
+    if not scores_csv.exists():
+        return False
+    with open(scores_csv, "r") as f:
+        header = (f.readline() or "").strip()
+        required_cols = ["protein_id", "structure_file", "structure_path", "t", "energy"]
+        if not all(col in header for col in required_cols):
+            return False
+        n_scored = sum(1 for line in f if line.strip())
+    return n_scored >= len(pdb_files)
+
+
+def find_proteins_needing_proteinebm(csv_file: str, csv_col: str, inference_config: str, analysis_subdir: str = "proteinebm_v2_cathmd_analysis"):
+    csv_proteins = get_protein_names(csv_file, csv_col)
     inference_base_dir = os.path.join(PROTEINA_BASE_DIR, "inference", inference_config)
     if not os.path.exists(inference_base_dir):
         return []
@@ -142,16 +159,10 @@ def find_proteins_needing_proteinebm(csv_file: str, csv_column: str, inference_c
             continue
 
         scores_csv = protein_dir / analysis_subdir / f"proteinebm_scores_{protein_name}.csv"
-        if not scores_csv.exists():
-            proteins_needing_work.append(protein_name)
+        if _proteinebm_csv_complete(scores_csv, pdb_files):
+            logger.info(f"ProteinEBM scoring already completed for {protein_name} ({len(pdb_files)} structures), skipping")
         else:
-            with open(scores_csv, "r") as f:
-                header = (f.readline() or "").strip()
-            required_cols = ["protein_id", "structure_file", "structure_path", "t", "energy"]
-            if not all(col in header for col in required_cols):
-                proteins_needing_work.append(protein_name)
-            else:
-                logger.info(f"ProteinEBM scoring already completed for {protein_name}, skipping")
+            proteins_needing_work.append(protein_name)
 
     return proteins_needing_work
 
@@ -254,7 +265,7 @@ def run_gpu_worker_subprocess(
 def main():
     parser = argparse.ArgumentParser(description="Parallel ProteinEBM scoring pipeline")
     parser.add_argument("--csv_file", required=True, help="Path to CSV file with protein data")
-    parser.add_argument("--csv_column", required=True, help="Column name in CSV file to use for protein selection")
+    parser.add_argument("--csv_col", required=True, help="Column name in CSV file to use for protein selection")
     parser.add_argument("--cif_dir", default=None, help="Directory containing reference CIF files (for TMscore ground-truth). Optional; if omitted, TM-score metrics are skipped.")
     parser.add_argument("--inference_config", required=True, help="Inference configuration name")
     parser.add_argument("--num_gpus", type=int, default=1, help="Number of GPUs to use")
@@ -310,7 +321,7 @@ def main():
     # Always shard the full protein list for consistent cross-step assignment.
     # Applying the already-done filter BEFORE sharding causes different steps to shard
     # different subsets, resulting in the same shard index owning different proteins per step.
-    protein_names = get_protein_names(args.csv_file, args.csv_column)
+    protein_names = get_protein_names(args.csv_file, args.csv_col)
     logger.info(f"Found {len(protein_names)} proteins in CSV file")
 
     if not protein_names:
@@ -319,7 +330,7 @@ def main():
 
     shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
     if shard_index is not None:
-        lengths = lengths_from_csv(args.csv_file, args.csv_column, args.len_col)
+        lengths = lengths_from_csv(args.csv_file, args.csv_col, args.len_col)
         if lengths is not None:
             protein_names = shard_proteins(protein_names, shard_index, num_shards, lengths=lengths)
         else:
@@ -328,7 +339,7 @@ def main():
 
     # Now apply the already-done filter to this shard's proteins only
     if args.filter_existing:
-        needing_work = set(find_proteins_needing_proteinebm(args.csv_file, args.csv_column, args.inference_config, args.proteinebm_analysis_subdir))
+        needing_work = set(find_proteins_needing_proteinebm(args.csv_file, args.csv_col, args.inference_config, args.proteinebm_analysis_subdir))
         protein_names = [p for p in protein_names if p in needing_work]
         logger.info(f"Found {len(protein_names)} proteins in this shard needing ProteinEBM scoring")
 

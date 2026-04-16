@@ -466,18 +466,18 @@ def has_multi_char_chain_id(protein_name):
         return len(chain_id) > 1
     return False
 
-def get_protein_names(csv_file, csv_column):
+def get_protein_names(csv_file, csv_col):
     """Extract protein names from CSV file."""
     df = pd.read_csv(csv_file)
     # Strip whitespace from column names
     df.columns = df.columns.str.strip()
-    proteins = df[csv_column].dropna().unique().tolist()
+    proteins = df[csv_col].dropna().unique().tolist()
     return [p.strip() for p in proteins if p and p.strip()]
 
-def find_proteins_needing_af2rank(csv_file, csv_column, inference_config, regenerate_plots=False):
+def find_proteins_needing_af2rank(csv_file, csv_col, inference_config, regenerate_plots=False):
     """Find proteins from CSV that need AF2Rank scoring or plot regeneration."""
     # Get proteins from CSV file
-    csv_proteins = get_protein_names(csv_file, csv_column)
+    csv_proteins = get_protein_names(csv_file, csv_col)
     
     inference_base_dir = os.path.join(PROTEINA_BASE_DIR, 'inference', inference_config)
     
@@ -513,7 +513,7 @@ def find_proteins_needing_af2rank(csv_file, csv_column, inference_config, regene
 def main():
     parser = argparse.ArgumentParser(description='Parallel AF2Rank Scoring Pipeline')
     parser.add_argument('--csv_file', required=True, help='Path to CSV file with protein data')
-    parser.add_argument('--csv_column', required=True, help='Column name in CSV file to use for protein selection')
+    parser.add_argument('--csv_col', required=True, help='Column name in CSV file to use for protein selection')
     parser.add_argument('--cif_dir', required=True, help='Directory containing reference CIF files')
     parser.add_argument('--inference_config', required=True, help='Inference configuration name')
     parser.add_argument('--num_gpus', type=int, default=1, help='Number of GPUs to use')
@@ -552,7 +552,7 @@ def main():
     # Always shard the full protein list for consistent cross-step assignment.
     # Applying the already-done filter BEFORE sharding causes different steps to shard
     # different subsets, resulting in the same shard index owning different proteins per step.
-    protein_names = get_protein_names(args.csv_file, args.csv_column)
+    protein_names = get_protein_names(args.csv_file, args.csv_col)
     logger.info(f"Found {len(protein_names)} proteins in CSV file")
 
     if not protein_names:
@@ -561,7 +561,7 @@ def main():
 
     shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
     if shard_index is not None:
-        lengths = lengths_from_csv(args.csv_file, args.csv_column, args.len_col)
+        lengths = lengths_from_csv(args.csv_file, args.csv_col, args.len_col)
         if lengths is not None:
             protein_names = shard_proteins(protein_names, shard_index, num_shards, lengths=lengths)
         else:
@@ -570,7 +570,7 @@ def main():
 
     # Now apply the already-done filter to this shard's proteins only
     if args.filter_existing:
-        needing_work = set(find_proteins_needing_af2rank(args.csv_file, args.csv_column, args.inference_config, args.regenerate_plots))
+        needing_work = set(find_proteins_needing_af2rank(args.csv_file, args.csv_col, args.inference_config, args.regenerate_plots))
         protein_names = [p for p in protein_names if p in needing_work]
         if args.regenerate_plots:
             logger.info(f"Found {len(protein_names)} proteins in this shard needing AF2Rank scoring or plot regeneration")

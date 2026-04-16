@@ -9,8 +9,8 @@ This script runs the complete pipeline:
 4. Cross-protein plots (always)
 
 Usage:
-    python run_full_pipeline.py --dataset_file data.csv --id_column pdb --cif_dir /path/to/cif \\
-        --inference_config config_name --num_gpus 4 --tms_column tms_single --cross_protein_output_dir out/
+    python run_full_pipeline.py --dataset_file data.csv --id_col pdb --cif_dir /path/to/cif \\
+        --inference_config config_name --num_gpus 4 --tms_col tms_single --cross_protein_output_dir out/
 
 Shared flags with run_prediction_pipeline.py include --af2rank_backend, --af2rank_top_k, --proteina_force_compile,
 --proteinebm_batch_size, --proteinebm_template_self_condition, and sharding options.
@@ -141,14 +141,14 @@ def run_with_conda_env(env_name, command_list, cwd=None, direct_python: bool = F
         logger.error(f"❌ Failed to run command: {e}")
         return False
 
-def run_proteina_inference(csv_file, csv_column, cif_dir, inference_config, num_gpus, usalign_path=None, force_compile: bool = False, shard_args=None, direct_python: bool = False, rerun: bool = False):
+def run_proteina_inference(csv_file, csv_col, cif_dir, inference_config, num_gpus, usalign_path=None, force_compile: bool = False, shard_args=None, direct_python: bool = False, rerun: bool = False):
     """Run the Proteina inference pipeline."""
     logger.info("🧬 Starting Proteina inference pipeline...")
 
     cmd = [
         'python', 'parallel_proteina_inference.py',
         '--csv_file', csv_file,
-        '--csv_column', csv_column,
+        '--csv_col', csv_col,
         '--cif_dir', cif_dir,
         '--inference_config', inference_config,
         '--num_gpus', str(num_gpus),
@@ -163,14 +163,14 @@ def run_proteina_inference(csv_file, csv_column, cif_dir, inference_config, num_
 
     return run_with_conda_env('proteina', cmd, direct_python=direct_python)
 
-def run_af2rank_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpus, recycles=3, regenerate_plots=False, backend="colabdesign", use_deepspeed_evoformer_attention=True, use_cuequivariance_attention=True, use_cuequivariance_multiplicative_update=True, shard_args=None, direct_python: bool = False, rerun: bool = False):
+def run_af2rank_scoring(csv_file, csv_col, cif_dir, inference_config, num_gpus, recycles=3, regenerate_plots=False, backend="colabdesign", use_deepspeed_evoformer_attention=True, use_cuequivariance_attention=True, use_cuequivariance_multiplicative_update=True, shard_args=None, direct_python: bool = False, rerun: bool = False):
     """Run the AF2Rank scoring pipeline."""
     logger.info(f"⚡ Starting AF2Rank scoring pipeline (backend={backend})...")
 
     cmd = [
         'python', 'parallel_af2rank_scoring.py',
         '--csv_file', csv_file,
-        '--csv_column', csv_column,
+        '--csv_col', csv_col,
         '--cif_dir', cif_dir,
         '--inference_config', inference_config,
         '--num_gpus', str(num_gpus),
@@ -195,7 +195,7 @@ def run_af2rank_scoring(csv_file, csv_column, cif_dir, inference_config, num_gpu
 
 def run_proteinebm_scoring(
     csv_file,
-    csv_column,
+    csv_col,
     cif_dir,
     inference_config,
     num_gpus,
@@ -216,7 +216,7 @@ def run_proteinebm_scoring(
     cmd = [
         'python', 'parallel_proteinebm_scoring.py',
         '--csv_file', csv_file,
-        '--csv_column', csv_column,
+        '--csv_col', csv_col,
         '--cif_dir', cif_dir,
         '--inference_config', inference_config,
         '--num_gpus', str(num_gpus),
@@ -243,8 +243,8 @@ def run_cross_protein_plots(
     output_dir: str,
     scorer: str,
     dataset_file: str,
-    id_column: str,
-    tms_column: str,
+    id_col: str,
+    tms_col: str,
     af2rank_top_k: int,
     proteinebm_plot_mode: str = "tm",
     proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
@@ -262,10 +262,10 @@ def run_cross_protein_plots(
         scorer,
         "--dataset_file",
         dataset_file,
-        "--id_column",
-        id_column,
-        "--tms_column",
-        tms_column,
+        "--id_col",
+        id_col,
+        "--tms_col",
+        tms_col,
         "--proteinebm_analysis_subdir",
         proteinebm_analysis_subdir,
     ]
@@ -282,8 +282,8 @@ def run_cross_protein_plots(
 def run_af2rank_on_proteinebm_topk(
     inference_dir: str,
     dataset_file: str,
-    id_column: str,
-    tms_column: str,
+    id_col: str,
+    tms_col: str,
     top_k: int,
     recycles: int,
     num_gpus: int,
@@ -335,10 +335,10 @@ def run_af2rank_on_proteinebm_topk(
             [
                 "--dataset_file",
                 dataset_file,
-                "--id_column",
-                id_column,
-                "--tms_column",
-                tms_column,
+                "--id_col",
+                id_col,
+                "--tms_col",
+                tms_col,
             ]
         )
     if filter_existing:
@@ -358,7 +358,7 @@ def run_af2rank_on_proteinebm_topk(
 def run_central_analysis(
     inference_dir: str,
     dataset_file: str,
-    id_column: str,
+    id_col: str,
     cif_dir: str,
     proteinebm_analysis_subdir: str,
     num_workers: int | None = None,
@@ -374,8 +374,8 @@ def run_central_analysis(
         inference_dir,
         "--csv_file",
         dataset_file,
-        "--csv_column",
-        id_column,
+        "--csv_col",
+        id_col,
         "--cif_dir",
         cif_dir,
         "--proteinebm_analysis_subdir",
@@ -395,12 +395,12 @@ def run_central_analysis(
 def build_parser() -> argparse.ArgumentParser:
     """CLI for the full AF2Rank evaluation pipeline (shared flag names align with run_prediction_pipeline)."""
     parser = argparse.ArgumentParser(description='Complete AF2Rank Evaluation Pipeline')
-    # Prefer consistent naming: dataset_file + id_column.
-    # Keep --csv_file/--csv_column as hidden aliases for backward compatibility.
+    # Prefer consistent naming: dataset_file + id_col.
+    # Keep --csv_file/--csv_col as hidden aliases for backward compatibility.
     parser.add_argument('--dataset_file', required=True, help='Path to dataset CSV file with protein ids and reference TM scores')
-    parser.add_argument('--id_column', required=True, help='Column name in dataset CSV to use as protein ID (e.g. pdb)')
+    parser.add_argument('--id_col', required=True, help='Column name in dataset CSV to use as protein ID (e.g. pdb)')
     parser.add_argument('--csv_file', dest='dataset_file', help=argparse.SUPPRESS)
-    parser.add_argument('--csv_column', dest='id_column', help=argparse.SUPPRESS)
+    parser.add_argument('--csv_col', dest='id_col', help=argparse.SUPPRESS)
     parser.add_argument('--cif_dir', required=True, help='Directory containing CIF files')
     parser.add_argument('--inference_config', required=True, help='Inference configuration name')
     parser.add_argument('--num_gpus', type=int, default=1, help='Number of GPUs to use')
@@ -497,7 +497,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--direct_python', action='store_true',
                         help='Use current Python interpreter for subprocesses instead of shell script wrappers. '
                              'Useful on HPC where conda env activation is slow; requires all deps in current env.')
-    parser.add_argument('--tms_column', required=True,
+    parser.add_argument('--tms_col', required=True,
                        help='Dataset column name to use as reference TM score (required, used for cross-protein plots)')
     parser.add_argument(
         '--cross_protein_output_dir',
@@ -580,8 +580,8 @@ def main(argv: list[str] | None = None):
     logger.info(f"🧮 Scorer: {args.scorer}")
     logger.info(f"🔄 AF2Rank recycles: {args.recycles}")
     logger.info(f"🐍 Mode: {'direct Python' if args.direct_python else 'shell script wrappers'}")
-    logger.info(f"🔑 ID column: {args.id_column}")
-    logger.info(f"🔑 TM score column: {args.tms_column}")
+    logger.info(f"🔑 ID column: {args.id_col}")
+    logger.info(f"🔑 TM score column: {args.tms_col}")
     logger.info(f"🔧 AF2Rank backend: {args.af2rank_backend}")
     logger.info(f"📦 ProteinEBM batch size: {args.proteinebm_batch_size}")
     from proteinfoundation.af2rank_evaluation.proteina_analysis import resolve_num_workers
@@ -598,7 +598,7 @@ def main(argv: list[str] | None = None):
         
         inference_success = run_proteina_inference(
             args.dataset_file,
-            args.id_column,
+            args.id_col,
             args.cif_dir,
             args.inference_config,
             args.num_gpus,
@@ -629,7 +629,7 @@ def main(argv: list[str] | None = None):
         if args.scorer == 'af2rank':
             scoring_success = run_af2rank_scoring(
                 args.dataset_file,
-                args.id_column,
+                args.id_col,
                 args.cif_dir,
                 args.inference_config,
                 args.num_gpus,
@@ -646,7 +646,7 @@ def main(argv: list[str] | None = None):
         else:
             scoring_success = run_proteinebm_scoring(
                 csv_file=args.dataset_file,
-                csv_column=args.id_column,
+                csv_col=args.id_col,
                 cif_dir=args.cif_dir,
                 inference_config=args.inference_config,
                 num_gpus=args.num_gpus,
@@ -680,8 +680,8 @@ def main(argv: list[str] | None = None):
         topk_success = run_af2rank_on_proteinebm_topk(
             inference_dir=inference_dir,
             dataset_file=args.dataset_file,
-            id_column=args.id_column,
-            tms_column=args.tms_column,
+            id_col=args.id_col,
+            tms_col=args.tms_col,
             top_k=int(args.af2rank_top_k),
             recycles=int(args.recycles),
             num_gpus=int(args.num_gpus),
@@ -716,7 +716,7 @@ def main(argv: list[str] | None = None):
                 analysis_success = run_central_analysis(
                     inference_dir=inference_dir,
                     dataset_file=args.dataset_file,
-                    id_column=args.id_column,
+                    id_col=args.id_col,
                     cif_dir=args.cif_dir,
                     proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
                     num_workers=args.num_workers,
@@ -784,8 +784,8 @@ def main(argv: list[str] | None = None):
             run_af2rank_on_proteinebm_topk(
                 inference_dir=inference_dir,
                 dataset_file=args.dataset_file,
-                id_column=args.id_column,
-                tms_column=args.tms_column,
+                id_col=args.id_col,
+                tms_col=args.tms_col,
                 top_k=int(args.af2rank_top_k),
                 recycles=int(args.recycles),
                 num_gpus=int(args.num_gpus),
@@ -815,8 +815,8 @@ def main(argv: list[str] | None = None):
                 output_dir=cross_out_dir,
                 scorer=args.scorer,
                 dataset_file=args.dataset_file,
-                id_column=args.id_column,
-                tms_column=args.tms_column,
+                id_col=args.id_col,
+                tms_col=args.tms_col,
                 af2rank_top_k=int(args.af2rank_top_k),
                 proteinebm_plot_mode=str(args.proteinebm_cross_protein_plot_mode),
                 proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
@@ -832,8 +832,8 @@ def main(argv: list[str] | None = None):
                 output_dir=cross_out_dir,
                 scorer="af2rank_on_proteinebm_topk",
                 dataset_file=args.dataset_file,
-                id_column=args.id_column,
-                tms_column=args.tms_column,
+                id_col=args.id_col,
+                tms_col=args.tms_col,
                 af2rank_top_k=int(args.af2rank_top_k),
                 proteinebm_plot_mode=str(args.proteinebm_cross_protein_plot_mode),
                 proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,

@@ -28,7 +28,7 @@ cd /home/gridsan/cou/proteina
 # OOM errors automatically halve max_nsamples and retry.
 python af2rank_evaluation/parallel_proteina_inference.py \
     --csv_file /home/gridsan/cou/data/bad_afdb/pdb_70_cluster_reps_aligned_confidence_aggregate_monomer_length_50-640_tm-05_cutoff-190828_in-train.csv \
-    --csv_column pdb \
+    --csv_col pdb \
     --cif_dir /home/gridsan/cou/data/bad_afdb/pdb \
     --inference_config inference_seq_cond_sampling_ca_beta-2.5-2.0_finetune-all_v1.6_default-fold_4-seq-S25_64-eff-bs_purge-test_warmup_cutoff-190828_last_045-noise \
     --num_gpus 2 \

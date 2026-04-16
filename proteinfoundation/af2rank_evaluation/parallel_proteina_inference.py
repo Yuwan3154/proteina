@@ -33,6 +33,7 @@ from proteinfoundation.af2rank_evaluation.cif_to_pt_converter import convert_fro
 from proteinfoundation.af2rank_evaluation.sharding_utils import (
     add_shard_args,
     lengths_from_csv,
+    load_lengths_from_pt,
     resolve_shard_args,
     shard_proteins,
 )
@@ -96,12 +97,12 @@ def generate_protein_output_dir(inference_config, protein_name):
     """Generate consistent output directory path for a protein."""
     return os.path.join(PROTEINA_BASE_DIR, 'inference', inference_config, protein_name)
 
-def create_single_protein_csv(csv_file, csv_column, protein_name, output_dir):
+def create_single_protein_csv(csv_file, csv_col, protein_name, output_dir):
     """Create a single-protein CSV file for individual processing."""
     df = pd.read_csv(csv_file)
     
     # Filter for this specific protein
-    protein_df = df[df[csv_column] == protein_name]
+    protein_df = df[df[csv_col] == protein_name]
     
     if protein_df.empty:
         raise ValueError(f"Protein {protein_name} not found in CSV file")
@@ -115,7 +116,7 @@ def create_single_protein_csv(csv_file, csv_column, protein_name, output_dir):
     
     return single_csv_path
 
-def run_cif_to_pt_conversion(csv_file, csv_column, cif_dir):
+def run_cif_to_pt_conversion(csv_file, csv_col, cif_dir):
     """
     Run CIF to PT conversion step.
     Directly imports and calls the converter to avoid subprocess overhead.
@@ -123,7 +124,7 @@ def run_cif_to_pt_conversion(csv_file, csv_column, cif_dir):
     try:
         convert_from_csv(
             csv_file=csv_file,
-            csv_column=csv_column,
+            csv_col=csv_col,
             cif_dir=cif_dir,
             output_dir=os.path.join(PROTEINA_BASE_DIR, 'data')  # Uses DATA_PATH internally
         )
@@ -176,7 +177,7 @@ def process_single_protein(args):
     Process a single protein through the entire Proteina pipeline.
     Includes proper error handling and GPU memory cleanup.
     """
-    protein_name, csv_file, csv_column, cif_dir, inference_config, usalign_path, gpu_id, force_compile, skip_pt_conversion = args
+    protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path, gpu_id, force_compile, skip_pt_conversion = args
     
     try:
         # Set GPU for this process
@@ -191,14 +192,14 @@ def process_single_protein(args):
         
         # Create single-protein CSV file
         logger.info(f"[GPU {gpu_id}] Creating single_protein.csv for {protein_name}")
-        single_csv_path = create_single_protein_csv(csv_file, csv_column, protein_name, protein_output_dir)
+        single_csv_path = create_single_protein_csv(csv_file, csv_col, protein_name, protein_output_dir)
         
         # Step 1: CIF to PT conversion (skip if PT files already exist)
         if skip_pt_conversion:
             logger.info(f"[GPU {gpu_id}] Skipping CIF to PT conversion for {protein_name} (--skip_pt_conversion)")
         else:
             logger.info(f"[GPU {gpu_id}] Step 1: CIF to PT conversion for {protein_name}")
-            result = run_cif_to_pt_conversion(single_csv_path, csv_column, cif_dir)
+            result = run_cif_to_pt_conversion(single_csv_path, csv_col, cif_dir)
 
             if result.returncode != 0:
                 logger.error(f"[GPU {gpu_id}] CIF to PT conversion failed for {protein_name}")
@@ -306,13 +307,13 @@ def worker_init_proteina(counter, lock, num_gpus):
 # Wrapper function (must be at module level for pickling)
 def process_single_protein_wrapper(args_tuple):
     """Wrapper that uses the GPU assigned during worker init."""
-    protein_name, csv_file, csv_column, cif_dir, inference_config, usalign_path, force_compile, skip_pt_conversion = args_tuple
+    protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path, force_compile, skip_pt_conversion = args_tuple
 
     # Get GPU ID from process-local variable set by worker_init
     gpu_id = getattr(builtins, '_worker_gpu_id', 0)
 
     # Call the actual processing function
-    full_args = (protein_name, csv_file, csv_column, cif_dir, inference_config, usalign_path, gpu_id, force_compile, skip_pt_conversion)
+    full_args = (protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path, gpu_id, force_compile, skip_pt_conversion)
     return process_single_protein(full_args)
 
 def has_multi_char_chain_id(protein_name):
@@ -332,10 +333,10 @@ def has_multi_char_chain_id(protein_name):
         return len(chain_id) > 1
     return False
 
-def get_protein_names(csv_file, csv_column):
+def get_protein_names(csv_file, csv_col):
     """Extract protein names from CSV file."""
     df = pd.read_csv(csv_file)
-    proteins = df[csv_column].dropna().unique().tolist()
+    proteins = df[csv_col].dropna().unique().tolist()
     return [p for p in proteins if p.strip()]
 
 
@@ -368,7 +369,7 @@ def _get_expected_nsamples(inference_config):
     return None  # Unknown — caller decides policy
 
 
-def find_proteins_needing_inference(csv_file, csv_column, inference_config):
+def find_proteins_needing_inference(csv_file, csv_col, inference_config):
     """Find proteins from CSV that need inference (incomplete or missing).
 
     A protein is skipped only when it already has at least ``nsamples_per_len``
@@ -376,7 +377,7 @@ def find_proteins_needing_inference(csv_file, csv_column, inference_config):
     included so that ``inference.py`` can resume from where they left off.
     """
     # Get proteins from CSV file
-    csv_proteins = get_protein_names(csv_file, csv_column)
+    csv_proteins = get_protein_names(csv_file, csv_col)
 
     inference_base_dir = os.path.join(PROTEINA_BASE_DIR, 'inference', inference_config)
 
@@ -412,7 +413,7 @@ def find_proteins_needing_inference(csv_file, csv_column, inference_config):
 def main():
     parser = argparse.ArgumentParser(description='Parallel Proteina Inference Pipeline')
     parser.add_argument('--csv_file', required=True, help='Path to CSV file with protein data')
-    parser.add_argument('--csv_column', required=True, help='Column name in CSV file to use for protein selection')
+    parser.add_argument('--csv_col', required=True, help='Column name in CSV file to use for protein selection')
     parser.add_argument('--cif_dir', default=None, help='Directory containing CIF files (not required when --skip_pt_conversion is set)')
     parser.add_argument('--inference_config', required=True, help='Inference configuration name')
     parser.add_argument('--num_gpus', type=int, default=1, help='Number of GPUs to use')
@@ -449,7 +450,7 @@ def main():
     # Always shard the full protein list for consistent cross-step assignment.
     # Applying the already-done filter BEFORE sharding causes different steps to shard
     # different subsets, resulting in the same shard index owning different proteins per step.
-    protein_names = get_protein_names(args.csv_file, args.csv_column)
+    protein_names = get_protein_names(args.csv_file, args.csv_col)
     logger.info(f"Found {len(protein_names)} proteins in CSV file")
 
     # Note: Multi-character chain IDs are now supported in AF2Rank via chain extraction
@@ -457,16 +458,27 @@ def main():
 
     shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
     if shard_index is not None:
-        lengths = lengths_from_csv(args.csv_file, args.csv_column, args.len_col)
+        lengths = lengths_from_csv(args.csv_file, args.csv_col, args.len_col)
         if lengths is not None:
             protein_names = shard_proteins(protein_names, shard_index, num_shards, lengths=lengths)
         else:
             data_dir = os.environ.get("DATA_PATH", os.path.join(PROTEINA_BASE_DIR, "data"))
             protein_names = shard_proteins(protein_names, shard_index, num_shards, data_dir=data_dir)
+    else:
+        # Non-sharded: sort short-to-long so OOM batch-size reductions stay conservative
+        lengths = lengths_from_csv(args.csv_file, args.csv_col, args.len_col)
+        if lengths is None:
+            data_dir = os.environ.get("DATA_PATH", os.path.join(PROTEINA_BASE_DIR, "data"))
+            pt_lengths = load_lengths_from_pt(protein_names, data_dir)
+            if pt_lengths:
+                lengths = pt_lengths
+        if lengths:
+            protein_names = sorted(protein_names, key=lambda p: lengths.get(p, 0))
+            logger.info("Sorted proteins short-to-long for OOM-conservative batch-size adaptation.")
 
     # Now apply the already-done filter to this shard's proteins only
     if args.skip_existing:
-        needing_inference = set(find_proteins_needing_inference(args.csv_file, args.csv_column, args.inference_config))
+        needing_inference = set(find_proteins_needing_inference(args.csv_file, args.csv_col, args.inference_config))
         protein_names = [p for p in protein_names if p in needing_inference]
         logger.info(f"Found {len(protein_names)} proteins in this shard needing inference")
     else:
@@ -503,7 +515,7 @@ def main():
     
     try:
         # Submit all jobs (GPU assignment happens via worker init)
-        work_items = [(protein_name, args.csv_file, args.csv_column, args.cif_dir, args.inference_config, args.usalign_path, args.force_compile, args.skip_pt_conversion)
+        work_items = [(protein_name, args.csv_file, args.csv_col, args.cif_dir, args.inference_config, args.usalign_path, args.force_compile, args.skip_pt_conversion)
                       for protein_name in protein_names]
         future_to_protein = {executor.submit(process_single_protein_wrapper, item): work_items[i][0] 
                             for i, item in enumerate(work_items)}

@@ -52,11 +52,11 @@ logger = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _load_protein_ids(csv_file: str, id_column: str) -> List[str]:
+def _load_protein_ids(csv_file: str, id_col: str) -> List[str]:
     df = pd.read_csv(csv_file)
-    if id_column not in df.columns:
-        raise KeyError(f"CSV missing column '{id_column}'. Available: {sorted(df.columns)}")
-    return [str(v).strip() for v in df[id_column].dropna().unique() if str(v).strip()]
+    if id_col not in df.columns:
+        raise KeyError(f"CSV missing column '{id_col}'. Available: {sorted(df.columns)}")
+    return [str(v).strip() for v in df[id_col].dropna().unique() if str(v).strip()]
 
 
 def _select_topk(scores_csv: Path, top_k: int) -> pd.DataFrame:
@@ -316,7 +316,7 @@ def main() -> None:
                         help="Base inference directory (contains per-protein folders)")
     parser.add_argument("--csv_file", required=True,
                         help="CSV file listing proteins to score")
-    parser.add_argument("--csv_column", default="id",
+    parser.add_argument("--csv_col", default="id",
                         help="Column name in --csv_file for protein IDs (default: id)")
     parser.add_argument("--top_k", type=int, default=5,
                         help="Number of top ProteinEBM templates per protein (default: 5)")
@@ -343,7 +343,7 @@ def main() -> None:
     cif_dir = args.cif_dir.strip() or None
 
     # ── Build per-protein work list ──────────────────────────────────────────
-    protein_ids = _load_protein_ids(args.csv_file, args.csv_column)
+    protein_ids = _load_protein_ids(args.csv_file, args.csv_col)
     logger.info(f"Loaded {len(protein_ids)} proteins from {args.csv_file}")
 
     shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
@@ -405,6 +405,8 @@ def main() -> None:
     # Temp files are moved to persistent locations; any leftover temps are cleaned up.
     allatom_map = _persist_allatom_files(allatom_map, protein_configs, inference_base)
 
+    has_ground_truth = cif_dir is not None
+
     # ── Model 1: model_1_ptm ─────────────────────────────────────────────────
     _run_model_pass(
         protein_configs=protein_configs,
@@ -417,6 +419,7 @@ def main() -> None:
         use_cuequivariance_multiplicative_update=args.use_cuequivariance_multiplicative_update,
         OpenFoldAF2Rank=OpenFoldAF2Rank,
         allatom_map=allatom_map,
+        has_ground_truth=has_ground_truth,
     )
 
     # ── Model 2: model_2_ptm ─────────────────────────────────────────────────
@@ -431,6 +434,7 @@ def main() -> None:
         use_cuequivariance_multiplicative_update=args.use_cuequivariance_multiplicative_update,
         OpenFoldAF2Rank=OpenFoldAF2Rank,
         allatom_map=allatom_map,
+        has_ground_truth=has_ground_truth,
     )
 
     # ── Generate per-protein summary CSVs ────────────────────────────────────
@@ -484,6 +488,7 @@ def _run_model_pass(
     use_cuequivariance_multiplicative_update: bool,
     OpenFoldAF2Rank,
     allatom_map: Dict[str, str],
+    has_ground_truth: bool = True,
 ) -> None:
     """Load model_name ONCE, then iterate over all proteins.
 
@@ -504,6 +509,7 @@ def _run_model_pass(
         use_deepspeed_evoformer_attention=use_deepspeed_evoformer_attention,
         use_cuequivariance_attention=use_cuequivariance_attention,
         use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
+        skip_ref_metrics=not has_ground_truth,
     )
     logger.info(f"{model_name} loaded. Scoring {len(protein_configs)} proteins ...")
 

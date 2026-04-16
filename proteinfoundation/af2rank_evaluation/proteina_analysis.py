@@ -384,7 +384,15 @@ def compute_pairwise_tm(
     summary_path = os.path.join(out_dir, f"diversity_summary_{protein_id}.json")
     if skip_existing and os.path.exists(summary_path):
         with open(summary_path, "r") as f:
-            return json.load(f)
+            existing = json.load(f)
+        current_templates = _discover_template_paths(str(protein_dir), protein_id)
+        cached_n = existing.get("n_samples", 0)
+        if len(current_templates) <= cached_n:
+            return existing
+        logger.info(
+            "[%s] Diversity sample count changed (%d → %d), recomputing",
+            protein_id, cached_n, len(current_templates),
+        )
 
     tm_values, pairwise_mode, template_paths = _compute_pairwise_template_metrics(
         protein_dir=str(protein_dir),
@@ -1046,34 +1054,44 @@ def run_analysis_for_protein(
     if skip_existing and os.path.exists(summary_path):
         with open(summary_path, "r") as f:
             existing = json.load(f)
-        # Still run enrichment to generate any missing per-protein plots even when the
-        # analysis JSON already exists (e.g. from a prior run or a code update).
-        _ref = existing.get("reference_structure") or reference_cif or _find_reference_cif(protein_id, cif_dir)
-        _chain = existing.get("reference_chain") or (reference_chain if reference_chain is not None else _default_chain(protein_id))
-        try:
-            enrich_proteinebm_outputs(
-                protein_id=protein_id,
-                protein_dir=protein_dir,
-                reference_cif=_ref,
-                reference_chain=_chain,
-                proteinebm_analysis_subdir=proteinebm_analysis_subdir,
+        # Detect incremental samples: if PDB count on disk exceeds the
+        # n_samples recorded in the summary, the analysis is stale.
+        current_templates = _discover_template_paths(protein_dir, protein_id)
+        cached_n = existing.get("n_samples", 0)
+        if len(current_templates) > cached_n:
+            logger.info(
+                "[%s] Sample count changed (%d → %d), re-running analysis",
+                protein_id, cached_n, len(current_templates),
             )
-            for _af2rank_dir in [
-                os.path.join(protein_dir, "af2rank_analysis"),
-                os.path.join(protein_dir, "af2rank_analysis_model_2_ptm"),
-                os.path.join(protein_dir, "af2rank_on_proteinebm_top_k", "af2rank_analysis"),
-                os.path.join(protein_dir, "af2rank_on_proteinebm_top_k", "af2rank_analysis_model_2_ptm"),
-            ]:
-                enrich_af2rank_output_dir(
+        else:
+            # Still run enrichment to generate any missing per-protein plots even when the
+            # analysis JSON already exists (e.g. from a prior run or a code update).
+            _ref = existing.get("reference_structure") or reference_cif or _find_reference_cif(protein_id, cif_dir)
+            _chain = existing.get("reference_chain") or (reference_chain if reference_chain is not None else _default_chain(protein_id))
+            try:
+                enrich_proteinebm_outputs(
                     protein_id=protein_id,
-                    inference_dir=protein_dir,
-                    output_dir=_af2rank_dir,
+                    protein_dir=protein_dir,
                     reference_cif=_ref,
                     reference_chain=_chain,
+                    proteinebm_analysis_subdir=proteinebm_analysis_subdir,
                 )
-        except Exception as _e:
-            logger.warning("[%s] enrichment in skip_existing path raised: %s", protein_id, _e)
-        return existing
+                for _af2rank_dir in [
+                    os.path.join(protein_dir, "af2rank_analysis"),
+                    os.path.join(protein_dir, "af2rank_analysis_model_2_ptm"),
+                    os.path.join(protein_dir, "af2rank_on_proteinebm_top_k", "af2rank_analysis"),
+                    os.path.join(protein_dir, "af2rank_on_proteinebm_top_k", "af2rank_analysis_model_2_ptm"),
+                ]:
+                    enrich_af2rank_output_dir(
+                        protein_id=protein_id,
+                        inference_dir=protein_dir,
+                        output_dir=_af2rank_dir,
+                        reference_cif=_ref,
+                        reference_chain=_chain,
+                    )
+            except Exception as _e:
+                logger.warning("[%s] enrichment in skip_existing path raised: %s", protein_id, _e)
+            return existing
 
     resolved_reference_cif = reference_cif or _find_reference_cif(protein_id, cif_dir)
     resolved_reference_chain = reference_chain if reference_chain is not None else _default_chain(protein_id)
@@ -1239,7 +1257,7 @@ def main() -> None:
     parser.add_argument("--inference_dir", required=True, help="Base inference directory")
     parser.add_argument("--protein_ids", nargs="*", help="Protein IDs to process")
     parser.add_argument("--csv_file", help="CSV file with protein IDs")
-    parser.add_argument("--csv_column", default="id", help="Protein ID column in CSV (default: id)")
+    parser.add_argument("--csv_col", default="id", help="Protein ID column in CSV (default: id)")
     parser.add_argument("--cif_dir", default="", help="Optional directory with reference CIF files")
     parser.add_argument("--output_subdir", default="proteina_analysis", help="Per-protein analysis output subdir")
     parser.add_argument(
@@ -1260,7 +1278,7 @@ def main() -> None:
         protein_ids = args.protein_ids
     elif args.csv_file:
         df = pd.read_csv(args.csv_file)
-        protein_ids = df[args.csv_column].dropna().astype(str).str.strip().unique().tolist()
+        protein_ids = df[args.csv_col].dropna().astype(str).str.strip().unique().tolist()
     else:
         protein_ids = sorted(
             [
@@ -1275,7 +1293,7 @@ def main() -> None:
 
     shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
     if shard_index is not None:
-        lengths = lengths_from_csv(getattr(args, "csv_file", None) or "", args.csv_column, args.len_col)
+        lengths = lengths_from_csv(getattr(args, "csv_file", None) or "", args.csv_col, args.len_col)
         if lengths is not None:
             protein_ids = shard_proteins(protein_ids, shard_index, num_shards, lengths=lengths)
         else:
