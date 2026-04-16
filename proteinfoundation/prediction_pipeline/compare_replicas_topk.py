@@ -195,6 +195,7 @@ def _empty_row(protein_id: str, status: str) -> Dict[str, object]:
         "lali_templates": nan, "l1_templates": nan, "l2_templates": nan,
         "tm_predictions_TM1": nan, "tm_predictions_TM2": nan, "rmsd_predictions": nan,
         "lali_predictions": nan, "l1_predictions": nan, "l2_predictions": nan,
+        "passes_cutoff_a": False, "passes_cutoff_b": False, "passes_cutoff_either": False,
         "status": status,
     }
     return row
@@ -206,6 +207,7 @@ def compare_protein(
     replica_b_dir: str,
     max_sample_index: int,
     tmscore_mode: int,
+    ptm_cutoff: float,
 ) -> Dict[str, object]:
     a_dir = Path(replica_a_dir)
     b_dir = Path(replica_b_dir)
@@ -226,6 +228,9 @@ def compare_protein(
 
     tm_templates = _run_usalign_pair(top_a["template_path"], top_b["template_path"], tmscore_mode)
     tm_predictions = _run_usalign_pair(top_a["prediction_path"], top_b["prediction_path"], tmscore_mode)
+
+    passes_a = bool(top_a["min_ptm"] >= ptm_cutoff)
+    passes_b = bool(top_b["min_ptm"] >= ptm_cutoff)
 
     row = {
         "protein_id": protein_id,
@@ -248,6 +253,9 @@ def compare_protein(
         "tm_predictions_TM1": tm_predictions["TM1"], "tm_predictions_TM2": tm_predictions["TM2"],
         "rmsd_predictions": tm_predictions["RMSD"], "lali_predictions": tm_predictions["Lali"],
         "l1_predictions": tm_predictions["L1"], "l2_predictions": tm_predictions["L2"],
+        "passes_cutoff_a": passes_a,
+        "passes_cutoff_b": passes_b,
+        "passes_cutoff_either": bool(passes_a or passes_b),
         "status": "ok",
     }
     return row
@@ -274,8 +282,15 @@ def _finite_series(values: List[float]) -> np.ndarray:
 
 
 def _aggregate_stats(df: pd.DataFrame, args: argparse.Namespace) -> Dict[str, object]:
-    ok = df[df["status"] == "ok"].copy()
+    ok_all = df[df["status"] == "ok"].copy()
     skipped_counts = df[df["status"] != "ok"]["status"].value_counts().to_dict()
+    num_pass_a = int(ok_all["passes_cutoff_a"].sum()) if len(ok_all) else 0
+    num_pass_b = int(ok_all["passes_cutoff_b"].sum()) if len(ok_all) else 0
+    num_pass_either = int(ok_all["passes_cutoff_either"].sum()) if len(ok_all) else 0
+    num_pass_both = int((ok_all["passes_cutoff_a"] & ok_all["passes_cutoff_b"]).sum()) if len(ok_all) else 0
+
+    ok = ok_all[ok_all["passes_cutoff_either"]].copy() if args.filter_passing_either else ok_all
+
     summary: Dict[str, object] = {
         "replica_a_dir": args.replica_a_dir,
         "replica_b_dir": args.replica_b_dir,
@@ -283,9 +298,16 @@ def _aggregate_stats(df: pd.DataFrame, args: argparse.Namespace) -> Dict[str, ob
         "replica_b_label": args.replica_b_label,
         "max_sample_index": args.max_sample_index,
         "tmscore_mode": args.tmscore_mode,
+        "ptm_cutoff": args.ptm_cutoff,
+        "filter_passing_either": bool(args.filter_passing_either),
         "num_targets_total": int(len(df)),
+        "num_targets_ok": int(len(ok_all)),
         "num_targets_compared": int(len(ok)),
-        "num_skipped": int(len(df) - len(ok)),
+        "num_skipped": int(len(df) - len(ok_all)),
+        "num_passes_cutoff_a": num_pass_a,
+        "num_passes_cutoff_b": num_pass_b,
+        "num_passes_cutoff_either": num_pass_either,
+        "num_passes_cutoff_both": num_pass_both,
         "skipped_status_counts": {k: int(v) for k, v in skipped_counts.items()},
     }
     if ok.empty:
@@ -320,12 +342,15 @@ def _plot_tm_distribution(
     output_path: Path,
     replica_a_label: str,
     replica_b_label: str,
+    extra_title: str = "",
 ) -> None:
     """Histogram + CDF for TM-score of templates and predictions, side by side."""
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
     bins = np.linspace(0.0, 1.0, 41)
     thresholds = [0.5, 0.6, 0.7, 0.8, 0.9]
     title_suffix = f"{replica_a_label} vs {replica_b_label}"
+    if extra_title:
+        title_suffix += f" {extra_title}"
 
     datasets = [
         ("Templates (top-1)", tm_templates, "tab:blue"),
@@ -381,6 +406,10 @@ def main() -> int:
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--num_workers", type=int, default=min(os.cpu_count() or 1, 16))
     parser.add_argument("--tmscore_mode", type=int, default=5)
+    parser.add_argument("--ptm_cutoff", type=float, default=0.7,
+                        help="pTM cutoff (default 0.7); used to flag passes_cutoff_a/b/either columns")
+    parser.add_argument("--filter_passing_either", action="store_true",
+                        help="Restrict aggregate summary JSON and distribution plot to targets where passes_cutoff_either is True")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -400,7 +429,7 @@ def main() -> int:
     if args.num_workers > 1 and len(protein_ids) > 1:
         with ProcessPoolExecutor(max_workers=args.num_workers) as ex:
             futures = {
-                ex.submit(compare_protein, pid, str(a_dir), str(b_dir), args.max_sample_index, args.tmscore_mode): pid
+                ex.submit(compare_protein, pid, str(a_dir), str(b_dir), args.max_sample_index, args.tmscore_mode, args.ptm_cutoff): pid
                 for pid in protein_ids
             }
             for i, fut in enumerate(as_completed(futures), 1):
@@ -411,7 +440,7 @@ def main() -> int:
                     logger.info("Processed %d/%d (last: %s, status: %s)", i, len(protein_ids), pid, row["status"])
     else:
         for i, pid in enumerate(protein_ids, 1):
-            row = compare_protein(pid, str(a_dir), str(b_dir), args.max_sample_index, args.tmscore_mode)
+            row = compare_protein(pid, str(a_dir), str(b_dir), args.max_sample_index, args.tmscore_mode, args.ptm_cutoff)
             results.append(row)
             logger.info("Processed %d/%d (%s, status: %s)", i, len(protein_ids), pid, row["status"])
 
@@ -427,10 +456,20 @@ def main() -> int:
     logger.info("Wrote %s", json_path)
 
     ok = df[df["status"] == "ok"]
+    if args.filter_passing_either:
+        ok = ok[ok["passes_cutoff_either"]]
+        extra_title = f"[pTM>={args.ptm_cutoff} in >=1 replica, n={len(ok)}]"
+        plot_path = out_dir / "compare_replicas_tm_distribution_passing.png"
+    else:
+        extra_title = f"[all ok targets, n={len(ok)}]"
+        plot_path = out_dir / "compare_replicas_tm_distribution.png"
     tm_templates = _finite_series(ok["tm_templates_TM1"].tolist())
     tm_predictions = _finite_series(ok["tm_predictions_TM1"].tolist())
-    plot_path = out_dir / "compare_replicas_tm_distribution.png"
-    _plot_tm_distribution(tm_templates, tm_predictions, plot_path, args.replica_a_label, args.replica_b_label)
+    _plot_tm_distribution(
+        tm_templates, tm_predictions, plot_path,
+        args.replica_a_label, args.replica_b_label,
+        extra_title=extra_title,
+    )
     logger.info("Wrote %s", plot_path)
 
     logger.info("Summary: compared=%d skipped=%d", summary["num_targets_compared"], summary["num_skipped"])
