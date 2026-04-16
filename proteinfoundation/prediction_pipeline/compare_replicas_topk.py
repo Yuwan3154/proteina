@@ -458,10 +458,10 @@ def main() -> int:
     ok = df[df["status"] == "ok"]
     if args.filter_passing_either:
         ok = ok[ok["passes_cutoff_either"]]
-        extra_title = f"[pTM>={args.ptm_cutoff} in >=1 replica, n={len(ok)}]"
+        extra_title = f"[n={len(ok)}]"
         plot_path = out_dir / "compare_replicas_tm_distribution_passing.png"
     else:
-        extra_title = f"[all ok targets, n={len(ok)}]"
+        extra_title = f"[n={len(ok)}]"
         plot_path = out_dir / "compare_replicas_tm_distribution.png"
     tm_templates = _finite_series(ok["tm_templates_TM1"].tolist())
     tm_predictions = _finite_series(ok["tm_predictions_TM1"].tolist())
