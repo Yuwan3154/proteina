@@ -447,3 +447,78 @@ def import_jax_weights_(model, npz_path, version="model_1"):
 
     # Set weights
     assign(flat, data)
+
+def import_jax_weights_ipa_(model, npz_path, version="model_1"):
+    """
+    Load ONLY the IPA weights from JAX AlphaFold2 npz.
+    """
+    data = np.load(npz_path)
+
+    # We only need LinearParams, LayerNormParams, Param, ParamType
+    LinearParams = lambda l: {
+        "weights": Param(l.weight, param_type=ParamType.LinearWeight),
+        "bias": Param(l.bias),
+    }
+
+    LayerNormParams = lambda l: {
+        "scale": Param(l.weight),
+        "offset": Param(l.bias),
+    }
+
+    IPAParams = lambda ipa: {
+        "q_scalar": LinearParams(ipa.linear_q),
+        "kv_scalar": LinearParams(ipa.linear_kv),
+        "q_point_local": LinearParams(ipa.linear_q_points),
+        "kv_point_local": LinearParams(ipa.linear_kv_points),
+        "trainable_point_weights": Param(
+            param=ipa.head_weights, param_type=ParamType.Other
+        ),
+        "attention_2d": LinearParams(ipa.linear_b),
+        "output_projection": LinearParams(ipa.linear_out),
+    }
+
+    # Only load the IPA sub-dictionary
+    translations = {
+        "structure_module": {
+            "fold_iteration": {
+                "invariant_point_attention": IPAParams(model.coors_3d_decoder.ipa),
+                "attention_layer_norm": LayerNormParams(model.coors_3d_decoder.layer_norm_ipa),
+            }
+        }
+    }
+
+    # Flatten keys and insert missing key prefixes
+    flat = _process_translations_dict(translations)
+
+    # Sanity check
+    keys = list(data.keys())
+    flat_keys = list(flat.keys())
+    incorrect = [k for k in flat_keys if k not in keys]
+
+    assert len(incorrect) == 0, f"Incorrect keys: {incorrect}"
+
+    # Set weights using a tolerant slicer
+    for k, param in flat.items():
+        with torch.no_grad():
+            weights = torch.as_tensor(data[k])
+            ref = param.param
+            param_type = param.param_type
+            if param.stacked:
+                weights = torch.unbind(weights, 0)
+            else:
+                weights = [weights]
+                ref = [ref]
+
+            weights = list(map(param_type.transformation, weights))
+            for p, w in zip(ref, weights):
+                # Slice target weight down to target shape if it is smaller
+                slices = tuple(slice(0, min(s_w, s_p)) for s_w, s_p in zip(w.shape, p.shape))
+                w_sliced = w[slices]
+                if w_sliced.shape != p.shape:
+                    # If p is somehow larger than w, just copy what we can into the top-left
+                    p_slices = tuple(slice(0, s) for s in w_sliced.shape)
+                    p[p_slices] = w_sliced
+                else:
+                    p.copy_(w_sliced)
+
+

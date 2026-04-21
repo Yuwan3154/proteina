@@ -75,6 +75,9 @@ class ModelTrainerBase(L.LightningModule):
         self.discrete_diffusion = None
         self.discrete_diffusion_type = None
         self._init_discrete_diffusion()
+        self.dssp_diffusion = None
+        self.dssp_diffusion_type = None
+        self._init_dssp_diffusion()
 
         # Lazy OpenFold template inference helper
         self._template_inference = None
@@ -623,15 +626,103 @@ class ModelTrainerBase(L.LightningModule):
                 eps=gen_cfg.get("eps", 1e-4),
                 position_bias=position_bias,
             )
+        elif diffusion_type == "udlm":
+            from proteinfoundation.flow_matching import UDLMDiscreteDiffusion
+            udlm_cfg = cfg.get("udlm", cfg.get("md4", {}))
+            self.discrete_diffusion = UDLMDiscreteDiffusion(
+                vocab_size=udlm_cfg.get("vocab_size", 2),
+                noise_schedule_type=udlm_cfg.get("noise_schedule", "cosine"),
+                timesteps=udlm_cfg.get("timesteps", 1000),
+                cont_time=udlm_cfg.get("cont_time", True),
+                sampling_grid=udlm_cfg.get("sampling_grid", "cosine"),
+                eps=udlm_cfg.get("eps", 1e-4),
+                position_bias=position_bias,
+                symmetrize=True,  # Contact maps are symmetric
+            )
         else:
             raise ValueError(
                 f"Unknown discrete diffusion type {diffusion_type}. "
-                "Use 'md4' or 'genmd4'."
+                "Use 'md4', 'genmd4', or 'udlm'."
             )
         self.discrete_diffusion_type = diffusion_type
 
+    def _get_dssp_diffusion_cfg(self):
+        cfg = self.cfg_exp.model.get("dssp_diffusion", None)
+        if cfg is None or not cfg.get("enabled", False):
+            return None
+        return cfg
+
+    def _init_dssp_diffusion(self):
+        """Initialize DSSP discrete diffusion (1D per-residue sequence)."""
+        cfg = self._get_dssp_diffusion_cfg()
+        if cfg is None:
+            self.dssp_diffusion = None
+            self.dssp_diffusion_type = None
+            return
+        diffusion_type = cfg.get("type", "md4")
+        dssp_cfg = cfg.get(diffusion_type, cfg)
+        vocab_size = int(dssp_cfg.get("vocab_size", 3))  # loop, helix, strand
+        if diffusion_type == "md4":
+            self.dssp_diffusion = MD4DiscreteDiffusion(
+                vocab_size=vocab_size,
+                noise_schedule_type=dssp_cfg.get("noise_schedule", "cosine"),
+                timesteps=dssp_cfg.get("timesteps", 1000),
+                cont_time=dssp_cfg.get("cont_time", True),
+                sampling_grid=dssp_cfg.get("sampling_grid", "cosine"),
+                eps=dssp_cfg.get("eps", 1e-4),
+                symmetrize=False,  # DSSP is 1D, no symmetrization
+            )
+        elif diffusion_type == "udlm":
+            from proteinfoundation.flow_matching import UDLMDiscreteDiffusion
+            self.dssp_diffusion = UDLMDiscreteDiffusion(
+                vocab_size=vocab_size,
+                noise_schedule_type=dssp_cfg.get("noise_schedule", "cosine"),
+                timesteps=dssp_cfg.get("timesteps", 1000),
+                cont_time=dssp_cfg.get("cont_time", True),
+                sampling_grid=dssp_cfg.get("sampling_grid", "cosine"),
+                eps=dssp_cfg.get("eps", 1e-4),
+                symmetrize=False,  # DSSP is 1D, no symmetrization
+            )
+        else:
+            raise ValueError(
+                f"Unknown DSSP diffusion type {diffusion_type}. "
+                "Use 'md4' or 'udlm'."
+            )
+        self.dssp_diffusion_type = diffusion_type
+
     def _discrete_diffusion_enabled(self) -> bool:
         return self.discrete_diffusion is not None
+
+    def _dssp_diffusion_enabled(self) -> bool:
+        return getattr(self, "dssp_diffusion", None) is not None
+
+    def _compute_discrete_input_dims(self) -> dict:
+        """Compute NN input dimensions from diffusion config.
+
+        Returns a dict with 'contact_map_input_dim' and 'dssp_input_dim' and
+        'dssp_num_classes' derived from the active diffusion modules.
+
+        For UDLM (uniform): vocab_size (no mask token).
+        For MD4/GenMD4 (absorbing): vocab_size + 1 (extra mask token).
+        """
+        dims = {}
+        if self._discrete_diffusion_enabled():
+            dd = self.discrete_diffusion
+            if dd.mask_token is not None:
+                # Absorbing diffusion: one-hot over vocab_size + 1 (mask)
+                dims["contact_map_input_dim"] = dd.vocab_size + 1
+            else:
+                # UDLM: one-hot over vocab_size only
+                dims["contact_map_input_dim"] = dd.vocab_size
+        if self._dssp_diffusion_enabled():
+            dd = self.dssp_diffusion
+            if dd.mask_token is not None:
+                dims["dssp_input_dim"] = dd.vocab_size + 1
+            else:
+                dims["dssp_input_dim"] = dd.vocab_size
+            # dssp_num_classes: always the actual vocab size (for output head)
+            dims["dssp_num_classes"] = dd.vocab_size
+        return dims
 
     def _pair_mask(self, mask: torch.Tensor) -> torch.Tensor:
         return mask[..., :, None] * mask[..., None, :]
@@ -644,24 +735,60 @@ class ModelTrainerBase(L.LightningModule):
 
     def _contact_tokens_to_input(self, tokens: torch.Tensor) -> torch.Tensor:
         input_dim = int(getattr(self.nn, "contact_map_input_dim", 1))
+        is_uniform = self.discrete_diffusion_type == "udlm"
         if input_dim == 1:
             non_contact_value = getattr(self.nn, "non_contact_value", 0)
             if non_contact_value == -1:
-                contact = torch.ones_like(tokens, dtype=torch.float32)
-                non_contact = -torch.ones_like(tokens, dtype=torch.float32)
-                mask_val = torch.zeros_like(tokens, dtype=torch.float32)
-                return torch.where(
-                    tokens == self.discrete_diffusion.mask_token,
-                    mask_val,
-                    torch.where(tokens == 1, contact, non_contact),
-                )
+                if is_uniform:
+                    # Uniform: tokens are always valid vocab {0, 1}
+                    contact = torch.ones_like(tokens, dtype=torch.float32)
+                    non_contact = -torch.ones_like(tokens, dtype=torch.float32)
+                    return torch.where(tokens == 1, contact, non_contact)
+                else:
+                    contact = torch.ones_like(tokens, dtype=torch.float32)
+                    non_contact = -torch.ones_like(tokens, dtype=torch.float32)
+                    mask_val = torch.zeros_like(tokens, dtype=torch.float32)
+                    return torch.where(
+                        tokens == self.discrete_diffusion.mask_token,
+                        mask_val,
+                        torch.where(tokens == 1, contact, non_contact),
+                    )
             return tokens.float()
+        if is_uniform:
+            # Uniform mode: one-hot over vocab_size (no mask token)
+            num_classes = self.discrete_diffusion.vocab_size
+            result = torch.nn.functional.one_hot(tokens, num_classes=num_classes).float()
+            # Pad to input_dim if needed
+            if num_classes < input_dim:
+                pad = torch.zeros(*result.shape[:-1], input_dim - num_classes,
+                                  device=result.device, dtype=result.dtype)
+                result = torch.cat([result, pad], dim=-1)
+            return result
         if input_dim == 3:
-            num_classes = self.discrete_diffusion.vocab_size + 1
+            num_classes = self.discrete_diffusion.vocab_size + 1  # +1 for mask token
             return torch.nn.functional.one_hot(tokens, num_classes=num_classes).float()
         raise ValueError(
             f"Unsupported contact_map_input_dim {input_dim}. Expected 1 or 3."
         )
+
+    def _dssp_tokens_to_input(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Convert DSSP diffusion tokens to network input (one-hot).
+
+        For absorbing mode (mask_token exists): one-hot over vocab_size + 1
+        For uniform mode (no mask token): one-hot over vocab_size
+        """
+        dssp_vocab = self.dssp_diffusion.vocab_size
+        if self.dssp_diffusion.mask_token is not None:
+            num_classes = dssp_vocab + 1  # +1 for mask token
+        else:
+            num_classes = dssp_vocab
+        return torch.nn.functional.one_hot(
+            tokens.long(), num_classes=num_classes
+        ).float()
+
+    def _dssp_tokens_to_output(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Convert DSSP tokens to clean output representation (long tensor)."""
+        return tokens.long()
 
     def _contact_tokens_to_output(self, tokens: torch.Tensor) -> torch.Tensor:
         non_contact_value = getattr(self.nn, "non_contact_value", 0)
@@ -677,9 +804,22 @@ class ModelTrainerBase(L.LightningModule):
 
         Initializes the SC key to zeros first so all feature params are exercised,
         then optionally runs an SC forward to produce a prediction.
+
+        When DSSP diffusion is enabled, also sets dssp_sc using the shared SC flag.
         """
         sc_key = "contact_map_sc" if contact_map_mode else "x_sc"
         batch[sc_key] = torch.zeros_like(target_clean)
+
+        # Initialize DSSP SC to zeros if DSSP diffusion is enabled
+        dssp_enabled = self._dssp_diffusion_enabled()
+        if dssp_enabled:
+            b, n_res = batch["mask"].shape
+            dssp_vocab = self.dssp_diffusion.vocab_size
+            batch["dssp_sc"] = torch.zeros(
+                b, n_res, dssp_vocab,
+                device=batch["mask"].device,
+                dtype=target_clean.dtype,
+            )
 
         if use_self_cond:
             with torch.no_grad():
@@ -692,6 +832,13 @@ class ModelTrainerBase(L.LightningModule):
                     pred_sc = self._nn_out_to_x_clean(nn_out_sc, batch)
             if pred_sc is not None:
                 batch[sc_key] = self.detach_gradients(pred_sc)
+            # DSSP SC: use softmax of dssp logits as probability distribution
+            if dssp_enabled:
+                dssp_logits_sc = nn_out_sc.get("dssp_logits")
+                if dssp_logits_sc is not None:
+                    batch["dssp_sc"] = torch.softmax(
+                        dssp_logits_sc, dim=-1
+                    ).detach()
 
     def sample_t(self, shape):
         dist_name = self.cfg_exp.loss.t_distribution.name
@@ -774,6 +921,9 @@ class ModelTrainerBase(L.LightningModule):
         zt = None
         zt_2 = None
         contact_map_t_1 = None
+        dssp_enabled = self._dssp_diffusion_enabled()
+        dssp_tokens = None
+        dssp_zt = None
 
         if contact_map_mode:
             if discrete_enabled:
@@ -827,6 +977,24 @@ class ModelTrainerBase(L.LightningModule):
             )
             x_t = self.fm.interpolate(x_0, x_1, t, modality="coordinates")
         
+        # DSSP discrete diffusion: corrupt DSSP tokens using shared timestep t
+        if dssp_enabled:
+            dssp_target = batch.get("dssp_target")
+            if dssp_target is None:
+                raise ValueError(
+                    "dssp_target not found in batch. Ensure DSSPTargetTransform is enabled."
+                )
+            # dssp_target is [b, n] with values in {0, 1, 2} and -1 for padding
+            dssp_tokens = dssp_target.long()
+            # Replace padding (-1) with 0 to avoid indexing errors; mask handles this
+            dssp_tokens = dssp_tokens.clamp(min=0)
+            dssp_tokens = dssp_tokens * mask.long()
+            dssp_zt = self.dssp_diffusion.forward_sample(dssp_tokens, t)
+            dssp_zt = dssp_zt * mask.long()
+            dssp_t_input = self._dssp_tokens_to_input(dssp_zt)
+            dssp_t_input = dssp_t_input * mask[..., None].float()
+            batch["dssp_t"] = dssp_t_input
+
         if self.motif_conditioning:
             batch.update(self.motif_factory(batch))
             x_1 = batch["x_1"] # we need this since we change x_1 based n the motif center
@@ -1010,6 +1178,32 @@ class ModelTrainerBase(L.LightningModule):
                 )
             contact_map_loss = _sanitize_and_log_loss_vec(contact_map_loss, "contact_map_loss")
             train_loss = torch.mean(contact_map_loss)
+
+            # DSSP discrete diffusion loss
+            if dssp_enabled and dssp_tokens is not None and dssp_zt is not None:
+                dssp_logits = nn_out.get("dssp_logits")
+                if dssp_logits is None:
+                    raise ValueError(
+                        "DSSP diffusion requires dssp_logits in model output. "
+                        "Ensure dssp_diffusion_mode=True in nn config."
+                    )
+                dssp_diff_loss = self.dssp_diffusion.diffusion_loss(
+                    dssp_logits, dssp_tokens, dssp_zt, t, pair_mask=mask.float()
+                )
+                dssp_recon_loss = self.dssp_diffusion.recon_loss(mask.float())
+                dssp_prior_loss = self.dssp_diffusion.latent_loss(
+                    dssp_tokens.shape[0], dssp_tokens.device
+                )
+                dssp_loss_total = dssp_diff_loss + dssp_recon_loss + dssp_prior_loss
+                dssp_loss_total = _sanitize_and_log_loss_vec(dssp_loss_total, "dssp_diffusion_loss")
+                dssp_loss_weight = float(self.cfg_exp.model.get("dssp_diffusion", {}).get("loss_weight", 1.0))
+                self.log(
+                    f"{log_prefix}/dssp_diffusion_loss",
+                    torch.mean(dssp_loss_total),
+                    on_step=True, on_epoch=True, prog_bar=False, logger=True,
+                    batch_size=mask.shape[0], sync_dist=True, add_dataloader_idx=False,
+                )
+                train_loss = train_loss + dssp_loss_weight * torch.mean(dssp_loss_total)
 
             if predict_coords:
                 x_1_pred = nn_out["coords_pred"]
@@ -1772,6 +1966,16 @@ class ModelTrainerBase(L.LightningModule):
                 self.discrete_diffusion.position_bias_w_min = w_min
                 self.discrete_diffusion.position_bias_w_max = w_max
                 self.discrete_diffusion.position_bias_k = k
+        # Also propagate sampling_grid to DSSP diffusion if present
+        if self.dssp_diffusion is not None:
+            dssp_sampling_grid = inf_cfg.get("dssp_sampling_grid", inf_cfg.get("sampling_grid", None))
+            if dssp_sampling_grid is not None:
+                if dssp_sampling_grid not in ("uniform", "cosine"):
+                    raise ValueError(
+                        "dssp_sampling_grid must be 'uniform' or 'cosine' "
+                        f"(got {dssp_sampling_grid!r})."
+                    )
+                self.dssp_diffusion.sampling_grid = dssp_sampling_grid
 
     def predict_step(self, batch, batch_idx):
         """
@@ -1938,33 +2142,63 @@ class ModelTrainerBase(L.LightningModule):
 
         contact_map_mode = getattr(self, "contact_map_mode", False)
         discrete_enabled = contact_map_mode and self._discrete_diffusion_enabled()
-        if discrete_enabled:
-            if self.discrete_diffusion_type != "md4":
+        dssp_diff_enabled = self._dssp_diffusion_enabled()
+        if discrete_enabled or dssp_diff_enabled:
+            if discrete_enabled and self.discrete_diffusion_type not in ("md4", "udlm"):
                 raise ValueError("GenMD4 sampling is not implemented for inference.")
-            timesteps = self.discrete_diffusion.timesteps
-            pair_mask = self._pair_mask(mask)
-            zt = self.discrete_diffusion.prior_sample(
-                (nsamples, n, n), device=self.device
-            )
+            # Use contact map timesteps as primary; fall back to DSSP if no contact diffusion
+            if discrete_enabled:
+                timesteps = self.discrete_diffusion.timesteps
+            else:
+                timesteps = self.dssp_diffusion.timesteps
+            pair_mask = self._pair_mask(mask) if discrete_enabled else None
+            # Prior samples
+            zt = None
+            dssp_zt = None
+            if discrete_enabled:
+                zt = self.discrete_diffusion.prior_sample(
+                    (nsamples, n, n), device=self.device
+                )
+            if dssp_diff_enabled:
+                dssp_zt = self.dssp_diffusion.prior_sample(
+                    (nsamples, n), device=self.device
+                )
             contact_map_sc = None
+            dssp_sc = None
             distogram = None
             coords = None
             c_logits = None
+            dssp_logits = None
             stride = max(1, int(trajectory_stride))
             trajectory_tokens = [] if return_trajectory else None
             for i in range(timesteps):
-                s, t = self.discrete_diffusion.get_sampling_grid(i, timesteps)
+                # Use the appropriate diffusion module for grid
+                if discrete_enabled:
+                    s, t = self.discrete_diffusion.get_sampling_grid(i, timesteps)
+                else:
+                    s, t = self.dssp_diffusion.get_sampling_grid(i, timesteps)
                 t_tensor = torch.full((nsamples,), t, device=self.device, dtype=torch.float32)
-                contact_map_t = self._contact_tokens_to_input(zt)
-                contact_map_t = self._apply_pair_mask(contact_map_t, pair_mask)
+
                 nn_in = {
                     "x_t": torch.zeros(
                         nsamples, n, 3, device=self.device, dtype=dtype or torch.float32
                     ),
-                    "contact_map_t": contact_map_t,
                     "t": t_tensor,
                     "mask": mask,
                 }
+
+                # Contact map input
+                if discrete_enabled:
+                    contact_map_t = self._contact_tokens_to_input(zt)
+                    contact_map_t = self._apply_pair_mask(contact_map_t, pair_mask)
+                    nn_in["contact_map_t"] = contact_map_t
+
+                # DSSP input
+                if dssp_diff_enabled:
+                    dssp_t_input = self._dssp_tokens_to_input(dssp_zt)
+                    dssp_t_input = dssp_t_input * mask[..., None].float()
+                    nn_in["dssp_t"] = dssp_t_input
+
                 if cath_code_indices is not None:
                     nn_in["cath_code_indices"] = cath_code_indices
                     if cath_code_indices_mask is not None:
@@ -1979,45 +2213,75 @@ class ModelTrainerBase(L.LightningModule):
                     nn_in["fixed_structure_mask"] = fixed_structure_mask
                 if x_motif is not None:
                     nn_in["x_motif"] = x_motif
+
+                # Self-conditioning (shared flag for both tracks)
                 if self_cond:
-                    if contact_map_sc is None:
-                        contact_map_sc = torch.zeros(
-                            nsamples,
-                            n,
-                            n,
-                            device=self.device,
-                            dtype=contact_map_t.dtype,
-                        )
-                    nn_in["contact_map_sc"] = contact_map_sc
+                    if discrete_enabled:
+                        if contact_map_sc is None:
+                            contact_map_sc = torch.zeros(
+                                nsamples, n, n,
+                                device=self.device,
+                                dtype=(dtype or torch.float32),
+                            )
+                        nn_in["contact_map_sc"] = contact_map_sc
+                    if dssp_diff_enabled:
+                        dssp_vocab = self.dssp_diffusion.vocab_size
+                        if dssp_sc is None:
+                            dssp_sc = torch.zeros(
+                                nsamples, n, dssp_vocab,
+                                device=self.device,
+                                dtype=(dtype or torch.float32),
+                            )
+                        nn_in["dssp_sc"] = dssp_sc
+
                 result = predict_clean_n_v_w_guidance(nn_in)
-                c_logits = result.get("contact_map_logits")
-                if c_logits is None:
-                    raise ValueError(
-                        "discrete diffusion sampling requires contact_map_logits in model output."
-                    )
-                zt = self.discrete_diffusion.sample_step(zt, c_logits, s, t)
-                if return_trajectory and (i % stride == 0):
+
+                # Contact map sampling step
+                if discrete_enabled:
+                    c_logits = result.get("contact_map_logits")
+                    if c_logits is None:
+                        raise ValueError(
+                            "discrete diffusion sampling requires contact_map_logits in model output."
+                        )
+                    zt = self.discrete_diffusion.sample_step(zt, c_logits, s, t)
+
+                # DSSP sampling step
+                if dssp_diff_enabled:
+                    dssp_logits = result.get("dssp_logits")
+                    if dssp_logits is not None:
+                        dssp_zt = self.dssp_diffusion.sample_step(dssp_zt, dssp_logits, s, t)
+
+                if return_trajectory and (i % stride == 0) and zt is not None:
                     trajectory_tokens.append(zt.detach().cpu())
                 distogram = result.get("distogram")
                 coords = result.get("coords")
+
+                # Update self-conditioning
                 if self_cond:
-                    c_pred = result.get("contact_map")
-                    if c_pred is not None:
-                        contact_map_sc = c_pred.detach()
-            if c_logits is None:
-                raise ValueError("discrete diffusion sampling produced no logits.")
-            z0 = self.discrete_diffusion.decode(zt, c_logits)
-            contact_map = self._contact_tokens_to_output(z0)
-            contact_map = self._apply_pair_mask(contact_map, pair_mask)
-            result = {"coords": coords, "contact_map": contact_map, "distogram": distogram}
+                    if discrete_enabled:
+                        c_pred = result.get("contact_map")
+                        if c_pred is not None:
+                            contact_map_sc = c_pred.detach()
+                    if dssp_diff_enabled and dssp_logits is not None:
+                        dssp_sc = torch.softmax(dssp_logits, dim=-1).detach()
+
+            # Decode final results
+            gen_result = {"coords": coords, "distogram": distogram}
+            if discrete_enabled and c_logits is not None:
+                z0 = self.discrete_diffusion.decode(zt, c_logits)
+                contact_map = self._contact_tokens_to_output(z0)
+                contact_map = self._apply_pair_mask(contact_map, pair_mask)
+                gen_result["contact_map"] = contact_map
+            if dssp_diff_enabled and dssp_logits is not None:
+                dssp_z0 = self.dssp_diffusion.decode(dssp_zt, dssp_logits)
+                gen_result["dssp"] = self._dssp_tokens_to_output(dssp_z0)
             if return_trajectory:
                 if trajectory_tokens:
-                    result["trajectory_tokens"] = torch.stack(trajectory_tokens, dim=0)
+                    gen_result["trajectory_tokens"] = torch.stack(trajectory_tokens, dim=0)
                 else:
-                    result["trajectory_tokens"] = torch.empty(
-                        (0, nsamples, n, n), dtype=torch.long
-                    )
-            return result
+                    shape = (0, nsamples, n, n) if discrete_enabled else (0, nsamples, n)
+                    gen_result["trajectory_tokens"] = torch.empty(shape, dtype=torch.long)
+            return gen_result
         modality = "contact_map" if contact_map_mode else "coordinates"
         predict_coords = getattr(self.nn, "predict_coords", True)
 

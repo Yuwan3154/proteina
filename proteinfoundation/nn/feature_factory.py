@@ -584,6 +584,51 @@ class ContactMapScPairFeat(Feature):
             return torch.zeros(b, n, n, self.dim, device=x_t.device, dtype=x_t.dtype)
 
 
+class DsspScSeqFeat(Feature):
+    """Embeds self-conditioned DSSP prediction as a sequence feature.
+
+    Takes the self-conditioning DSSP probabilities from batch["dssp_sc"]
+    (shape [b, n, num_dssp_classes]) and projects them to the sequence
+    representation dimension.
+    """
+
+    def __init__(
+        self,
+        dssp_sc_embed_dim: int = 64,
+        dssp_num_classes: int = 3,
+        **kwargs
+    ):
+        """Initialize the self-conditioning DSSP sequence feature.
+
+        Args:
+            dssp_sc_embed_dim: Output dimension for the embedding.
+            dssp_num_classes: Number of DSSP classes (default 3: loop, helix, strand).
+        """
+        super().__init__(dim=dssp_sc_embed_dim)
+        self.dssp_sc_embed_dim = dssp_sc_embed_dim
+        self.dssp_num_classes = dssp_num_classes
+        self.linear_embed = torch.nn.Linear(dssp_num_classes, dssp_sc_embed_dim, bias=False)
+
+    def forward(self, batch):
+        """Extract and embed the self-conditioning DSSP prediction.
+
+        Args:
+            batch: Dictionary containing "dssp_sc" of shape [b, n, num_dssp_classes]
+                   and "x_t" for shape/device inference.
+
+        Returns:
+            Embedded DSSP SC of shape [b, n, dim]
+        """
+        if "dssp_sc" in batch:
+            dssp_sc = batch["dssp_sc"]  # [b, n, num_dssp_classes]
+            return self.linear_embed(dssp_sc)  # [b, n, dim]
+        else:
+            # If no self-conditioning, return zeros
+            x_t = batch["x_t"]  # [b, n, 3]
+            b, n = x_t.shape[0], x_t.shape[1]
+            return torch.zeros(b, n, self.dim, device=x_t.device, dtype=x_t.dtype)
+
+
 ####################################
 # # Class that produces features # #
 ####################################
@@ -610,6 +655,8 @@ def _get_feature_creator(f: str, mode: Literal["seq", "pair"], **kwargs) -> Feat
             return ResidueTypeEmbeddingSeqFeat(**kwargs)
         elif f == "ext_lig_emb":
             return ExtLigEmbeddingSeqFeat(**kwargs)
+        elif f == "dssp_sc":
+            return DsspScSeqFeat(**kwargs)
         else:
             raise IOError(f"Sequence feature {f} not implemented.")
     elif mode == "pair":

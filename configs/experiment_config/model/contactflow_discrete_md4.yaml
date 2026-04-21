@@ -23,6 +23,17 @@ discrete_diffusion:
     t1: 1e-3
     eps: 1e-4
 
+dssp_diffusion:
+  enabled: false
+  type: md4  # md4 or udlm
+  loss_weight: 1.0
+  vocab_size: 3  # loop, helix, strand
+  noise_schedule: cosine
+  timesteps: 1000
+  cont_time: true
+  sampling_grid: cosine
+  eps: 1e-4
+
 augmentation:
   global_rotation: true  # Still apply to coordinates for FAPE loss if predict_coords is enabled
   naug_rot: 1  # How many augmentations to apply per sample

@@ -165,6 +165,7 @@ class MD4DiscreteDiffusion(nn.Module):
         sampling_grid: str = "cosine",
         eps: float = 1e-4,
         position_bias: Optional[dict] = None,
+        symmetrize: bool = True,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -172,6 +173,7 @@ class MD4DiscreteDiffusion(nn.Module):
         self.timesteps = timesteps
         self.cont_time = cont_time
         self.sampling_grid = sampling_grid
+        self.symmetrize = symmetrize
         self.position_bias = position_bias or {}
         self.position_bias_enabled = bool(self.position_bias.get("enabled", False))
         self.position_bias_mode = _normalize_position_bias_mode(
@@ -234,10 +236,14 @@ class MD4DiscreteDiffusion(nn.Module):
 
     def forward_sample(self, x: Tensor, t: Tensor) -> Tensor:
         alpha_t, _ = self._alpha_and_dgamma(t, x.shape, x.device, x.dtype)
-        rand = _symmetrize_matrix(torch.rand_like(x.float()))
+        rand = torch.rand_like(x.float())
+        if self.symmetrize:
+            rand = _symmetrize_matrix(rand)
         unmask = rand < alpha_t
         zt = torch.where(unmask, x, torch.full_like(x, self.mask_token))
-        return _symmetrize_matrix(zt)
+        if self.symmetrize:
+            zt = _symmetrize_matrix(zt)
+        return zt
 
     def recon_loss(self, pair_mask: Optional[Tensor]) -> Tensor:
         if pair_mask is None:
@@ -268,9 +274,16 @@ class MD4DiscreteDiffusion(nn.Module):
         t: Tensor,
         pair_mask: Optional[Tensor] = None,
     ) -> Tensor:
-        log_p1 = torch.nn.functional.logsigmoid(logits)
-        log_p0 = torch.nn.functional.logsigmoid(-logits)
-        log_p_true = torch.where(x == 1, log_p1, log_p0)
+        if self.vocab_size == 2:
+            # Binary case: use sigmoid (original MD4)
+            log_p1 = torch.nn.functional.logsigmoid(logits)
+            log_p0 = torch.nn.functional.logsigmoid(-logits)
+            log_p_true = torch.where(x == 1, log_p1, log_p0)
+        else:
+            # Multi-class case: use softmax
+            log_p = torch.nn.functional.log_softmax(logits, dim=-1)
+            one_hot_x = torch.nn.functional.one_hot(x, self.vocab_size).float()
+            log_p_true = (one_hot_x * log_p).sum(dim=-1)
 
         mask = (zt == self.mask_token).float()
         if pair_mask is not None:
@@ -337,23 +350,321 @@ class MD4DiscreteDiffusion(nn.Module):
         unmask_prob = torch.clamp(unmask_prob, 0.0, 1.0)
 
         is_mask = zt == self.mask_token
-        u = _symmetrize_matrix(torch.rand_like(zt.float()))
+        u = torch.rand_like(zt.float())
+        if self.symmetrize:
+            u = _symmetrize_matrix(u)
         unmask = (u < unmask_prob) & is_mask
 
-        p_contact = torch.sigmoid(logits)
-        u2 = torch.rand_like(p_contact)
-        sampled = torch.where(u2 < p_contact, torch.ones_like(zt), torch.zeros_like(zt))
+        if self.vocab_size == 2:
+            # Binary: sample from sigmoid
+            p_contact = torch.sigmoid(logits)
+            u2 = torch.rand_like(p_contact)
+            sampled = torch.where(u2 < p_contact, torch.ones_like(zt), torch.zeros_like(zt))
+        else:
+            # Multi-class: sample from softmax
+            probs = torch.softmax(logits, dim=-1)  # [..., vocab_size]
+            flat_probs = probs.reshape(-1, self.vocab_size)
+            sampled_flat = torch.multinomial(flat_probs.clamp_min(0), 1).squeeze(-1)
+            sampled = sampled_flat.reshape(zt.shape)
 
         zt_updated = torch.where(unmask, sampled, zt)
-        return _symmetrize_matrix(zt_updated)
+        if self.symmetrize:
+            zt_updated = _symmetrize_matrix(zt_updated)
+        return zt_updated
 
     def decode(self, zt: Tensor, logits: Tensor) -> Tensor:
         is_mask = zt == self.mask_token
         zt_clipped = torch.where(is_mask, torch.zeros_like(zt), zt)
-        p_contact = torch.sigmoid(logits)
-        sampled = (p_contact >= 0.5).long()
+        if self.vocab_size == 2:
+            p_contact = torch.sigmoid(logits)
+            sampled = (p_contact >= 0.5).long()
+        else:
+            sampled = logits.argmax(dim=-1)
         return torch.where(is_mask, sampled, zt_clipped)
 
+
+class UDLMDiscreteDiffusion(nn.Module):
+    """Uniform Diffusion Language Model (Schiff et al., ICLR 2025).
+
+    Uniform noise discrete diffusion where tokens transition to uniformly
+    random values instead of a special mask token (absorbing diffusion).
+
+    Forward process: q(z_t | x) = alpha(t) * delta(z_t, x) + (1 - alpha(t)) / N
+    where N = vocab_size.
+
+    The training loss uses the continuous-time NELBO from Eq. 18/19, and the
+    reverse process uses the closed-form posterior from Eq. 15.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int = 2,
+        noise_schedule_type: str = "cosine",
+        timesteps: int = 1000,
+        cont_time: bool = True,
+        sampling_grid: str = "cosine",
+        eps: float = 1e-4,
+        position_bias: Optional[dict] = None,
+        symmetrize: bool = False,
+    ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.mask_token = None  # No mask token in uniform diffusion
+        self.timesteps = timesteps
+        self.cont_time = cont_time
+        self.sampling_grid = sampling_grid
+        self.symmetrize = symmetrize
+        self.position_bias = position_bias or {}
+        self.position_bias_enabled = bool(self.position_bias.get("enabled", False))
+        self.position_bias_mode = _normalize_position_bias_mode(
+            self.position_bias.get("mode", "polynomial")
+        )
+        self.position_bias_w_min = float(self.position_bias.get("w_min", 0.2))
+        self.position_bias_w_max = float(self.position_bias.get("w_max", 5.0))
+        self.position_bias_k = float(self.position_bias.get("k", 30.0))
+        self.noise_schedule = MaskingSchedule(
+            schedule_fn_type=noise_schedule_type, eps=eps
+        )
+
+    def _position_w(self, n: int, device: torch.device, dtype: torch.dtype) -> Optional[Tensor]:
+        if not self.position_bias_enabled:
+            return None
+        if self.position_bias_mode != "polynomial":
+            raise NotImplementedError(
+                f"Unknown position bias mode {self.position_bias_mode}"
+            )
+        return _distance_w(
+            n,
+            self.position_bias_w_min,
+            self.position_bias_w_max,
+            device=device,
+            dtype=dtype,
+        )
+
+    def _alpha_and_dalpha(
+        self, t: Tensor, x_shape: tuple, device: torch.device, dtype: torch.dtype
+    ) -> tuple[Tensor, Tensor]:
+        """Return (alpha_t, dalpha_t) with proper broadcasting to data shape."""
+        alpha_cos = self.noise_schedule.alpha(t)
+        dalpha_cos = self.noise_schedule.dalpha(t)
+        alpha_cos = _reverse_broadcast(alpha_cos, len(x_shape))
+        dalpha_cos = _reverse_broadcast(dalpha_cos, len(x_shape))
+
+        if not self.position_bias_enabled:
+            return alpha_cos, dalpha_cos
+
+        if self.position_bias_mode != "sigmoid":
+            raise NotImplementedError(
+                f"UDLM only supports 'sigmoid' position bias, got '{self.position_bias_mode}'"
+            )
+
+        n = x_shape[-1]
+        t_ext = _reverse_broadcast(t, len(x_shape))
+        d_pos = _distance_fraction(n, device=device, dtype=dtype)
+        k = torch.tensor(self.position_bias_k, device=device, dtype=dtype)
+        alpha_sig, dalpha_sig = _sigmoid_alpha(
+            t_ext, d_pos, k, self.noise_schedule.eps
+        )
+
+        # Product schedule: alpha = alpha_cos * alpha_sig
+        alpha_t = alpha_cos * alpha_sig
+        # Product rule: dalpha = dalpha_cos * alpha_sig + alpha_cos * dalpha_sig
+        dalpha_t = dalpha_cos * alpha_sig + alpha_cos * dalpha_sig
+
+        return alpha_t, dalpha_t
+
+    def prior_sample(self, shape: tuple, device: torch.device) -> Tensor:
+        """Sample from prior: uniform over vocabulary."""
+        return torch.randint(0, self.vocab_size, shape, device=device)
+
+    def forward_sample(self, x: Tensor, t: Tensor) -> Tensor:
+        """Corrupt clean tokens using uniform noise.
+
+        Each token is kept with probability alpha(t), replaced with a uniform
+        random token from {0, ..., vocab_size-1} with probability 1 - alpha(t).
+        """
+        alpha_t, _ = self._alpha_and_dalpha(t, x.shape, x.device, x.dtype)
+        rand_tokens = torch.randint_like(x, 0, self.vocab_size)
+        keep_rand = torch.rand_like(x.float())
+        if self.symmetrize:
+            keep_rand = _symmetrize_matrix(keep_rand)
+            rand_tokens = _symmetrize_matrix(rand_tokens)
+        keep_mask = keep_rand < alpha_t
+        zt = torch.where(keep_mask, x, rand_tokens)
+        return zt
+
+    def recon_loss(self, pair_mask: Optional[Tensor]) -> Tensor:
+        """Reconstruction loss.
+
+        In the continuous-time limit (T -> inf), the reconstruction loss goes
+        to zero analytically (Section 4.2, Schiff et al. 2025), because
+        alpha(1/T) -> 1 implies z_{1/T} = x with probability 1.
+        """
+        if pair_mask is None:
+            return torch.tensor(0.0)
+        return torch.zeros(pair_mask.shape[0], device=pair_mask.device)
+
+    def latent_loss(self, batch_size: int, device: torch.device) -> Tensor:
+        return torch.zeros(batch_size, device=device)
+
+    def diffusion_loss(
+        self,
+        logits: Tensor,
+        x: Tensor,
+        zt: Tensor,
+        t: Tensor,
+        pair_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Compute UDLM continuous-time NELBO (Eq. 18/19, Schiff et al. 2025).
+
+        L_inf = integral_0^1 E_q [ (alpha'_t / (N * alpha_t)) *
+            [ N / x_bar_i  -  N / x_bar_theta_i
+              - sum_{j != i} (x_bar_j / x_bar_i)
+                * log( (x_bar_theta_i * x_bar_j) / (x_bar_theta_j * x_bar_i) )
+            ]
+        ] dt
+
+        where:
+            N = vocab_size
+            x_bar = N * alpha_t * x + (1 - alpha_t) * 1  (smoothed clean data)
+            x_bar_theta = N * alpha_t * x_theta + (1 - alpha_t) * 1  (smoothed pred)
+            i = index of z_t (the observed noisy token)
+            x_theta = softmax(logits)  (model prediction of clean data distribution)
+
+        The integral is approximated with Monte Carlo using uniformly sampled t.
+        The weight alpha'_t / (N * alpha_t) < 0 and the bracket <= 0, so the
+        product is non-negative (a valid loss to minimize).
+        """
+        N = self.vocab_size
+        eps = 1e-8  # numerical stability
+
+        # -- noise schedule values --
+        alpha_t, dalpha_t = self._alpha_and_dalpha(t, x.shape, x.device, x.dtype)
+
+        # -- model prediction as probability distribution --
+        if N == 2:
+            p1 = torch.sigmoid(logits)
+            x_theta = torch.stack([1.0 - p1, p1], dim=-1)  # [..., 2]
+        else:
+            x_theta = torch.softmax(logits, dim=-1)  # [..., N]
+
+        # -- one-hot representations --
+        x_onehot = torch.nn.functional.one_hot(x.long(), N).float()   # [*, N]
+        zt_onehot = torch.nn.functional.one_hot(zt.long(), N).float() # [*, N]
+
+        # -- smoothed quantities: x_bar = N * alpha_t * x + (1 - alpha_t) --
+        alpha_ext = alpha_t[..., None]  # add vocab dim
+        x_bar = N * alpha_ext * x_onehot + (1.0 - alpha_ext)
+        x_bar_theta = N * alpha_ext * x_theta + (1.0 - alpha_ext)
+
+        # -- extract values at the observed noisy token index i --
+        x_bar_i = (x_bar * zt_onehot).sum(dim=-1)               # [*]
+        x_bar_theta_i = (x_bar_theta * zt_onehot).sum(dim=-1)   # [*]
+
+        # -- Term 1: N / x_bar_i - N / x_bar_theta_i --
+        term1 = N / x_bar_i.clamp_min(eps) - N / x_bar_theta_i.clamp_min(eps)
+
+        # -- Term 2: sum_{j != i} (x_bar_j / x_bar_i) * log(...) --
+        # log((x_bar_theta_i * x_bar_j) / (x_bar_theta_j * x_bar_i))
+        #   = log(x_bar_theta_i / x_bar_i) - log(x_bar_theta_j / x_bar_j)
+        log_ratio = (
+            torch.log(x_bar_theta.clamp_min(eps))
+            - torch.log(x_bar.clamp_min(eps))
+        )  # [*, N]
+        log_ratio_i = (log_ratio * zt_onehot).sum(dim=-1)  # [*]
+
+        not_i = 1.0 - zt_onehot                              # [*, N]
+        coeff = x_bar * not_i / x_bar_i[..., None].clamp_min(eps)  # [*, N]
+
+        term2 = (coeff * (log_ratio_i[..., None] - log_ratio)).sum(dim=-1)  # [*]
+
+        # -- bracket: term1 - term2 --
+        bracket = term1 - term2
+
+        # -- weight: alpha'_t / (N * alpha_t) --
+        weight = dalpha_t / (N * alpha_t.clamp_min(eps))
+
+        loss_per_pos = weight * bracket
+
+        # -- apply mask --
+        if pair_mask is not None:
+            loss_per_pos = loss_per_pos * pair_mask.float()
+
+        # Sum over spatial dimensions (per-sample loss)
+        return loss_per_pos.sum(dim=tuple(range(1, loss_per_pos.dim())))
+
+    def get_sampling_grid(self, i: int, timesteps: int) -> tuple[float, float]:
+        t = (timesteps - i) / timesteps
+        s = t - 1.0 / timesteps
+        if self.sampling_grid == "cosine":
+            t = math.cos(math.pi / 2.0 * (1.0 - t))
+            s = math.cos(math.pi / 2.0 * (1.0 - s))
+        return s, t
+
+    def sample_step(self, zt: Tensor, logits: Tensor, s: float, t: float) -> Tensor:
+        """Denoising step from time t to time s using the UDLM posterior (Eq. 15).
+
+        p_theta(z_s | z_t) = Cat(z_s; p_s) where, for each class j:
+
+        p_s_j = [ N * alpha_t * (z_t)_j * (x_theta)_j
+                   + (alpha_{t|s} - alpha_t) * (z_t)_j
+                   + (alpha_s - alpha_t) * (x_theta)_j
+                   + (alpha_s - alpha_t) * (1 - alpha_s) / (N * alpha_s)
+                 ] / Z
+
+        where alpha_{t|s} = alpha_t / alpha_s, and Z normalizes to sum 1.
+        """
+        N = self.vocab_size
+        eps = 1e-8
+
+        t_tensor = torch.full((zt.shape[0],), t, device=zt.device, dtype=logits.dtype)
+        s_tensor = torch.full((zt.shape[0],), s, device=zt.device, dtype=logits.dtype)
+
+        # Position-dependent alpha (uses product schedule when PB enabled)
+        alpha_t_b, _ = self._alpha_and_dalpha(t_tensor, zt.shape, zt.device, logits.dtype)
+        alpha_s_b, _ = self._alpha_and_dalpha(s_tensor, zt.shape, zt.device, logits.dtype)
+
+        alpha_ts = (alpha_t_b / alpha_s_b.clamp_min(eps)).clamp(max=1.0)
+
+        # Model prediction
+        if N == 2:
+            p1 = torch.sigmoid(logits)
+            x_theta = torch.stack([1.0 - p1, p1], dim=-1)
+        else:
+            x_theta = torch.softmax(logits, dim=-1)
+
+        zt_onehot = torch.nn.functional.one_hot(zt.long(), N).float()
+
+        alpha_t_ext = alpha_t_b[..., None]
+        alpha_s_ext = alpha_s_b[..., None]
+        alpha_ts_ext = alpha_ts[..., None]
+        diff_as_at = alpha_s_ext - alpha_t_ext
+
+        # Numerator terms per Eq. 15
+        p1_term = N * alpha_t_ext * zt_onehot * x_theta
+        p2_term = (alpha_ts_ext - alpha_t_ext) * zt_onehot
+        p3_term = diff_as_at * x_theta
+        p4_term = diff_as_at * (1.0 - alpha_s_ext) / (N * alpha_s_ext.clamp_min(eps))
+
+        numerator = p1_term + p2_term + p3_term + p4_term
+        numerator = numerator.clamp_min(0.0)
+
+        posterior = numerator / numerator.sum(dim=-1, keepdim=True).clamp_min(eps)
+
+        flat_posterior = posterior.reshape(-1, N)
+        sampled_flat = torch.multinomial(flat_posterior.clamp_min(0), 1).squeeze(-1)
+        z_new = sampled_flat.reshape(zt.shape)
+
+        if self.symmetrize:
+            z_new = _symmetrize_matrix(z_new)
+
+        return z_new
+
+    def decode(self, zt: Tensor, logits: Tensor) -> Tensor:
+        """Decode final tokens: argmax of logits."""
+        if self.vocab_size == 2:
+            return (torch.sigmoid(logits) >= 0.5).long()
+        return logits.argmax(dim=-1)
 
 class GenMD4DiscreteDiffusion(nn.Module):
     """Generalized state-dependent masked diffusion (GenMD4)."""

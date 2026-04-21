@@ -540,10 +540,18 @@ if __name__ == "__main__":
 
     # If this is the first run for fine-tuning, load pre-trained checkpoint and don't load optimizer states
     pretrain_ckpt_path = cfg_exp.get("pretrain_ckpt_path", None)
-    if last_ckpt_path is None and pretrain_ckpt_path is not None:
-        log_info(f"Loading from pre-trained checkpoint path {os.path.expanduser(pretrain_ckpt_path)}")
-        ckpt = torch.load(os.path.expanduser(pretrain_ckpt_path), map_location="cpu", weights_only=False)
-        model.load_state_dict(ckpt["state_dict"], strict=False)
+    if last_ckpt_path is None:
+        if pretrain_ckpt_path is not None:
+            log_info(f"Loading from pre-trained checkpoint path {os.path.expanduser(pretrain_ckpt_path)}")
+            ckpt = torch.load(os.path.expanduser(pretrain_ckpt_path), map_location="cpu", weights_only=False)
+            model.load_state_dict(ckpt["state_dict"], strict=False)
+            
+        af2_ipa_weights_path = cfg_exp.get("af2_ipa_weights_path", None)
+        if af2_ipa_weights_path is not None:
+            log_info(f"Loading IPA weights exclusively from AF2 param path {os.path.expanduser(af2_ipa_weights_path)}")
+            from proteinfoundation.openfold_stub.utils.import_weights import import_jax_weights_ipa_
+            # Passing model.nn since that is the ProteinTransformer containing structure_module
+            import_jax_weights_ipa_(model.nn, os.path.expanduser(af2_ipa_weights_path), version="model_1")
 
     # Train
     plugins = []

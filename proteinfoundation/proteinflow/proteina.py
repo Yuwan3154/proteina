@@ -132,10 +132,14 @@ class Proteina(ModelTrainerBase):
         # - cuequivariance_torch is available, AND
         # - triangle-mult dimensions are compatible (checked inside ProteinTransformerAF3).
         use_cueq_opt = cfg_exp.opt.get("use_cueq", None)
-        if use_cueq_opt is not None:
-            # cfg_exp is a structured OmegaConf; use open_dict to allow adding new keys.
-            with open_dict(cfg_exp.model.nn):
+        with open_dict(cfg_exp.model.nn):
+            if use_cueq_opt is not None:
                 cfg_exp.model.nn.use_cueq = bool(use_cueq_opt)
+            # Dynamically compute discrete input dimensions from diffusion config
+            # so the NN layer sizes are always consistent with the diffusion mode.
+            discrete_dims = self._compute_discrete_input_dims()
+            for key, val in discrete_dims.items():
+                cfg_exp.model.nn[key] = val
         # Pass the DictConfig through so OmegaConf interpolations (e.g. ${oc.env:DATA_PATH})
         # resolve correctly in the actual training environment.
         self.nn = ProteinTransformerAF3(**cfg_exp.model.nn)

@@ -780,13 +780,19 @@ class ProteinTransformerAF3(torch.nn.Module):
                 torch.nn.Linear(kwargs["token_dim"], 3, bias=False),
             )
         elif self.predict_coords == "ipa":
+            self.ipa_token_dim = kwargs.get("ipa_token_dim", kwargs["token_dim"])
+            self.ipa_pair_repr_dim = kwargs.get("ipa_pair_repr_dim", kwargs["pair_repr_dim"])
+            
+            self.ipa_linear_s = torch.nn.Linear(kwargs["token_dim"], self.ipa_token_dim, bias=True)
+            self.ipa_linear_z = torch.nn.Linear(kwargs["pair_repr_dim"], self.ipa_pair_repr_dim, bias=True)
+            
             sm_cfg = kwargs.get("structure_module_cfg", {})
             self.structure_module_cfg = {
-                "c_s": kwargs["token_dim"],
-                "c_z": kwargs["pair_repr_dim"],
+                "c_s": self.ipa_token_dim,
+                "c_z": self.ipa_pair_repr_dim,
                 "c_ipa": sm_cfg.get("c_ipa", 16),
                 "c_resnet": sm_cfg.get("c_resnet", 128),
-                "no_heads_ipa": sm_cfg.get("no_heads_ipa", 12),
+                "no_heads_ipa": kwargs.get("ipa_nheads", 12),
                 "no_qk_points": sm_cfg.get("no_qk_points", 4),
                 "no_v_points": sm_cfg.get("no_v_points", 8),
                 "dropout_rate": sm_cfg.get("dropout_rate", 0.1),
@@ -826,13 +832,27 @@ class ProteinTransformerAF3(torch.nn.Module):
             )
 
         self.predict_dssp = kwargs.get("predict_dssp", False)
-        if self.predict_dssp:
+        self.dssp_diffusion_mode = kwargs.get("dssp_diffusion_mode", False)
+        # DSSP head: needed for both auxiliary loss (predict_dssp) and DSSP diffusion
+        if self.predict_dssp or self.dssp_diffusion_mode:
+            dssp_num_classes = int(kwargs.get("dssp_num_classes", 3))
             self.dssp_head = torch.nn.Sequential(
                 torch.nn.LayerNorm(kwargs["token_dim"]),
-                torch.nn.Linear(kwargs["token_dim"], 3, bias=True),  # 3-state: loop, helix, strand
+                torch.nn.Linear(kwargs["token_dim"], dssp_num_classes, bias=True),
             )
         else:
             self.dssp_head = None
+
+        # DSSP diffusion input embedding
+        if self.dssp_diffusion_mode:
+            dssp_input_dim = int(kwargs.get("dssp_input_dim", 4))  # vocab + 1 for mask token (absorbing)
+            self.dssp_input_dim = dssp_input_dim
+            self.linear_dssp_embed = torch.nn.Linear(
+                dssp_input_dim, kwargs["token_dim"], bias=False
+            )
+        else:
+            self.dssp_input_dim = 0
+            self.linear_dssp_embed = None
 
     def _extend_w_registers(self, seqs, pair, mask, cond_seq):
         """
@@ -1004,6 +1024,18 @@ class ProteinTransformerAF3(torch.nn.Module):
             if self.use_attn_pair_bias:
                 pair_rep = self.pair_repr_builder(batch_nn)  # [b, n, n, pair_dim]
 
+        # DSSP diffusion input embedding (add to sequence representation)
+        if self.dssp_diffusion_mode and self.linear_dssp_embed is not None:
+            dssp_t = batch_nn.get("dssp_t")
+            if dssp_t is not None:
+                if dssp_t.dim() == 2 and dssp_t.shape[-1] != self.dssp_input_dim:
+                    # Token indices → one-hot
+                    dssp_t = torch.nn.functional.one_hot(
+                        dssp_t.long(), num_classes=self.dssp_input_dim
+                    ).float()
+                dssp_embed = self.linear_dssp_embed(dssp_t) * mask[..., None]  # [b, n, token_dim]
+                seqs = seqs + dssp_embed
+
         # Apply registers
         seqs, pair_rep, mask, c = self._extend_w_registers(seqs, pair_rep, mask, c)
         # if torch.isnan(seqs).any() or torch.isinf(seqs).any() or torch.isnan(pair_rep).any() or torch.isinf(pair_rep).any():
@@ -1073,7 +1105,7 @@ class ProteinTransformerAF3(torch.nn.Module):
             #         f"pair_min={pair_rep.min().item()} pair_max={pair_rep.max().item()}"
             #     )
             struct_out = self.coors_3d_decoder(
-                {"single": seqs, "pair": pair_rep},
+                {"single": self.ipa_linear_s(seqs), "pair": self.ipa_linear_z(pair_rep)},
                 aatype=aatype,
                 mask=mask,
                 inplace_safe=False,
@@ -1145,9 +1177,9 @@ class ProteinTransformerAF3(torch.nn.Module):
             else:
                 nn_out["contact_map_pred"] = torch.sigmoid(contact_map_logits)
 
-        # DSSP 3-state secondary structure prediction (auxiliary head)
-        if self.predict_dssp and self.dssp_head is not None:
-            dssp_logits = self.dssp_head(seqs) * mask[..., None]  # [b, n, 3]
+        # DSSP 3-state secondary structure prediction (auxiliary head or diffusion)
+        if (self.predict_dssp or self.dssp_diffusion_mode) and self.dssp_head is not None:
+            dssp_logits = self.dssp_head(seqs) * mask[..., None]  # [b, n, num_dssp_classes]
             nn_out["dssp_logits"] = dssp_logits
 
         return nn_out

@@ -1,0 +1,40 @@
+# Inference config for Contact + DSSP Discrete UDLM mode.
+# Joint sequence conditioned logic incorporating explicit feature tracks for UDLM positional bias.
+defaults:
+  - inference_base
+  - _self_
+
+run_name_: seq_cond_pdb_30M_dssp_no-sin-pos-emb
+ckpt_name: contact_dssp_30M_udlm_pb_v1_beta-2.5-2.0_last.ckpt
+
+self_cond: True
+fold_cond: False
+cath_code_level: "T"
+seq_cond: True
+zero_sin_pos_emb: True
+
+data_dir: ${oc.env:DATA_PATH}/pdb_train/
+# Create from train split after first run: dfs_splits["train"].to_csv("cath_codes_train_<file_id>.csv", columns=["cath_code"])
+cath_code_file: cath_codes_train_df_pdb_f1_minl50_maxl256_mtprotein_etdiffractionEM_minoNone_maxoNone_minr0.0_maxr5.0_hl_rl_rnsrTrue_rpuTrue_l_rcuFalse.csv
+
+# ext_lig inference default: "unknown" (default) or "absent"
+ext_lig_default: "unknown"
+
+# Sampling
+dt: 0.005
+nsamples_per_len: 1024
+max_nsamples: 32
+
+lora:
+  use: False
+  lora_alpha: 32.0
+  lora_dropout: 0.0
+  r: 0
+  train_bias: "none"
+
+sampling_caflow:
+  sampling_mode: sc
+  sc_scale_noise: 0.45
+
+compute_designability: False
+compute_fid: False

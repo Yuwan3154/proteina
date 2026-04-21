@@ -1,0 +1,55 @@
+name: contactflow_discrete_uniform
+
+defaults:
+  - _self_
+  - nn: contact_af3_60M_tri
+
+target_pred: c_1
+
+discrete_diffusion:
+  enabled: true
+  type: udlm
+  udlm:
+    vocab_size: 2
+    noise_schedule: cosine
+    timesteps: 1000
+    cont_time: true
+    sampling_grid: cosine  # uniform or cosine
+    eps: 1e-4
+    position_bias:
+      enabled: false
+      mode: sigmoid
+      k: 10
+
+augmentation:
+  global_rotation: true
+  naug_rot: 1
+
+validation:
+  temp_05:
+    sampling_mode: sc
+    sc_scale_noise: 0.4
+    sc_scale_score: 1.0
+    gt_mode: "1/t"
+    gt_p: 1.0
+    gt_clamp_val: null
+  ode:
+    sampling_mode: vf
+    sc_scale_noise: 0.0
+    sc_scale_score: 0.0
+    gt_mode: "1/t"
+    gt_p: 1.0
+    gt_clamp_val: null
+  temp_035:
+    sampling_mode: sc
+    sc_scale_noise: 0.35
+    sc_scale_score: 1.0
+    gt_mode: "1/t"
+    gt_p: 1.0
+    gt_clamp_val: null
+
+# UDLM (Uniform Diffusion Language Model, Schiff et al. ICLR 2025) discrete contact map
+# diffusion uses uniform noise instead of absorbing (masking).
+# Each token is randomly replaced with a uniform sample from {0, 1} instead of a mask token.
+# The model learns to predict the clean token from corrupted inputs.
+# The training loss is the continuous-time NELBO from the UDLM paper (Eq. 18/19).
