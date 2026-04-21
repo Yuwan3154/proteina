@@ -1,4 +1,4 @@
-name: contact_af3_30M_tri_individual-embed_coor_tanh_ipa-coord
+name: contact_af3_20M_tri_individual-embed_coor_ipa-coord
 
 # Architecture parameters
 token_dim: 128

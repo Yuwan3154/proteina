@@ -1,4 +1,4 @@
-run_name_: dssp_contact_20M_udlm_pb_v1_beta-2-4
+run_name_: dssp_contact_20M_udlm_pb_v1
 
 # Initialize IPA from AF2 model 1 ptm at epoch 0
 af2_ipa_weights_path: /home/ubuntu/params/params_model_1_ptm.npz
@@ -31,7 +31,7 @@ loss:
 
 defaults:
   - model: contactflow_discrete_uniform
-  - override model/nn: contact_af3_20M_tri_individual-embed_coor_tanh_ipa-coord_dssp
+  - override model/nn: contact_af3_20M_tri_individual-embed_coor_ipa-coord_dssp
   - _self_
 
 model:
@@ -95,8 +95,8 @@ lora:
 opt:
   lr: 0.0001
   max_epochs: 1000
-  batch_size: 32
-  accumulate_grad_batches: 4
+  batch_size: 16
+  accumulate_grad_batches: 8
   optimizer: muon
   val_check_interval: 1000
   skip_nan_grad: False
