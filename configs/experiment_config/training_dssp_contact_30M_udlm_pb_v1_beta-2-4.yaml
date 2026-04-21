@@ -1,9 +1,9 @@
-run_name_: contact_dssp_30M_udlm_pb_v1_beta-2.5-2.0
+run_name_: dssp_contact_30M_udlm_pb_v1_beta-2-4
 
 # Initialize IPA from AF2 model 1 ptm at epoch 0
 af2_ipa_weights_path: /home/ubuntu/params/params_model_1_ptm.npz
 # Fallback pretrain if IPA not found or for other layers
-pretrain_ckpt_path: /home/ubuntu/proteina/data/weights/proteina_v1.6_DFS_200M_notri_long_chain_generation.ckpt
+pretrain_ckpt_path: none
 
 hardware:
   ncpus_per_task_train_: 16
@@ -15,14 +15,14 @@ hardware:
 loss:
   t_distribution:
     name: mix_up02_beta
-    p1: 2.5
-    p2: 2.0
+    p1: 2.0
+    p2: 4.0
   loss_t_clamp: 0.9
   use_aux_loss: True
   aux_loss_t_lim: 0.3
   thres_aux_2d_loss: 0.6
   aux_loss_weight: 1.0
-  dssp_aux_loss_weight: 1.0
+  dssp_aux_loss_weight: 0.0
   # Distogram settings (AlphaFold format: 38 bins of 1.25Å width between 3.25-50.75Å + 1 overflow)
   # Must match num_buckets_predict_pair in nn config
   num_dist_buckets: 39  # 38 bins + 1 underflow bucket (distances < 3.25Å are rare for CA/CB)
@@ -47,12 +47,12 @@ model:
     eps: 1e-4
 
   nn:
-    multilabel_mode: "sum" # Note inherited from 190828
+    multilabel_mode: sum # Note inherited from 190828
     residue_type_emb_init_seq: True
     residue_type_emb_cond_seq: True
     residue_type_emb_init_pair: True
     residue_type_emb_cond_pair: True
-    seq_emb_dim: 4
+    seq_emb_dim: 2
     predict_dssp: true
     dssp_diffusion_mode: true # For transformer native embedding
     ext_lig_emb_init_seq: True
@@ -90,13 +90,14 @@ lora:
   lora_alpha: 32.0
   lora_dropout: 0.0
   r: 0
-  train_bias: "none"
+  train_bias: none
 
 opt:
   lr: 0.0001
-  max_epochs: 200
-  batch_size: 2
-  accumulate_grad_batches: 64
+  max_epochs: 1000
+  batch_size: 32
+  accumulate_grad_batches: 4
+  optimizer: muon
   val_check_interval: 1000
   skip_nan_grad: False
   grad_and_weight_analysis: False
@@ -105,7 +106,7 @@ opt:
   use_lr_warmup: True
   warmup_steps: 3000
   warmup_start_lr_ratio: 0.0
-  lr_scheduler_type: "cosine"
+  lr_scheduler_type: cosine
   use_cueq: False
 
 log:

@@ -4,8 +4,8 @@ defaults:
   - inference_base
   - _self_
 
-run_name_: seq_cond_pdb_30M_dssp_no-sin-pos-emb
-ckpt_name: contact_dssp_30M_udlm_pb_v1_beta-2.5-2.0_last.ckpt
+run_name_: seq_cond_pdb_30M_dssp_contact
+ckpt_name: dssp_contact_30M_udlm_pb_v1_beta-2-4_last.ckpt
 
 self_cond: True
 fold_cond: False
