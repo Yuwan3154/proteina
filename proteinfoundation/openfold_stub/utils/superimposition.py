@@ -39,7 +39,7 @@ def _superimpose_single(reference, coords):
     sup = _superimpose_np(reference_np, coords_np)
     rot, tran = sup.get_rotran()
     superimposed, rmsd = sup.get_transformed(), sup.get_rms()
-    return coords.new_tensor(superimposed), coords.new_tensor(rmsd), rot, tran
+    return torch.tensor(superimposed, device=coords.device, dtype=coords.dtype), torch.tensor(rmsd, device=coords.device, dtype=coords.dtype), rot, tran
 
 
 def superimpose(reference, coords, mask, return_transform=False):

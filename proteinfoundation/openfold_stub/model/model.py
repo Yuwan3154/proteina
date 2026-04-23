@@ -111,7 +111,7 @@ class AlphaFold(nn.Module):
         template_embeds = []
         n_templ = batch["template_aatype"].shape[templ_dim]
         for i in range(n_templ):
-            idx = batch["template_aatype"].new_tensor(i)
+            idx = torch.tensor(i, device=batch["template_aatype"].device, dtype=batch["template_aatype"].dtype)
             single_template_feats = tensor_tree_map(
                 lambda t: torch.index_select(t, templ_dim, idx),
                 batch,

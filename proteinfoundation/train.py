@@ -553,6 +553,17 @@ if __name__ == "__main__":
             # Passing model.nn since that is the ProteinTransformer containing structure_module
             import_jax_weights_ipa_(model.nn, os.path.expanduser(af2_ipa_weights_path), version="model_1")
 
+    # Optionally freeze the pretrained IPA structure module — only learn the
+    # projection layers (ipa_linear_s, ipa_linear_z) that live on
+    # ProteinTransformerAF3 directly, not inside coors_3d_decoder.
+    if cfg_exp.get("freeze_ipa", False):
+        if hasattr(model.nn, "coors_3d_decoder") and model.nn.coors_3d_decoder is not None:
+            n_frozen = 0
+            for param in model.nn.coors_3d_decoder.parameters():
+                param.requires_grad = False
+                n_frozen += param.numel()
+            log_info(f"Froze {n_frozen:,} pretrained IPA structure module parameters")
+
     # Train
     plugins = []
     show_prog_bar = args.show_prog_bar

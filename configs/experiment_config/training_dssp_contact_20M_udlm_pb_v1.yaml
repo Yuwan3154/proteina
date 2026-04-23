@@ -2,6 +2,8 @@ run_name_: dssp_contact_20M_udlm_pb_v1
 
 # Initialize IPA from AF2 model 1 ptm at epoch 0
 af2_ipa_weights_path: /home/ubuntu/params/params_model_1_ptm.npz
+# Freeze pretrained IPA structure module weights; only train projection layers
+freeze_ipa: true
 # Fallback pretrain if IPA not found or for other layers
 pretrain_ckpt_path: null
 
@@ -60,7 +62,7 @@ model:
     ext_lig_emb_dim: 3
 
 # Dataset: PDB only (purge-test, no mixed d_FS)
-dataset: pdb_train_contact-CB-10A_S25_max512_purge-test_cutoff-190828
+dataset: pdb_train_contact-CB-10A_S25_max256_purge-test_cutoff-190828
 dataset_config_subdir: pdb
 
 force_precision_f32: False
@@ -95,8 +97,8 @@ lora:
 opt:
   lr: 0.0001
   max_epochs: 1000
-  batch_size: 16
-  accumulate_grad_batches: 8
+  batch_size: 4
+  accumulate_grad_batches: 32
   optimizer: muon
   val_check_interval: 1000
   skip_nan_grad: False

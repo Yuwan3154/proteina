@@ -101,7 +101,7 @@ def build_template_pair_feat(
         (tpb[..., None, :] - tpb[..., None, :, :]) ** 2, dim=-1, keepdim=True
     )
     lower = torch.linspace(min_bin, max_bin, no_bins, device=tpb.device) ** 2
-    upper = torch.cat([lower[:-1], lower.new_tensor([inf])], dim=-1)
+    upper = torch.cat([lower[:-1], torch.tensor([inf], device=lower.device, dtype=lower.dtype)], dim=-1)
     dgram = ((dgram > lower) * (dgram < upper)).type(dgram.dtype)
 
     to_concat = [dgram, template_mask_2d[..., None]]

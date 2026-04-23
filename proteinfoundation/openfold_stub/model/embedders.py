@@ -208,7 +208,7 @@ class RecyclingEmbedder(nn.Module):
         # couldn't find in time.
         squared_bins = self.bins ** 2
         upper = torch.cat(
-            [squared_bins[1:], squared_bins.new_tensor([self.inf])], dim=-1
+            [squared_bins[1:], torch.tensor([self.inf], device=squared_bins.device, dtype=squared_bins.dtype)], dim=-1
         )
         d = torch.sum(
             (x[..., None, :] - x[..., None, :, :]) ** 2, dim=-1, keepdims=True

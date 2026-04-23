@@ -170,16 +170,17 @@ def _to_mat(pairs):
     return mat
 
 
-_QTR_MAT = np.zeros((4, 4, 3, 3))
-_QTR_MAT[..., 0, 0] = _to_mat([("aa", 1), ("bb", 1), ("cc", -1), ("dd", -1)])
-_QTR_MAT[..., 0, 1] = _to_mat([("bc", 2), ("ad", -2)])
-_QTR_MAT[..., 0, 2] = _to_mat([("bd", 2), ("ac", 2)])
-_QTR_MAT[..., 1, 0] = _to_mat([("bc", 2), ("ad", 2)])
-_QTR_MAT[..., 1, 1] = _to_mat([("aa", 1), ("bb", -1), ("cc", 1), ("dd", -1)])
-_QTR_MAT[..., 1, 2] = _to_mat([("cd", 2), ("ab", -2)])
-_QTR_MAT[..., 2, 0] = _to_mat([("bd", 2), ("ac", -2)])
-_QTR_MAT[..., 2, 1] = _to_mat([("cd", 2), ("ab", 2)])
-_QTR_MAT[..., 2, 2] = _to_mat([("aa", 1), ("bb", -1), ("cc", -1), ("dd", 1)])
+_QTR_MAT_NP = np.zeros((4, 4, 3, 3))
+_QTR_MAT_NP[..., 0, 0] = _to_mat([("aa", 1), ("bb", 1), ("cc", -1), ("dd", -1)])
+_QTR_MAT_NP[..., 0, 1] = _to_mat([("bc", 2), ("ad", -2)])
+_QTR_MAT_NP[..., 0, 2] = _to_mat([("bd", 2), ("ac", 2)])
+_QTR_MAT_NP[..., 1, 0] = _to_mat([("bc", 2), ("ad", 2)])
+_QTR_MAT_NP[..., 1, 1] = _to_mat([("aa", 1), ("bb", -1), ("cc", 1), ("dd", -1)])
+_QTR_MAT_NP[..., 1, 2] = _to_mat([("cd", 2), ("ab", -2)])
+_QTR_MAT_NP[..., 2, 0] = _to_mat([("bd", 2), ("ac", -2)])
+_QTR_MAT_NP[..., 2, 1] = _to_mat([("cd", 2), ("ab", 2)])
+_QTR_MAT_NP[..., 2, 2] = _to_mat([("aa", 1), ("bb", -1), ("cc", -1), ("dd", 1)])
+_QTR_MAT = torch.from_numpy(_QTR_MAT_NP)
 
 
 def quat_to_rot(quat: torch.Tensor) -> torch.Tensor:
@@ -195,7 +196,7 @@ def quat_to_rot(quat: torch.Tensor) -> torch.Tensor:
     quat = quat[..., None] * quat[..., None, :]
 
     # [4, 4, 3, 3]
-    mat = quat.new_tensor(_QTR_MAT, requires_grad=False)
+    mat = _QTR_MAT.to(device=quat.device, dtype=quat.dtype)
 
     # [*, 4, 4, 3, 3]
     shaped_qtr_mat = mat.view((1,) * len(quat.shape[:-2]) + mat.shape)
@@ -227,33 +228,34 @@ def rot_to_quat(
     return vectors[..., -1]
 
 
-_QUAT_MULTIPLY = np.zeros((4, 4, 4))
-_QUAT_MULTIPLY[:, :, 0] = [[ 1, 0, 0, 0],
+_QUAT_MULTIPLY_NP = np.zeros((4, 4, 4))
+_QUAT_MULTIPLY_NP[:, :, 0] = [[ 1, 0, 0, 0],
                           [ 0,-1, 0, 0],
                           [ 0, 0,-1, 0],
                           [ 0, 0, 0,-1]]
 
-_QUAT_MULTIPLY[:, :, 1] = [[ 0, 1, 0, 0],
+_QUAT_MULTIPLY_NP[:, :, 1] = [[ 0, 1, 0, 0],
                           [ 1, 0, 0, 0],
                           [ 0, 0, 0, 1],
                           [ 0, 0,-1, 0]]
 
-_QUAT_MULTIPLY[:, :, 2] = [[ 0, 0, 1, 0],
+_QUAT_MULTIPLY_NP[:, :, 2] = [[ 0, 0, 1, 0],
                           [ 0, 0, 0,-1],
                           [ 1, 0, 0, 0],
                           [ 0, 1, 0, 0]]
 
-_QUAT_MULTIPLY[:, :, 3] = [[ 0, 0, 0, 1],
+_QUAT_MULTIPLY_NP[:, :, 3] = [[ 0, 0, 0, 1],
                           [ 0, 0, 1, 0],
                           [ 0,-1, 0, 0],
                           [ 1, 0, 0, 0]]
 
+_QUAT_MULTIPLY = torch.from_numpy(_QUAT_MULTIPLY_NP)
 _QUAT_MULTIPLY_BY_VEC = _QUAT_MULTIPLY[:, 1:, :]
 
 
 def quat_multiply(quat1, quat2):
     """Multiply a quaternion by another quaternion."""
-    mat = quat1.new_tensor(_QUAT_MULTIPLY)
+    mat = _QUAT_MULTIPLY.to(device=quat1.device, dtype=quat1.dtype)
     reshaped_mat = mat.view((1,) * len(quat1.shape[:-1]) + mat.shape)
     return torch.sum(
         reshaped_mat *
@@ -265,7 +267,7 @@ def quat_multiply(quat1, quat2):
 
 def quat_multiply_by_vec(quat, vec):
     """Multiply a quaternion by a pure-vector quaternion."""
-    mat = quat.new_tensor(_QUAT_MULTIPLY_BY_VEC)
+    mat = _QUAT_MULTIPLY_BY_VEC.to(device=quat.device, dtype=quat.dtype)
     reshaped_mat = mat.view((1,) * len(quat.shape[:-1]) + mat.shape)
     return torch.sum(
         reshaped_mat *
@@ -296,6 +298,7 @@ class Rotation:
         to mimic the behavior of a torch Tensor, almost as if each Rotation
         object were a tensor of rotations, in one format or another.
     """
+    @torch.compiler.disable
     def __init__(self,
         rot_mats: Optional[torch.Tensor] = None,
         quats: Optional[torch.Tensor] = None,
@@ -322,11 +325,6 @@ class Rotation:
                 "Incorrectly shaped rotation matrix or quaternion"
             )
 
-        # Force full-precision
-        if(quats is not None):
-            quats = quats.type(torch.float32)
-        if(rot_mats is not None):
-            rot_mats = rot_mats.type(torch.float32)
 
         if(quats is not None and normalize_quats):
             quats = quats / torch.linalg.norm(quats, dim=-1, keepdim=True)
@@ -857,6 +855,7 @@ class Rigid:
         Designed to behave approximately like a single torch tensor with the 
         shape of the shared batch dimensions of its component parts.
     """
+    @torch.compiler.disable
     def __init__(self, 
         rots: Optional[Rotation],
         trans: Optional[torch.Tensor],
@@ -895,8 +894,6 @@ class Rigid:
            (rots.device != trans.device)):
             raise ValueError("Rots and trans incompatible")
 
-        # Force full precision. Happens to the rotations automatically.
-        trans = trans.type(torch.float32)
 
         self._rots = rots
         self._trans = trans

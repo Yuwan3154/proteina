@@ -1143,7 +1143,7 @@ class ProteinTransformerAF3(torch.nn.Module):
             coords_pred = atom37 / 10.0
             nn_out["coords_pred"] = coords_pred
             # Convert frame translations Å -> nm (quaternions unchanged).
-            frame_scale = frames7.new_tensor([1.0, 1.0, 1.0, 1.0, 0.1, 0.1, 0.1])
+            frame_scale = torch.tensor([1.0, 1.0, 1.0, 1.0, 0.1, 0.1, 0.1], device=frames7.device, dtype=frames7.dtype)
             nn_out["frames_pred"] = frames7 * frame_scale
         elif self.contact_map_mode and self.predict_coords == "linear":
             raw = self.coors_3d_decoder(seqs)  # [b, n, 9]

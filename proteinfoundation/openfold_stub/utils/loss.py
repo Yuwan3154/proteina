@@ -352,7 +352,7 @@ def supervised_chi_loss(
     chi_pi_periodic = torch.einsum(
         "...ij,jk->ik",
         residue_type_one_hot.type(angles_sin_cos.dtype),
-        angles_sin_cos.new_tensor(residue_constants.chi_pi_periodic),
+        torch.tensor(residue_constants.chi_pi_periodic, device=angles_sin_cos.device, dtype=angles_sin_cos.dtype),
     )
 
     true_chi = chi_angles_sin_cos[None]
@@ -962,14 +962,14 @@ def between_residue_clash_loss(
 
     # Backbone C--N bond between subsequent residues is no clash.
     c_one_hot = torch.nn.functional.one_hot(
-        residue_index.new_tensor(2), num_classes=14
+        torch.tensor(2, device=residue_index.device, dtype=residue_index.dtype), num_classes=14
     )
     c_one_hot = c_one_hot.reshape(
         *((1,) * len(residue_index.shape[:-1])), *c_one_hot.shape
     )
     c_one_hot = c_one_hot.type(fp_type)
     n_one_hot = torch.nn.functional.one_hot(
-        residue_index.new_tensor(0), num_classes=14
+        torch.tensor(0, device=residue_index.device, dtype=residue_index.dtype), num_classes=14
     )
     n_one_hot = n_one_hot.reshape(
         *((1,) * len(residue_index.shape[:-1])), *n_one_hot.shape
@@ -989,7 +989,7 @@ def between_residue_clash_loss(
     # Disulfide bridge between two cysteines is no clash.
     cys = residue_constants.restype_name_to_atom14_names["CYS"]
     cys_sg_idx = cys.index("SG")
-    cys_sg_idx = residue_index.new_tensor(cys_sg_idx)
+    cys_sg_idx = torch.tensor(cys_sg_idx, device=residue_index.device, dtype=residue_index.dtype)
     cys_sg_idx = cys_sg_idx.reshape(
         *((1,) * len(residue_index.shape[:-1])), 1
     ).squeeze(-1)
@@ -1156,7 +1156,7 @@ def find_structural_violations(
         residue_constants.van_der_waals_radius[name[0]]
         for name in residue_constants.atom_types
     ]
-    atomtype_radius = atom14_pred_positions.new_tensor(atomtype_radius)
+    atomtype_radius = torch.tensor(atomtype_radius, device=atom14_pred_positions.device, dtype=atom14_pred_positions.dtype)
     atom14_atom_radius = (
         batch["atom14_atom_exists"]
         * atomtype_radius[batch["residx_atom14_to_atom37"]]
@@ -1179,11 +1179,11 @@ def find_structural_violations(
         bond_length_tolerance_factor=violation_tolerance_factor,
     )
     atom14_atom_exists = batch["atom14_atom_exists"]
-    atom14_dists_lower_bound = atom14_pred_positions.new_tensor(
-        restype_atom14_bounds["lower_bound"]
+    atom14_dists_lower_bound = torch.tensor(
+        restype_atom14_bounds["lower_bound"], device=atom14_pred_positions.device, dtype=atom14_pred_positions.dtype
     )[batch["aatype"]]
-    atom14_dists_upper_bound = atom14_pred_positions.new_tensor(
-        restype_atom14_bounds["upper_bound"]
+    atom14_dists_upper_bound = torch.tensor(
+        restype_atom14_bounds["upper_bound"], device=atom14_pred_positions.device, dtype=atom14_pred_positions.dtype
     )[batch["aatype"]]
     residue_violations = within_residue_violations(
         atom14_pred_positions=atom14_pred_positions,
@@ -1645,7 +1645,7 @@ class AlphaFoldLoss(nn.Module):
             loss = loss_fn()
             if(torch.isnan(loss) or torch.isinf(loss)):
                 logging.warning(f"{loss_name} loss is NaN. Skipping...")
-                loss = loss.new_tensor(0., requires_grad=True)
+                loss = torch.tensor(0., device=loss.device, dtype=loss.dtype, requires_grad=True)
             cum_loss = cum_loss + weight * loss
             losses[loss_name] = loss.detach().clone()
 
