@@ -20,6 +20,13 @@ For each target:
 - Run USalign -TMscore 5 -outfmt 2 on (a_template, b_template) and
   (a_prediction, b_prediction); record TM1/TM2/RMSD/Lali/L1/L2.
 - Emit per-target CSV and an aggregate JSON summary.
+
+Optional ground-truth mode (--use_ground_truth, requires --cif_dir):
+- For each protein, select the "winner" side (higher min_ptm) and also run
+  USalign of (winner_template, GT) and (winner_prediction, GT) to test whether
+  replica convergence correlates with ground-truth prediction quality.
+- Reports scatter plots of (replica a-vs-b TM) vs (winner-vs-GT TM) for both
+  templates and predictions, in unfiltered and passing variants.
 """
 
 from __future__ import annotations
@@ -173,10 +180,21 @@ def _select_top1(
     return _pick_top1_subset(merged[merged["sample_index"] < max_sample_index], inference_dir, protein_id)
 
 
-def _run_usalign_pair(pdb_a: str, pdb_b: str, tmscore_mode: int) -> Dict[str, float]:
+def _run_usalign_pair(
+    pdb_a: str,
+    pdb_b: str,
+    tmscore_mode: int,
+    chain1: Optional[str] = None,
+    chain2: Optional[str] = None,
+) -> Dict[str, float]:
     """Run USalign on a pair and return metrics dict with NaN on failure."""
     nan = {"TM1": float("nan"), "TM2": float("nan"), "RMSD": float("nan"), "L1": float("nan"), "L2": float("nan"), "Lali": float("nan")}
-    cmd = ["USalign", pdb_a, pdb_b, "-TMscore", str(int(tmscore_mode)), "-outfmt", "2"]
+    cmd = ["USalign", pdb_a, pdb_b]
+    if chain1 is not None:
+        cmd += ["-chain1", chain1]
+    if chain2 is not None:
+        cmd += ["-chain2", chain2]
+    cmd += ["-TMscore", str(int(tmscore_mode)), "-outfmt", "2"]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         logger.warning("USalign failed (rc=%d) for %s vs %s: %s", proc.returncode, pdb_a, pdb_b, proc.stderr.strip()[:200])
@@ -196,7 +214,83 @@ def _run_usalign_pair(pdb_a: str, pdb_b: str, tmscore_mode: int) -> Dict[str, fl
     return {"TM1": _get(2), "TM2": _get(3), "RMSD": _get(4), "L1": _get(8), "L2": _get(9), "Lali": _get(10)}
 
 
-def _empty_row(protein_id: str, status: str) -> Dict[str, object]:
+def _default_chain(protein_id: str) -> Optional[str]:
+    return protein_id.split("_", 1)[1] if "_" in protein_id else None
+
+
+def _find_reference_cif(protein_id: str, cif_dir: str) -> Optional[str]:
+    pdb_id = protein_id.split("_")[0]
+    base = Path(cif_dir)
+    direct = base / f"{pdb_id}.cif"
+    if direct.exists():
+        return str(direct)
+    if base.is_dir():
+        for child in sorted(base.iterdir()):
+            cand = child / f"{pdb_id}.cif"
+            if cand.exists():
+                return str(cand)
+    return None
+
+
+_GT_COLUMNS = (
+    "winner_side",
+    "gt_path",
+    "gt_missing",
+    "tm_gt_winner_template_TM1",
+    "tm_gt_winner_template_TM2",
+    "rmsd_gt_winner_template",
+    "tm_gt_winner_prediction_TM1",
+    "tm_gt_winner_prediction_TM2",
+    "rmsd_gt_winner_prediction",
+)
+
+
+def _empty_gt_dict() -> Dict[str, object]:
+    nan = float("nan")
+    return {
+        "winner_side": "",
+        "gt_path": "",
+        "gt_missing": True,
+        "tm_gt_winner_template_TM1": nan,
+        "tm_gt_winner_template_TM2": nan,
+        "rmsd_gt_winner_template": nan,
+        "tm_gt_winner_prediction_TM1": nan,
+        "tm_gt_winner_prediction_TM2": nan,
+        "rmsd_gt_winner_prediction": nan,
+    }
+
+
+def _compute_gt_metrics(
+    protein_id: str,
+    top_a: Dict[str, object],
+    top_b: Dict[str, object],
+    cif_dir: str,
+    tmscore_mode: int,
+) -> Dict[str, object]:
+    winner = "a" if float(top_a["min_ptm"]) >= float(top_b["min_ptm"]) else "b"
+    top_w = top_a if winner == "a" else top_b
+    gt_path = _find_reference_cif(protein_id, cif_dir)
+    if gt_path is None:
+        out = _empty_gt_dict()
+        out["winner_side"] = winner
+        return out
+    chain1 = _default_chain(protein_id)
+    tm_tpl = _run_usalign_pair(gt_path, str(top_w["template_path"]), tmscore_mode, chain1=chain1)
+    tm_prd = _run_usalign_pair(gt_path, str(top_w["prediction_path"]), tmscore_mode, chain1=chain1)
+    return {
+        "winner_side": winner,
+        "gt_path": gt_path,
+        "gt_missing": False,
+        "tm_gt_winner_template_TM1": tm_tpl["TM1"],
+        "tm_gt_winner_template_TM2": tm_tpl["TM2"],
+        "rmsd_gt_winner_template": tm_tpl["RMSD"],
+        "tm_gt_winner_prediction_TM1": tm_prd["TM1"],
+        "tm_gt_winner_prediction_TM2": tm_prd["TM2"],
+        "rmsd_gt_winner_prediction": tm_prd["RMSD"],
+    }
+
+
+def _empty_row(protein_id: str, status: str, use_ground_truth: bool = False) -> Dict[str, object]:
     nan = float("nan")
     row = {
         "protein_id": protein_id,
@@ -212,6 +306,8 @@ def _empty_row(protein_id: str, status: str) -> Dict[str, object]:
         "passes_cutoff_a": False, "passes_cutoff_b": False, "passes_cutoff_either": False,
         "status": status,
     }
+    if use_ground_truth:
+        row.update(_empty_gt_dict())
     return row
 
 
@@ -221,6 +317,8 @@ def _build_row(
     top_b: Dict[str, object],
     tmscore_mode: int,
     ptm_cutoff: float,
+    use_ground_truth: bool = False,
+    cif_dir: Optional[str] = None,
 ) -> Dict[str, object]:
     tm_templates = _run_usalign_pair(top_a["template_path"], top_b["template_path"], tmscore_mode)
     tm_predictions = _run_usalign_pair(top_a["prediction_path"], top_b["prediction_path"], tmscore_mode)
@@ -228,7 +326,7 @@ def _build_row(
     passes_a = bool(top_a["min_ptm"] >= ptm_cutoff)
     passes_b = bool(top_b["min_ptm"] >= ptm_cutoff)
 
-    return {
+    row: Dict[str, object] = {
         "protein_id": protein_id,
         "a_sample_index": top_a["sample_index"],
         "b_sample_index": top_b["sample_index"],
@@ -254,6 +352,10 @@ def _build_row(
         "passes_cutoff_either": bool(passes_a or passes_b),
         "status": "ok",
     }
+    if use_ground_truth:
+        assert cif_dir is not None
+        row.update(_compute_gt_metrics(protein_id, top_a, top_b, cif_dir, tmscore_mode))
+    return row
 
 
 def compare_protein(
@@ -263,25 +365,28 @@ def compare_protein(
     max_sample_index: int,
     tmscore_mode: int,
     ptm_cutoff: float,
+    use_ground_truth: bool = False,
+    cif_dir: Optional[str] = None,
 ) -> Dict[str, object]:
     a_dir = Path(replica_a_dir)
     b_dir = Path(replica_b_dir)
 
     merged_a, err_a = _load_merged_m1_m2(a_dir, protein_id)
     if merged_a is None:
-        return _empty_row(protein_id, f"a_{err_a}")
+        return _empty_row(protein_id, f"a_{err_a}", use_ground_truth=use_ground_truth)
     merged_b, err_b = _load_merged_m1_m2(b_dir, protein_id)
     if merged_b is None:
-        return _empty_row(protein_id, f"b_{err_b}")
+        return _empty_row(protein_id, f"b_{err_b}", use_ground_truth=use_ground_truth)
 
     top_a, err_a = _select_top1(merged_a, a_dir, protein_id, max_sample_index)
     if top_a is None:
-        return _empty_row(protein_id, f"a_{err_a}")
+        return _empty_row(protein_id, f"a_{err_a}", use_ground_truth=use_ground_truth)
     top_b, err_b = _select_top1(merged_b, b_dir, protein_id, max_sample_index)
     if top_b is None:
-        return _empty_row(protein_id, f"b_{err_b}")
+        return _empty_row(protein_id, f"b_{err_b}", use_ground_truth=use_ground_truth)
 
-    return _build_row(protein_id, top_a, top_b, tmscore_mode, ptm_cutoff)
+    return _build_row(protein_id, top_a, top_b, tmscore_mode, ptm_cutoff,
+                      use_ground_truth=use_ground_truth, cif_dir=cif_dir)
 
 
 def compare_protein_self(
@@ -290,24 +395,27 @@ def compare_protein_self(
     max_sample_index: int,
     tmscore_mode: int,
     ptm_cutoff: float,
+    use_ground_truth: bool = False,
+    cif_dir: Optional[str] = None,
 ) -> Dict[str, object]:
     a_dir = Path(replica_a_dir)
 
     merged, err = _load_merged_m1_m2(a_dir, protein_id)
     if merged is None:
-        return _empty_row(protein_id, f"a_{err}")
+        return _empty_row(protein_id, f"a_{err}", use_ground_truth=use_ground_truth)
 
     first = merged[merged["sample_index"] < max_sample_index]
     second = merged[(merged["sample_index"] >= max_sample_index) & (merged["sample_index"] < 2 * max_sample_index)]
 
     top_a, err_a = _pick_top1_subset(first, a_dir, protein_id)
     if top_a is None:
-        return _empty_row(protein_id, f"a_{err_a}")
+        return _empty_row(protein_id, f"a_{err_a}", use_ground_truth=use_ground_truth)
     top_b, err_b = _pick_top1_subset(second, a_dir, protein_id)
     if top_b is None:
-        return _empty_row(protein_id, f"b_{err_b}")
+        return _empty_row(protein_id, f"b_{err_b}", use_ground_truth=use_ground_truth)
 
-    return _build_row(protein_id, top_a, top_b, tmscore_mode, ptm_cutoff)
+    return _build_row(protein_id, top_a, top_b, tmscore_mode, ptm_cutoff,
+                      use_ground_truth=use_ground_truth, cif_dir=cif_dir)
 
 
 def _load_protein_ids_from_input(input_path: str, id_col: str) -> List[str]:
@@ -323,7 +431,21 @@ def _finite_series(values: List[float]) -> np.ndarray:
     return arr
 
 
-def _aggregate_stats(df: pd.DataFrame, args: argparse.Namespace, passing_only: bool, self_mode: bool = False) -> Dict[str, object]:
+def _pearson_r(x: np.ndarray, y: np.ndarray) -> Optional[float]:
+    if x.size < 2 or y.size < 2:
+        return None
+    if float(x.std()) == 0.0 or float(y.std()) == 0.0:
+        return None
+    return float(np.corrcoef(x, y)[0, 1])
+
+
+def _aggregate_stats(
+    df: pd.DataFrame,
+    args: argparse.Namespace,
+    passing_only: bool,
+    self_mode: bool = False,
+    use_ground_truth: bool = False,
+) -> Dict[str, object]:
     ok_all = df[df["status"] == "ok"].copy()
     skipped_counts = df[df["status"] != "ok"]["status"].value_counts().to_dict()
     num_pass_a = int(ok_all["passes_cutoff_a"].sum()) if len(ok_all) else 0
@@ -356,6 +478,10 @@ def _aggregate_stats(df: pd.DataFrame, args: argparse.Namespace, passing_only: b
     if self_mode:
         summary["first_half_range"] = [0, int(args.max_sample_index)]
         summary["second_half_range"] = [int(args.max_sample_index), int(2 * args.max_sample_index)]
+    if use_ground_truth:
+        summary["use_ground_truth"] = True
+        summary["cif_dir"] = args.cif_dir
+        summary["num_gt_missing"] = int(ok_all["gt_missing"].sum()) if "gt_missing" in ok_all.columns and len(ok_all) else 0
     if ok.empty:
         return summary
 
@@ -379,6 +505,51 @@ def _aggregate_stats(df: pd.DataFrame, args: argparse.Namespace, passing_only: b
     for thresh in (0.5, 0.6, 0.7, 0.8, 0.9):
         summary[f"fraction_tm_templates_ge_{thresh}"] = float((ok["tm_templates_TM1"] >= thresh).mean())
         summary[f"fraction_tm_predictions_ge_{thresh}"] = float((ok["tm_predictions_TM1"] >= thresh).mean())
+
+    if use_ground_truth:
+        gt_ok = ok[~ok["gt_missing"]] if "gt_missing" in ok.columns else ok.iloc[0:0]
+        summary["num_gt_used"] = int(len(gt_ok))
+        for col in ["tm_gt_winner_template_TM1", "tm_gt_winner_prediction_TM1",
+                    "rmsd_gt_winner_template", "rmsd_gt_winner_prediction"]:
+            arr = _finite_series(gt_ok[col].tolist()) if col in gt_ok.columns else np.array([])
+            summary[f"stats_{col}"] = (
+                {"mean": None, "median": None, "std": None, "min": None, "max": None, "n": 0}
+                if arr.size == 0
+                else {
+                    "mean": float(arr.mean()),
+                    "median": float(np.median(arr)),
+                    "std": float(arr.std(ddof=0)),
+                    "min": float(arr.min()),
+                    "max": float(arr.max()),
+                    "n": int(arr.size),
+                }
+            )
+
+        def _paired(x_col: str, y_col: str) -> Tuple[np.ndarray, np.ndarray]:
+            if x_col not in gt_ok.columns or y_col not in gt_ok.columns:
+                return np.array([]), np.array([])
+            x = gt_ok[x_col].to_numpy(dtype=float)
+            y = gt_ok[y_col].to_numpy(dtype=float)
+            mask = np.isfinite(x) & np.isfinite(y)
+            return x[mask], y[mask]
+
+        x_t, y_t = _paired("tm_templates_TM1", "tm_gt_winner_template_TM1")
+        x_p, y_p = _paired("tm_predictions_TM1", "tm_gt_winner_prediction_TM1")
+        summary["pearson_r_templates_vs_gt"] = _pearson_r(x_t, y_t)
+        summary["pearson_r_predictions_vs_gt"] = _pearson_r(x_p, y_p)
+        summary["n_pairs_templates_vs_gt"] = int(x_t.size)
+        summary["n_pairs_predictions_vs_gt"] = int(x_p.size)
+
+        winner_counts = gt_ok["winner_side"].value_counts().to_dict() if "winner_side" in gt_ok.columns else {}
+        summary["winner_side_counts"] = {str(k): int(v) for k, v in winner_counts.items()}
+
+        for thresh in (0.5, 0.7, 0.8, 0.9):
+            if len(gt_ok):
+                summary[f"fraction_gt_winner_template_ge_{thresh}"] = float((gt_ok["tm_gt_winner_template_TM1"] >= thresh).mean())
+                summary[f"fraction_gt_winner_prediction_ge_{thresh}"] = float((gt_ok["tm_gt_winner_prediction_TM1"] >= thresh).mean())
+            else:
+                summary[f"fraction_gt_winner_template_ge_{thresh}"] = None
+                summary[f"fraction_gt_winner_prediction_ge_{thresh}"] = None
     return summary
 
 
@@ -440,6 +611,48 @@ def _plot_tm_distribution(
     plt.close(fig)
 
 
+def _plot_gt_scatter(
+    ok_df: pd.DataFrame,
+    output_path: Path,
+    replica_a_label: str,
+    replica_b_label: str,
+    extra_title: str = "",
+) -> None:
+    """1x2 scatter: replica a-vs-b TM (x) vs winner-vs-GT TM (y), for templates and predictions."""
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
+    panels = [
+        ("Templates", "tm_templates_TM1", "tm_gt_winner_template_TM1"),
+        ("Predictions", "tm_predictions_TM1", "tm_gt_winner_prediction_TM1"),
+    ]
+    for ax, (name, x_col, y_col) in zip(axes, panels):
+        if x_col not in ok_df.columns or y_col not in ok_df.columns:
+            ax.text(0.5, 0.5, "no GT data", ha="center", va="center", transform=ax.transAxes)
+            ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+            ax.set_title(name)
+            continue
+        x = ok_df[x_col].to_numpy(dtype=float)
+        y = ok_df[y_col].to_numpy(dtype=float)
+        mask = np.isfinite(x) & np.isfinite(y)
+        x, y = x[mask], y[mask]
+        ax.scatter(x, y, s=18, alpha=0.75, color="tab:blue" if name == "Templates" else "tab:orange", edgecolor="black", linewidth=0.3)
+        ax.plot([0, 1], [0, 1], "k--", lw=0.7, alpha=0.5)
+        for t in (0.5, 0.7):
+            ax.axvline(t, color="gray", ls=":", lw=0.7)
+            ax.axhline(t, color="gray", ls=":", lw=0.7)
+        r = _pearson_r(x, y)
+        r_str = f"r={r:.3f}" if r is not None else "r=n/a"
+        ax.set_xlabel(f"TM({replica_a_label} vs {replica_b_label})")
+        ax.set_ylabel("TM(winner vs GT)")
+        ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+        title = f"{name} [n={x.size}, {r_str}]"
+        if extra_title:
+            title += f" {extra_title}"
+        ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Compare top-1 AF2Rank template/prediction between two replicas, "
@@ -463,7 +676,18 @@ def main() -> int:
     parser.add_argument("--tmscore_mode", type=int, default=5)
     parser.add_argument("--ptm_cutoff", type=float, default=0.7,
                         help="pTM cutoff (default 0.7); used to flag passes_cutoff_a/b/either columns")
+    parser.add_argument("--use_ground_truth", action="store_true",
+                        help="Also compute TM of the winning replica's (higher min_ptm) top-1 "
+                             "template/prediction vs a ground-truth CIF and emit scatter plots "
+                             "vs replica convergence TM. Requires --cif_dir.")
+    parser.add_argument("--cif_dir", default=None,
+                        help="Directory containing reference CIFs (layout: <cif_dir>/<pdb_id>.cif "
+                             "or <cif_dir>/<sub>/<pdb_id>.cif, where pdb_id = protein_id.split('_')[0]). "
+                             "Required with --use_ground_truth.")
     args = parser.parse_args()
+
+    if args.use_ground_truth and not args.cif_dir:
+        parser.error("--use_ground_truth requires --cif_dir")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -476,6 +700,8 @@ def main() -> int:
     a_dir = Path(args.replica_a_dir).resolve()
     b_dir = a_dir if self_mode else Path(args.replica_b_dir).resolve()
     args.replica_b_dir = str(b_dir)
+    if args.cif_dir:
+        args.cif_dir = str(Path(args.cif_dir).resolve())
     out_dir = Path(args.output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -494,17 +720,23 @@ def main() -> int:
         logger.info("Comparing %d proteins from %s across replicas (labels: %s vs %s)",
                     len(protein_ids), args.input, args.replica_a_label, args.replica_b_label)
 
+    gt_kwargs = {"use_ground_truth": args.use_ground_truth, "cif_dir": args.cif_dir}
+
     results: List[Dict[str, object]] = []
     if args.num_workers > 1 and len(protein_ids) > 1:
         with ProcessPoolExecutor(max_workers=args.num_workers) as ex:
             if self_mode:
                 futures = {
-                    ex.submit(compare_protein_self, pid, str(a_dir), args.max_sample_index, args.tmscore_mode, args.ptm_cutoff): pid
+                    ex.submit(compare_protein_self, pid, str(a_dir),
+                              args.max_sample_index, args.tmscore_mode, args.ptm_cutoff,
+                              **gt_kwargs): pid
                     for pid in protein_ids
                 }
             else:
                 futures = {
-                    ex.submit(compare_protein, pid, str(a_dir), str(b_dir), args.max_sample_index, args.tmscore_mode, args.ptm_cutoff): pid
+                    ex.submit(compare_protein, pid, str(a_dir), str(b_dir),
+                              args.max_sample_index, args.tmscore_mode, args.ptm_cutoff,
+                              **gt_kwargs): pid
                     for pid in protein_ids
                 }
             for i, fut in enumerate(as_completed(futures), 1):
@@ -516,9 +748,13 @@ def main() -> int:
     else:
         for i, pid in enumerate(protein_ids, 1):
             if self_mode:
-                row = compare_protein_self(pid, str(a_dir), args.max_sample_index, args.tmscore_mode, args.ptm_cutoff)
+                row = compare_protein_self(pid, str(a_dir),
+                                           args.max_sample_index, args.tmscore_mode, args.ptm_cutoff,
+                                           **gt_kwargs)
             else:
-                row = compare_protein(pid, str(a_dir), str(b_dir), args.max_sample_index, args.tmscore_mode, args.ptm_cutoff)
+                row = compare_protein(pid, str(a_dir), str(b_dir),
+                                      args.max_sample_index, args.tmscore_mode, args.ptm_cutoff,
+                                      **gt_kwargs)
             results.append(row)
             logger.info("Processed %d/%d (%s, status: %s)", i, len(protein_ids), pid, row["status"])
 
@@ -541,7 +777,8 @@ def main() -> int:
          f"n={len(ok_passing)}]"),
     ]
     for name, passing_only, subset_df, json_path, plot_path, extra_title in variants:
-        summary = _aggregate_stats(df, args, passing_only=passing_only, self_mode=self_mode)
+        summary = _aggregate_stats(df, args, passing_only=passing_only, self_mode=self_mode,
+                                   use_ground_truth=args.use_ground_truth)
         with open(json_path, "w") as f:
             json.dump(summary, f, indent=2)
         logger.info("Wrote %s", json_path)
@@ -555,6 +792,16 @@ def main() -> int:
         )
         logger.info("Wrote %s", plot_path)
 
+        if args.use_ground_truth:
+            gt_plot_path = out_dir / (f"compare_replicas_gt_scatter_passing.png" if passing_only else "compare_replicas_gt_scatter.png")
+            gt_subset = subset_df[~subset_df["gt_missing"]] if "gt_missing" in subset_df.columns else subset_df.iloc[0:0]
+            _plot_gt_scatter(
+                gt_subset, gt_plot_path,
+                args.replica_a_label, args.replica_b_label,
+                extra_title=extra_title,
+            )
+            logger.info("Wrote %s", gt_plot_path)
+
         logger.info("[%s] compared=%d skipped=%d", name, summary["num_targets_compared"], summary["num_skipped"])
         if summary.get("stats_tm_templates_TM1", {}).get("n", 0):
             logger.info("[%s] tm_templates_TM1 mean=%.4f median=%.4f",
@@ -562,6 +809,13 @@ def main() -> int:
         if summary.get("stats_tm_predictions_TM1", {}).get("n", 0):
             logger.info("[%s] tm_predictions_TM1 mean=%.4f median=%.4f",
                         name, summary["stats_tm_predictions_TM1"]["mean"], summary["stats_tm_predictions_TM1"]["median"])
+        if args.use_ground_truth and summary.get("stats_tm_gt_winner_template_TM1", {}).get("n", 0):
+            logger.info("[%s] tm_gt_winner_template_TM1 mean=%.4f median=%.4f  r(tpl vs GT)=%s  r(pred vs GT)=%s",
+                        name,
+                        summary["stats_tm_gt_winner_template_TM1"]["mean"],
+                        summary["stats_tm_gt_winner_template_TM1"]["median"],
+                        f"{summary['pearson_r_templates_vs_gt']:.3f}" if summary.get("pearson_r_templates_vs_gt") is not None else "n/a",
+                        f"{summary['pearson_r_predictions_vs_gt']:.3f}" if summary.get("pearson_r_predictions_vs_gt") is not None else "n/a")
     return 0
 
 
