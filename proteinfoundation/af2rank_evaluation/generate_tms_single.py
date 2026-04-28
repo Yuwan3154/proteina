@@ -36,6 +36,7 @@ from tqdm import tqdm
 from Bio.PDB import MMCIFParser, PDBIO, Select
 import warnings
 from Bio import BiopythonWarning
+from proteinfoundation.af2rank_evaluation.cif_chain_mapping import resolve_ground_truth_usalign_chain
 warnings.simplefilter('ignore', BiopythonWarning)
 
 
@@ -179,10 +180,11 @@ def run_usalign(pdb_path: str, pdb_chain: str, afdb_path: str, usalign_path: str
     Returns:
         TM1 score (normalized by chain 1), or None if failed
     """
+    resolved_pdb_chain = resolve_ground_truth_usalign_chain(pdb_path, pdb_chain)
     cmd = [
         usalign_path,
         pdb_path,
-        '-chain1', pdb_chain,
+        '-chain1', resolved_pdb_chain,
         afdb_path,
         '-chain2', 'A',
         '-TMscore', '5',

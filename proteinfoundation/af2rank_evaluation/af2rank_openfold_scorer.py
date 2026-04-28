@@ -32,6 +32,7 @@ import openfold.np.residue_constants as rc
 from openfold.np import protein as openfold_protein
 from proteinfoundation.utils.openfold_inference import OpenFoldTemplateInference
 from proteinfoundation.utils.ff_utils.pdb_utils import write_prot_to_pdb
+from proteinfoundation.af2rank_evaluation.cif_chain_mapping import resolve_biopython_chain_for_structure
 from proteinfoundation.af2rank_evaluation.usalign_tabular import parse_usalign_pair_outfmt2
 from scipy.stats import spearmanr
 
@@ -521,7 +522,7 @@ def load_af2rank_scores_from_csv(csv_path: str) -> List[Dict]:
 
 
 def _detect_chain_in_cif(cif_file, chain_hint=None):
-    """Detect the correct chain ID in a CIF file, with fallback mapping."""
+    """Detect the correct Bio.PDB chain ID in a reference CIF file."""
     parser = MMCIFParser(QUIET=True)
     structure = parser.get_structure('protein', cif_file)
     available_chains = []
@@ -530,19 +531,10 @@ def _detect_chain_in_cif(cif_file, chain_hint=None):
             available_chains.append(chain.id)
         break
 
-    if chain_hint is not None and chain_hint in available_chains:
-        return chain_hint
-
     if chain_hint is not None:
-        chain_mappings = {
-            'A': ['E', 'N', 'X', '1', 'a'],
-            'B': ['F', 'O', 'Y', '2', 'b'],
-            'C': ['G', 'P', 'Z', '3', 'c'],
-        }
-        if chain_hint in chain_mappings:
-            for alt in chain_mappings[chain_hint]:
-                if alt in available_chains:
-                    return alt
+        resolved = resolve_biopython_chain_for_structure(cif_file, chain_hint)
+        if resolved in available_chains:
+            return resolved
 
     return available_chains[0] if available_chains else 'A'
 

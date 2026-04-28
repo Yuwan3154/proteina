@@ -53,6 +53,7 @@ _REPO_ROOT = _HERE.parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from proteinfoundation.af2rank_evaluation.cif_chain_mapping import resolve_ground_truth_usalign_chain
 from proteinfoundation.af2rank_evaluation.usalign_tabular import iter_usalign_outfmt2_rows
 
 logger = logging.getLogger(__name__)
@@ -275,7 +276,10 @@ def _compute_gt_metrics(
         out = _empty_gt_dict()
         out["winner_side"] = winner
         return out
-    chain1 = _default_chain(protein_id)
+    label_chain = _default_chain(protein_id)
+    chain1 = resolve_ground_truth_usalign_chain(gt_path, label_chain)
+    if label_chain != chain1:
+        logger.debug("Resolved GT chain for %s: %s -> %s", gt_path, label_chain, chain1)
     tm_tpl = _run_usalign_pair(gt_path, str(top_w["template_path"]), tmscore_mode, chain1=chain1)
     tm_prd = _run_usalign_pair(gt_path, str(top_w["prediction_path"]), tmscore_mode, chain1=chain1)
     return {

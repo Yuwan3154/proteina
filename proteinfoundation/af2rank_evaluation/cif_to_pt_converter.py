@@ -26,6 +26,8 @@ from Bio.PDB import PDBParser, MMCIFParser
 from loguru import logger
 from dotenv import load_dotenv
 
+from proteinfoundation.af2rank_evaluation.cif_chain_mapping import resolve_biopython_chain_for_structure
+
 # Import Proteina's exact amino acid encoding to ensure consistency
 from proteinfoundation.openfold_stub.np.residue_constants import (
     restypes, 
@@ -72,30 +74,22 @@ def extract_sequence_from_cif(cif_file: str, chain_id: str) -> Optional[List[str
                                 sequence.append('X')  # Unknown residue
                     return sequence
         
-        # If exact chain not found, try common mappings
-        # Many CIF files use different chain naming conventions
-        chain_mappings = {
-            'A': ['X', '1', 'a', 'E', 'N'],  # Common mappings for chain A (expanded for 1ugh, 2i24)
-            'B': ['Y', '2', 'b', 'F', 'O'],  # Common mappings for chain B  
-            'C': ['Z', '3', 'c', 'G', 'P'],  # Common mappings for chain C
-        }
-        
-        if chain_id in chain_mappings:
-            for alt_chain in chain_mappings[chain_id]:
-                for model in structure:
-                    for chain in model:
-                        if chain.id == alt_chain:
-                            logger.info(f"Found chain {chain_id} as {alt_chain} in {cif_file}")
-                            sequence = []
-                            for residue in chain:
-                                if residue.id[0] == ' ':  # Standard residue (not heteroatom)
-                                    resname = residue.get_resname()
-                                    if resname in restype_3to1:
-                                        sequence.append(restype_3to1[resname])
-                                    else:
-                                        logger.warning(f"Unknown residue {resname} in {cif_file}, chain {alt_chain}")
-                                        sequence.append('X')  # Unknown residue
-                            return sequence
+        resolved_chain_id = resolve_biopython_chain_for_structure(cif_file, chain_id)
+        if resolved_chain_id != chain_id:
+            for model in structure:
+                for chain in model:
+                    if chain.id == resolved_chain_id:
+                        logger.info(f"Found chain {chain_id} as {resolved_chain_id} in {cif_file}")
+                        sequence = []
+                        for residue in chain:
+                            if residue.id[0] == ' ':  # Standard residue (not heteroatom)
+                                resname = residue.get_resname()
+                                if resname in restype_3to1:
+                                    sequence.append(restype_3to1[resname])
+                                else:
+                                    logger.warning(f"Unknown residue {resname} in {cif_file}, chain {resolved_chain_id}")
+                                    sequence.append('X')  # Unknown residue
+                        return sequence
         
         logger.error(f"Chain {chain_id} not found in {cif_file}. Available chains: {available_chains}")
         return None

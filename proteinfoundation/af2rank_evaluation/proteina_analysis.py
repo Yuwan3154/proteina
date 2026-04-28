@@ -38,6 +38,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from proteinfoundation.af2rank_evaluation.cif_chain_mapping import resolve_ground_truth_usalign_chain
 from proteinfoundation.af2rank_evaluation.sharding_utils import add_shard_args, lengths_from_csv, resolve_shard_args, shard_proteins
 from proteinfoundation.af2rank_evaluation.topk_summary_utils import generate_topk_summary_csv
 from proteinfoundation.af2rank_evaluation.usalign_tabular import (
@@ -236,6 +237,9 @@ def run_reference_vs_paths_dir2(
 ) -> Dict[str, Dict[str, float]]:
     reference_abs = os.path.abspath(reference_path)
     reference_name = os.path.basename(reference_abs)
+    resolved_chain1 = resolve_ground_truth_usalign_chain(reference_abs, chain1)
+    if resolved_chain1 != chain1:
+        logger.debug("Resolved reference chain for %s: %s -> %s", reference_abs, chain1, resolved_chain1)
     target_names = [os.path.basename(os.path.abspath(path)) for path in target_paths]
     by_folder: Dict[str, List[str]] = {}
     for path in target_paths:
@@ -249,7 +253,7 @@ def run_reference_vs_paths_dir2(
             folder2=folder,
             names2=[os.path.basename(path) for path in paths],
             env=env,
-            chain1=chain1,
+            chain1=resolved_chain1,
             chain2=chain2,
         )
         for row in rows:

@@ -49,6 +49,7 @@ from colabdesign.af.alphafold.common import residue_constants
 from loguru import logger
 from tqdm import tqdm
 
+from proteinfoundation.af2rank_evaluation.cif_chain_mapping import resolve_biopython_chain_for_structure
 from proteinfoundation.af2rank_evaluation.usalign_tabular import parse_usalign_pair_outfmt2
 from scipy.stats import spearmanr
 
@@ -268,25 +269,13 @@ def get_sequence_from_pdb(pdb_file, chain=None):
                         available_chains.append(struct_chain.id)
                     break
                 
-                # If chain specified, try to find it or map it
+                # If chain specified, resolve dataset label IDs to mmCIF author IDs.
                 if chain is not None:
-                    if chain in available_chains:
-                        detected_chain = chain
-                    else:
-                        # Try chain mapping (A->E, A->N, etc.)
-                        chain_mappings = {
-                            'A': ['E', 'N', 'X', '1', 'a'],
-                            'B': ['F', 'O', 'Y', '2', 'b'],
-                            'C': ['G', 'P', 'Z', '3', 'c']
-                        }
-                        if chain in chain_mappings:
-                            for alt_chain in chain_mappings[chain]:
-                                if alt_chain in available_chains:
-                                    detected_chain = alt_chain
-                                    break
-                        
-                        if detected_chain is None:
-                            detected_chain = available_chains[0] if available_chains else 'A'
+                    resolved_chain = resolve_biopython_chain_for_structure(pdb_file, chain)
+                    if resolved_chain in available_chains:
+                        detected_chain = resolved_chain
+                    if detected_chain is None:
+                        detected_chain = available_chains[0] if available_chains else 'A'
                 else:
                     # No chain specified, use first available
                     detected_chain = available_chains[0] if available_chains else 'A'
@@ -631,25 +620,13 @@ class ModernAF2Rank:
                             available_chains.append(struct_chain.id)
                         break
                     
-                    # If chain specified, try to find it or map it
+                    # If chain specified, resolve dataset label IDs to mmCIF author IDs.
                     if chain is not None:
-                        if chain in available_chains:
-                            detected_chain = chain
-                        else:
-                            # Try chain mapping (A->E, A->N, etc.)
-                            chain_mappings = {
-                                'A': ['E', 'N', 'X', '1', 'a'],
-                                'B': ['F', 'O', 'Y', '2', 'b'],
-                                'C': ['G', 'P', 'Z', '3', 'c']
-                            }
-                            if chain in chain_mappings:
-                                for alt_chain in chain_mappings[chain]:
-                                    if alt_chain in available_chains:
-                                        detected_chain = alt_chain
-                                        break
-                            
-                            if detected_chain is None:
-                                detected_chain = available_chains[0] if available_chains else 'A'
+                        resolved_chain = resolve_biopython_chain_for_structure(pdb_file, chain)
+                        if resolved_chain in available_chains:
+                            detected_chain = resolved_chain
+                        if detected_chain is None:
+                            detected_chain = available_chains[0] if available_chains else 'A'
                     else:
                         # No chain specified, use first available
                         detected_chain = available_chains[0] if available_chains else 'A'

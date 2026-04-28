@@ -35,6 +35,10 @@ from protein_ebm.model.boltz_utils import center_random_augmentation
 from protein_ebm.model.ebm import ProteinEBM
 from protein_ebm.model.r3_diffuser import R3Diffuser
 
+from proteinfoundation.af2rank_evaluation.cif_chain_mapping import (
+    resolve_biopython_chain_for_structure,
+    resolve_ground_truth_usalign_chain,
+)
 from proteinfoundation.af2rank_evaluation.usalign_tabular import parse_usalign_pair_outfmt2
 
 
@@ -131,31 +135,16 @@ def _extract_ca_coords(structure_path: str, chain_id: str | None) -> np.ndarray:
     chains = list(model.get_chains())
     chain_ids = [c.id for c in chains]
 
-    # Heuristic chain mappings (copied from AF2Rank scorer logic) for cases where
-    # the dataset's "A/B/C" chain IDs don't match author-provided CIF chain IDs.
-    chain_mappings: dict[str, list[str]] = {
-        "A": ["E", "N", "X", "1", "a"],
-        "B": ["F", "O", "Y", "2", "b"],
-        "C": ["G", "P", "Z", "3", "c"],
-    }
-
     if chain_id is None:
         if len(chains) != 1:
             raise ValueError(f"chain_id not provided and structure has multiple chains: {chain_ids}")
         chain = chains[0]
     else:
-        if chain_id in chain_ids:
-            chain = next(c for c in chains if c.id == chain_id)
+        resolved_chain_id = resolve_biopython_chain_for_structure(structure_path, chain_id)
+        if resolved_chain_id in chain_ids:
+            chain = next(c for c in chains if c.id == resolved_chain_id)
         else:
-            # Try common chain remappings (A->E, etc.)
-            mapped = None
-            for alt in chain_mappings.get(chain_id, []):
-                if alt in chain_ids:
-                    mapped = alt
-                    break
-            if mapped is not None:
-                chain = next(c for c in chains if c.id == mapped)
-            elif len(chains) == 1:
+            if len(chains) == 1:
                 chain = chains[0]
             else:
                 raise ValueError(f"Chain '{chain_id}' not found in {structure_path}. Available chains: {chain_ids}")
@@ -239,6 +228,8 @@ def tmscore_pdb_paths(
     env: Optional[Dict[str, str]] = None,
     chain1: Optional[str] = None,
     chain2: Optional[str] = None,
+    chain1_is_reference: bool = False,
+    chain2_is_reference: bool = False,
 ) -> Dict[str, float]:
     """
     Run USalign (or TMscore) on two existing structure files (PDB/mmCIF per USalign auto-detect).
@@ -252,10 +243,12 @@ def tmscore_pdb_paths(
         raise FileNotFoundError("Neither USalign nor TMscore found in PATH")
     cmd = [exe, path_a, path_b]
     if os.path.basename(exe) == "USalign":
-        if chain1 is not None:
-            cmd += ["-chain1", chain1]
-        if chain2 is not None:
-            cmd += ["-chain2", chain2]
+        resolved_chain1 = resolve_ground_truth_usalign_chain(path_a, chain1) if chain1_is_reference else chain1
+        resolved_chain2 = resolve_ground_truth_usalign_chain(path_b, chain2) if chain2_is_reference else chain2
+        if resolved_chain1 is not None:
+            cmd += ["-chain1", resolved_chain1]
+        if resolved_chain2 is not None:
+            cmd += ["-chain2", resolved_chain2]
         cmd += ["-TMscore", "5", "-outfmt", "2"]
     subprocess_env = None
     if env is not None:
