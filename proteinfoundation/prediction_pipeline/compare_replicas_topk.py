@@ -202,6 +202,7 @@ def _run_usalign_pair(
     rows = iter_usalign_outfmt2_rows(proc.stdout)
     if not rows:
         logger.warning("USalign produced no data rows for %s vs %s", pdb_a, pdb_b)
+        logger.warning("USalign output: %s", proc.stdout)
         return nan
     parts = rows[0]
     def _get(idx: int) -> float:
