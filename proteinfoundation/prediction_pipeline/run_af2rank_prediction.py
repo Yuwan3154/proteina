@@ -40,6 +40,7 @@ from proteinfoundation.af2rank_evaluation.sharding_utils import (
     resolve_shard_args,
     shard_proteins,
 )
+from proteinfoundation.af2rank_evaluation.protein_tar_utils import pack_protein_dirs, restore_protein_dirs
 
 logging.basicConfig(
     level=logging.INFO,
@@ -335,6 +336,12 @@ def main() -> None:
                         action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--use_cuequivariance_multiplicative_update",
                         action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--tar_protein_dirs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Store per-protein inference directories as uncompressed <protein_id>.tar archives (default: True).",
+    )
     add_shard_args(parser)
 
     args = parser.parse_args()
@@ -351,6 +358,11 @@ def main() -> None:
         data_dir = os.environ.get("DATA_PATH", str(inference_base.parent.parent / "data"))
         protein_ids = shard_proteins(protein_ids, shard_index, num_shards, data_dir=data_dir)
         logger.info(f"Shard {shard_index}/{num_shards}: {len(protein_ids)} proteins")
+
+    protein_ids_for_tar = list(protein_ids)
+    if args.tar_protein_dirs:
+        stats = restore_protein_dirs(inference_base, protein_ids_for_tar)
+        logger.info("Tar restore stats before AF2Rank top-k prediction: %s", stats)
 
     ProteinConfig = Dict  # type alias for clarity
     protein_configs: List[ProteinConfig] = []
@@ -391,6 +403,9 @@ def main() -> None:
 
     if not protein_configs:
         logger.info("No proteins to score.")
+        if args.tar_protein_dirs:
+            stats = pack_protein_dirs(inference_base, protein_ids_for_tar, delete_after=True)
+            logger.info("Tar pack/delete stats after AF2Rank top-k prediction: %s", stats)
         return
 
     logger.info(f"{len(protein_configs)} proteins to score")
@@ -457,6 +472,9 @@ def main() -> None:
             logger.warning(f"{protein_id}: summary CSV generation failed: {e}")
 
     logger.info("AF2Rank prediction scoring complete.")
+    if args.tar_protein_dirs:
+        stats = pack_protein_dirs(inference_base, protein_ids_for_tar, delete_after=True)
+        logger.info("Tar pack/delete stats after AF2Rank top-k prediction: %s", stats)
 
 
 def _all_scored(scores_csv: Path, desired_files: set) -> bool:

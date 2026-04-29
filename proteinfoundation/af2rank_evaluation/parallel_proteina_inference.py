@@ -37,6 +37,7 @@ from proteinfoundation.af2rank_evaluation.sharding_utils import (
     resolve_shard_args,
     shard_proteins,
 )
+from proteinfoundation.af2rank_evaluation.protein_tar_utils import pack_protein_dirs, restore_protein_dirs
 
 def _terminate_process_group(signum: int) -> None:
     """
@@ -430,6 +431,12 @@ def main():
         action='store_true',
         help='Skip CIF-to-PT conversion (use when PT files already exist, e.g. created from sequences).',
     )
+    parser.add_argument(
+        "--tar_protein_dirs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Store per-protein inference directories as uncompressed <protein_id>.tar archives (default: True).",
+    )
     add_shard_args(parser)
 
     args = parser.parse_args()
@@ -475,6 +482,12 @@ def main():
         if lengths:
             protein_names = sorted(protein_names, key=lambda p: lengths.get(p, 0))
             logger.info("Sorted proteins short-to-long for OOM-conservative batch-size adaptation.")
+
+    inference_base_dir = os.path.join(PROTEINA_BASE_DIR, "inference", args.inference_config)
+    protein_names_for_tar = list(protein_names)
+    if args.tar_protein_dirs:
+        stats = restore_protein_dirs(inference_base_dir, protein_names_for_tar)
+        logger.info("Tar restore stats before inference: %s", stats)
 
     # Now apply the already-done filter to this shard's proteins only
     if args.skip_existing:
@@ -571,6 +584,10 @@ def main():
                 error_type = result.get('error_type', 'UNKNOWN')
                 error_preview = str(result.get('error', 'Unknown error'))[:100]
                 logger.info(f"  - {result['protein']} [{error_type}]: {error_preview}")
+
+    if args.tar_protein_dirs:
+        stats = pack_protein_dirs(inference_base_dir, protein_names_for_tar, delete_after=True)
+        logger.info("Tar pack/delete stats after inference: %s", stats)
     
     # Return appropriate exit code
     sys.exit(0 if failed == 0 else 1)

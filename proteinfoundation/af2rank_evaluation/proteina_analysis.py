@@ -39,6 +39,7 @@ import numpy as np
 import pandas as pd
 
 from proteinfoundation.af2rank_evaluation.cif_chain_mapping import resolve_ground_truth_usalign_chain
+from proteinfoundation.af2rank_evaluation.protein_tar_utils import pack_protein_dirs, restore_protein_dirs
 from proteinfoundation.af2rank_evaluation.sharding_utils import add_shard_args, lengths_from_csv, resolve_shard_args, shard_proteins
 from proteinfoundation.af2rank_evaluation.topk_summary_utils import generate_topk_summary_csv
 from proteinfoundation.af2rank_evaluation.usalign_tabular import (
@@ -1273,6 +1274,12 @@ def main() -> None:
     parser.add_argument("--num_workers", type=int, default=None, help="Max one-process-per-protein worker count")
     parser.add_argument("--no_usalign_dir", action="store_true", help="Disable USalign -dir for template all-to-all")
     parser.add_argument("--skip_diversity", action="store_true", help="Skip pairwise template-to-template diversity computation")
+    parser.add_argument(
+        "--tar_protein_dirs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Store per-protein inference directories as uncompressed <protein_id>.tar archives (default: True).",
+    )
     add_shard_args(parser)
     args = parser.parse_args()
 
@@ -1305,6 +1312,10 @@ def main() -> None:
             protein_ids = shard_proteins(protein_ids, shard_index, num_shards, data_dir=data_dir)
         logger.info(f"Central analysis shard {shard_index}/{num_shards}: {len(protein_ids)} proteins selected")
 
+    if args.tar_protein_dirs:
+        stats = restore_protein_dirs(args.inference_dir, protein_ids)
+        logger.info("Tar restore stats before central analysis: %s", stats)
+
     results = compute_analysis_for_proteins(
         inference_dir=args.inference_dir,
         protein_ids=protein_ids,
@@ -1316,6 +1327,9 @@ def main() -> None:
         use_usalign_dir=not args.no_usalign_dir,
         skip_diversity=args.skip_diversity,
     )
+    if args.tar_protein_dirs:
+        stats = pack_protein_dirs(args.inference_dir, protein_ids, delete_after=True)
+        logger.info("Tar pack/delete stats after central analysis: %s", stats)
     logger.info(f"Done. {len(results)} proteins with analysis metrics.")
 
 

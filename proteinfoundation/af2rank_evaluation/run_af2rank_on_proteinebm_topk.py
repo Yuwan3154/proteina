@@ -30,6 +30,7 @@ from proteinfoundation.af2rank_evaluation.sharding_utils import (
     resolve_shard_args,
     shard_proteins,
 )
+from proteinfoundation.af2rank_evaluation.protein_tar_utils import pack_protein_dirs, restore_protein_dirs
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s",
                     stream=sys.stdout)
@@ -727,6 +728,12 @@ def main() -> None:
                        help="Use cuEquivariance multiplicative update (openfold backend, default: True)")
     parser.add_argument("--direct_python", action="store_true", default=False,
                        help="Use current Python interpreter for inner subprocesses instead of shell wrappers (for HPC)")
+    parser.add_argument(
+        "--tar_protein_dirs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Store per-protein inference directories as uncompressed <protein_id>.tar archives (default: True).",
+    )
     add_shard_args(parser)
     args = parser.parse_args()
 
@@ -744,20 +751,12 @@ def main() -> None:
     if len(gpu_ids) == 0:
         raise ValueError("No GPU ids provided/derived for AF2Rank subprocesses")
 
-    score_csvs = _find_proteinebm_scores(args.inference_dir, args.proteinebm_analysis_subdir)
-    logger.info(f"Found {len(score_csvs)} ProteinEBM score CSVs under {args.inference_dir}")
-    if len(score_csvs) == 0:
-        raise FileNotFoundError(f"No proteinebm_scores_*.csv found under {args.inference_dir}")
-
     has_dataset = bool(args.dataset_file.strip())
     has_csv = bool(args.csv_file.strip())
     dataset_map: Dict[str, Dict[str, float]] = {}
     if has_dataset:
         dataset_map = _load_dataset_map(args.dataset_file, args.id_col, args.tms_col, len_col=args.len_col)
         logger.info(f"Loaded {len(dataset_map)} proteins from dataset CSV")
-
-    scores_by_protein: Dict[str, Path] = {p.parent.parent.name: p for p in score_csvs}
-    logger.info(f"scores_by_protein has {len(scores_by_protein)} entries")
 
     # Protein list: --csv_file (current run) > --dataset_file > all with scores
     if has_csv:
@@ -766,8 +765,11 @@ def main() -> None:
     elif has_dataset:
         candidate_ids_raw = list(dataset_map.keys())
     else:
-        candidate_ids_raw = list(scores_by_protein.keys())
-        logger.info(f"No --csv_file or --dataset_file: processing all {len(candidate_ids_raw)} proteins with ProteinEBM scores")
+        inference_path = Path(args.inference_dir)
+        dir_ids = [p.name for p in inference_path.iterdir() if p.is_dir()]
+        tar_ids = [p.stem for p in inference_path.glob("*.tar")]
+        candidate_ids_raw = sorted(set(dir_ids + tar_ids))
+        logger.info(f"No --csv_file or --dataset_file: processing all {len(candidate_ids_raw)} protein dirs/tars")
 
     out_dir = args.output_dir.strip()
     if not out_dir:
@@ -791,10 +793,25 @@ def main() -> None:
     else:
         shard_ids = None
 
+    candidate_ids = list(shard_ids) if shard_ids is not None else candidate_ids_raw
+    if args.tar_protein_dirs:
+        stats = restore_protein_dirs(args.inference_dir, candidate_ids)
+        logger.info("Tar restore stats before AF2Rank-on-ProteinEBM-topk: %s", stats)
+
+    score_csvs = _find_proteinebm_scores(args.inference_dir, args.proteinebm_analysis_subdir)
+    logger.info(f"Found {len(score_csvs)} ProteinEBM score CSVs under {args.inference_dir}")
+    if len(score_csvs) == 0:
+        if args.tar_protein_dirs:
+            stats = pack_protein_dirs(args.inference_dir, candidate_ids, delete_after=True)
+            logger.info("Tar pack/delete stats after AF2Rank-on-ProteinEBM-topk: %s", stats)
+        raise FileNotFoundError(f"No proteinebm_scores_*.csv found under {args.inference_dir}")
+
+    scores_by_protein: Dict[str, Path] = {p.parent.parent.name: p for p in score_csvs}
+    logger.info(f"scores_by_protein has {len(scores_by_protein)} entries")
+
     tasks: List[Tuple[str, str, Dict[str, object], str]] = []
     n_considered = 0
     n_no_scores = 0
-    candidate_ids = list(shard_ids) if shard_ids is not None else candidate_ids_raw
     for protein_id in candidate_ids:
         if protein_id not in scores_by_protein:
             n_no_scores += 1
@@ -848,6 +865,9 @@ def main() -> None:
                         except Exception as e:
                             logger.error("FAILED %s: %s", pid, e)
                         pbar.update(1)
+        if args.tar_protein_dirs:
+            stats = pack_protein_dirs(args.inference_dir, candidate_ids, delete_after=True)
+            logger.info("Tar pack/delete stats after AF2Rank-on-ProteinEBM-topk: %s", stats)
         return
 
     rows: List[Dict[str, object]] = []
@@ -892,17 +912,29 @@ def main() -> None:
                         "Cross-protein plots may be generated from pre-existing data by generate_cross_protein_plots.py.")
         if n_failed > 0:
             logger.error(f"{n_failed}/{len(tasks)} proteins failed — check errors above")
+            if args.tar_protein_dirs:
+                stats = pack_protein_dirs(args.inference_dir, candidate_ids, delete_after=True)
+                logger.info("Tar pack/delete stats after AF2Rank-on-ProteinEBM-topk: %s", stats)
             sys.exit(1)
+        if args.tar_protein_dirs:
+            stats = pack_protein_dirs(args.inference_dir, candidate_ids, delete_after=True)
+            logger.info("Tar pack/delete stats after AF2Rank-on-ProteinEBM-topk: %s", stats)
         return
 
     if shard_index is not None:
         logger.info("Per-protein work complete (sharded run) — cross-protein summary will be aggregated by shard 0 after all shards finish.")
+        if args.tar_protein_dirs:
+            stats = pack_protein_dirs(args.inference_dir, candidate_ids, delete_after=True)
+            logger.info("Tar pack/delete stats after AF2Rank-on-ProteinEBM-topk: %s", stats)
         return
 
     summary_df = pd.DataFrame(rows)
     summary_csv = out_dir_path / f"af2rank_on_proteinebm_top_{int(args.top_k)}_summary.csv"
     summary_df.to_csv(summary_csv, index=False)
     logger.info(f"Summary CSV written to {summary_csv} — cross-protein plots are generated by generate_cross_protein_plots.py")
+    if args.tar_protein_dirs:
+        stats = pack_protein_dirs(args.inference_dir, candidate_ids, delete_after=True)
+        logger.info("Tar pack/delete stats after AF2Rank-on-ProteinEBM-topk: %s", stats)
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ from proteinfoundation.af2rank_evaluation.sharding_utils import (
     resolve_shard_args,
     shard_proteins,
 )
+from proteinfoundation.af2rank_evaluation.protein_tar_utils import pack_protein_dirs, restore_protein_dirs
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -315,6 +316,12 @@ def main():
         default=False,
         help="Use the current Python interpreter instead of conda wrapper scripts to launch scorer subprocesses",
     )
+    parser.add_argument(
+        "--tar_protein_dirs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Store per-protein inference directories as uncompressed <protein_id>.tar archives (default: True).",
+    )
 
     args = parser.parse_args()
 
@@ -337,6 +344,12 @@ def main():
             data_dir = os.environ.get("DATA_PATH", os.path.join(PROTEINA_BASE_DIR, "data"))
             protein_names = shard_proteins(protein_names, shard_index, num_shards, data_dir=data_dir)
 
+    inference_base_dir = os.path.join(PROTEINA_BASE_DIR, "inference", args.inference_config)
+    protein_names_for_tar = list(protein_names)
+    if args.tar_protein_dirs:
+        stats = restore_protein_dirs(inference_base_dir, protein_names_for_tar)
+        logger.info("Tar restore stats before ProteinEBM scoring: %s", stats)
+
     # Now apply the already-done filter to this shard's proteins only
     if args.filter_existing:
         needing_work = set(find_proteins_needing_proteinebm(args.csv_file, args.csv_col, args.inference_config, args.proteinebm_analysis_subdir))
@@ -352,6 +365,9 @@ def main():
     )
     if not all_configs:
         logger.warning("No valid protein directories found")
+        if args.tar_protein_dirs:
+            stats = pack_protein_dirs(inference_base_dir, protein_names_for_tar, delete_after=True)
+            logger.info("Tar pack/delete stats after ProteinEBM scoring: %s", stats)
         sys.exit(0)
 
     logger.info(
@@ -438,6 +454,9 @@ def main():
     total_time = time.time() - start_time
     n_proteins = sum(len(c) for c in gpu_chunks)
     logger.info(f"\nProteinEBM scoring complete: {n_proteins} proteins in {total_time:.1f}s")
+    if args.tar_protein_dirs:
+        stats = pack_protein_dirs(inference_base_dir, protein_names_for_tar, delete_after=True)
+        logger.info("Tar pack/delete stats after ProteinEBM scoring: %s", stats)
     if failed_gpus:
         logger.error(f"Failed GPU workers: {failed_gpus}")
         sys.exit(1)

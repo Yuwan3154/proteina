@@ -34,6 +34,11 @@ from proteinfoundation.af2rank_evaluation.sharding_utils import (
     resolve_shard_args,
     wait_for_completion,
 )
+from proteinfoundation.af2rank_evaluation.protein_tar_utils import (
+    ensure_protein_tar,
+    pack_protein_dirs,
+    restore_protein_dirs,
+)
 
 # Setup logging
 logging.basicConfig(
@@ -44,6 +49,10 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+
+def _tar_cli_args(enabled: bool) -> list[str]:
+    return ["--tar_protein_dirs"] if enabled else ["--no-tar_protein_dirs"]
 
 def detect_conda_executable():
     """Auto-detect conda executable path."""
@@ -141,7 +150,7 @@ def run_with_conda_env(env_name, command_list, cwd=None, direct_python: bool = F
         logger.error(f"❌ Failed to run command: {e}")
         return False
 
-def run_proteina_inference(csv_file, csv_col, cif_dir, inference_config, num_gpus, usalign_path=None, force_compile: bool = False, shard_args=None, direct_python: bool = False, rerun: bool = False):
+def run_proteina_inference(csv_file, csv_col, cif_dir, inference_config, num_gpus, usalign_path=None, force_compile: bool = False, shard_args=None, direct_python: bool = False, rerun: bool = False, tar_protein_dirs: bool = True):
     """Run the Proteina inference pipeline."""
     logger.info("🧬 Starting Proteina inference pipeline...")
 
@@ -160,10 +169,11 @@ def run_proteina_inference(csv_file, csv_col, cif_dir, inference_config, num_gpu
         cmd.extend(['--usalign_path', usalign_path])
     if shard_args:
         cmd.extend(shard_args)
+    cmd.extend(_tar_cli_args(tar_protein_dirs))
 
     return run_with_conda_env('proteina', cmd, direct_python=direct_python)
 
-def run_af2rank_scoring(csv_file, csv_col, cif_dir, inference_config, num_gpus, recycles=3, regenerate_plots=False, backend="colabdesign", use_deepspeed_evoformer_attention=True, use_cuequivariance_attention=True, use_cuequivariance_multiplicative_update=True, shard_args=None, direct_python: bool = False, rerun: bool = False):
+def run_af2rank_scoring(csv_file, csv_col, cif_dir, inference_config, num_gpus, recycles=3, regenerate_plots=False, backend="colabdesign", use_deepspeed_evoformer_attention=True, use_cuequivariance_attention=True, use_cuequivariance_multiplicative_update=True, shard_args=None, direct_python: bool = False, rerun: bool = False, tar_protein_dirs: bool = True):
     """Run the AF2Rank scoring pipeline."""
     logger.info(f"⚡ Starting AF2Rank scoring pipeline (backend={backend})...")
 
@@ -189,6 +199,7 @@ def run_af2rank_scoring(csv_file, csv_col, cif_dir, inference_config, num_gpus, 
             cmd.append('--no-use_cuequivariance_multiplicative_update')
     if shard_args:
         cmd.extend(shard_args)
+    cmd.extend(_tar_cli_args(tar_protein_dirs))
 
     env_name = 'proteina' if backend == 'openfold' else 'colabdesign'
     return run_with_conda_env(env_name, cmd, direct_python=direct_python)
@@ -209,6 +220,7 @@ def run_proteinebm_scoring(
     shard_args=None,
     direct_python: bool = False,
     rerun: bool = False,
+    tar_protein_dirs: bool = True,
 ):
     """Run the ProteinEBM scoring pipeline."""
     logger.info("💸 Starting ProteinEBM scoring pipeline...")
@@ -235,6 +247,7 @@ def run_proteinebm_scoring(
         cmd.append('--direct_python')
     if shard_args:
         cmd.extend(shard_args)
+    cmd.extend(_tar_cli_args(tar_protein_dirs))
 
     return run_with_conda_env('proteinebm', cmd, direct_python=direct_python)
 
@@ -297,6 +310,7 @@ def run_af2rank_on_proteinebm_topk(
     direct_python: bool = False,
     cif_dir: str = "",
     output_dir: str = "",
+    tar_protein_dirs: bool = True,
 ) -> bool:
     """Run AF2Rank scoring on the ProteinEBM top-k templates per protein."""
     logger.info(f"🧪 Starting AF2Rank-on-ProteinEBM-topk step (backend={backend})...")
@@ -351,6 +365,7 @@ def run_af2rank_on_proteinebm_topk(
         cmd.extend(shard_args)
     if output_dir:
         cmd.extend(["--output_dir", output_dir])
+    cmd.extend(_tar_cli_args(tar_protein_dirs))
 
     return run_with_conda_env("proteina", cmd, cwd=os.path.dirname(os.path.abspath(__file__)), direct_python=direct_python)
 
@@ -366,6 +381,7 @@ def run_central_analysis(
     direct_python: bool = False,
     rerun: bool = False,
     skip_diversity: bool = False,
+    tar_protein_dirs: bool = True,
 ) -> bool:
     cmd = [
         "python",
@@ -389,6 +405,7 @@ def run_central_analysis(
         cmd.append("--rerun")
     if skip_diversity:
         cmd.append("--skip_diversity")
+    cmd.extend(_tar_cli_args(tar_protein_dirs))
     return run_with_conda_env("proteina", cmd, cwd=os.path.dirname(os.path.abspath(__file__)), direct_python=direct_python)
 
 
@@ -497,6 +514,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--direct_python', action='store_true',
                         help='Use current Python interpreter for subprocesses instead of shell script wrappers. '
                              'Useful on HPC where conda env activation is slow; requires all deps in current env.')
+    parser.add_argument(
+        "--tar_protein_dirs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Store per-protein inference directories as uncompressed <protein_id>.tar archives (default: True).",
+    )
     parser.add_argument('--tms_col', required=True,
                        help='Dataset column name to use as reference TM score (required, used for cross-protein plots)')
     parser.add_argument(
@@ -562,6 +585,12 @@ def main(argv: list[str] | None = None):
     start_time = time.time()
     project_root = os.getcwd()
     base_inference_dir = os.path.join(project_root, "inference", args.inference_config)
+    dataset_df = pd.read_csv(args.dataset_file)
+    protein_ids_for_tar = dataset_df[args.id_col].dropna().astype(str).str.strip().unique().tolist()
+    if args.tar_protein_dirs:
+        for protein_id in protein_ids_for_tar:
+            ensure_protein_tar(base_inference_dir, protein_id)
+        logger.info(f"Initialized {len(protein_ids_for_tar)} per-protein tar files under {base_inference_dir}")
     if args.cross_protein_output_dir:
         cross_out_dir = os.path.abspath(os.path.expanduser(args.cross_protein_output_dir))
     else:
@@ -584,6 +613,7 @@ def main(argv: list[str] | None = None):
     logger.info(f"🔑 TM score column: {args.tms_col}")
     logger.info(f"🔧 AF2Rank backend: {args.af2rank_backend}")
     logger.info(f"📦 ProteinEBM batch size: {args.proteinebm_batch_size}")
+    logger.info(f"📦 Tar protein dirs: {args.tar_protein_dirs}")
     from proteinfoundation.af2rank_evaluation.proteina_analysis import resolve_num_workers
     logger.info(f"🔩 num_workers (CPU, analysis etc.): {resolve_num_workers(args.num_workers)}")
     skip_analysis = args.skip_analysis
@@ -607,6 +637,7 @@ def main(argv: list[str] | None = None):
             shard_args=shard_cli_args,
             direct_python=args.direct_python,
             rerun=args.rerun_proteina,
+            tar_protein_dirs=args.tar_protein_dirs,
         )
         
         if inference_success:
@@ -642,6 +673,7 @@ def main(argv: list[str] | None = None):
                 shard_args=shard_cli_args,
                 direct_python=args.direct_python,
                 rerun=args.rerun_score,
+                tar_protein_dirs=args.tar_protein_dirs,
             )
         else:
             scoring_success = run_proteinebm_scoring(
@@ -660,6 +692,7 @@ def main(argv: list[str] | None = None):
                 shard_args=shard_cli_args,
                 direct_python=args.direct_python,
                 rerun=args.rerun_score,
+                tar_protein_dirs=args.tar_protein_dirs,
             )
         
         if scoring_success:
@@ -695,6 +728,7 @@ def main(argv: list[str] | None = None):
             direct_python=args.direct_python,
             cif_dir=args.cif_dir,
             output_dir=cross_out_dir,
+            tar_protein_dirs=args.tar_protein_dirs,
         )
 
         if topk_success:
@@ -724,6 +758,7 @@ def main(argv: list[str] | None = None):
                     direct_python=args.direct_python,
                     rerun=args.rerun_proteina or args.rerun_score or args.rerun_af2rank_on_top_k or args.rerun_analysis,
                     skip_diversity=args.skip_diversity,
+                    tar_protein_dirs=args.tar_protein_dirs,
                 )
                 if analysis_success:
                     shard_desc = f" (shard {shard_index})" if shard_index is not None else ""
@@ -799,6 +834,7 @@ def main(argv: list[str] | None = None):
                 direct_python=args.direct_python,
                 cif_dir=args.cif_dir,
                 output_dir=cross_out_dir,
+                tar_protein_dirs=args.tar_protein_dirs,
             )
 
     # Step 5: Cross-protein plots
@@ -810,6 +846,9 @@ def main(argv: list[str] | None = None):
         inference_dir = os.path.join(project_root, "inference", args.inference_config)
 
         if success:
+            if args.tar_protein_dirs:
+                stats = restore_protein_dirs(inference_dir, protein_ids_for_tar)
+                logger.info(f"Tar restore stats before cross-protein plotting: {stats}")
             plot_success = run_cross_protein_plots(
                 inference_dir=inference_dir,
                 output_dir=cross_out_dir,
@@ -844,6 +883,9 @@ def main(argv: list[str] | None = None):
                 # for this inference_dir/dataset combination. Treat as a warning so the
                 # pipeline can still complete after producing the primary plots.
                 logger.warning("⚠️  Cross-protein plotting skipped/failed (af2rank_on_proteinebm_topk)")
+        if args.tar_protein_dirs:
+            stats = pack_protein_dirs(inference_dir, protein_ids_for_tar, delete_after=True)
+            logger.info(f"Tar pack/delete stats after cross-protein plotting: {stats}")
     
     # Final summary
     total_time = time.time() - start_time

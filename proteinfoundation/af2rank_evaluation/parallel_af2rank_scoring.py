@@ -25,6 +25,7 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 from sharding_utils import add_shard_args, lengths_from_csv, resolve_shard_args, shard_proteins
+from protein_tar_utils import pack_protein_dirs, restore_protein_dirs
 
 try:
     from dotenv import load_dotenv
@@ -536,6 +537,12 @@ def main():
                        help='Use cuEquivariance attention kernels (openfold backend, default: True)')
     parser.add_argument('--use_cuequivariance_multiplicative_update', action=argparse.BooleanOptionalAction, default=True,
                        help='Use cuEquivariance multiplicative update (openfold backend, default: True)')
+    parser.add_argument(
+        "--tar_protein_dirs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Store per-protein inference directories as uncompressed <protein_id>.tar archives (default: True).",
+    )
     add_shard_args(parser)
 
     args = parser.parse_args()
@@ -567,6 +574,12 @@ def main():
         else:
             data_dir = os.environ.get("DATA_PATH", os.path.join(PROTEINA_BASE_DIR, "data"))
             protein_names = shard_proteins(protein_names, shard_index, num_shards, data_dir=data_dir)
+
+    inference_base_dir = os.path.join(PROTEINA_BASE_DIR, "inference", args.inference_config)
+    protein_names_for_tar = list(protein_names)
+    if args.tar_protein_dirs:
+        stats = restore_protein_dirs(inference_base_dir, protein_names_for_tar)
+        logger.info("Tar restore stats before AF2Rank scoring: %s", stats)
 
     # Now apply the already-done filter to this shard's proteins only
     if args.filter_existing:
@@ -732,13 +745,18 @@ def main():
     logger.info(f"⏭️  Skipped: {skipped}")
     logger.info(f"📈 Total structures scored: {total_structures_scored}")
     logger.info(f"⏱️  Total time: {total_time:.1f}s")
-    logger.info(f"📊 Average time per protein: {total_time/len(all_results):.1f}s")
+    if all_results:
+        logger.info(f"📊 Average time per protein: {total_time/len(all_results):.1f}s")
     
     if failed:
         logger.error("Failed proteins:")
         for result in all_results:
             if result['status'] == 'failed':
                 logger.error(f"  - {result['protein']}: {result.get('error', 'Unknown error')}")
+
+    if args.tar_protein_dirs:
+        stats = pack_protein_dirs(inference_base_dir, protein_names_for_tar, delete_after=True)
+        logger.info("Tar pack/delete stats after AF2Rank scoring: %s", stats)
     
     # Check if shutdown was requested
     if shutdown_requested:
