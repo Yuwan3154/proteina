@@ -24,6 +24,7 @@ The AF2Rank refinement step uses OpenFold only (run_af2rank_prediction.py); only
 
 import argparse
 import csv
+import io
 import json
 import logging
 import math
@@ -51,8 +52,9 @@ from proteinfoundation.af2rank_evaluation.sharding_utils import (
 from proteinfoundation.af2rank_evaluation.protein_tar_utils import (
     ensure_protein_tar,
     pack_protein_dirs,
-    protein_relative_path_exists,
-    restore_protein_dirs,
+    protein_glob_members,
+    read_protein_text,
+    restore_selected_protein_dirs,
 )
 from proteinfoundation.prediction_pipeline.input_parser import create_pt_files, create_working_csv, parse_input
 
@@ -295,6 +297,7 @@ def step_collect_results(
     output_dir: str,
     ptm_cutoff: float,
     proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
+    tar_protein_dirs: bool = False,
 ) -> list:
     """
     Read AF2Rank scores, select best structure per protein, copy to output.
@@ -309,6 +312,7 @@ def step_collect_results(
     os.makedirs(best_predictions_dir, exist_ok=True)
 
     results = []
+    restored_for_copy = []
 
     for protein_id in protein_ids:
         protein_dir = Path(inference_base) / protein_id
@@ -317,7 +321,10 @@ def step_collect_results(
         m2_csv = topk_dir / "af2rank_analysis_model_2_ptm" / f"af2rank_scores_{protein_id}.csv"
 
         # Count generated structures
-        num_generated = len(list(protein_dir.glob(f"{protein_id}_*.pdb")))
+        if tar_protein_dirs:
+            num_generated = len(protein_glob_members(inference_base, protein_id, f"{protein_id}_*.pdb"))
+        else:
+            num_generated = len(list(protein_dir.glob(f"{protein_id}_*.pdb")))
 
         # Read sequence length from PT file
         data_path = os.environ.get("DATA_PATH", os.path.join(PROTEINA_BASE_DIR, "data"))
@@ -328,7 +335,22 @@ def step_collect_results(
         except Exception:
             seq_len = 0
 
-        if not m1_csv.exists() or not m2_csv.exists():
+        if tar_protein_dirs:
+            m1_text = read_protein_text(
+                inference_base,
+                protein_id,
+                Path("af2rank_on_proteinebm_top_k") / "af2rank_analysis" / f"af2rank_scores_{protein_id}.csv",
+            )
+            m2_text = read_protein_text(
+                inference_base,
+                protein_id,
+                Path("af2rank_on_proteinebm_top_k") / "af2rank_analysis_model_2_ptm" / f"af2rank_scores_{protein_id}.csv",
+            )
+        else:
+            m1_text = m1_csv.read_text() if m1_csv.exists() else None
+            m2_text = m2_csv.read_text() if m2_csv.exists() else None
+
+        if m1_text is None or m2_text is None:
             logger.warning(f"AF2Rank scores not found for {protein_id}, skipping")
             results.append({
                 "protein_id": protein_id,
@@ -343,8 +365,8 @@ def step_collect_results(
             })
             continue
 
-        m1_df = pd.read_csv(m1_csv)
-        m2_df = pd.read_csv(m2_csv)
+        m1_df = pd.read_csv(io.StringIO(m1_text))
+        m2_df = pd.read_csv(io.StringIO(m2_text))
 
         # Merge across models: take min pTM per structure (conservative)
         merged = m1_df[["structure_file", "ptm", "plddt"]].merge(
@@ -355,8 +377,13 @@ def step_collect_results(
         # Also get energy from ProteinEBM scores
         ebm_csv = protein_dir / proteinebm_analysis_subdir / f"proteinebm_scores_{protein_id}.csv"
         energy_map = {}
-        if ebm_csv.exists():
-            ebm_df = pd.read_csv(ebm_csv)
+        ebm_text = read_protein_text(
+            inference_base,
+            protein_id,
+            Path(proteinebm_analysis_subdir) / f"proteinebm_scores_{protein_id}.csv",
+        ) if tar_protein_dirs else (ebm_csv.read_text() if ebm_csv.exists() else None)
+        if ebm_text is not None:
+            ebm_df = pd.read_csv(io.StringIO(ebm_text))
             energy_map = dict(zip(ebm_df["structure_file"].astype(str), ebm_df["energy"].astype(float)))
 
         merged["energy"] = merged["structure_file"].map(energy_map).fillna(float("nan"))
@@ -385,6 +412,13 @@ def step_collect_results(
         passes = best_ptm >= ptm_cutoff
 
         # ── Save best cg2all template ──────────────────────────────────────────
+        if tar_protein_dirs and not protein_dir.exists():
+            stats = restore_selected_protein_dirs(inference_base, [protein_id])
+            logger.info("tar_restore collect_results copy %s: %s", protein_id, stats)
+            if protein_id not in restored_for_copy:
+                restored_for_copy.append(protein_id)
+        elif tar_protein_dirs and protein_id not in restored_for_copy:
+            restored_for_copy.append(protein_id)
         best_stem = Path(best_file).stem
         cg2all_pdb = topk_dir / "cg2all_topk_structures" / f"{best_stem}_allatom.pdb"
         dest_template = os.path.join(best_templates_dir, f"{protein_id}.pdb")
@@ -431,6 +465,10 @@ def step_collect_results(
             "best_prediction": os.path.basename(dest_prediction) if dest_prediction else "",
             "passes_cutoff": passes,
         })
+
+    if tar_protein_dirs and restored_for_copy:
+        stats = pack_protein_dirs(inference_base, restored_for_copy, delete_after=True)
+        logger.info("tar_pack collect_results copy: %s", stats)
 
     # Write prediction_summary.csv
     summary_csv_path = os.path.join(output_dir, "prediction_summary.csv")
@@ -666,7 +704,12 @@ def main(argv: list[str] | None = None):
         logger.error(f"Input file not found: {args.input}")
         sys.exit(1)
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    output_dir_path = Path(args.output_dir)
+    output_dir_path.mkdir(parents=True, exist_ok=True)
+    if shard_index is not None and num_shards is not None:
+        own_sentinel = output_dir_path / f".shard_{shard_index}_of_{num_shards}_complete"
+        own_sentinel.unlink(missing_ok=True)
+        logger.info(f"Cleared own shard completion sentinel (shard {shard_index}/{num_shards}).")
     start_time = time.time()
     success = True
 
@@ -804,50 +847,50 @@ def main(argv: list[str] | None = None):
         else:
             logger.info("Skipping central analysis")
 
+    if shard_index is not None and num_shards is not None:
+        sentinel = output_dir_path / f".shard_{shard_index}_of_{num_shards}_complete"
+        sentinel.write_text("0" if success else "1")
+        logger.info(f"Wrote shard {shard_index} completion sentinel ({'success' if success else 'failure'}).")
+
     if shard_index is not None and shard_index != 0:
         logger.info("Per-protein work complete (after central analysis), exiting.")
         sys.exit(0 if success else 1)
 
     if success and shard_index is not None:
-        inference_base = os.path.join(PROTEINA_BASE_DIR, "inference", args.inference_config)
-        if skip_analysis:
-            def _check_global_ready(protein_id):
-                m1 = Path("af2rank_on_proteinebm_top_k") / "af2rank_analysis" / f"af2rank_scores_{protein_id}.csv"
-                m2 = Path("af2rank_on_proteinebm_top_k") / "af2rank_analysis_model_2_ptm" / f"af2rank_scores_{protein_id}.csv"
-                if args.tar_protein_dirs:
-                    return (
-                        protein_relative_path_exists(inference_base, protein_id, m1)
-                        and protein_relative_path_exists(inference_base, protein_id, m2)
-                    )
-                protein_dir = Path(inference_base) / protein_id
-                return (protein_dir / m1).exists() and (protein_dir / m2).exists()
-        else:
-            def _check_global_ready(protein_id):
-                summary_path = Path("proteina_analysis") / f"analysis_summary_{protein_id}.json"
-                if args.tar_protein_dirs:
-                    return protein_relative_path_exists(inference_base, protein_id, summary_path)
-                return (Path(inference_base) / protein_id / summary_path).exists()
+        other_shard_indices = list(range(1, num_shards))
+        if other_shard_indices:
+            def _check_shard_done(shard_idx: int) -> bool:
+                sentinel_path = output_dir_path / f".shard_{shard_idx}_of_{num_shards}_complete"
+                return sentinel_path.exists()
 
-        if not wait_for_completion(
-            protein_ids,
-            _check_global_ready,
-            poll_interval=args.shard_poll_interval,
-            timeout=args.shard_timeout,
-        ):
-            logger.error("Timeout waiting for all shards to complete")
-            success = False
+            if not wait_for_completion(
+                other_shard_indices,
+                _check_shard_done,
+                poll_interval=args.shard_poll_interval,
+                timeout=args.shard_timeout,
+                item_name="shards",
+            ):
+                logger.error("Timeout waiting for all shards to complete")
+                success = False
+
+            failed_shards = []
+            for shard_idx in other_shard_indices:
+                sentinel_path = output_dir_path / f".shard_{shard_idx}_of_{num_shards}_complete"
+                if sentinel_path.exists() and sentinel_path.read_text().strip() != "0":
+                    failed_shards.append(shard_idx)
+            if failed_shards:
+                logger.error("%d shard(s) reported failure: %s", len(failed_shards), failed_shards)
+                success = False
 
     # ── Step 6: Collect results ──
     if success:
         logger.info("\n" + "=" * 60)
         logger.info("STEP 6: COLLECT RESULTS")
         logger.info("=" * 60)
-        if args.tar_protein_dirs:
-            stats = restore_protein_dirs(inference_base, protein_ids)
-            logger.info("Tar restore stats before collect/plot: %s", stats)
         results = step_collect_results(
             protein_ids, args.inference_config, args.output_dir,
             args.ptm_cutoff, args.proteinebm_analysis_subdir,
+            tar_protein_dirs=args.tar_protein_dirs,
         )
 
         # ── Step 7: Plot distribution ──
@@ -855,9 +898,6 @@ def main(argv: list[str] | None = None):
         logger.info("STEP 7: PTM DISTRIBUTION PLOT")
         logger.info("=" * 60)
         step_plot_distribution(results, args.output_dir, args.ptm_cutoff)
-        if args.tar_protein_dirs:
-            stats = pack_protein_dirs(inference_base, protein_ids, delete_after=True)
-            logger.info("Tar pack/delete stats after collect/plot: %s", stats)
 
     # ── Summary ──
     total_time = time.time() - start_time

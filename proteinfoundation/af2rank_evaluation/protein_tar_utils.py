@@ -6,6 +6,7 @@ import os
 import shutil
 import tarfile
 import time
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Iterable
 
@@ -46,6 +47,78 @@ def _validate_member(member: tarfile.TarInfo, protein_id: str) -> None:
 def _tar_members(tar_path: Path) -> list[tarfile.TarInfo]:
     with tarfile.open(tar_path, "r:") as tf:
         return tf.getmembers()
+
+
+def _strip_protein_prefix(member_name: str, protein_id: str) -> str:
+    prefix = f"{protein_id}/"
+    if member_name == protein_id:
+        return ""
+    if member_name.startswith(prefix):
+        return member_name[len(prefix):]
+    return member_name
+
+
+def list_protein_members(inference_dir: str | Path, protein_id: str) -> set[str]:
+    """List file paths relative to the protein dir from loose files or tar members."""
+    inference_path = Path(inference_dir)
+    protein_dir = inference_path / protein_id
+    if protein_dir.is_dir():
+        return {
+            str(path.relative_to(protein_dir))
+            for path in protein_dir.rglob("*")
+            if path.is_file()
+        }
+
+    tar_path = protein_tar_path(inference_path, protein_id)
+    if not tar_path.exists():
+        return set()
+    members: set[str] = set()
+    with tarfile.open(tar_path, "r:") as tf:
+        for member in tf:
+            _validate_member(member, protein_id)
+            if member.isfile():
+                rel_name = _strip_protein_prefix(member.name, protein_id)
+                if rel_name:
+                    members.add(rel_name)
+    return members
+
+
+def protein_glob_members(inference_dir: str | Path, protein_id: str, pattern: str) -> list[str]:
+    """Return file members matching a relative glob pattern from loose files or tar."""
+    return sorted(
+        member
+        for member in list_protein_members(inference_dir, protein_id)
+        if "/" in pattern or "/" not in member
+        if Path(member).match(pattern) or fnmatch(member, pattern)
+    )
+
+
+def read_protein_text(
+    inference_dir: str | Path,
+    protein_id: str,
+    relative_path: str | Path,
+    encoding: str = "utf-8",
+) -> str | None:
+    """Read a small text file from a loose protein dir or directly from its tar archive."""
+    inference_path = Path(inference_dir)
+    rel = Path(relative_path)
+    loose_path = inference_path / protein_id / rel
+    if loose_path.exists():
+        return loose_path.read_text(encoding=encoding)
+
+    tar_path = protein_tar_path(inference_path, protein_id)
+    if not tar_path.exists():
+        return None
+    member_name = str(Path(protein_id) / rel)
+    with tarfile.open(tar_path, "r:") as tf:
+        for member in tf:
+            if member.name == member_name:
+                _validate_member(member, protein_id)
+                handle = tf.extractfile(member)
+                if handle is None:
+                    return None
+                return handle.read().decode(encoding)
+    return None
 
 
 def safe_extract_protein_tar(inference_dir: str | Path, protein_id: str) -> bool:
@@ -93,6 +166,10 @@ def restore_protein_dirs(inference_dir: str | Path, protein_ids: Iterable[str]) 
         "empty_or_missing": empty_or_missing,
         "elapsed_seconds": time.perf_counter() - start,
     }
+
+
+def restore_selected_protein_dirs(inference_dir: str | Path, protein_ids: Iterable[str]) -> dict[str, float | int]:
+    return restore_protein_dirs(inference_dir, protein_ids)
 
 
 def pack_protein_dir(inference_dir: str | Path, protein_id: str, delete_after: bool = True) -> bool:
@@ -144,4 +221,8 @@ def protein_relative_path_exists(inference_dir: str | Path, protein_id: str, rel
         return False
     member_name = str(Path(protein_id) / relative_path)
     with tarfile.open(tar_path, "r:") as tf:
-        return member_name in set(tf.getnames())
+        for member in tf:
+            if member.name == member_name:
+                _validate_member(member, protein_id)
+                return member.isfile()
+    return False

@@ -36,8 +36,6 @@ from proteinfoundation.af2rank_evaluation.sharding_utils import (
 )
 from proteinfoundation.af2rank_evaluation.protein_tar_utils import (
     ensure_protein_tar,
-    pack_protein_dirs,
-    restore_protein_dirs,
 )
 
 # Setup logging
@@ -846,9 +844,6 @@ def main(argv: list[str] | None = None):
         inference_dir = os.path.join(project_root, "inference", args.inference_config)
 
         if success:
-            if args.tar_protein_dirs:
-                stats = restore_protein_dirs(inference_dir, protein_ids_for_tar)
-                logger.info(f"Tar restore stats before cross-protein plotting: {stats}")
             plot_success = run_cross_protein_plots(
                 inference_dir=inference_dir,
                 output_dir=cross_out_dir,
@@ -883,9 +878,6 @@ def main(argv: list[str] | None = None):
                 # for this inference_dir/dataset combination. Treat as a warning so the
                 # pipeline can still complete after producing the primary plots.
                 logger.warning("⚠️  Cross-protein plotting skipped/failed (af2rank_on_proteinebm_topk)")
-        if args.tar_protein_dirs:
-            stats = pack_protein_dirs(inference_dir, protein_ids_for_tar, delete_after=True)
-            logger.info(f"Tar pack/delete stats after cross-protein plotting: {stats}")
     
     # Final summary
     total_time = time.time() - start_time

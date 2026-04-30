@@ -27,6 +27,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from itertools import combinations
 from pathlib import Path
@@ -39,7 +40,12 @@ import numpy as np
 import pandas as pd
 
 from proteinfoundation.af2rank_evaluation.cif_chain_mapping import resolve_ground_truth_usalign_chain
-from proteinfoundation.af2rank_evaluation.protein_tar_utils import pack_protein_dirs, restore_protein_dirs
+from proteinfoundation.af2rank_evaluation.protein_tar_utils import (
+    pack_protein_dirs,
+    protein_glob_members,
+    read_protein_text,
+    restore_selected_protein_dirs,
+)
 from proteinfoundation.af2rank_evaluation.sharding_utils import add_shard_args, lengths_from_csv, resolve_shard_args, shard_proteins
 from proteinfoundation.af2rank_evaluation.topk_summary_utils import generate_topk_summary_csv
 from proteinfoundation.af2rank_evaluation.usalign_tabular import (
@@ -1185,6 +1191,20 @@ def run_analysis_for_protein(
     return analysis_summary
 
 
+def analysis_complete_in_tar_or_dir(
+    inference_dir: str,
+    protein_id: str,
+    output_subdir: str = "proteina_analysis",
+) -> bool:
+    summary_rel = Path(output_subdir) / f"analysis_summary_{protein_id}.json"
+    summary_text = read_protein_text(inference_dir, protein_id, summary_rel)
+    if summary_text is None:
+        return False
+    summary = json.loads(summary_text)
+    current_templates = protein_glob_members(inference_dir, protein_id, f"{protein_id}_*.pdb")
+    return len(current_templates) <= int(summary.get("n_samples", 0) or 0)
+
+
 def compute_analysis_for_proteins(
     inference_dir: str,
     protein_ids: List[str],
@@ -1312,13 +1332,39 @@ def main() -> None:
             protein_ids = shard_proteins(protein_ids, shard_index, num_shards, data_dir=data_dir)
         logger.info(f"Central analysis shard {shard_index}/{num_shards}: {len(protein_ids)} proteins selected")
 
+    analysis_ids = list(protein_ids)
+    complete_ids: List[str] = []
+    if args.tar_protein_dirs and not args.rerun:
+        check_start = time.perf_counter()
+        complete_ids = [
+            protein_id
+            for protein_id in protein_ids
+            if analysis_complete_in_tar_or_dir(args.inference_dir, protein_id, args.output_subdir)
+        ]
+        complete_id_set = set(complete_ids)
+        analysis_ids = [
+            protein_id
+            for protein_id in protein_ids
+            if protein_id not in complete_id_set
+        ]
+        logger.info(
+            "tar_check central analysis: checked=%d complete=%d needing_work=%d elapsed_seconds=%.3f",
+            len(protein_ids), len(protein_ids) - len(analysis_ids), len(analysis_ids),
+            time.perf_counter() - check_start,
+        )
+    elif args.tar_protein_dirs:
+        logger.info(
+            "tar_check central analysis: checked=%d complete=0 needing_work=%d elapsed_seconds=0.000",
+            len(protein_ids), len(protein_ids),
+        )
+
     if args.tar_protein_dirs:
-        stats = restore_protein_dirs(args.inference_dir, protein_ids)
-        logger.info("Tar restore stats before central analysis: %s", stats)
+        stats = restore_selected_protein_dirs(args.inference_dir, analysis_ids)
+        logger.info("tar_restore central analysis: %s", stats)
 
     results = compute_analysis_for_proteins(
         inference_dir=args.inference_dir,
-        protein_ids=protein_ids,
+        protein_ids=analysis_ids,
         output_subdir=args.output_subdir,
         proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
         skip_existing=not args.rerun,
@@ -1327,9 +1373,17 @@ def main() -> None:
         use_usalign_dir=not args.no_usalign_dir,
         skip_diversity=args.skip_diversity,
     )
+    for protein_id in complete_ids:
+        summary_text = read_protein_text(
+            args.inference_dir,
+            protein_id,
+            Path(args.output_subdir) / f"analysis_summary_{protein_id}.json",
+        )
+        if summary_text is not None:
+            results[protein_id] = json.loads(summary_text)
     if args.tar_protein_dirs:
-        stats = pack_protein_dirs(args.inference_dir, protein_ids, delete_after=True)
-        logger.info("Tar pack/delete stats after central analysis: %s", stats)
+        stats = pack_protein_dirs(args.inference_dir, analysis_ids, delete_after=True)
+        logger.info("tar_pack central analysis: %s", stats)
     logger.info(f"Done. {len(results)} proteins with analysis metrics.")
 
 

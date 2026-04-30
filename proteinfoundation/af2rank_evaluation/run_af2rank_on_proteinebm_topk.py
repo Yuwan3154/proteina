@@ -9,6 +9,7 @@ This is intentionally separate from run_full_pipeline.py for now.
 """
 
 import argparse
+import io
 import json
 import logging
 import os
@@ -16,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -30,7 +32,12 @@ from proteinfoundation.af2rank_evaluation.sharding_utils import (
     resolve_shard_args,
     shard_proteins,
 )
-from proteinfoundation.af2rank_evaluation.protein_tar_utils import pack_protein_dirs, restore_protein_dirs
+from proteinfoundation.af2rank_evaluation.protein_tar_utils import (
+    list_protein_members,
+    pack_protein_dirs,
+    read_protein_text,
+    restore_selected_protein_dirs,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s",
                     stream=sys.stdout)
@@ -95,18 +102,20 @@ def _read_proteinebm_summary(summary_path: Path) -> Dict[str, str | None]:
 
 
 def _select_topk_templates(scores_csv: Path, top_k: int) -> pd.DataFrame:
-    df = pd.read_csv(scores_csv)
+    return _select_topk_templates_df(pd.read_csv(scores_csv), scores_csv.parent.parent, top_k)
+
+
+def _select_topk_templates_df(df: pd.DataFrame, protein_dir: Path, top_k: int) -> pd.DataFrame:
     needed = {"structure_path", "energy"}
     missing = sorted([c for c in needed if c not in df.columns])
     if missing:
-        raise KeyError(f"ProteinEBM scores CSV missing columns {missing}: {scores_csv}")
+        raise KeyError(f"ProteinEBM scores CSV missing columns {missing}")
     df = df.dropna(subset=["structure_path", "energy"])
     df["energy"] = df["energy"].astype(float)
     df = df.sort_values("energy", ascending=True).head(int(top_k)).reset_index(drop=True)
     if len(df) == 0:
         raise ValueError(f"No valid rows found in {scores_csv}")
 
-    protein_dir = scores_csv.parent.parent
     def _rebase_path(p: str) -> str:
         """Resolve structure_path relative to the protein dir on the current machine."""
         orig = Path(p)
@@ -160,6 +169,34 @@ def _extract_top1_top5_metrics(
     out["top_5_composite"] = float(r5["composite"]) if "composite" in r5 and pd.notna(r5.get("composite")) else nan
     out["top_5_plddt"] = float(r5["plddt"]) if "plddt" in r5 and pd.notna(r5.get("plddt")) else nan
     return out
+
+
+def _af2rank_topk_complete_from_tar_or_dir(
+    inference_dir: str,
+    protein_id: str,
+    desired: set,
+) -> bool:
+    members = list_protein_members(inference_dir, protein_id)
+    for model_dir in ("af2rank_analysis", "af2rank_analysis_model_2_ptm"):
+        scores_rel = Path("af2rank_on_proteinebm_top_k") / model_dir / f"af2rank_scores_{protein_id}.csv"
+        scores_text = read_protein_text(inference_dir, protein_id, scores_rel)
+        if scores_text is None:
+            return False
+        df = pd.read_csv(io.StringIO(scores_text))
+        if "structure_file" not in df.columns:
+            return False
+        if not {"tm_ref_pred", "tm_ref_template"}.issubset(df.columns):
+            return False
+        predicted_rel = Path("af2rank_on_proteinebm_top_k") / model_dir / "predicted_structures"
+        processed = {
+            str(row["structure_file"])
+            for _, row in df.iterrows()
+            if pd.notna(row["structure_file"])
+            and str(predicted_rel / str(row["structure_file"])) in members
+        }
+        if not desired.issubset(processed):
+            return False
+    return True
 
 
 def _merge_min_across_models(
@@ -794,29 +831,24 @@ def main() -> None:
         shard_ids = None
 
     candidate_ids = list(shard_ids) if shard_ids is not None else candidate_ids_raw
-    if args.tar_protein_dirs:
-        stats = restore_protein_dirs(args.inference_dir, candidate_ids)
-        logger.info("Tar restore stats before AF2Rank-on-ProteinEBM-topk: %s", stats)
-
-    score_csvs = _find_proteinebm_scores(args.inference_dir, args.proteinebm_analysis_subdir)
-    logger.info(f"Found {len(score_csvs)} ProteinEBM score CSVs under {args.inference_dir}")
-    if len(score_csvs) == 0:
-        if args.tar_protein_dirs:
-            stats = pack_protein_dirs(args.inference_dir, candidate_ids, delete_after=True)
-            logger.info("Tar pack/delete stats after AF2Rank-on-ProteinEBM-topk: %s", stats)
-        raise FileNotFoundError(f"No proteinebm_scores_*.csv found under {args.inference_dir}")
-
-    scores_by_protein: Dict[str, Path] = {p.parent.parent.name: p for p in score_csvs}
-    logger.info(f"scores_by_protein has {len(scores_by_protein)} entries")
-
     tasks: List[Tuple[str, str, Dict[str, object], str]] = []
     n_considered = 0
     n_no_scores = 0
+    n_complete = 0
+    check_start = time.perf_counter()
     for protein_id in candidate_ids:
-        if protein_id not in scores_by_protein:
+        protein_dir = Path(args.inference_dir) / protein_id
+        scores_rel = Path(args.proteinebm_analysis_subdir) / f"proteinebm_scores_{protein_id}.csv"
+        scores_text = read_protein_text(args.inference_dir, protein_id, scores_rel)
+        if scores_text is None:
             n_no_scores += 1
             continue
-        scores_csv = scores_by_protein[protein_id]
+        scores_csv = protein_dir / scores_rel
+        topk_df = _select_topk_templates_df(pd.read_csv(io.StringIO(scores_text)), protein_dir, args.top_k)
+        desired = set(Path(str(p)).name for p in topk_df["structure_path"].tolist())
+        if args.filter_existing and _af2rank_topk_complete_from_tar_or_dir(args.inference_dir, protein_id, desired):
+            n_complete += 1
+            continue
         gpu_id = gpu_ids[len(tasks) % len(gpu_ids)]
         if has_dataset and protein_id in dataset_map:
             ref = dataset_map[protein_id]
@@ -827,6 +859,15 @@ def main() -> None:
         n_considered += 1
         if args.limit and n_considered >= int(args.limit):
             break
+
+    logger.info(
+        "tar_check AF2Rank-on-ProteinEBM-topk: checked=%d complete=%d needing_work=%d skipped_no_scores=%d elapsed_seconds=%.3f",
+        len(candidate_ids), n_complete, len(tasks), n_no_scores, time.perf_counter() - check_start,
+    )
+    task_ids = [task[0] for task in tasks]
+    if args.tar_protein_dirs:
+        stats = restore_selected_protein_dirs(args.inference_dir, task_ids)
+        logger.info("tar_restore AF2Rank-on-ProteinEBM-topk: %s", stats)
 
     logger.info(f"Built {len(tasks)} tasks (candidates={len(candidate_ids)}, skipped_no_scores={n_no_scores}, filter_existing={args.filter_existing}, direct_python={args.direct_python})")
     if len(tasks) > 0:
@@ -866,8 +907,8 @@ def main() -> None:
                             logger.error("FAILED %s: %s", pid, e)
                         pbar.update(1)
         if args.tar_protein_dirs:
-            stats = pack_protein_dirs(args.inference_dir, candidate_ids, delete_after=True)
-            logger.info("Tar pack/delete stats after AF2Rank-on-ProteinEBM-topk: %s", stats)
+            stats = pack_protein_dirs(args.inference_dir, task_ids, delete_after=True)
+            logger.info("tar_pack AF2Rank-on-ProteinEBM-topk: %s", stats)
         return
 
     rows: List[Dict[str, object]] = []
@@ -913,19 +954,19 @@ def main() -> None:
         if n_failed > 0:
             logger.error(f"{n_failed}/{len(tasks)} proteins failed — check errors above")
             if args.tar_protein_dirs:
-                stats = pack_protein_dirs(args.inference_dir, candidate_ids, delete_after=True)
-                logger.info("Tar pack/delete stats after AF2Rank-on-ProteinEBM-topk: %s", stats)
+                stats = pack_protein_dirs(args.inference_dir, task_ids, delete_after=True)
+                logger.info("tar_pack AF2Rank-on-ProteinEBM-topk: %s", stats)
             sys.exit(1)
         if args.tar_protein_dirs:
-            stats = pack_protein_dirs(args.inference_dir, candidate_ids, delete_after=True)
-            logger.info("Tar pack/delete stats after AF2Rank-on-ProteinEBM-topk: %s", stats)
+            stats = pack_protein_dirs(args.inference_dir, task_ids, delete_after=True)
+            logger.info("tar_pack AF2Rank-on-ProteinEBM-topk: %s", stats)
         return
 
     if shard_index is not None:
         logger.info("Per-protein work complete (sharded run) — cross-protein summary will be aggregated by shard 0 after all shards finish.")
         if args.tar_protein_dirs:
-            stats = pack_protein_dirs(args.inference_dir, candidate_ids, delete_after=True)
-            logger.info("Tar pack/delete stats after AF2Rank-on-ProteinEBM-topk: %s", stats)
+            stats = pack_protein_dirs(args.inference_dir, task_ids, delete_after=True)
+            logger.info("tar_pack AF2Rank-on-ProteinEBM-topk: %s", stats)
         return
 
     summary_df = pd.DataFrame(rows)
@@ -933,8 +974,8 @@ def main() -> None:
     summary_df.to_csv(summary_csv, index=False)
     logger.info(f"Summary CSV written to {summary_csv} — cross-protein plots are generated by generate_cross_protein_plots.py")
     if args.tar_protein_dirs:
-        stats = pack_protein_dirs(args.inference_dir, candidate_ids, delete_after=True)
-        logger.info("Tar pack/delete stats after AF2Rank-on-ProteinEBM-topk: %s", stats)
+        stats = pack_protein_dirs(args.inference_dir, task_ids, delete_after=True)
+        logger.info("tar_pack AF2Rank-on-ProteinEBM-topk: %s", stats)
 
 
 if __name__ == "__main__":

@@ -20,12 +20,62 @@ import sys
 import json
 import glob
 import argparse
+import io
 from pathlib import Path
 from typing import List, Dict, Tuple
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from loguru import logger
+
+from proteinfoundation.af2rank_evaluation.protein_tar_utils import protein_glob_members, read_protein_text
+
+
+TAR_REF_PREFIX = "tar://"
+
+
+def _tar_ref(inference_dir: str, protein_id: str, relative_path: str | Path) -> str:
+    return f"{TAR_REF_PREFIX}{inference_dir}|{protein_id}|{Path(relative_path).as_posix()}"
+
+
+def _is_tar_ref(path_ref: str | Path) -> bool:
+    return str(path_ref).startswith(TAR_REF_PREFIX)
+
+
+def _parse_tar_ref(path_ref: str | Path) -> tuple[str, str, Path]:
+    body = str(path_ref)[len(TAR_REF_PREFIX):]
+    inference_dir, protein_id, rel = body.split("|", 2)
+    return inference_dir, protein_id, Path(rel)
+
+
+def _read_csv_ref(path_ref: str | Path) -> pd.DataFrame:
+    if _is_tar_ref(path_ref):
+        inference_dir, protein_id, rel = _parse_tar_ref(path_ref)
+        text = read_protein_text(inference_dir, protein_id, rel)
+        if text is None:
+            raise FileNotFoundError(str(path_ref))
+        return pd.read_csv(io.StringIO(text))
+    return pd.read_csv(path_ref)
+
+
+def _read_json_ref(path_ref: str | Path) -> dict:
+    if _is_tar_ref(path_ref):
+        inference_dir, protein_id, rel = _parse_tar_ref(path_ref)
+        text = read_protein_text(inference_dir, protein_id, rel)
+        if text is None:
+            raise FileNotFoundError(str(path_ref))
+        return json.loads(text)
+    with open(path_ref, "r") as f:
+        return json.load(f)
+
+
+def _protein_id_from_ref(path_ref: str | Path, levels_up: int) -> str:
+    if _is_tar_ref(path_ref):
+        return _parse_tar_ref(path_ref)[1]
+    parent = Path(path_ref)
+    for _ in range(levels_up):
+        parent = parent.parent
+    return parent.name
 
 
 def find_af2rank_summaries(inference_base_dir: str) -> List[str]:
@@ -57,6 +107,11 @@ def find_proteinebm_score_files(inference_base_dir: str, analysis_subdir: str = 
     """
     pattern = os.path.join(inference_base_dir, "*", analysis_subdir, "proteinebm_scores_*.csv")
     score_files = glob.glob(pattern)
+    for tar_path in Path(inference_base_dir).glob("*.tar"):
+        protein_id = tar_path.stem
+        rel = Path(analysis_subdir) / f"proteinebm_scores_{protein_id}.csv"
+        if read_protein_text(inference_base_dir, protein_id, rel) is not None:
+            score_files.append(_tar_ref(inference_base_dir, protein_id, rel))
     logger.info(f"Found {len(score_files)} ProteinEBM score files")
     return score_files
 
@@ -67,6 +122,11 @@ def find_proteinebm_summaries(inference_base_dir: str, analysis_subdir: str = "p
     """
     pattern = os.path.join(inference_base_dir, "*", analysis_subdir, "proteinebm_summary_*.json")
     summary_files = glob.glob(pattern)
+    for tar_path in Path(inference_base_dir).glob("*.tar"):
+        protein_id = tar_path.stem
+        rel = Path(analysis_subdir) / f"proteinebm_summary_{protein_id}.json"
+        if read_protein_text(inference_base_dir, protein_id, rel) is not None:
+            summary_files.append(_tar_ref(inference_base_dir, protein_id, rel))
     logger.info(f"Found {len(summary_files)} ProteinEBM summary files")
     return summary_files
 
@@ -85,6 +145,11 @@ def find_af2rank_on_proteinebm_topk_score_files(inference_base_dir: str, top_k: 
         "af2rank_scores_*.csv",
     )
     score_files = glob.glob(pattern)
+    for tar_path in Path(inference_base_dir).glob("*.tar"):
+        protein_id = tar_path.stem
+        rel = Path("af2rank_on_proteinebm_top_k") / "af2rank_analysis" / f"af2rank_scores_{protein_id}.csv"
+        if read_protein_text(inference_base_dir, protein_id, rel) is not None:
+            score_files.append(_tar_ref(inference_base_dir, protein_id, rel))
     logger.info(f"Found {len(score_files)} AF2Rank-on-ProteinEBM-topk score files (using folder af2rank_on_proteinebm_top_k)")
     return score_files
 
@@ -184,11 +249,11 @@ def load_af2rank_on_proteinebm_topk_data(
         return merged[["structure_file", "ptm", "tm_ref_pred", "tm_ref_template", "composite", "plddt"]]
 
     for score_file in score_files:
-        protein_id = Path(score_file).parent.parent.parent.name
+        protein_id = _protein_id_from_ref(score_file, 3)
         if protein_id not in dataset_proteins:
             continue
 
-        m1_df = pd.read_csv(score_file)
+        m1_df = _read_csv_ref(score_file)
         needed = {"ptm", "tm_ref_pred", "tm_ref_template", "structure_file"}
         missing = sorted([c for c in needed if c not in m1_df.columns])
         if missing:
@@ -199,8 +264,19 @@ def load_af2rank_on_proteinebm_topk_data(
             )
             continue
 
-        staged_dir = Path(score_file).parent.parent / "staged_topk_templates"
-        staged_names = set(f.name for f in staged_dir.iterdir() if f.is_file() or f.is_symlink()) if staged_dir.exists() else set()
+        if _is_tar_ref(score_file):
+            inference_dir, _, _ = _parse_tar_ref(score_file)
+            staged_names = {
+                Path(member).name
+                for member in protein_glob_members(
+                    inference_dir,
+                    protein_id,
+                    "af2rank_on_proteinebm_top_k/staged_topk_templates/*",
+                )
+            }
+        else:
+            staged_dir = Path(score_file).parent.parent / "staged_topk_templates"
+            staged_names = set(f.name for f in staged_dir.iterdir() if f.is_file() or f.is_symlink()) if staged_dir.exists() else set()
         if not staged_names:
             staged_names = set(m1_df["structure_file"].astype(str).tolist())
         if len(staged_names) == 0:
@@ -210,15 +286,33 @@ def load_af2rank_on_proteinebm_topk_data(
         if not m1_metrics:
             continue
 
-        m2_path = Path(score_file).parent.parent / "af2rank_analysis_model_2_ptm" / Path(score_file).name
+        if _is_tar_ref(score_file):
+            inference_dir, _, _ = _parse_tar_ref(score_file)
+            m2_path = _tar_ref(
+                inference_dir,
+                protein_id,
+                Path("af2rank_on_proteinebm_top_k") / "af2rank_analysis_model_2_ptm" / f"af2rank_scores_{protein_id}.csv",
+            )
+        else:
+            m2_path = Path(score_file).parent.parent / "af2rank_analysis_model_2_ptm" / Path(score_file).name
 
         # Load ProteinEBM energy for this protein (min energy among top-k)
-        protein_dir = Path(score_file).parent.parent.parent
-        ebm_csv_path = protein_dir / proteinebm_analysis_subdir / f"proteinebm_scores_{protein_id}.csv"
+        if _is_tar_ref(score_file):
+            inference_dir, _, _ = _parse_tar_ref(score_file)
+            ebm_csv_path = _tar_ref(
+                inference_dir,
+                protein_id,
+                Path(proteinebm_analysis_subdir) / f"proteinebm_scores_{protein_id}.csv",
+            )
+        else:
+            protein_dir = Path(score_file).parent.parent.parent
+            ebm_csv_path = protein_dir / proteinebm_analysis_subdir / f"proteinebm_scores_{protein_id}.csv"
         min_energy = float("nan")
-        if ebm_csv_path.exists():
+        if (_is_tar_ref(ebm_csv_path) and read_protein_text(*_parse_tar_ref(ebm_csv_path)) is not None) or (
+            not _is_tar_ref(ebm_csv_path) and ebm_csv_path.exists()
+        ):
             try:
-                ebm_df = pd.read_csv(ebm_csv_path)
+                ebm_df = _read_csv_ref(ebm_csv_path)
                 if "energy" in ebm_df.columns and "structure_file" in ebm_df.columns:
                     ebm_staged = ebm_df[ebm_df["structure_file"].astype(str).isin(staged_names)]
                     if len(ebm_staged) > 0:
@@ -244,8 +338,13 @@ def load_af2rank_on_proteinebm_topk_data(
             # max_ptm_topk = top_1_ptm (top-1 by pTM is the max pTM)
             "max_ptm_topk": m1_metrics["top_1_ptm"],
         }
-        if m2_path.exists():
-            m2_df = pd.read_csv(m2_path)
+        m2_exists = (
+            read_protein_text(*_parse_tar_ref(m2_path)) is not None
+            if _is_tar_ref(m2_path)
+            else m2_path.exists()
+        )
+        if m2_exists:
+            m2_df = _read_csv_ref(m2_path)
             if needed.issubset(m2_df.columns):
                 m2_metrics = _extract_metrics(m2_df, staged_names, top_k)
                 min_df = _merge_min(m1_df, m2_df, staged_names)
@@ -687,12 +786,12 @@ def load_proteinebm_data(score_files: List[str], dataset_file: str, id_col: str,
 
     for score_file in score_files:
         # Extract protein ID from path: .../protein_id/proteinebm_analysis/proteinebm_scores_*.csv
-        protein_id = Path(score_file).parent.parent.name
+        protein_id = _protein_id_from_ref(score_file, 2)
 
         if protein_id not in dataset_proteins:
             continue
 
-        scores_df = pd.read_csv(score_file)
+        scores_df = _read_csv_ref(score_file)
         if "energy" not in scores_df.columns:
             raise KeyError(f"Missing required column 'energy' in {score_file}. Columns: {scores_df.columns.tolist()}")
 
@@ -741,12 +840,11 @@ def load_proteinebm_summary_data(summary_files: List[str], dataset_file: str, id
     logger.info(f"Dataset contains {len(dataset_proteins)} proteins")
 
     for summary_file in summary_files:
-        protein_id = Path(summary_file).parent.parent.name
+        protein_id = _protein_id_from_ref(summary_file, 2)
         if protein_id not in dataset_proteins:
             continue
 
-        with open(summary_file, "r") as f:
-            summary = json.load(f)
+        summary = _read_json_ref(summary_file)
 
         spearman_rho = summary.get("spearman_correlation_rho_composite")
         max_tm_ref_template = summary.get("max_tm_ref_template")

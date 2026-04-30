@@ -37,7 +37,11 @@ from proteinfoundation.af2rank_evaluation.sharding_utils import (
     resolve_shard_args,
     shard_proteins,
 )
-from proteinfoundation.af2rank_evaluation.protein_tar_utils import pack_protein_dirs, restore_protein_dirs
+from proteinfoundation.af2rank_evaluation.protein_tar_utils import (
+    pack_protein_dirs,
+    protein_glob_members,
+    restore_selected_protein_dirs,
+)
 
 def _terminate_process_group(signum: int) -> None:
     """
@@ -370,7 +374,13 @@ def _get_expected_nsamples(inference_config):
     return None  # Unknown — caller decides policy
 
 
-def find_proteins_needing_inference(csv_file, csv_col, inference_config):
+def find_proteins_needing_inference(
+    csv_file,
+    csv_col,
+    inference_config,
+    candidate_proteins=None,
+    tar_protein_dirs: bool = False,
+):
     """Find proteins from CSV that need inference (incomplete or missing).
 
     A protein is skipped only when it already has at least ``nsamples_per_len``
@@ -378,7 +388,7 @@ def find_proteins_needing_inference(csv_file, csv_col, inference_config):
     included so that ``inference.py`` can resume from where they left off.
     """
     # Get proteins from CSV file
-    csv_proteins = get_protein_names(csv_file, csv_col)
+    csv_proteins = list(candidate_proteins) if candidate_proteins is not None else get_protein_names(csv_file, csv_col)
 
     inference_base_dir = os.path.join(PROTEINA_BASE_DIR, 'inference', inference_config)
 
@@ -391,11 +401,15 @@ def find_proteins_needing_inference(csv_file, csv_col, inference_config):
     for protein_name in csv_proteins:
         protein_dir = Path(inference_base_dir) / protein_name
 
-        if protein_dir.exists() and protein_dir.is_dir():
-            # Check if there are PDB files (inference completed)
-            pdb_files = list(protein_dir.glob(f"{protein_name}_*.pdb"))
+        if tar_protein_dirs:
+            n_existing = len(protein_glob_members(inference_base_dir, protein_name, f"{protein_name}_*.pdb"))
+            exists_for_check = n_existing > 0 or protein_dir.exists() or (Path(inference_base_dir) / f"{protein_name}.tar").exists()
+        else:
+            exists_for_check = protein_dir.exists() and protein_dir.is_dir()
+            pdb_files = list(protein_dir.glob(f"{protein_name}_*.pdb")) if exists_for_check else []
             n_existing = len(pdb_files)
 
+        if exists_for_check:
             if n_existing == 0:
                 # Directory exists but no PDB files
                 proteins_needing_inference.append(protein_name)
@@ -484,18 +498,33 @@ def main():
             logger.info("Sorted proteins short-to-long for OOM-conservative batch-size adaptation.")
 
     inference_base_dir = os.path.join(PROTEINA_BASE_DIR, "inference", args.inference_config)
-    protein_names_for_tar = list(protein_names)
-    if args.tar_protein_dirs:
-        stats = restore_protein_dirs(inference_base_dir, protein_names_for_tar)
-        logger.info("Tar restore stats before inference: %s", stats)
 
     # Now apply the already-done filter to this shard's proteins only
     if args.skip_existing:
-        needing_inference = set(find_proteins_needing_inference(args.csv_file, args.csv_col, args.inference_config))
+        check_start = time.perf_counter()
+        needing_inference = set(
+            find_proteins_needing_inference(
+                args.csv_file,
+                args.csv_col,
+                args.inference_config,
+                candidate_proteins=protein_names,
+                tar_protein_dirs=args.tar_protein_dirs,
+            )
+        )
+        logger.info(
+            "tar_check inference: checked=%d complete=%d needing_work=%d elapsed_seconds=%.3f",
+            len(protein_names), len(protein_names) - len(needing_inference), len(needing_inference),
+            time.perf_counter() - check_start,
+        )
         protein_names = [p for p in protein_names if p in needing_inference]
         logger.info(f"Found {len(protein_names)} proteins in this shard needing inference")
     else:
         logger.info(f"Found {len(protein_names)} proteins in this shard to process")
+
+    protein_names_for_tar = list(protein_names)
+    if args.tar_protein_dirs:
+        stats = restore_selected_protein_dirs(inference_base_dir, protein_names_for_tar)
+        logger.info("tar_restore inference: %s", stats)
 
     logger.info(f"Proteins: {protein_names}")
     
@@ -587,7 +616,7 @@ def main():
 
     if args.tar_protein_dirs:
         stats = pack_protein_dirs(inference_base_dir, protein_names_for_tar, delete_after=True)
-        logger.info("Tar pack/delete stats after inference: %s", stats)
+        logger.info("tar_pack inference: %s", stats)
     
     # Return appropriate exit code
     sys.exit(0 if failed == 0 else 1)
