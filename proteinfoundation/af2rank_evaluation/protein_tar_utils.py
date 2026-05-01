@@ -44,6 +44,12 @@ def _validate_member(member: tarfile.TarInfo, protein_id: str) -> None:
         raise ValueError(f"Unsafe link tar member: {member.name}")
 
 
+def _validate_readable_member(member: tarfile.TarInfo, protein_id: str) -> bool:
+    """Validate member names for metadata reads; ignore legacy link entries."""
+    _validate_member_name(member.name, protein_id)
+    return not (member.issym() or member.islnk())
+
+
 def _tar_members(tar_path: Path) -> list[tarfile.TarInfo]:
     with tarfile.open(tar_path, "r:") as tf:
         return tf.getmembers()
@@ -61,8 +67,7 @@ def _tar_file_members(tar_path: Path, protein_id: str) -> set[str]:
     members: set[str] = set()
     with tarfile.open(tar_path, "r:") as tf:
         for member in tf:
-            _validate_member(member, protein_id)
-            if member.isfile():
+            if _validate_readable_member(member, protein_id) and member.isfile():
                 rel_name = _strip_protein_prefix(member.name, protein_id)
                 if rel_name:
                     members.add(rel_name)
@@ -95,8 +100,7 @@ def list_protein_members(inference_dir: str | Path, protein_id: str) -> set[str]
     members: set[str] = set()
     with tarfile.open(tar_path, "r:") as tf:
         for member in tf:
-            _validate_member(member, protein_id)
-            if member.isfile():
+            if _validate_readable_member(member, protein_id) and member.isfile():
                 rel_name = _strip_protein_prefix(member.name, protein_id)
                 if rel_name:
                     members.add(rel_name)
@@ -133,7 +137,8 @@ def read_protein_text(
     with tarfile.open(tar_path, "r:") as tf:
         for member in tf:
             if member.name == member_name:
-                _validate_member(member, protein_id)
+                if not _validate_readable_member(member, protein_id):
+                    return None
                 handle = tf.extractfile(member)
                 if handle is None:
                     return None
@@ -254,6 +259,5 @@ def protein_relative_path_exists(inference_dir: str | Path, protein_id: str, rel
     with tarfile.open(tar_path, "r:") as tf:
         for member in tf:
             if member.name == member_name:
-                _validate_member(member, protein_id)
-                return member.isfile()
+                return _validate_readable_member(member, protein_id) and member.isfile()
     return False

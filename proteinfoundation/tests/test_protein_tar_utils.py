@@ -115,6 +115,29 @@ def test_rejects_unsafe_members(tmp_path):
     assert not (tmp_path.parent / "bad").exists()
 
 
+def test_metadata_readers_ignore_legacy_symlink_members(tmp_path):
+    protein_id = "protein_A"
+    tar_path = protein_tar_path(tmp_path, protein_id)
+    data = b"x\n"
+    info = tarfile.TarInfo(f"{protein_id}/real.txt")
+    info.size = len(data)
+    link_info = tarfile.TarInfo(f"{protein_id}/linked.txt")
+    link_info.type = tarfile.SYMTYPE
+    link_info.linkname = "real.txt"
+    with tarfile.open(tar_path, "w") as tf:
+        tf.addfile(info, io.BytesIO(data))
+        tf.addfile(link_info)
+
+    assert list_protein_members(tmp_path, protein_id) == {"real.txt"}
+    assert protein_relative_path_exists(tmp_path, protein_id, "real.txt")
+    assert not protein_relative_path_exists(tmp_path, protein_id, "linked.txt")
+    assert read_protein_text(tmp_path, protein_id, "real.txt") == "x\n"
+    assert read_protein_text(tmp_path, protein_id, "linked.txt") is None
+
+    with pytest.raises(ValueError):
+        safe_extract_protein_tar(tmp_path, protein_id)
+
+
 def test_list_members_from_loose_and_tar(tmp_path):
     protein_id = "protein_A"
     protein_dir = tmp_path / protein_id
