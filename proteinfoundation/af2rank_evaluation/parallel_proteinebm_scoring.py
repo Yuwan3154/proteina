@@ -376,6 +376,7 @@ def main():
             protein_names = shard_proteins(protein_names, shard_index, num_shards, data_dir=data_dir)
 
     inference_base_dir = os.path.join(PROTEINA_BASE_DIR, "inference", args.inference_config)
+    shard_protein_names_for_tar = list(protein_names)
 
     # Now apply the already-done filter to this shard's proteins only
     if args.filter_existing:
@@ -413,8 +414,8 @@ def main():
     if not all_configs:
         logger.warning("No valid protein directories found")
         if args.tar_protein_dirs:
-            stats = pack_protein_dirs(inference_base_dir, protein_names_for_tar, delete_after=True)
-            logger.info("tar_pack ProteinEBM: %s", stats)
+            stats = pack_protein_dirs(inference_base_dir, shard_protein_names_for_tar, delete_after=True)
+            logger.info("tar_pack ProteinEBM finalization: %s", stats)
         sys.exit(0)
 
     logger.info(
@@ -502,8 +503,8 @@ def main():
     n_proteins = sum(len(c) for c in gpu_chunks)
     logger.info(f"\nProteinEBM scoring complete: {n_proteins} proteins in {total_time:.1f}s")
     if args.tar_protein_dirs:
-        stats = pack_protein_dirs(inference_base_dir, protein_names_for_tar, delete_after=True)
-        logger.info("tar_pack ProteinEBM: %s", stats)
+        stats = pack_protein_dirs(inference_base_dir, shard_protein_names_for_tar, delete_after=True)
+        logger.info("tar_pack ProteinEBM finalization: %s", stats)
     if failed_gpus:
         logger.error(f"Failed GPU workers: {failed_gpus}")
         sys.exit(1)

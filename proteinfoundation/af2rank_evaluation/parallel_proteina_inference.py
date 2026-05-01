@@ -498,6 +498,7 @@ def main():
             logger.info("Sorted proteins short-to-long for OOM-conservative batch-size adaptation.")
 
     inference_base_dir = os.path.join(PROTEINA_BASE_DIR, "inference", args.inference_config)
+    shard_protein_names_for_tar = list(protein_names)
 
     # Now apply the already-done filter to this shard's proteins only
     if args.skip_existing:
@@ -615,8 +616,8 @@ def main():
                 logger.info(f"  - {result['protein']} [{error_type}]: {error_preview}")
 
     if args.tar_protein_dirs:
-        stats = pack_protein_dirs(inference_base_dir, protein_names_for_tar, delete_after=True)
-        logger.info("tar_pack inference: %s", stats)
+        stats = pack_protein_dirs(inference_base_dir, shard_protein_names_for_tar, delete_after=True)
+        logger.info("tar_pack inference finalization: %s", stats)
     
     # Return appropriate exit code
     sys.exit(0 if failed == 0 else 1)

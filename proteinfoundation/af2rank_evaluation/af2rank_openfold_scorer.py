@@ -377,6 +377,35 @@ def get_ca_coords_from_structure(pdb_file, chain=None):
     return np.array(coords, dtype=np.float32)
 
 
+def _large_ca_gap_error(pdb_file: str, chain: Optional[str] = None, limit: float = 150.0) -> Optional[str]:
+    coords = get_ca_coords_from_structure(pdb_file, chain)
+    if coords.shape[0] < 2:
+        return None
+    distances = np.linalg.norm(np.diff(coords, axis=0), axis=1)
+    max_idx = int(np.argmax(distances))
+    max_distance = float(distances[max_idx])
+    if max_distance <= limit:
+        return None
+    return (
+        f"large_ca_gap: consecutive CA distance between residues {max_idx + 1} "
+        f"and {max_idx + 2} is {max_distance:.3f} > limit {limit:.3f}"
+    )
+
+
+def _invalid_template_scores(error_message: str) -> Dict[str, float | str]:
+    nan = float("nan")
+    return {
+        "ptm": nan,
+        "plddt": nan,
+        "pae_mean": nan,
+        "composite": nan,
+        "tm_ref_template": nan,
+        "tm_ref_pred": nan,
+        "tm_template_pred": nan,
+        "error": error_message,
+    }
+
+
 def rescale(a, amin=None, amax=None):
     """Rescale array values to [0,1] range."""
     a = np.copy(a)
@@ -717,6 +746,12 @@ class OpenFoldAF2Rank:
         if verbose:
             logger.debug(f"Scoring {decoy_pdb} with OpenFold AF2Rank")
 
+        ca_source = _original_pdb if _original_pdb else decoy_pdb
+        ca_gap_error = _large_ca_gap_error(ca_source, decoy_chain)
+        if ca_gap_error is not None:
+            logger.warning("Skipping %s: %s", os.path.basename(ca_source), ca_gap_error)
+            return _invalid_template_scores(ca_gap_error)
+
         batch, template_coords = self._featurize(
             decoy_pdb,
             decoy_chain=decoy_chain,
@@ -835,10 +870,34 @@ def score_proteina_structures_openfold(
             use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
         )
 
+    scores = []
+    valid_items = []
+    for pdb_path in pdb_files:
+        ca_gap_error = _large_ca_gap_error(pdb_path, "A")
+        if ca_gap_error is not None:
+            pdb_filename = os.path.basename(pdb_path)
+            logger.warning("Skipping %s: %s", pdb_filename, ca_gap_error)
+            structure_scores = _invalid_template_scores(ca_gap_error)
+            structure_scores.update({
+                "protein_id": protein_id,
+                "structure_file": pdb_filename,
+                "structure_path": pdb_path,
+            })
+            scores.append(structure_scores)
+        else:
+            valid_items.append((pdb_path, allatom_map.get(pdb_path, pdb_path)))
+
+    if not valid_items:
+        logger.warning("No valid templates remained for %s after CA-gap filtering", protein_id)
+        for temp_path in allatom_map.values():
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+        return scores
+
     # Pipeline featurization and GPU forward: while the GPU runs the model for
     # decoy i, a background thread pre-featurizes decoy i+1 (build_batch is
     # CPU-only, ~0.7–1.4 s; GPU forward is ~2–5 s, so overlap is nearly free).
-    items = [(p, allatom_map.get(p, p)) for p in pdb_files]
+    items = valid_items
 
     def _featurize_item(item):
         orig_pdb, scored_pdb = item
@@ -847,7 +906,6 @@ def score_proteina_structures_openfold(
         )
         return orig_pdb, batch, template_coords
 
-    scores = []
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(_featurize_item, items[0])
 

@@ -49,6 +49,26 @@ def _tar_members(tar_path: Path) -> list[tarfile.TarInfo]:
         return tf.getmembers()
 
 
+def _loose_file_members(protein_dir: Path) -> set[str]:
+    return {
+        str(path.relative_to(protein_dir))
+        for path in protein_dir.rglob("*")
+        if path.is_file()
+    }
+
+
+def _tar_file_members(tar_path: Path, protein_id: str) -> set[str]:
+    members: set[str] = set()
+    with tarfile.open(tar_path, "r:") as tf:
+        for member in tf:
+            _validate_member(member, protein_id)
+            if member.isfile():
+                rel_name = _strip_protein_prefix(member.name, protein_id)
+                if rel_name:
+                    members.add(rel_name)
+    return members
+
+
 def _strip_protein_prefix(member_name: str, protein_id: str) -> str:
     prefix = f"{protein_id}/"
     if member_name == protein_id:
@@ -183,8 +203,19 @@ def pack_protein_dir(inference_dir: str | Path, protein_id: str, delete_after: b
     tmp_path = inference_path / f"{protein_id}.tar.tmp.{os.getpid()}"
     if tmp_path.exists():
         tmp_path.unlink()
-    with tarfile.open(tmp_path, "w") as tf:
-        tf.add(protein_dir, arcname=protein_id, recursive=True)
+    expected_members = _loose_file_members(protein_dir)
+    with tarfile.open(tmp_path, "w", dereference=True) as tf:
+        for path in sorted(protein_dir.rglob("*")):
+            if path.is_file():
+                rel_path = path.relative_to(protein_dir)
+                tf.add(path, arcname=str(Path(protein_id) / rel_path), recursive=False)
+    packed_members = _tar_file_members(tmp_path, protein_id)
+    if packed_members != expected_members:
+        missing = sorted(expected_members - packed_members)[:5]
+        extra = sorted(packed_members - expected_members)[:5]
+        raise RuntimeError(
+            f"Tar validation failed for {protein_id}: missing={missing}, extra={extra}"
+        )
     os.replace(tmp_path, tar_path)
     if delete_after:
         shutil.rmtree(protein_dir)

@@ -46,7 +46,9 @@ from proteinfoundation.af2rank_evaluation.pipeline_cli_utils import parallel_inc
 from proteinfoundation.af2rank_evaluation.sharding_utils import (
     add_shard_args,
     build_shard_cli_args,
+    lengths_from_csv,
     resolve_shard_args,
+    shard_proteins,
     wait_for_completion,
 )
 from proteinfoundation.af2rank_evaluation.protein_tar_utils import (
@@ -75,6 +77,16 @@ PROTEINA_BASE_DIR = os.getcwd()
 
 def _tar_cli_args(enabled: bool) -> list[str]:
     return ["--tar_protein_dirs"] if enabled else ["--no-tar_protein_dirs"]
+
+
+def _cleanup_shard_sentinels(output_dir: Path, num_shards: int) -> None:
+    removed = 0
+    for shard_idx in range(num_shards):
+        sentinel = output_dir / f".shard_{shard_idx}_of_{num_shards}_complete"
+        if sentinel.exists():
+            sentinel.unlink()
+            removed += 1
+    logger.info("Cleaned up %d shard completion sentinel file(s).", removed)
 
 
 def run_with_conda_env(env_name: str, command_list: list, cwd: str | None = None, direct_python: bool = False) -> bool:
@@ -736,6 +748,14 @@ def main(argv: list[str] | None = None):
     protein_ids = df["id"].tolist()
     logger.info(f"Parsed {len(protein_ids)} proteins")
     inference_base = os.path.join(PROTEINA_BASE_DIR, "inference", args.inference_config)
+    shard_protein_ids_for_tar = list(protein_ids)
+    if shard_index is not None:
+        lengths = lengths_from_csv(working_csv, "id", args.len_col)
+        if lengths is not None:
+            shard_protein_ids_for_tar = shard_proteins(protein_ids, shard_index, num_shards, lengths=lengths)
+        else:
+            data_dir = os.environ.get("DATA_PATH", os.path.join(PROTEINA_BASE_DIR, "data"))
+            shard_protein_ids_for_tar = shard_proteins(protein_ids, shard_index, num_shards, data_dir=data_dir)
     if args.tar_protein_dirs:
         for protein_id in protein_ids:
             ensure_protein_tar(inference_base, str(protein_id))
@@ -847,6 +867,10 @@ def main(argv: list[str] | None = None):
         else:
             logger.info("Skipping central analysis")
 
+    if args.tar_protein_dirs and shard_index is not None and num_shards is not None:
+        stats = pack_protein_dirs(inference_base, shard_protein_ids_for_tar, delete_after=True)
+        logger.info("Shard-owned tar finalization: %s", stats)
+
     if shard_index is not None and num_shards is not None:
         sentinel = output_dir_path / f".shard_{shard_index}_of_{num_shards}_complete"
         sentinel.write_text("0" if success else "1")
@@ -915,6 +939,8 @@ def main(argv: list[str] | None = None):
         logger.error(f"Pipeline failed after {total_time:.1f}s")
 
     logger.info("=" * 60)
+    if shard_index == 0 and num_shards is not None:
+        _cleanup_shard_sentinels(output_dir_path, num_shards)
     sys.exit(0 if success else 1)
 
 

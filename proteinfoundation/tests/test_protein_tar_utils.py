@@ -8,6 +8,7 @@ from proteinfoundation.af2rank_evaluation.protein_tar_utils import (
     ensure_protein_tar,
     list_protein_members,
     pack_protein_dir,
+    pack_protein_dirs,
     protein_glob_members,
     protein_relative_path_exists,
     protein_tar_path,
@@ -53,6 +54,38 @@ def test_restore_round_trip(tmp_path):
     assert safe_extract_protein_tar(tmp_path, protein_id)
 
     assert (protein_dir / "protein_A_0.pdb").read_text() == "ATOM\n"
+
+
+def test_pack_validates_and_dereferences_file_symlinks(tmp_path):
+    protein_id = "protein_A"
+    source = tmp_path / "source.pdb"
+    source.write_text("ATOM\n")
+    protein_dir = tmp_path / protein_id
+    protein_dir.mkdir()
+    (protein_dir / "linked.pdb").symlink_to(source)
+
+    assert pack_protein_dir(tmp_path, protein_id, delete_after=True)
+    with tarfile.open(protein_tar_path(tmp_path, protein_id), "r:") as tf:
+        member = tf.getmember(f"{protein_id}/linked.pdb")
+        assert member.isfile()
+        assert not member.issym()
+
+    assert safe_extract_protein_tar(tmp_path, protein_id)
+    assert (protein_dir / "linked.pdb").read_text() == "ATOM\n"
+
+
+def test_pack_dirs_migrates_complete_loose_dir(tmp_path):
+    protein_id = "protein_A"
+    protein_dir = tmp_path / protein_id
+    protein_dir.mkdir()
+    (protein_dir / "done.txt").write_text("complete\n")
+    ensure_protein_tar(tmp_path, protein_id)
+
+    stats = pack_protein_dirs(tmp_path, [protein_id], delete_after=True)
+
+    assert stats["packed"] == 1
+    assert not protein_dir.exists()
+    assert read_protein_text(tmp_path, protein_id, "done.txt") == "complete\n"
 
 
 def test_path_exists_loose_or_tar(tmp_path):

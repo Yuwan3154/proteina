@@ -121,7 +121,11 @@ def _af2rank_csv_complete(af2rank_csv: Path, desired_files) -> bool:
     completed = {
         str(row["structure_file"])
         for _, row in df.iterrows()
-        if pd.notna(row["structure_file"]) and Path(str(row["predicted_structure_path"])).exists()
+        if pd.notna(row["structure_file"])
+        and (
+            Path(str(row["predicted_structure_path"])).exists()
+            or pd.notna(row.get("error"))
+        )
     }
     desired = {Path(str(path)).name for path in desired_files}
     return desired.issubset(completed)

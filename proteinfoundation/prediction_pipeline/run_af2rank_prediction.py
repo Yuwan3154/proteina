@@ -267,7 +267,9 @@ def _score_protein_with_scorer(
         for row in existing_scores:
             structure_file = str(row.get("structure_file", ""))
             predicted_path = str(row.get("predicted_structure_path", ""))
-            if structure_file and predicted_path and Path(predicted_path).exists():
+            if structure_file and (
+                (predicted_path and Path(predicted_path).exists()) or pd.notna(row.get("error"))
+            ):
                 existing_files.add(structure_file)
 
     desired_files = set(Path(str(p)).name for p in topk_df["structure_path"].tolist())
@@ -368,6 +370,7 @@ def main() -> None:
         data_dir = os.environ.get("DATA_PATH", str(inference_base.parent.parent / "data"))
         protein_ids = shard_proteins(protein_ids, shard_index, num_shards, data_dir=data_dir)
         logger.info(f"Shard {shard_index}/{num_shards}: {len(protein_ids)} proteins")
+    shard_protein_ids_for_tar = list(protein_ids)
 
     check_start = time.perf_counter() if "time" in globals() else None
     skipped_complete = 0
@@ -431,6 +434,9 @@ def main() -> None:
 
     if not protein_configs:
         logger.info("No proteins to score.")
+        if args.tar_protein_dirs:
+            stats = pack_protein_dirs(inference_base, shard_protein_ids_for_tar, delete_after=True)
+            logger.info("tar_pack AF2Rank top-k prediction finalization: %s", stats)
         return
 
     protein_ids_for_tar = [str(cfg["protein_id"]) for cfg in protein_configs]
@@ -503,8 +509,8 @@ def main() -> None:
 
     logger.info("AF2Rank prediction scoring complete.")
     if args.tar_protein_dirs:
-        stats = pack_protein_dirs(inference_base, protein_ids_for_tar, delete_after=True)
-        logger.info("tar_pack AF2Rank top-k prediction: %s", stats)
+        stats = pack_protein_dirs(inference_base, shard_protein_ids_for_tar, delete_after=True)
+        logger.info("tar_pack AF2Rank top-k prediction finalization: %s", stats)
 
 
 def _all_scored(scores_csv: Path, desired_files: set) -> bool:
@@ -520,7 +526,11 @@ def _all_scored(scores_csv: Path, desired_files: set) -> bool:
     completed = {
         str(row["structure_file"])
         for _, row in df.iterrows()
-        if pd.notna(row.get("structure_file")) and Path(str(row["predicted_structure_path"])).exists()
+        if pd.notna(row.get("structure_file"))
+        and (
+            Path(str(row["predicted_structure_path"])).exists()
+            or pd.notna(row.get("error"))
+        )
     }
     return desired_files.issubset(completed)
 
@@ -544,7 +554,10 @@ def _all_scored_from_tar_or_dir(
         str(row["structure_file"])
         for _, row in df.iterrows()
         if pd.notna(row.get("structure_file"))
-        and str(predicted_rel_dir / str(row["structure_file"])) in members
+        and (
+            str(predicted_rel_dir / str(row["structure_file"])) in members
+            or pd.notna(row.get("error"))
+        )
     }
     return desired_files.issubset(completed)
 

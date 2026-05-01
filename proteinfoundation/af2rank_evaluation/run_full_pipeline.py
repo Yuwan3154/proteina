@@ -31,11 +31,14 @@ from proteinfoundation.af2rank_evaluation.pipeline_cli_utils import parallel_inc
 from proteinfoundation.af2rank_evaluation.sharding_utils import (
     add_shard_args,
     build_shard_cli_args,
+    lengths_from_csv,
     resolve_shard_args,
+    shard_proteins,
     wait_for_completion,
 )
 from proteinfoundation.af2rank_evaluation.protein_tar_utils import (
     ensure_protein_tar,
+    pack_protein_dirs,
 )
 
 # Setup logging
@@ -585,6 +588,14 @@ def main(argv: list[str] | None = None):
     base_inference_dir = os.path.join(project_root, "inference", args.inference_config)
     dataset_df = pd.read_csv(args.dataset_file)
     protein_ids_for_tar = dataset_df[args.id_col].dropna().astype(str).str.strip().unique().tolist()
+    shard_protein_ids_for_tar = list(protein_ids_for_tar)
+    if shard_index is not None:
+        lengths = lengths_from_csv(args.dataset_file, args.id_col, args.len_col)
+        if lengths is not None:
+            shard_protein_ids_for_tar = shard_proteins(protein_ids_for_tar, shard_index, num_shards, lengths=lengths)
+        else:
+            data_dir = os.environ.get("DATA_PATH", os.path.join(project_root, "data"))
+            shard_protein_ids_for_tar = shard_proteins(protein_ids_for_tar, shard_index, num_shards, data_dir=data_dir)
     if args.tar_protein_dirs:
         for protein_id in protein_ids_for_tar:
             ensure_protein_tar(base_inference_dir, protein_id)
@@ -767,6 +778,10 @@ def main(argv: list[str] | None = None):
                     success = False
             else:
                 logger.info("⏭️  Skipping central analysis")
+
+    if args.tar_protein_dirs and shard_index is not None and num_shards is not None:
+        stats = pack_protein_dirs(base_inference_dir, shard_protein_ids_for_tar, delete_after=True)
+        logger.info(f"Shard-owned tar finalization: {stats}")
 
     # Write per-shard sentinel so shard 0 can reliably know when all shards' per-protein work
     # is done — even on re-runs where stale per-protein output files may already exist.

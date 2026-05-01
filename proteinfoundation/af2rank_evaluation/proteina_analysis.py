@@ -1382,8 +1382,8 @@ def main() -> None:
         if summary_text is not None:
             results[protein_id] = json.loads(summary_text)
     if args.tar_protein_dirs:
-        stats = pack_protein_dirs(args.inference_dir, analysis_ids, delete_after=True)
-        logger.info("tar_pack central analysis: %s", stats)
+        stats = pack_protein_dirs(args.inference_dir, protein_ids, delete_after=True)
+        logger.info("tar_pack central analysis finalization: %s", stats)
     logger.info(f"Done. {len(results)} proteins with analysis metrics.")
 
 
