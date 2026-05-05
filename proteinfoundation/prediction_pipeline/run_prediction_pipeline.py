@@ -756,6 +756,8 @@ def main(argv: list[str] | None = None):
     if shard_index is not None and num_shards is not None:
         own_sentinel = output_dir_path / f".shard_{shard_index}_of_{num_shards}_complete"
         own_sentinel.unlink(missing_ok=True)
+        for _step_s in output_dir_path.glob(f".step_*_shard_{shard_index}_of_{num_shards}_complete"):
+            _step_s.unlink()
         logger.info(f"Cleared own shard completion sentinel (shard {shard_index}/{num_shards}).")
     start_time = time.time()
     success = True

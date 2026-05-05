@@ -42,6 +42,10 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import io
+import tarfile
+import tempfile
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -54,6 +58,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from proteinfoundation.af2rank_evaluation.cif_chain_mapping import resolve_ground_truth_usalign_chain
+from proteinfoundation.af2rank_evaluation.protein_tar_utils import protein_tar_path, read_protein_text
 from proteinfoundation.af2rank_evaluation.usalign_tabular import iter_usalign_outfmt2_rows
 
 logger = logging.getLogger(__name__)
@@ -82,16 +87,50 @@ def _parse_sample_index(structure_file: str) -> Optional[int]:
     return int(tail)
 
 
+def _resolve_pdb_path(
+    inference_dir: Path,
+    protein_id: str,
+    rel_path: Path,
+    tmp_dir: Path,
+) -> Optional[Path]:
+    """Return a filesystem path to a protein PDB file, extracting from tar into tmp_dir if needed."""
+    loose = inference_dir / protein_id / rel_path
+    if loose.exists():
+        return loose
+    tar = protein_tar_path(inference_dir, protein_id)
+    if not tar.exists():
+        return None
+    member_name = f"{protein_id}/{rel_path}"
+    try:
+        with tarfile.open(tar, "r") as tf:
+            try:
+                member = tf.getmember(member_name)
+            except KeyError:
+                return None
+            out = tmp_dir / rel_path
+            out.parent.mkdir(parents=True, exist_ok=True)
+            handle = tf.extractfile(member)
+            if handle is None:
+                return None
+            out.write_bytes(handle.read())
+        return out
+    except Exception as e:
+        logger.warning("Failed to extract %s from %s: %s", member_name, tar, e)
+        return None
+
+
 def _load_merged_m1_m2(inference_dir: Path, protein_id: str) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
     """Return inner-joined per-template DataFrame or (None, error_status)."""
-    m1_csv = _scores_csv_path(inference_dir, protein_id, M1_SUBDIR)
-    m2_csv = _scores_csv_path(inference_dir, protein_id, M2_SUBDIR)
-    if not m1_csv.exists():
+    m1_rel = Path(AF2RANK_TOPK_SUBDIR) / M1_SUBDIR / f"af2rank_scores_{protein_id}.csv"
+    m2_rel = Path(AF2RANK_TOPK_SUBDIR) / M2_SUBDIR / f"af2rank_scores_{protein_id}.csv"
+    m1_content = read_protein_text(inference_dir, protein_id, m1_rel)
+    if m1_content is None:
         return None, "missing_csv_m1"
-    if not m2_csv.exists():
+    m2_content = read_protein_text(inference_dir, protein_id, m2_rel)
+    if m2_content is None:
         return None, "missing_csv_m2"
-    df_m1 = pd.read_csv(m1_csv)
-    df_m2 = pd.read_csv(m2_csv)
+    df_m1 = pd.read_csv(io.StringIO(m1_content))
+    df_m2 = pd.read_csv(io.StringIO(m2_content))
     required = {"structure_file", "ptm"}
     if not required.issubset(df_m1.columns) or not required.issubset(df_m2.columns):
         return None, "missing_columns"
@@ -122,6 +161,7 @@ def _pick_top1_subset(
     subset: pd.DataFrame,
     inference_dir: Path,
     protein_id: str,
+    tmp_dir: Path,
 ) -> Tuple[Optional[Dict[str, object]], Optional[str]]:
     if subset.empty:
         return None, "empty_after_filter"
@@ -130,30 +170,32 @@ def _pick_top1_subset(
     ptm_m1 = float(top["ptm_m1"])
     ptm_m2 = float(top["ptm_m2"])
     best_model = "m1" if ptm_m1 >= ptm_m2 else "m2"
-    template_path = inference_dir / protein_id / structure_file
     pred_file_m1 = top.get("predicted_file_m1", structure_file) if isinstance(top.get("predicted_file_m1", None), str) else structure_file
     pred_file_m2 = top.get("predicted_file_m2", structure_file) if isinstance(top.get("predicted_file_m2", None), str) else structure_file
-    pred_m1 = _prediction_pdb_path(inference_dir, protein_id, M1_SUBDIR, pred_file_m1)
-    pred_m2 = _prediction_pdb_path(inference_dir, protein_id, M2_SUBDIR, pred_file_m2)
+    pred_rel_m1 = Path(AF2RANK_TOPK_SUBDIR) / M1_SUBDIR / PREDICTED_SUBDIR / pred_file_m1
+    pred_rel_m2 = Path(AF2RANK_TOPK_SUBDIR) / M2_SUBDIR / PREDICTED_SUBDIR / pred_file_m2
+    resolved_m1 = _resolve_pdb_path(inference_dir, protein_id, pred_rel_m1, tmp_dir)
+    resolved_m2 = _resolve_pdb_path(inference_dir, protein_id, pred_rel_m2, tmp_dir)
 
     if best_model == "m1":
-        if pred_m1.exists():
-            chosen_pred = pred_m1
-        elif pred_m2.exists():
-            chosen_pred = pred_m2
+        if resolved_m1 is not None:
+            chosen_pred = resolved_m1
+        elif resolved_m2 is not None:
+            chosen_pred = resolved_m2
             best_model = "m2"
         else:
             return None, "missing_prediction_pdb"
     else:
-        if pred_m2.exists():
-            chosen_pred = pred_m2
-        elif pred_m1.exists():
-            chosen_pred = pred_m1
+        if resolved_m2 is not None:
+            chosen_pred = resolved_m2
+        elif resolved_m1 is not None:
+            chosen_pred = resolved_m1
             best_model = "m1"
         else:
             return None, "missing_prediction_pdb"
 
-    if not template_path.exists():
+    template_path = _resolve_pdb_path(inference_dir, protein_id, Path(structure_file), tmp_dir)
+    if template_path is None:
         return None, "missing_template_pdb"
 
     return (
@@ -177,8 +219,9 @@ def _select_top1(
     inference_dir: Path,
     protein_id: str,
     max_sample_index: int,
+    tmp_dir: Path,
 ) -> Tuple[Optional[Dict[str, object]], Optional[str]]:
-    return _pick_top1_subset(merged[merged["sample_index"] < max_sample_index], inference_dir, protein_id)
+    return _pick_top1_subset(merged[merged["sample_index"] < max_sample_index], inference_dir, protein_id, tmp_dir)
 
 
 def _run_usalign_pair(
@@ -383,15 +426,17 @@ def compare_protein(
     if merged_b is None:
         return _empty_row(protein_id, f"b_{err_b}", use_ground_truth=use_ground_truth)
 
-    top_a, err_a = _select_top1(merged_a, a_dir, protein_id, max_sample_index)
-    if top_a is None:
-        return _empty_row(protein_id, f"a_{err_a}", use_ground_truth=use_ground_truth)
-    top_b, err_b = _select_top1(merged_b, b_dir, protein_id, max_sample_index)
-    if top_b is None:
-        return _empty_row(protein_id, f"b_{err_b}", use_ground_truth=use_ground_truth)
+    with tempfile.TemporaryDirectory(prefix=f"cmp_{protein_id}_") as _tmp:
+        tmp = Path(_tmp)
+        top_a, err_a = _select_top1(merged_a, a_dir, protein_id, max_sample_index, tmp / "a")
+        if top_a is None:
+            return _empty_row(protein_id, f"a_{err_a}", use_ground_truth=use_ground_truth)
+        top_b, err_b = _select_top1(merged_b, b_dir, protein_id, max_sample_index, tmp / "b")
+        if top_b is None:
+            return _empty_row(protein_id, f"b_{err_b}", use_ground_truth=use_ground_truth)
 
-    return _build_row(protein_id, top_a, top_b, tmscore_mode, ptm_cutoff,
-                      use_ground_truth=use_ground_truth, cif_dir=cif_dir)
+        return _build_row(protein_id, top_a, top_b, tmscore_mode, ptm_cutoff,
+                          use_ground_truth=use_ground_truth, cif_dir=cif_dir)
 
 
 def compare_protein_self(
@@ -412,15 +457,17 @@ def compare_protein_self(
     first = merged[merged["sample_index"] < max_sample_index]
     second = merged[(merged["sample_index"] >= max_sample_index) & (merged["sample_index"] < 2 * max_sample_index)]
 
-    top_a, err_a = _pick_top1_subset(first, a_dir, protein_id)
-    if top_a is None:
-        return _empty_row(protein_id, f"a_{err_a}", use_ground_truth=use_ground_truth)
-    top_b, err_b = _pick_top1_subset(second, a_dir, protein_id)
-    if top_b is None:
-        return _empty_row(protein_id, f"b_{err_b}", use_ground_truth=use_ground_truth)
+    with tempfile.TemporaryDirectory(prefix=f"cmp_{protein_id}_") as _tmp:
+        tmp = Path(_tmp)
+        top_a, err_a = _pick_top1_subset(first, a_dir, protein_id, tmp)
+        if top_a is None:
+            return _empty_row(protein_id, f"a_{err_a}", use_ground_truth=use_ground_truth)
+        top_b, err_b = _pick_top1_subset(second, a_dir, protein_id, tmp)
+        if top_b is None:
+            return _empty_row(protein_id, f"b_{err_b}", use_ground_truth=use_ground_truth)
 
-    return _build_row(protein_id, top_a, top_b, tmscore_mode, ptm_cutoff,
-                      use_ground_truth=use_ground_truth, cif_dir=cif_dir)
+        return _build_row(protein_id, top_a, top_b, tmscore_mode, ptm_cutoff,
+                          use_ground_truth=use_ground_truth, cif_dir=cif_dir)
 
 
 def _load_protein_ids_from_input(input_path: str, id_col: str) -> List[str]:

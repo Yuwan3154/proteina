@@ -652,6 +652,8 @@ def main(argv: list[str] | None = None):
         os.makedirs(cross_out_dir, exist_ok=True)
         _own_sentinel = Path(cross_out_dir) / f".shard_{shard_index}_of_{num_shards}_complete"
         _own_sentinel.unlink(missing_ok=True)
+        for _step_s in Path(cross_out_dir).glob(f".step_*_shard_{shard_index}_of_{num_shards}_complete"):
+            _step_s.unlink()
         logger.info(f"Cleared own shard completion sentinel (shard {shard_index}/{num_shards}).")
 
     logger.info(f"🚀 Starting complete AF2Rank evaluation pipeline")
