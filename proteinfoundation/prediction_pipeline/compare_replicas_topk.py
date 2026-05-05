@@ -494,7 +494,7 @@ def _pearson_r(x: np.ndarray, y: np.ndarray) -> Optional[float]:
 def _aggregate_stats(
     df: pd.DataFrame,
     args: argparse.Namespace,
-    passing_only: bool,
+    filter_mode: str = "none",
     self_mode: bool = False,
     use_ground_truth: bool = False,
 ) -> Dict[str, object]:
@@ -505,7 +505,12 @@ def _aggregate_stats(
     num_pass_either = int(ok_all["passes_cutoff_either"].sum()) if len(ok_all) else 0
     num_pass_both = int((ok_all["passes_cutoff_a"] & ok_all["passes_cutoff_b"]).sum()) if len(ok_all) else 0
 
-    ok = ok_all[ok_all["passes_cutoff_either"]].copy() if passing_only else ok_all
+    if filter_mode == "union":
+        ok = ok_all[ok_all["passes_cutoff_either"]].copy()
+    elif filter_mode == "intersect":
+        ok = ok_all[ok_all["passes_cutoff_a"] & ok_all["passes_cutoff_b"]].copy()
+    else:
+        ok = ok_all
 
     convergence_metric = getattr(args, "convergence_tm_metric", "tm_predictions_TM1")
     convergence_threshold = float(getattr(args, "convergence_tm_threshold", 0.5))
@@ -524,7 +529,7 @@ def _aggregate_stats(
         "max_sample_index": args.max_sample_index,
         "tmscore_mode": args.tmscore_mode,
         "ptm_cutoff": args.ptm_cutoff,
-        "filter_passing_either": bool(passing_only),
+        "filter_mode": filter_mode,
         "convergence_tm_metric": convergence_metric,
         "convergence_tm_threshold": convergence_threshold,
         "num_targets_total": int(len(df)),
@@ -835,19 +840,30 @@ def main() -> int:
 
     ok_all = df[df["status"] == "ok"]
     ok_passing = ok_all[ok_all["passes_cutoff_either"]]
+    ok_intersect = ok_all[ok_all["passes_cutoff_a"] & ok_all["passes_cutoff_b"]]
+
+    _gt_scatter_paths = {
+        "none": out_dir / "compare_replicas_gt_scatter.png",
+        "union": out_dir / "compare_replicas_gt_scatter_passing.png",
+        "intersect": out_dir / "compare_replicas_gt_scatter_passing_intersect.png",
+    }
 
     variants = [
-        ("unfiltered", False, ok_all,
+        ("unfiltered", "none", ok_all,
          out_dir / "compare_replicas_summary.json",
          out_dir / "compare_replicas_tm_distribution.png",
          f"n={len(ok_all)}]"),
-        ("passing", True, ok_passing,
+        ("passing (union)", "union", ok_passing,
          out_dir / "compare_replicas_summary_passing.json",
          out_dir / "compare_replicas_tm_distribution_passing.png",
          f"n={len(ok_passing)}]"),
+        ("passing (intersect)", "intersect", ok_intersect,
+         out_dir / "compare_replicas_summary_passing_intersect.json",
+         out_dir / "compare_replicas_tm_distribution_passing_intersect.png",
+         f"n={len(ok_intersect)}]"),
     ]
-    for name, passing_only, subset_df, json_path, plot_path, extra_title in variants:
-        summary = _aggregate_stats(df, args, passing_only=passing_only, self_mode=self_mode,
+    for name, filter_mode, subset_df, json_path, plot_path, extra_title in variants:
+        summary = _aggregate_stats(df, args, filter_mode=filter_mode, self_mode=self_mode,
                                    use_ground_truth=args.use_ground_truth)
         with open(json_path, "w") as f:
             json.dump(summary, f, indent=2)
@@ -863,7 +879,7 @@ def main() -> int:
         logger.info("Wrote %s", plot_path)
 
         if args.use_ground_truth:
-            gt_plot_path = out_dir / (f"compare_replicas_gt_scatter_passing.png" if passing_only else "compare_replicas_gt_scatter.png")
+            gt_plot_path = _gt_scatter_paths[filter_mode]
             gt_subset = subset_df[~subset_df["gt_missing"]] if "gt_missing" in subset_df.columns else subset_df.iloc[0:0]
             _plot_gt_scatter(
                 gt_subset, gt_plot_path,
@@ -891,11 +907,12 @@ def main() -> int:
     threshold = float(args.convergence_tm_threshold)
     metric = args.convergence_tm_metric
     converged_all = ok_all[ok_all[metric] > threshold].copy()
-    ok_passing = ok_all[ok_all["passes_cutoff_either"]]
     converged_passing = ok_passing[ok_passing[metric] > threshold].copy()
+    converged_intersect = ok_intersect[ok_intersect[metric] > threshold].copy()
     for label, subset, src_df, path in [
         ("unfiltered", converged_all, ok_all, out_dir / "compare_replicas_converged.csv"),
-        ("passing", converged_passing, ok_passing, out_dir / "compare_replicas_converged_passing.csv"),
+        ("passing (union)", converged_passing, ok_passing, out_dir / "compare_replicas_converged_passing.csv"),
+        ("passing (intersect)", converged_intersect, ok_intersect, out_dir / "compare_replicas_converged_passing_intersect.csv"),
     ]:
         subset.to_csv(path, index=False)
         n_total = len(src_df)
