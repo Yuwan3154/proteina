@@ -1992,6 +1992,7 @@ class ModelTrainerBase(L.LightningModule):
                 - "cath_code": CATH codes for each sample
         """
         force_compile = getattr(self, "_force_compile", False)
+        verbose = getattr(self, "_verbose", False)
         sampling_args = self.inf_cfg.sampling_caflow
 
         cath_code_raw = (
@@ -2062,6 +2063,7 @@ class ModelTrainerBase(L.LightningModule):
             force_compile=force_compile,
             return_trajectory=return_trajectory,
             trajectory_stride=trajectory_stride,
+            verbose=verbose,
         )
         coords_atom37 = None
         if result.get("coords") is not None:
@@ -2119,6 +2121,7 @@ class ModelTrainerBase(L.LightningModule):
         force_compile: bool = False,
         return_trajectory: bool = False,
         trajectory_stride: int = 1,
+        verbose: bool = False,
     ) -> Dict[str, Tensor]:
         """
         Generates samples by integrating ODE with learned vector field.
@@ -2311,6 +2314,7 @@ class ModelTrainerBase(L.LightningModule):
             fixed_structure_mask=fixed_structure_mask,
             modality=modality,
             predict_coords=predict_coords,
+            verbose=verbose,
         )
 
 

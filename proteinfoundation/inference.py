@@ -278,6 +278,12 @@ if __name__ == "__main__":
         help="Force compile the model.",
     )
     parser.add_argument(
+        "--verbose",
+        action="store_true",
+        default=False,
+        help="Show sampling progress bars and debug output (suppressed by default for clean logs).",
+    )
+    parser.add_argument(
         "--use_cueq",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -473,6 +479,7 @@ if __name__ == "__main__":
     # Lightning does not support passing custom kwargs through Trainer.predict to predict_step.
     # Store on the model and read it in predict_step.
     model._force_compile = bool(args.force_compile)
+    model._verbose = bool(args.verbose)
     predictions = trainer.predict(model, dataloader)
 
     # Save RNG state after prediction so future runs can resume from here

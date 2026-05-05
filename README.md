@@ -192,7 +192,7 @@ A motif scaffolding model can be trained with the following command `python prot
 ### Training/Sampling with compiled models
 
 Since our transformer-based architecture is amenable to hardware optimizations, we leverage the torch compilation framework to speed up training and inference. This feature is by default disabled in this repository, but can be enabled easily:
-- For sampling, just outcomment the `torch.compile` line in the forward method of `ProteinTransformerAF3` in `proteinfoundation/nn/protein_transfomer.py`.
+- For sampling, just outcomment the `torch.compile` line in the forward method of `ProteinTransformerAF3` in `proteinfoundation/nn/protein_transformer.py`.
 - For training, in addition you need to enable the `PaddingTransform` with the appropriate `max_size` argument to make all batches the same length across the sequence dimension. By default, we only pad the batches to the longest sequence in the batch for efficiency reasons, but to leverage compilation this size should be constant.
 
 ## Sampling our models
@@ -227,7 +227,7 @@ We provide config files to reproduce our results. Here we provide commands to re
 
 - Fold class-conditional samples from the $\mathcal{M}_{\textrm{21M}}$ model (~400M transformer and ~15M triangle layer parameters) using autoguidance. The first step involves setting the right path for the variable `autoguidance_ckpt_path` in `configs/experiment_config/inference_ccond_autoguidance.yaml`, pointing at the early checkpoint used for autoguidance. Then run `python proteinfoundation/inference.py --config_name inference_cond_autoguidance`. This will sample with a guidance weight of 2, conditioned on "T" level labels, using the ODE sampler. This can be changed by modifying the corresponding parameters in `configs/experiment_config/inference_ccond_autoguidance.yaml`.
 
-- Unconditional long chain generation with $\mathcal{M}_{\textrm{long}}$ model (~200M transformer parameters without triangular multiplicative layers): Run `python proteinfoundation/inference.py --config_name inference_long_len`. This will sample backbones of lengths [300, 400, 500, 600, 700, 800], using a noise scale of 0.35. This can be changed by modifying the corresponding paraemters in `configs/experiment_config/inference_long_len.yaml`.
+- Unconditional long chain generation with $\mathcal{M}_{\textrm{long}}$ model (~200M transformer parameters without triangular multiplicative layers): Run `python proteinfoundation/inference.py --config_name inference_long_len`. This will sample backbones of lengths [300, 400, 500, 600, 700, 800], using a noise scale of 0.35. This can be changed by modifying the corresponding parameters in `configs/experiment_config/inference_long_len.yaml`.
 
 
 ### Explanation of config file parameters

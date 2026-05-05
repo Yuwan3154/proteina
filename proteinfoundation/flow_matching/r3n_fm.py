@@ -442,6 +442,7 @@ class _CoordinateFlowMatcher:
         fixed_sequence_mask = None,
         fixed_structure_mask = None,
         dtype: Optional[torch.dtype] = None,
+        verbose: bool = False,
     ) -> Dict[str, Tensor]:
         """
         Generates samples by simulating the full process starting from
@@ -479,9 +480,10 @@ class _CoordinateFlowMatcher:
         nsteps = math.ceil(
             1.0 / dt
         )  # below it uses nsteps + 1 since we need to include limits 0 and 1, but we never evaluate at 1
-        print(
-            f"Sampling: nsteps={nsteps}, schedule={schedule_mode}, param={schedule_p}, gt={gt_mode}, gt_p={gt_p}, gt_clamp={gt_clamp_val}, temp={sc_scale_noise}"
-        )
+        if verbose:
+            print(
+                f"Sampling: nsteps={nsteps}, schedule={schedule_mode}, param={schedule_p}, gt={gt_mode}, gt_p={gt_p}, gt_clamp={gt_clamp_val}, temp={sc_scale_noise}"
+            )
         # print("mask.shape:", mask.shape)
 
         ts = self.get_schedule(
@@ -510,7 +512,7 @@ class _CoordinateFlowMatcher:
             if fixed_sequence_mask is not None:
                 x_motif = (x_motif - mean_w_mask(x_motif, fixed_sequence_mask, keepdim=True)) * fixed_sequence_mask[..., None]
                 
-            for step in tqdm(range(nsteps)):
+            for step in tqdm(range(nsteps), disable=not verbose):
                 t = ts[step] * torch.ones(nsamples, device=device)  # [nsamples]
                 dt = ts[step + 1] - ts[step]  # float
                 gt_step = gt[step]  # float
@@ -977,6 +979,7 @@ class _ContactMapFlowMatcher:
         fixed_sequence_mask = None,
         fixed_structure_mask = None,
         predict_coords: bool = False,
+        verbose: bool = False,
     ) -> Dict[str, Optional[Tensor]]:
         """
         Full simulation for contact map generation with optional coordinate tracking.
@@ -1028,7 +1031,7 @@ class _ContactMapFlowMatcher:
             c_1_pred = None
             distogram = None
 
-            for step in tqdm(range(nsteps), desc="Contact Map Diffusion"):
+            for step in tqdm(range(nsteps), desc="Contact Map Diffusion", disable=not verbose):
                 t = ts[step] * torch.ones(nsamples, device=device)
                 dt_step = ts[step + 1] - ts[step]
                 gt_step = gt[step]
@@ -1297,6 +1300,7 @@ class FlowMatcher:
         fixed_structure_mask = None,
         modality: Optional[str] = None,
         predict_coords: bool = True,
+        verbose: bool = False,
     ) -> Dict[str, Optional[Tensor]]:
         """
         Full simulation supporting both coordinate and contact map modalities.
@@ -1333,9 +1337,10 @@ class FlowMatcher:
                 gt_mode=gt_mode, gt_p=gt_p, gt_clamp_val=gt_clamp_val,
                 x_motif=x_motif, fixed_sequence_mask=fixed_sequence_mask,
                 fixed_structure_mask=fixed_structure_mask,
+                verbose=verbose,
             )
             return {"coords": x, "contact_map": None, "distogram": None}
-        
+
         # Delegate to contact map flow matcher
         return self.contact_fm.full_simulation(
             predict_clean_n_v, dt=dt, nsamples=nsamples, n=n, self_cond=self_cond,
@@ -1349,4 +1354,5 @@ class FlowMatcher:
             x_motif=x_motif, fixed_sequence_mask=fixed_sequence_mask,
             fixed_structure_mask=fixed_structure_mask,
             predict_coords=predict_coords,
+            verbose=verbose,
         )

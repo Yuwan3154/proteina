@@ -11,7 +11,6 @@
 
 from typing import Dict, Literal, Optional
 
-import einops
 import torch
 from torch.utils.checkpoint import checkpoint
 
@@ -108,13 +107,11 @@ class MultiHeadBiasedAttention(torch.nn.Module):
             Updated sequence representation, shape [b, n, dim_token]
         """
         # Add extra dimension for MSA, unused here but required by openfold
-        x = einops.rearrange(x, "b n d -> b () n d")  # [b, 1, n, dim_token]
-        mask = einops.rearrange(mask, "b n -> b () n") * 1.0  # float [b, 1, n]
+        x = x.unsqueeze(1)  # [b, 1, n, dim_token]
+        mask = mask.unsqueeze(1) * 1.0  # float [b, 1, n]
         x = self.row_attn_pair_bias(x, pair_rep, mask)  # [b, 1, n, dim_token]
         x = x * mask[..., None]
-        x = einops.rearrange(
-            x, "b () n c -> b n c"
-        )  # Remove extra dimension [b, n, dim_token]
+        x = x.squeeze(1)  # Remove extra dimension [b, n, dim_token]
         return x
 
 
@@ -1074,7 +1071,8 @@ class ProteinTransformerAF3(torch.nn.Module):
         seqs, pair_rep, mask = self._undo_registers(seqs, pair_rep, mask)
         
         # Symmetrize pair representation
-        pair_rep = (pair_rep + pair_rep.transpose(-2, -3)) / 2.0
+        if pair_rep is not None:
+            pair_rep = (pair_rep + pair_rep.transpose(-2, -3)) / 2.0
         # if torch.isnan(pair_rep).any() or torch.isinf(pair_rep).any():
         #     print(
         #         f"[pair_rep_sym_debug] nan={torch.isnan(pair_rep).any().item()} "

@@ -12,7 +12,6 @@
 from typing import Optional
 
 import torch
-from einops import rearrange
 from torch import Tensor, einsum, nn
 
 
@@ -84,24 +83,23 @@ class PairBiasAttention(nn.Module):
         k = self.k_layer_norm(k)
         g = self.to_g(node_feats)
         b = (
-            rearrange(self.to_bias(pair_feats), "b ... h -> b h ...")
+            self.to_bias(pair_feats).permute(0, 3, 1, 2)
             if exists(pair_feats)
             else 0
         )
         q, k, v, g = map(
-            lambda t: rearrange(t, "b ... (h d) -> b h ... d", h=h), (q, k, v, g)
+            lambda t: t.unflatten(-1, (h, t.shape[-1] // h)).permute(0, 2, 1, 3),
+            (q, k, v, g),
         )
         attn_feats = self._attn(q, k, v, b, mask)
-        attn_feats = rearrange(
-            torch.sigmoid(g) * attn_feats, "b h n d -> b n (h d)", h=h
-        )
+        attn_feats = (torch.sigmoid(g) * attn_feats).permute(0, 2, 1, 3).flatten(2)
         return self.to_out_node(attn_feats)
 
     def _attn(self, q, k, v, b, mask: Optional[Tensor]) -> Tensor:
         """Perform attention update"""
         sim = einsum("b h i d, b h j d -> b h i j", q, k) * self.scale
         if exists(mask):
-            mask = rearrange(mask, "b i j -> b () i j")
+            mask = mask.unsqueeze(1)
             sim = sim.masked_fill(~mask, max_neg_value(sim))
         attn = torch.softmax((sim + b).contiguous(), dim=-1)
         return einsum("b h i j, b h j d -> b h i d", attn, v)
