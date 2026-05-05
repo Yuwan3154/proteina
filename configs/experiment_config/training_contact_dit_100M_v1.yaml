@@ -1,0 +1,96 @@
+run_name_: train_run_contact_dit_100M_v1
+
+hardware:
+  ncpus_per_task_train_: 8
+  ncpus_per_task_prepro_: 8
+  accelerator: gpu
+  ngpus_per_node_: 1
+  nnodes_: 1
+
+loss:
+  t_distribution:
+    name: logit-normal
+    p1: 0.0
+    p2: 1.0
+  loss_t_clamp: 0.9
+  use_aux_loss: True
+  aux_loss_t_lim: 0.3
+  thres_aux_2d_loss: 0.6
+  aux_loss_weight: 1.0
+  num_dist_buckets: 39
+  distogram_min_bin: 0.325
+  distogram_max_bin: 5.075
+
+defaults:
+  - model: contactflow
+  - override model/nn: contact_map_dit_100M
+  - _self_
+
+model:
+  nn:
+    residue_type_emb_init_seq: True
+    residue_type_emb_cond_seq: True
+    residue_type_emb_init_pair: True
+    residue_type_emb_cond_pair: True
+    seq_emb_dim: 4
+
+# Dataset params
+dataset: pdb_train_contact_S25_max384_purge-test_cutoff-190828
+dataset_config_subdir: pdb
+
+force_precision_f32: False
+
+training:
+  self_cond: True
+  seq_cond: True
+  fold_cond: True
+  mask_T_prob: 0.5
+  mask_A_prob: 0.5
+  mask_C_prob: 0.5
+  fold_label_sample_ratio: [0.5, 0.1, 0.15, 0.25]
+  mask_seq_proportion: 0.1
+  finetune_seq_cond_lora_only: False
+  contact_map_coord_loss_weight: 0.0  # ContactMapSiT does not predict coordinates
+
+lora:
+  use: False
+  lora_alpha: 32.0
+  lora_dropout: 0.0
+  r: 0
+  train_bias: "none"
+
+opt:
+  lr: 0.0001
+  max_epochs: 500
+  accumulate_grad_batches: 128
+  val_check_interval: 1000
+  skip_nan_grad: False
+  grad_and_weight_analysis: False
+  dist_strategy: ddp
+  dist_backend: gloo
+  use_lr_warmup: True
+  warmup_steps: 1000
+  warmup_start_lr_ratio: 0.0
+  lr_scheduler_type: "cosine"
+
+log:
+  wandb_project: protein_transformer_big_runs
+  log_wandb: True
+  log_every_n_steps: 100
+  log_structure_every_n_steps: 100
+  checkpoint: True
+  checkpoint_every_n_steps: 5000
+  last_ckpt_every_n_steps: 5000
+
+validation_sampling:
+  dt: 0.005
+  sampling_mode: sc
+  sc_scale_noise: 0.45
+
+seed: 42
+
+ema:
+  decay: 0.999
+  validate_original_weights: False
+  every_n_steps: 1
+  cpu_offload: False

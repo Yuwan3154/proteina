@@ -8,6 +8,7 @@ It takes inference results and compares them to ground truth structures.
 
 import argparse
 import builtins
+import io
 import json
 import logging
 import multiprocessing as mp
@@ -24,8 +25,15 @@ import pandas as pd
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
-from sharding_utils import add_shard_args, lengths_from_csv, resolve_shard_args, shard_proteins
-from protein_tar_utils import pack_protein_dirs, restore_protein_dirs
+from sharding_utils import (
+    add_shard_args,
+    default_progress_check_workers,
+    filter_proteins_threaded,
+    lengths_from_csv,
+    resolve_shard_args,
+    shard_proteins,
+)
+from protein_tar_utils import list_protein_members, pack_protein_dirs, read_protein_text, restore_protein_dirs
 
 try:
     from dotenv import load_dotenv
@@ -124,6 +132,26 @@ def _af2rank_csv_complete(af2rank_csv: Path, desired_files) -> bool:
         if pd.notna(row["structure_file"])
         and (
             Path(str(row["predicted_structure_path"])).exists()
+            or pd.notna(row.get("error"))
+        )
+    }
+    desired = {Path(str(path)).name for path in desired_files}
+    return desired.issubset(completed)
+
+
+def _af2rank_csv_text_complete(csv_text: str | None, members: set[str], desired_files) -> bool:
+    if csv_text is None:
+        return False
+    df = pd.read_csv(io.StringIO(csv_text))
+    if "structure_file" not in df.columns:
+        return False
+    predicted_dir = Path("af2rank_analysis") / "predicted_structures"
+    completed = {
+        str(row["structure_file"])
+        for _, row in df.iterrows()
+        if pd.notna(row["structure_file"])
+        and (
+            str(predicted_dir / str(row["structure_file"])) in members
             or pd.notna(row.get("error"))
         )
     }
@@ -479,40 +507,51 @@ def get_protein_names(csv_file, csv_col):
     proteins = df[csv_col].dropna().unique().tolist()
     return [p.strip() for p in proteins if p and p.strip()]
 
-def find_proteins_needing_af2rank(csv_file, csv_col, inference_config, regenerate_plots=False):
+def find_proteins_needing_af2rank(
+    csv_file,
+    csv_col,
+    inference_config,
+    regenerate_plots=False,
+    candidate_proteins=None,
+    tar_protein_dirs: bool = False,
+    max_workers=None,
+):
     """Find proteins from CSV that need AF2Rank scoring or plot regeneration."""
     # Get proteins from CSV file
-    csv_proteins = get_protein_names(csv_file, csv_col)
+    csv_proteins = list(candidate_proteins) if candidate_proteins is not None else get_protein_names(csv_file, csv_col)
     
     inference_base_dir = os.path.join(PROTEINA_BASE_DIR, 'inference', inference_config)
     
     if not os.path.exists(inference_base_dir):
         return []
     
-    proteins_needing_work = []
-    
-    for protein_name in csv_proteins:
+    def _af2rank_complete(protein_name: str) -> bool:
         protein_dir = Path(inference_base_dir) / protein_name
-        
-        if protein_dir.exists() and protein_dir.is_dir():
-            # Check if there are PDB files (inference completed)
+
+        if tar_protein_dirs:
+            members = list_protein_members(inference_base_dir, protein_name)
+            pdb_files = [member for member in members if "/" not in member and Path(member).match(f"{protein_name}_*.pdb")]
+            scores_rel = Path("af2rank_analysis") / f"af2rank_scores_{protein_name}.csv"
+            csv_text = read_protein_text(inference_base_dir, protein_name, scores_rel)
+            complete = bool(pdb_files) and _af2rank_csv_text_complete(csv_text, members, pdb_files)
+        else:
+            if not protein_dir.exists() or not protein_dir.is_dir():
+                return True
             pdb_files = list(protein_dir.glob(f"{protein_name}_*.pdb"))
-            
-            if pdb_files:
-                # Check if AF2Rank scoring is already completed
-                af2rank_dir = protein_dir / "af2rank_analysis"
-                af2rank_csv = af2rank_dir / f"af2rank_scores_{protein_name}.csv"
-                
-                if not _af2rank_csv_complete(af2rank_csv, pdb_files):
-                    # Has inference but no AF2Rank scoring
-                    proteins_needing_work.append(protein_name)
-                elif regenerate_plots:
-                    # Has scoring but user wants to regenerate plots
-                    logger.info(f"AF2Rank scoring exists for {protein_name}, but regenerating plots")
-                    proteins_needing_work.append(protein_name)
-                else:
-                    logger.info(f"AF2Rank scoring already completed for {protein_name}, skipping")
-    
+            af2rank_csv = protein_dir / "af2rank_analysis" / f"af2rank_scores_{protein_name}.csv"
+            complete = bool(pdb_files) and _af2rank_csv_complete(af2rank_csv, pdb_files)
+
+        if not pdb_files:
+            return True
+        if complete and not regenerate_plots:
+            logger.info(f"AF2Rank scoring already completed for {protein_name}, skipping")
+            return True
+        if complete and regenerate_plots:
+            logger.info(f"AF2Rank scoring exists for {protein_name}, but regenerating plots")
+            return False
+        return False
+
+    proteins_needing_work, _ = filter_proteins_threaded(csv_proteins, _af2rank_complete, max_workers=max_workers)
     return proteins_needing_work
 
 def main():
@@ -547,6 +586,10 @@ def main():
         default=True,
         help="Store per-protein inference directories as uncompressed <protein_id>.tar archives (default: True).",
     )
+    parser.add_argument("--progress_check_workers", type=int, default=default_progress_check_workers(),
+                        help="Thread workers for progress checks (default: min(32, cpu_count * 4)).")
+    parser.add_argument("--dynamic_resharding", action=argparse.BooleanOptionalAction, default=True,
+                        help="Filter global progress before sharding each step to reduce idle shards (default: True).")
     add_shard_args(parser)
 
     args = parser.parse_args()
@@ -560,39 +603,63 @@ def main():
         logger.error(f"CIF directory not found: {args.cif_dir}")
         sys.exit(1)
     
-    # Always shard the full protein list for consistent cross-step assignment.
-    # Applying the already-done filter BEFORE sharding causes different steps to shard
-    # different subsets, resulting in the same shard index owning different proteins per step.
-    protein_names = get_protein_names(args.csv_file, args.csv_col)
-    logger.info(f"Found {len(protein_names)} proteins in CSV file")
+    global_protein_names = get_protein_names(args.csv_file, args.csv_col)
+    protein_names = list(global_protein_names)
+    logger.info(f"Found {len(global_protein_names)} proteins in CSV file")
 
-    if not protein_names:
+    if not global_protein_names:
         logger.warning("No proteins to process")
         sys.exit(0)
 
     shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
+    lengths = lengths_from_csv(args.csv_file, args.csv_col, args.len_col)
+    data_dir = os.environ.get("DATA_PATH", os.path.join(PROTEINA_BASE_DIR, "data"))
     if shard_index is not None:
-        lengths = lengths_from_csv(args.csv_file, args.csv_col, args.len_col)
-        if lengths is not None:
-            protein_names = shard_proteins(protein_names, shard_index, num_shards, lengths=lengths)
-        else:
-            data_dir = os.environ.get("DATA_PATH", os.path.join(PROTEINA_BASE_DIR, "data"))
-            protein_names = shard_proteins(protein_names, shard_index, num_shards, data_dir=data_dir)
+        static_shard_names = shard_proteins(
+            global_protein_names, shard_index, num_shards, lengths=lengths, data_dir=None if lengths is not None else data_dir
+        )
+        if not args.dynamic_resharding:
+            protein_names = list(static_shard_names)
 
     inference_base_dir = os.path.join(PROTEINA_BASE_DIR, "inference", args.inference_config)
-    protein_names_for_tar = list(protein_names)
-    if args.tar_protein_dirs:
-        stats = restore_protein_dirs(inference_base_dir, protein_names_for_tar)
-        logger.info("Tar restore stats before AF2Rank scoring: %s", stats)
 
-    # Now apply the already-done filter to this shard's proteins only
+    check_candidates = global_protein_names if args.dynamic_resharding and shard_index is not None else protein_names
     if args.filter_existing:
-        needing_work = set(find_proteins_needing_af2rank(args.csv_file, args.csv_col, args.inference_config, args.regenerate_plots))
-        protein_names = [p for p in protein_names if p in needing_work]
+        check_start = time.perf_counter()
+        needing_work = find_proteins_needing_af2rank(
+            args.csv_file,
+            args.csv_col,
+            args.inference_config,
+            args.regenerate_plots,
+            candidate_proteins=check_candidates,
+            tar_protein_dirs=args.tar_protein_dirs,
+            max_workers=args.progress_check_workers,
+        )
+        if args.dynamic_resharding and shard_index is not None:
+            protein_names = shard_proteins(
+                needing_work, shard_index, num_shards, lengths=lengths, data_dir=None if lengths is not None else data_dir
+            )
+        else:
+            needing_set = set(needing_work)
+            protein_names = [p for p in protein_names if p in needing_set]
+        logger.info(
+            "tar_check AF2Rank scoring: checked=%d complete=%d needing_work=%d elapsed_seconds=%.3f",
+            len(check_candidates), len(check_candidates) - len(needing_work), len(protein_names),
+            time.perf_counter() - check_start,
+        )
         if args.regenerate_plots:
             logger.info(f"Found {len(protein_names)} proteins in this shard needing AF2Rank scoring or plot regeneration")
         else:
             logger.info(f"Found {len(protein_names)} proteins in this shard needing AF2Rank scoring")
+    elif args.dynamic_resharding and shard_index is not None:
+        protein_names = shard_proteins(
+            global_protein_names, shard_index, num_shards, lengths=lengths, data_dir=None if lengths is not None else data_dir
+        )
+
+    protein_names_for_tar = list(protein_names)
+    if args.tar_protein_dirs:
+        stats = restore_protein_dirs(inference_base_dir, protein_names_for_tar)
+        logger.info("Tar restore stats before AF2Rank scoring: %s", stats)
 
     # Note: Multi-character chain IDs are now supported via chain extraction and renaming
     # No need to filter them out anymore!

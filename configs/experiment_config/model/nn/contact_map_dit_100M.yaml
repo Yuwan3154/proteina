@@ -1,0 +1,49 @@
+name: contact_map_dit_100M
+
+# ── Phase 1: Protein Encoder ─────────────────────────────────────────────────
+# Existing modules (MultiheadAttnAndTransition + PairReprUpdate), no triangle mult.
+# Encodes residue identity, fold, and time into sequence + pair representations
+# that condition the DiT.
+
+token_dim: 256           # sequence representation dimension
+pair_repr_dim: 128       # pair representation dimension
+dim_cond: 256            # conditioning variable dimension (time + fold + seq)
+n_enc_layers: 4          # N_enc transformer blocks
+enc_pair_update_every_n: 2   # pair updates every N encoder layers → 2 pair updates total
+nheads_enc: 8
+use_qkln: True
+strict_feats: False
+
+# Sequence feature config
+feats_init_seq: ["res_seq_pdb_idx", "chain_break_per_res"]
+feats_cond_seq: ["time_emb", "fold_emb"]
+
+# Pair feature config (no structural pair distances in contact map mode)
+feats_pair_repr: ["rel_seq_sep", "contact_map_sc"]
+feats_pair_cond: ["time_emb"]
+
+# Feature dimension parameters
+t_emb_dim: 256
+idx_emb_dim: 128
+fold_emb_dim: 256
+seq_sep_dim: 63   # must be odd and > 3 (SequenceSeparationPairFeat requirement)
+contact_map_sc_embed_dim: 64
+cath_code_dir: ${oc.env:DATA_PATH}/pdb_raw/
+multilabel_mode: "sample"
+
+# ── Phase 2: SiT on Contact Map Patches ──────────────────────────────────────
+# SiT blocks (MultiHeadAttentionADALN + TransitionADALN) operating on 5×5 patches
+# of the noisy contact map. adaLN-Zero gates ensure stable training at init.
+
+d_patch: 512       # DiT token dimension
+n_dit_layers: 12   # number of SiT blocks (~60M params for this section alone)
+nheads_dit: 8
+d_cond_dit: 256    # adaLN conditioning dimension fed to each SiT block
+mlp_ratio: 4.0     # MLP expansion factor inside SiT blocks
+patch_size: 5      # 5×5 patch covers ~one secondary structure element
+
+# Contact map diffusion settings
+contact_map_mode: True        # required: tells Proteina to use contact map loss
+contact_map_input_dim: 1      # single-channel noisy contact map
+non_contact_value: 0          # 0 → sigmoid output; -1 → tanh output
+predict_coords: False         # no coordinate prediction head

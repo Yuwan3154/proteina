@@ -32,6 +32,8 @@ except ImportError:
 from proteinfoundation.af2rank_evaluation.cif_to_pt_converter import convert_from_csv
 from proteinfoundation.af2rank_evaluation.sharding_utils import (
     add_shard_args,
+    default_progress_check_workers,
+    filter_proteins_threaded,
     lengths_from_csv,
     load_lengths_from_pt,
     resolve_shard_args,
@@ -380,6 +382,7 @@ def find_proteins_needing_inference(
     inference_config,
     candidate_proteins=None,
     tar_protein_dirs: bool = False,
+    max_workers=None,
 ):
     """Find proteins from CSV that need inference (incomplete or missing).
 
@@ -396,9 +399,7 @@ def find_proteins_needing_inference(
     if expected_nsamples is not None:
         logger.info(f"Expected nsamples_per_len from config: {expected_nsamples}")
 
-    proteins_needing_inference = []
-
-    for protein_name in csv_proteins:
+    def _inference_complete(protein_name: str) -> bool:
         protein_dir = Path(inference_base_dir) / protein_name
 
         if tar_protein_dirs:
@@ -411,19 +412,17 @@ def find_proteins_needing_inference(
 
         if exists_for_check:
             if n_existing == 0:
-                # Directory exists but no PDB files
-                proteins_needing_inference.append(protein_name)
+                return False
             elif expected_nsamples is not None and n_existing < expected_nsamples:
-                # Partially completed — needs more samples
                 logger.info(f"Partial inference for {protein_name} ({n_existing}/{expected_nsamples} PDB files), will resume")
-                proteins_needing_inference.append(protein_name)
+                return False
             else:
                 logger.info(f"Inference already completed for {protein_name} ({n_existing} PDB files), skipping")
-        else:
-            # Directory doesn't exist, needs inference
-            proteins_needing_inference.append(protein_name)
+                return True
+        return False
 
-    return proteins_needing_inference
+    needing_inference, _ = filter_proteins_threaded(csv_proteins, _inference_complete, max_workers=max_workers)
+    return needing_inference
 
 def main():
     parser = argparse.ArgumentParser(description='Parallel Proteina Inference Pipeline')
@@ -451,6 +450,10 @@ def main():
         default=True,
         help="Store per-protein inference directories as uncompressed <protein_id>.tar archives (default: True).",
     )
+    parser.add_argument("--progress_check_workers", type=int, default=default_progress_check_workers(),
+                        help="Thread workers for progress checks (default: min(32, cpu_count * 4)).")
+    parser.add_argument("--dynamic_resharding", action=argparse.BooleanOptionalAction, default=True,
+                        help="Filter global progress before sharding each step to reduce idle shards (default: True).")
     add_shard_args(parser)
 
     args = parser.parse_args()
@@ -468,58 +471,67 @@ def main():
             logger.error(f"CIF directory not found: {args.cif_dir}")
             sys.exit(1)
     
-    # Always shard the full protein list for consistent cross-step assignment.
-    # Applying the already-done filter BEFORE sharding causes different steps to shard
-    # different subsets, resulting in the same shard index owning different proteins per step.
-    protein_names = get_protein_names(args.csv_file, args.csv_col)
-    logger.info(f"Found {len(protein_names)} proteins in CSV file")
+    # Static shard ownership is kept only for pipeline-level final tar cleanup.
+    # Dynamic re-sharding filters the global unfinished set, then partitions it
+    # disjointly per step so slow shards can pick up remaining work at boundaries.
+    global_protein_names = get_protein_names(args.csv_file, args.csv_col)
+    protein_names = list(global_protein_names)
+    logger.info(f"Found {len(global_protein_names)} proteins in CSV file")
 
     # Note: Multi-character chain IDs are now supported in AF2Rank via chain extraction
     # Proteina PT conversion also handles them correctly
 
     shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
+    lengths = lengths_from_csv(args.csv_file, args.csv_col, args.len_col)
+    data_dir = os.environ.get("DATA_PATH", os.path.join(PROTEINA_BASE_DIR, "data"))
     if shard_index is not None:
-        lengths = lengths_from_csv(args.csv_file, args.csv_col, args.len_col)
-        if lengths is not None:
-            protein_names = shard_proteins(protein_names, shard_index, num_shards, lengths=lengths)
-        else:
-            data_dir = os.environ.get("DATA_PATH", os.path.join(PROTEINA_BASE_DIR, "data"))
-            protein_names = shard_proteins(protein_names, shard_index, num_shards, data_dir=data_dir)
+        shard_protein_names_for_tar = shard_proteins(
+            global_protein_names, shard_index, num_shards, lengths=lengths, data_dir=None if lengths is not None else data_dir
+        )
+        if not args.dynamic_resharding:
+            protein_names = list(shard_protein_names_for_tar)
     else:
         # Non-sharded: sort short-to-long so OOM batch-size reductions stay conservative
-        lengths = lengths_from_csv(args.csv_file, args.csv_col, args.len_col)
         if lengths is None:
-            data_dir = os.environ.get("DATA_PATH", os.path.join(PROTEINA_BASE_DIR, "data"))
             pt_lengths = load_lengths_from_pt(protein_names, data_dir)
             if pt_lengths:
                 lengths = pt_lengths
         if lengths:
             protein_names = sorted(protein_names, key=lambda p: lengths.get(p, 0))
             logger.info("Sorted proteins short-to-long for OOM-conservative batch-size adaptation.")
+        shard_protein_names_for_tar = list(protein_names)
 
     inference_base_dir = os.path.join(PROTEINA_BASE_DIR, "inference", args.inference_config)
-    shard_protein_names_for_tar = list(protein_names)
 
-    # Now apply the already-done filter to this shard's proteins only
+    check_candidates = global_protein_names if args.dynamic_resharding and shard_index is not None else protein_names
     if args.skip_existing:
         check_start = time.perf_counter()
-        needing_inference = set(
-            find_proteins_needing_inference(
-                args.csv_file,
-                args.csv_col,
-                args.inference_config,
-                candidate_proteins=protein_names,
-                tar_protein_dirs=args.tar_protein_dirs,
-            )
+        needing_inference = find_proteins_needing_inference(
+            args.csv_file,
+            args.csv_col,
+            args.inference_config,
+            candidate_proteins=check_candidates,
+            tar_protein_dirs=args.tar_protein_dirs,
+            max_workers=args.progress_check_workers,
         )
+        if args.dynamic_resharding and shard_index is not None:
+            protein_names = shard_proteins(
+                needing_inference, shard_index, num_shards, lengths=lengths, data_dir=None if lengths is not None else data_dir
+            )
+        else:
+            needing_set = set(needing_inference)
+            protein_names = [p for p in protein_names if p in needing_set]
         logger.info(
             "tar_check inference: checked=%d complete=%d needing_work=%d elapsed_seconds=%.3f",
-            len(protein_names), len(protein_names) - len(needing_inference), len(needing_inference),
+            len(check_candidates), len(check_candidates) - len(needing_inference), len(protein_names),
             time.perf_counter() - check_start,
         )
-        protein_names = [p for p in protein_names if p in needing_inference]
         logger.info(f"Found {len(protein_names)} proteins in this shard needing inference")
     else:
+        if args.dynamic_resharding and shard_index is not None:
+            protein_names = shard_proteins(
+                global_protein_names, shard_index, num_shards, lengths=lengths, data_dir=None if lengths is not None else data_dir
+            )
         logger.info(f"Found {len(protein_names)} proteins in this shard to process")
 
     protein_names_for_tar = list(protein_names)

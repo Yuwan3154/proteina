@@ -39,6 +39,9 @@ import torch
 
 from proteinfoundation.af2rank_evaluation.sharding_utils import (
     add_shard_args,
+    default_progress_check_workers,
+    filter_proteins_threaded,
+    lengths_from_csv,
     resolve_shard_args,
     shard_proteins,
 )
@@ -354,6 +357,10 @@ def main() -> None:
         default=True,
         help="Store per-protein inference directories as uncompressed <protein_id>.tar archives (default: True).",
     )
+    parser.add_argument("--progress_check_workers", type=int, default=default_progress_check_workers(),
+                        help="Thread workers for progress checks (default: min(32, cpu_count * 4)).")
+    parser.add_argument("--dynamic_resharding", action=argparse.BooleanOptionalAction, default=True,
+                        help="Filter global progress before sharding each step to reduce idle shards (default: True).")
     add_shard_args(parser)
 
     args = parser.parse_args()
@@ -362,18 +369,81 @@ def main() -> None:
     cif_dir = args.cif_dir.strip() or None
 
     # ── Build per-protein work list ──────────────────────────────────────────
-    protein_ids = _load_protein_ids(args.csv_file, args.csv_col)
-    logger.info(f"Loaded {len(protein_ids)} proteins from {args.csv_file}")
+    global_protein_ids = _load_protein_ids(args.csv_file, args.csv_col)
+    protein_ids = list(global_protein_ids)
+    logger.info(f"Loaded {len(global_protein_ids)} proteins from {args.csv_file}")
 
     shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
+    lengths = lengths_from_csv(args.csv_file, args.csv_col, args.len_col)
+    data_dir = os.environ.get("DATA_PATH", str(inference_base.parent.parent / "data"))
     if shard_index is not None:
-        data_dir = os.environ.get("DATA_PATH", str(inference_base.parent.parent / "data"))
-        protein_ids = shard_proteins(protein_ids, shard_index, num_shards, data_dir=data_dir)
-        logger.info(f"Shard {shard_index}/{num_shards}: {len(protein_ids)} proteins")
-    shard_protein_ids_for_tar = list(protein_ids)
+        shard_protein_ids_for_tar = shard_proteins(
+            global_protein_ids, shard_index, num_shards, lengths=lengths, data_dir=None if lengths is not None else data_dir
+        )
+        if not args.dynamic_resharding:
+            protein_ids = list(shard_protein_ids_for_tar)
+        logger.info(
+            "Shard %d/%d: %d static proteins (dynamic_resharding=%s)",
+            shard_index, num_shards, len(shard_protein_ids_for_tar), args.dynamic_resharding,
+        )
+    else:
+        shard_protein_ids_for_tar = list(protein_ids)
 
     check_start = time.perf_counter() if "time" in globals() else None
+    check_candidates = global_protein_ids if args.dynamic_resharding and shard_index is not None else protein_ids
     skipped_complete = 0
+    if args.filter_existing:
+        def _af2rank_topk_complete(protein_id: str) -> bool:
+            scores_rel = Path(args.proteinebm_analysis_subdir) / f"proteinebm_scores_{protein_id}.csv"
+            scores_text = read_protein_text(inference_base, protein_id, scores_rel)
+            if scores_text is None:
+                return True
+            df = pd.read_csv(io.StringIO(scores_text))
+            if "structure_path" not in df.columns or "energy" not in df.columns:
+                # Malformed ProteinEBM CSV – let the per-protein processing loop handle it.
+                return False
+            df = df.dropna(subset=["structure_path", "energy"])
+            if df.empty:
+                return False
+            top_k_count = min(args.top_k, len(df))
+            desired = set(Path(str(p)).name for p in df.nsmallest(top_k_count, "energy")["structure_path"])
+            m1_done = _all_scored_from_tar_or_dir(
+                inference_base,
+                protein_id,
+                Path("af2rank_on_proteinebm_top_k") / "af2rank_analysis" / f"af2rank_scores_{protein_id}.csv",
+                Path("af2rank_on_proteinebm_top_k") / "af2rank_analysis" / "predicted_structures",
+                desired,
+            )
+            m2_done = _all_scored_from_tar_or_dir(
+                inference_base,
+                protein_id,
+                Path("af2rank_on_proteinebm_top_k") / "af2rank_analysis_model_2_ptm" / f"af2rank_scores_{protein_id}.csv",
+                Path("af2rank_on_proteinebm_top_k") / "af2rank_analysis_model_2_ptm" / "predicted_structures",
+                desired,
+            )
+            if m1_done and m2_done:
+                logger.info(f"{protein_id}: already fully scored, skipping")
+                return True
+            return False
+
+        needing_ids, complete_ids = filter_proteins_threaded(
+            check_candidates,
+            _af2rank_topk_complete,
+            max_workers=args.progress_check_workers,
+        )
+        skipped_complete = len(complete_ids)
+        if args.dynamic_resharding and shard_index is not None:
+            protein_ids = shard_proteins(
+                needing_ids, shard_index, num_shards, lengths=lengths, data_dir=None if lengths is not None else data_dir
+            )
+        else:
+            needing_set = set(needing_ids)
+            protein_ids = [protein_id for protein_id in protein_ids if protein_id in needing_set]
+    elif args.dynamic_resharding and shard_index is not None:
+        protein_ids = shard_proteins(
+            global_protein_ids, shard_index, num_shards, lengths=lengths, data_dir=None if lengths is not None else data_dir
+        )
+
     ProteinConfig = Dict  # type alias for clarity
     protein_configs: List[ProteinConfig] = []
     for protein_id in protein_ids:
@@ -394,28 +464,6 @@ def main() -> None:
         out_dir_m1 = protein_dir / "af2rank_on_proteinebm_top_k" / "af2rank_analysis"
         out_dir_m2 = protein_dir / "af2rank_on_proteinebm_top_k" / "af2rank_analysis_model_2_ptm"
 
-        # Quick skip check
-        if args.filter_existing:
-            desired = set(Path(str(p)).name for p in topk_df["structure_path"])
-            m1_done = _all_scored_from_tar_or_dir(
-                inference_base,
-                protein_id,
-                Path("af2rank_on_proteinebm_top_k") / "af2rank_analysis" / f"af2rank_scores_{protein_id}.csv",
-                Path("af2rank_on_proteinebm_top_k") / "af2rank_analysis" / "predicted_structures",
-                desired,
-            )
-            m2_done = _all_scored_from_tar_or_dir(
-                inference_base,
-                protein_id,
-                Path("af2rank_on_proteinebm_top_k") / "af2rank_analysis_model_2_ptm" / f"af2rank_scores_{protein_id}.csv",
-                Path("af2rank_on_proteinebm_top_k") / "af2rank_analysis_model_2_ptm" / "predicted_structures",
-                desired,
-            )
-            if m1_done and m2_done:
-                logger.info(f"{protein_id}: already fully scored, skipping")
-                skipped_complete += 1
-                continue
-
         protein_configs.append({
             "protein_id": protein_id,
             "topk_df": topk_df,
@@ -429,13 +477,13 @@ def main() -> None:
         elapsed = (time.perf_counter() - check_start) if check_start is not None else 0.0
         logger.info(
             "tar_check AF2Rank top-k prediction: checked=%d complete=%d needing_work=%d elapsed_seconds=%.3f",
-            len(protein_ids), skipped_complete, len(protein_configs), elapsed,
+            len(check_candidates), skipped_complete, len(protein_configs), elapsed,
         )
 
     if not protein_configs:
         logger.info("No proteins to score.")
         if args.tar_protein_dirs:
-            stats = pack_protein_dirs(inference_base, shard_protein_ids_for_tar, delete_after=True)
+            stats = pack_protein_dirs(inference_base, protein_ids, delete_after=True)
             logger.info("tar_pack AF2Rank top-k prediction finalization: %s", stats)
         return
 
@@ -509,7 +557,7 @@ def main() -> None:
 
     logger.info("AF2Rank prediction scoring complete.")
     if args.tar_protein_dirs:
-        stats = pack_protein_dirs(inference_base, shard_protein_ids_for_tar, delete_after=True)
+        stats = pack_protein_dirs(inference_base, protein_ids_for_tar, delete_after=True)
         logger.info("tar_pack AF2Rank top-k prediction finalization: %s", stats)
 
 

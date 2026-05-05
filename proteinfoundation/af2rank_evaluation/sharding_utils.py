@@ -12,6 +12,7 @@ Provides:
 
 import logging
 import os
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
@@ -136,9 +137,23 @@ def shard_proteins(
     sorted_names = sorted(names, key=lambda p: lengths.get(p, 0))
     shard_names = sorted_names[shard_index::num_shards]
     total_residues = sum(lengths.get(p, 0) for p in shard_names)
+    max_residues = max((lengths.get(p, 0) for p in shard_names), default=0)
     logger.info(
-        f"Shard {shard_index}/{num_shards}: {len(shard_names)} proteins, ~{total_residues} total residues"
+        f"Shard {shard_index}/{num_shards}: {len(shard_names)} proteins, "
+        f"~{total_residues} total residues, max protein length ~{max_residues}"
     )
+    if shard_index == 0 and num_shards:
+        shard_totals = [
+            sum(lengths.get(p, 0) for p in sorted_names[i::num_shards])
+            for i in range(num_shards)
+        ]
+        nonzero_totals = [total for total in shard_totals if total > 0]
+        if nonzero_totals:
+            imbalance_ratio = max(nonzero_totals) / min(nonzero_totals)
+            logger.info(
+                "Round-robin shard residue totals: min=%d max=%d ratio=%.3f",
+                min(nonzero_totals), max(nonzero_totals), imbalance_ratio,
+            )
     return shard_names
 
 
@@ -158,6 +173,101 @@ def build_shard_cli_args(
     if shard_index is None or num_shards is None:
         return args
     return ["--shard_index", str(shard_index), "--num_shards", str(num_shards)] + args
+
+
+def default_progress_check_workers() -> int:
+    return min(32, (os.cpu_count() or 1) * 4)
+
+
+def filter_proteins_threaded(
+    protein_ids: List[str],
+    is_complete_fn: Callable[[str], bool],
+    max_workers: Optional[int] = None,
+) -> Tuple[List[str], List[str]]:
+    """Return (needing_work, already_done) using threads for I/O-heavy progress checks.
+
+    Any exception raised by ``is_complete_fn`` for a protein is caught, logged at
+    WARNING level, and the protein is placed in *needing_work* so the per-protein
+    retry logic (with its own error handling) can deal with it.  A single bad
+    protein must not crash the entire step.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    workers = max_workers if max_workers is not None and max_workers > 0 else default_progress_check_workers()
+    needing_work: List[str] = []
+    already_done: List[str] = []
+
+    def _safe_check(protein_id: str) -> bool:
+        try:
+            return is_complete_fn(protein_id)
+        except Exception as exc:
+            logger.warning(
+                "Completion check raised for %s (%s: %s) – treating as needing work.",
+                protein_id, type(exc).__name__, exc,
+            )
+            return False
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for protein_id, complete in zip(protein_ids, executor.map(_safe_check, protein_ids)):
+            if complete:
+                already_done.append(protein_id)
+            else:
+                needing_work.append(protein_id)
+    return needing_work, already_done
+
+
+def step_sentinel_path(
+    output_dir: Union[str, Path],
+    step_name: str,
+    shard_index: int,
+    num_shards: int,
+) -> Path:
+    return Path(output_dir) / f".step_{step_name}_shard_{shard_index}_of_{num_shards}_complete"
+
+
+def wait_for_step(
+    output_dir: Union[str, Path],
+    step_name: str,
+    num_shards: int,
+    shard_index: int,
+    success: bool,
+    poll_interval: int = 60,
+    timeout: int = 86400,
+) -> bool:
+    """Write this shard's step sentinel and wait for peer step sentinels."""
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    sentinel = step_sentinel_path(output_path, step_name, shard_index, num_shards)
+    sentinel.write_text("0" if success else "1")
+    logger.info(
+        "Wrote step sentinel %s for shard %d/%d (%s).",
+        step_name, shard_index, num_shards, "success" if success else "failure",
+    )
+
+    other_shards = [idx for idx in range(num_shards) if idx != shard_index]
+    if other_shards:
+        def _peer_done(peer_idx: int) -> bool:
+            return step_sentinel_path(output_path, step_name, peer_idx, num_shards).exists()
+
+        if not wait_for_completion(
+            other_shards,
+            _peer_done,
+            poll_interval=poll_interval,
+            timeout=timeout,
+            item_name=f"{step_name} step shards",
+        ):
+            return False
+
+    failed_shards = []
+    for peer_idx in range(num_shards):
+        peer_sentinel = step_sentinel_path(output_path, step_name, peer_idx, num_shards)
+        if peer_sentinel.read_text().strip() != "0":
+            failed_shards.append(peer_idx)
+    if failed_shards:
+        logger.error("Step %s reported failure on shard(s): %s", step_name, failed_shards)
+        return False
+    logger.info("All shards completed step %s successfully.", step_name)
+    return True
 
 
 def wait_for_completion(

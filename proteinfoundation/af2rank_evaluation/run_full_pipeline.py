@@ -35,6 +35,7 @@ from proteinfoundation.af2rank_evaluation.sharding_utils import (
     resolve_shard_args,
     shard_proteins,
     wait_for_completion,
+    wait_for_step,
 )
 from proteinfoundation.af2rank_evaluation.protein_tar_utils import (
     ensure_protein_tar,
@@ -54,6 +55,26 @@ logger = logging.getLogger(__name__)
 
 def _tar_cli_args(enabled: bool) -> list[str]:
     return ["--tar_protein_dirs"] if enabled else ["--no-tar_protein_dirs"]
+
+
+def _dynamic_cli_args(enabled: bool, progress_check_workers: int | None) -> list[str]:
+    args = ["--dynamic_resharding"] if enabled else ["--no-dynamic_resharding"]
+    if progress_check_workers is not None:
+        args.extend(["--progress_check_workers", str(progress_check_workers)])
+    return args
+
+
+def _cleanup_shard_sentinels(output_dir: Path, num_shards: int) -> None:
+    removed = 0
+    for shard_idx in range(num_shards):
+        sentinel = output_dir / f".shard_{shard_idx}_of_{num_shards}_complete"
+        if sentinel.exists():
+            sentinel.unlink()
+            removed += 1
+    for sentinel in output_dir.glob(".step_*_shard_*_of_*_complete"):
+        sentinel.unlink()
+        removed += 1
+    logger.info("Cleaned up %d shard completion sentinel file(s).", removed)
 
 def detect_conda_executable():
     """Auto-detect conda executable path."""
@@ -151,7 +172,7 @@ def run_with_conda_env(env_name, command_list, cwd=None, direct_python: bool = F
         logger.error(f"❌ Failed to run command: {e}")
         return False
 
-def run_proteina_inference(csv_file, csv_col, cif_dir, inference_config, num_gpus, usalign_path=None, force_compile: bool = False, shard_args=None, direct_python: bool = False, rerun: bool = False, tar_protein_dirs: bool = True):
+def run_proteina_inference(csv_file, csv_col, cif_dir, inference_config, num_gpus, usalign_path=None, force_compile: bool = False, shard_args=None, direct_python: bool = False, rerun: bool = False, tar_protein_dirs: bool = True, dynamic_resharding: bool = True, progress_check_workers: int | None = None):
     """Run the Proteina inference pipeline."""
     logger.info("🧬 Starting Proteina inference pipeline...")
 
@@ -171,10 +192,11 @@ def run_proteina_inference(csv_file, csv_col, cif_dir, inference_config, num_gpu
     if shard_args:
         cmd.extend(shard_args)
     cmd.extend(_tar_cli_args(tar_protein_dirs))
+    cmd.extend(_dynamic_cli_args(dynamic_resharding, progress_check_workers))
 
     return run_with_conda_env('proteina', cmd, direct_python=direct_python)
 
-def run_af2rank_scoring(csv_file, csv_col, cif_dir, inference_config, num_gpus, recycles=3, regenerate_plots=False, backend="colabdesign", use_deepspeed_evoformer_attention=True, use_cuequivariance_attention=True, use_cuequivariance_multiplicative_update=True, shard_args=None, direct_python: bool = False, rerun: bool = False, tar_protein_dirs: bool = True):
+def run_af2rank_scoring(csv_file, csv_col, cif_dir, inference_config, num_gpus, recycles=3, regenerate_plots=False, backend="colabdesign", use_deepspeed_evoformer_attention=True, use_cuequivariance_attention=True, use_cuequivariance_multiplicative_update=True, shard_args=None, direct_python: bool = False, rerun: bool = False, tar_protein_dirs: bool = True, dynamic_resharding: bool = True, progress_check_workers: int | None = None):
     """Run the AF2Rank scoring pipeline."""
     logger.info(f"⚡ Starting AF2Rank scoring pipeline (backend={backend})...")
 
@@ -201,6 +223,7 @@ def run_af2rank_scoring(csv_file, csv_col, cif_dir, inference_config, num_gpus, 
     if shard_args:
         cmd.extend(shard_args)
     cmd.extend(_tar_cli_args(tar_protein_dirs))
+    cmd.extend(_dynamic_cli_args(dynamic_resharding, progress_check_workers))
 
     env_name = 'proteina' if backend == 'openfold' else 'colabdesign'
     return run_with_conda_env(env_name, cmd, direct_python=direct_python)
@@ -222,6 +245,8 @@ def run_proteinebm_scoring(
     direct_python: bool = False,
     rerun: bool = False,
     tar_protein_dirs: bool = True,
+    dynamic_resharding: bool = True,
+    progress_check_workers: int | None = None,
 ):
     """Run the ProteinEBM scoring pipeline."""
     logger.info("💸 Starting ProteinEBM scoring pipeline...")
@@ -249,6 +274,7 @@ def run_proteinebm_scoring(
     if shard_args:
         cmd.extend(shard_args)
     cmd.extend(_tar_cli_args(tar_protein_dirs))
+    cmd.extend(_dynamic_cli_args(dynamic_resharding, progress_check_workers))
 
     return run_with_conda_env('proteinebm', cmd, direct_python=direct_python)
 
@@ -312,6 +338,8 @@ def run_af2rank_on_proteinebm_topk(
     cif_dir: str = "",
     output_dir: str = "",
     tar_protein_dirs: bool = True,
+    dynamic_resharding: bool = True,
+    progress_check_workers: int | None = None,
 ) -> bool:
     """Run AF2Rank scoring on the ProteinEBM top-k templates per protein."""
     logger.info(f"🧪 Starting AF2Rank-on-ProteinEBM-topk step (backend={backend})...")
@@ -367,6 +395,7 @@ def run_af2rank_on_proteinebm_topk(
     if output_dir:
         cmd.extend(["--output_dir", output_dir])
     cmd.extend(_tar_cli_args(tar_protein_dirs))
+    cmd.extend(_dynamic_cli_args(dynamic_resharding, progress_check_workers))
 
     return run_with_conda_env("proteina", cmd, cwd=os.path.dirname(os.path.abspath(__file__)), direct_python=direct_python)
 
@@ -383,6 +412,8 @@ def run_central_analysis(
     rerun: bool = False,
     skip_diversity: bool = False,
     tar_protein_dirs: bool = True,
+    dynamic_resharding: bool = True,
+    progress_check_workers: int | None = None,
 ) -> bool:
     cmd = [
         "python",
@@ -407,6 +438,7 @@ def run_central_analysis(
     if skip_diversity:
         cmd.append("--skip_diversity")
     cmd.extend(_tar_cli_args(tar_protein_dirs))
+    cmd.extend(_dynamic_cli_args(dynamic_resharding, progress_check_workers))
     return run_with_conda_env("proteina", cmd, cwd=os.path.dirname(os.path.abspath(__file__)), direct_python=direct_python)
 
 
@@ -521,6 +553,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Store per-protein inference directories as uncompressed <protein_id>.tar archives (default: True).",
     )
+    parser.add_argument(
+        "--dynamic_resharding",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="At each step, filter global unfinished proteins before sharding to reduce idle shards (default: True).",
+    )
+    parser.add_argument(
+        "--progress_check_workers",
+        type=int,
+        default=None,
+        help="Thread workers for per-step progress checks (default: child script uses min(32, cpu_count * 4)).",
+    )
     parser.add_argument('--tms_col', required=True,
                        help='Dataset column name to use as reference TM score (required, used for cross-protein plots)')
     parser.add_argument(
@@ -623,6 +667,7 @@ def main(argv: list[str] | None = None):
     logger.info(f"🔧 AF2Rank backend: {args.af2rank_backend}")
     logger.info(f"📦 ProteinEBM batch size: {args.proteinebm_batch_size}")
     logger.info(f"📦 Tar protein dirs: {args.tar_protein_dirs}")
+    logger.info(f"📦 Dynamic re-sharding: {args.dynamic_resharding}")
     from proteinfoundation.af2rank_evaluation.proteina_analysis import resolve_num_workers
     logger.info(f"🔩 num_workers (CPU, analysis etc.): {resolve_num_workers(args.num_workers)}")
     skip_analysis = args.skip_analysis
@@ -647,6 +692,8 @@ def main(argv: list[str] | None = None):
             direct_python=args.direct_python,
             rerun=args.rerun_proteina,
             tar_protein_dirs=args.tar_protein_dirs,
+            dynamic_resharding=args.dynamic_resharding,
+            progress_check_workers=args.progress_check_workers,
         )
         
         if inference_success:
@@ -656,6 +703,11 @@ def main(argv: list[str] | None = None):
             success = False
     else:
         logger.info("⏭️  Skipping Proteina inference")
+    if args.dynamic_resharding and shard_index is not None and num_shards is not None:
+        success = wait_for_step(
+            cross_out_dir, "inference", num_shards, shard_index, success,
+            poll_interval=args.shard_poll_interval, timeout=args.shard_timeout,
+        ) and success
 
     # Step 2: Scoring (AF2Rank or ProteinEBM)
     if not args.skip_scoring and success:
@@ -683,6 +735,8 @@ def main(argv: list[str] | None = None):
                 direct_python=args.direct_python,
                 rerun=args.rerun_score,
                 tar_protein_dirs=args.tar_protein_dirs,
+                dynamic_resharding=args.dynamic_resharding,
+                progress_check_workers=args.progress_check_workers,
             )
         else:
             scoring_success = run_proteinebm_scoring(
@@ -702,6 +756,8 @@ def main(argv: list[str] | None = None):
                 direct_python=args.direct_python,
                 rerun=args.rerun_score,
                 tar_protein_dirs=args.tar_protein_dirs,
+                dynamic_resharding=args.dynamic_resharding,
+                progress_check_workers=args.progress_check_workers,
             )
         
         if scoring_success:
@@ -711,6 +767,11 @@ def main(argv: list[str] | None = None):
             success = False
     elif args.skip_scoring:
         logger.info(f"⏭️  Skipping scoring stage ({args.scorer})")
+    if args.dynamic_resharding and shard_index is not None and num_shards is not None:
+        success = wait_for_step(
+            cross_out_dir, "scoring", num_shards, shard_index, success,
+            poll_interval=args.shard_poll_interval, timeout=args.shard_timeout,
+        ) and success
 
     # Step 3: Optional AF2Rank scoring on ProteinEBM top-k templates
     if success and (not args.skip_scoring) and (not args.skip_af2rank_on_top_k) and args.scorer == "proteinebm" and int(args.af2rank_top_k) > 0:
@@ -738,6 +799,8 @@ def main(argv: list[str] | None = None):
             cif_dir=args.cif_dir,
             output_dir=cross_out_dir,
             tar_protein_dirs=args.tar_protein_dirs,
+            dynamic_resharding=args.dynamic_resharding,
+            progress_check_workers=args.progress_check_workers,
         )
 
         if topk_success:
@@ -745,6 +808,11 @@ def main(argv: list[str] | None = None):
         else:
             logger.error("❌ AF2Rank-on-ProteinEBM-topk failed")
             success = False
+    if args.dynamic_resharding and shard_index is not None and num_shards is not None:
+        success = wait_for_step(
+            cross_out_dir, "af2rank_topk", num_shards, shard_index, success,
+            poll_interval=args.shard_poll_interval, timeout=args.shard_timeout,
+        ) and success
 
     # Step 4: Central analysis (every shard runs its own subset)
     if success:
@@ -768,6 +836,8 @@ def main(argv: list[str] | None = None):
                     rerun=args.rerun_proteina or args.rerun_score or args.rerun_af2rank_on_top_k or args.rerun_analysis,
                     skip_diversity=args.skip_diversity,
                     tar_protein_dirs=args.tar_protein_dirs,
+                    dynamic_resharding=args.dynamic_resharding,
+                    progress_check_workers=args.progress_check_workers,
                 )
                 if analysis_success:
                     shard_desc = f" (shard {shard_index})" if shard_index is not None else ""
@@ -778,6 +848,11 @@ def main(argv: list[str] | None = None):
                     success = False
             else:
                 logger.info("⏭️  Skipping central analysis")
+    if args.dynamic_resharding and shard_index is not None and num_shards is not None:
+        success = wait_for_step(
+            cross_out_dir, "analysis", num_shards, shard_index, success,
+            poll_interval=args.shard_poll_interval, timeout=args.shard_timeout,
+        ) and success
 
     if args.tar_protein_dirs and shard_index is not None and num_shards is not None:
         stats = pack_protein_dirs(base_inference_dir, shard_protein_ids_for_tar, delete_after=True)
@@ -893,6 +968,9 @@ def main(argv: list[str] | None = None):
                 # for this inference_dir/dataset combination. Treat as a warning so the
                 # pipeline can still complete after producing the primary plots.
                 logger.warning("⚠️  Cross-protein plotting skipped/failed (af2rank_on_proteinebm_topk)")
+
+    if shard_index == 0 and num_shards is not None:
+        _cleanup_shard_sentinels(Path(cross_out_dir), num_shards)
     
     # Final summary
     total_time = time.time() - start_time

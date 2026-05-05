@@ -28,6 +28,8 @@ from tqdm import tqdm
 
 from proteinfoundation.af2rank_evaluation.sharding_utils import (
     add_shard_args,
+    default_progress_check_workers,
+    filter_proteins_threaded,
     lengths_from_csv,
     resolve_shard_args,
     shard_proteins,
@@ -114,7 +116,7 @@ def _select_topk_templates_df(df: pd.DataFrame, protein_dir: Path, top_k: int) -
     df["energy"] = df["energy"].astype(float)
     df = df.sort_values("energy", ascending=True).head(int(top_k)).reset_index(drop=True)
     if len(df) == 0:
-        raise ValueError(f"No valid rows found in {scores_csv}")
+        raise ValueError("No valid rows in ProteinEBM scores CSV after filtering")
 
     def _rebase_path(p: str) -> str:
         """Resolve structure_path relative to the protein dir on the current machine."""
@@ -774,6 +776,10 @@ def main() -> None:
         default=True,
         help="Store per-protein inference directories as uncompressed <protein_id>.tar archives (default: True).",
     )
+    parser.add_argument("--progress_check_workers", type=int, default=default_progress_check_workers(),
+                        help="Thread workers for progress checks (default: min(32, cpu_count * 4)).")
+    parser.add_argument("--dynamic_resharding", action=argparse.BooleanOptionalAction, default=True,
+                        help="Filter global progress before sharding each step to reduce idle shards (default: True).")
     add_shard_args(parser)
     args = parser.parse_args()
 
@@ -818,28 +824,65 @@ def main() -> None:
     out_dir_path.mkdir(parents=True, exist_ok=True)
 
     shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
+    if dataset_map:
+        lengths = {pid: int(info["length"]) for pid, info in dataset_map.items()}
+    else:
+        lengths = lengths_from_csv(args.csv_file, args.csv_col, args.len_col) if has_csv else None
+    data_dir = os.environ.get("DATA_PATH", os.path.join(Path(__file__).resolve().parents[2], "data"))
     if shard_index is not None:
         logger.info(f"Sharding {len(candidate_ids_raw)} proteins into shard {shard_index}/{num_shards}")
-        if dataset_map:
-            lengths = {pid: int(info["length"]) for pid, info in dataset_map.items()}
-        else:
-            lengths = lengths_from_csv(args.csv_file, args.csv_col, args.len_col)
-        if lengths is not None:
-            shard_ids = set(shard_proteins(candidate_ids_raw, shard_index, num_shards, lengths=lengths))
-        else:
-            data_dir = os.environ.get("DATA_PATH", os.path.join(Path(__file__).resolve().parents[2], "data"))
-            shard_ids = set(shard_proteins(candidate_ids_raw, shard_index, num_shards, data_dir=data_dir))
-        logger.info(f"Shard {shard_index} assigned {len(shard_ids)} proteins")
+        static_shard_ids = shard_proteins(
+            candidate_ids_raw, shard_index, num_shards, lengths=lengths, data_dir=None if lengths is not None else data_dir
+        )
+        logger.info(f"Static shard {shard_index} assigned {len(static_shard_ids)} proteins")
     else:
-        shard_ids = None
+        static_shard_ids = None
 
-    candidate_ids = list(shard_ids) if shard_ids is not None else candidate_ids_raw
-    shard_protein_ids_for_tar = list(candidate_ids)
+    prefilter_ids = candidate_ids_raw if args.dynamic_resharding and shard_index is not None else (
+        list(static_shard_ids) if static_shard_ids is not None else candidate_ids_raw
+    )
+    check_start = time.perf_counter()
+    if args.filter_existing:
+        def _af2rank_topk_done_or_unavailable(protein_id: str) -> bool:
+            scores_rel = Path(args.proteinebm_analysis_subdir) / f"proteinebm_scores_{protein_id}.csv"
+            scores_text = read_protein_text(args.inference_dir, protein_id, scores_rel)
+            if scores_text is None:
+                return True
+            df = pd.read_csv(io.StringIO(scores_text))
+            if "structure_path" not in df.columns or "energy" not in df.columns:
+                # Malformed ProteinEBM CSV – let the per-protein loop handle it.
+                return False
+            df = df.dropna(subset=["structure_path", "energy"])
+            if df.empty:
+                return False
+            top_k_count = min(args.top_k, len(df))
+            desired = set(
+                Path(str(p)).name
+                for p in df.nsmallest(top_k_count, "energy")["structure_path"].tolist()
+            )
+            return _af2rank_topk_complete_from_tar_or_dir(args.inference_dir, protein_id, desired)
+
+        needing_ids, complete_or_unavailable_ids = filter_proteins_threaded(
+            prefilter_ids,
+            _af2rank_topk_done_or_unavailable,
+            max_workers=args.progress_check_workers,
+        )
+    else:
+        needing_ids = list(prefilter_ids)
+        complete_or_unavailable_ids = []
+
+    if args.dynamic_resharding and shard_index is not None:
+        candidate_ids = shard_proteins(
+            needing_ids, shard_index, num_shards, lengths=lengths, data_dir=None if lengths is not None else data_dir
+        )
+    else:
+        needing_set = set(needing_ids)
+        candidate_ids = [protein_id for protein_id in prefilter_ids if protein_id in needing_set]
+    task_ids_for_tar = list(candidate_ids)  # dynamic slice assigned to this shard for this step
     tasks: List[Tuple[str, str, Dict[str, object], str]] = []
     n_considered = 0
     n_no_scores = 0
-    n_complete = 0
-    check_start = time.perf_counter()
+    n_complete = len(complete_or_unavailable_ids)
     for protein_id in candidate_ids:
         protein_dir = Path(args.inference_dir) / protein_id
         scores_rel = Path(args.proteinebm_analysis_subdir) / f"proteinebm_scores_{protein_id}.csv"
@@ -850,9 +893,6 @@ def main() -> None:
         scores_csv = protein_dir / scores_rel
         topk_df = _select_topk_templates_df(pd.read_csv(io.StringIO(scores_text)), protein_dir, args.top_k)
         desired = set(Path(str(p)).name for p in topk_df["structure_path"].tolist())
-        if args.filter_existing and _af2rank_topk_complete_from_tar_or_dir(args.inference_dir, protein_id, desired):
-            n_complete += 1
-            continue
         gpu_id = gpu_ids[len(tasks) % len(gpu_ids)]
         if has_dataset and protein_id in dataset_map:
             ref = dataset_map[protein_id]
@@ -866,7 +906,7 @@ def main() -> None:
 
     logger.info(
         "tar_check AF2Rank-on-ProteinEBM-topk: checked=%d complete=%d needing_work=%d skipped_no_scores=%d elapsed_seconds=%.3f",
-        len(candidate_ids), n_complete, len(tasks), n_no_scores, time.perf_counter() - check_start,
+        len(prefilter_ids), n_complete, len(tasks), n_no_scores, time.perf_counter() - check_start,
     )
     task_ids = [task[0] for task in tasks]
     if args.tar_protein_dirs:
@@ -911,7 +951,7 @@ def main() -> None:
                             logger.error("FAILED %s: %s", pid, e)
                         pbar.update(1)
         if args.tar_protein_dirs:
-            stats = pack_protein_dirs(args.inference_dir, shard_protein_ids_for_tar, delete_after=True)
+            stats = pack_protein_dirs(args.inference_dir, task_ids_for_tar, delete_after=True)
             logger.info("tar_pack AF2Rank-on-ProteinEBM-topk finalization: %s", stats)
         return
 
@@ -958,18 +998,18 @@ def main() -> None:
         if n_failed > 0:
             logger.error(f"{n_failed}/{len(tasks)} proteins failed — check errors above")
             if args.tar_protein_dirs:
-                stats = pack_protein_dirs(args.inference_dir, shard_protein_ids_for_tar, delete_after=True)
+                stats = pack_protein_dirs(args.inference_dir, task_ids_for_tar, delete_after=True)
                 logger.info("tar_pack AF2Rank-on-ProteinEBM-topk finalization: %s", stats)
             sys.exit(1)
         if args.tar_protein_dirs:
-            stats = pack_protein_dirs(args.inference_dir, shard_protein_ids_for_tar, delete_after=True)
+            stats = pack_protein_dirs(args.inference_dir, task_ids_for_tar, delete_after=True)
             logger.info("tar_pack AF2Rank-on-ProteinEBM-topk finalization: %s", stats)
         return
 
     if shard_index is not None:
         logger.info("Per-protein work complete (sharded run) — cross-protein summary will be aggregated by shard 0 after all shards finish.")
         if args.tar_protein_dirs:
-            stats = pack_protein_dirs(args.inference_dir, shard_protein_ids_for_tar, delete_after=True)
+            stats = pack_protein_dirs(args.inference_dir, task_ids_for_tar, delete_after=True)
             logger.info("tar_pack AF2Rank-on-ProteinEBM-topk finalization: %s", stats)
         return
 
@@ -978,7 +1018,7 @@ def main() -> None:
     summary_df.to_csv(summary_csv, index=False)
     logger.info(f"Summary CSV written to {summary_csv} — cross-protein plots are generated by generate_cross_protein_plots.py")
     if args.tar_protein_dirs:
-        stats = pack_protein_dirs(args.inference_dir, shard_protein_ids_for_tar, delete_after=True)
+        stats = pack_protein_dirs(args.inference_dir, task_ids_for_tar, delete_after=True)
         logger.info("tar_pack AF2Rank-on-ProteinEBM-topk finalization: %s", stats)
 
 

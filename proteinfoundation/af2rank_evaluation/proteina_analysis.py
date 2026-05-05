@@ -46,7 +46,14 @@ from proteinfoundation.af2rank_evaluation.protein_tar_utils import (
     read_protein_text,
     restore_selected_protein_dirs,
 )
-from proteinfoundation.af2rank_evaluation.sharding_utils import add_shard_args, lengths_from_csv, resolve_shard_args, shard_proteins
+from proteinfoundation.af2rank_evaluation.sharding_utils import (
+    add_shard_args,
+    default_progress_check_workers,
+    filter_proteins_threaded,
+    lengths_from_csv,
+    resolve_shard_args,
+    shard_proteins,
+)
 from proteinfoundation.af2rank_evaluation.topk_summary_utils import generate_topk_summary_csv
 from proteinfoundation.af2rank_evaluation.usalign_tabular import (
     normalize_usalign_structure_name,
@@ -1300,6 +1307,10 @@ def main() -> None:
         default=True,
         help="Store per-protein inference directories as uncompressed <protein_id>.tar archives (default: True).",
     )
+    parser.add_argument("--progress_check_workers", type=int, default=default_progress_check_workers(),
+                        help="Thread workers for progress checks (default: min(32, cpu_count * 4)).")
+    parser.add_argument("--dynamic_resharding", action=argparse.BooleanOptionalAction, default=True,
+                        help="Filter global progress before sharding each step to reduce idle shards (default: True).")
     add_shard_args(parser)
     args = parser.parse_args()
 
@@ -1322,40 +1333,47 @@ def main() -> None:
     if not protein_ids:
         raise ValueError("No protein IDs found")
 
+    global_protein_ids = list(protein_ids)
     shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
+    lengths = lengths_from_csv(getattr(args, "csv_file", None) or "", args.csv_col, args.len_col)
+    data_dir = os.environ.get("DATA_PATH", str(Path(__file__).resolve().parents[2] / "data"))
     if shard_index is not None:
-        lengths = lengths_from_csv(getattr(args, "csv_file", None) or "", args.csv_col, args.len_col)
-        if lengths is not None:
-            protein_ids = shard_proteins(protein_ids, shard_index, num_shards, lengths=lengths)
-        else:
-            data_dir = os.environ.get("DATA_PATH", str(Path(__file__).resolve().parents[2] / "data"))
-            protein_ids = shard_proteins(protein_ids, shard_index, num_shards, data_dir=data_dir)
+        static_protein_ids = shard_proteins(
+            global_protein_ids, shard_index, num_shards, lengths=lengths, data_dir=None if lengths is not None else data_dir
+        )
+        protein_ids = list(static_protein_ids)
         logger.info(f"Central analysis shard {shard_index}/{num_shards}: {len(protein_ids)} proteins selected")
 
     analysis_ids = list(protein_ids)
     complete_ids: List[str] = []
     if args.tar_protein_dirs and not args.rerun:
         check_start = time.perf_counter()
-        complete_ids = [
-            protein_id
-            for protein_id in protein_ids
-            if analysis_complete_in_tar_or_dir(args.inference_dir, protein_id, args.output_subdir)
-        ]
-        complete_id_set = set(complete_ids)
-        analysis_ids = [
-            protein_id
-            for protein_id in protein_ids
-            if protein_id not in complete_id_set
-        ]
+        check_candidates = global_protein_ids if args.dynamic_resharding and shard_index is not None else protein_ids
+        needing_ids, complete_ids = filter_proteins_threaded(
+            check_candidates,
+            lambda protein_id: analysis_complete_in_tar_or_dir(args.inference_dir, protein_id, args.output_subdir),
+            max_workers=args.progress_check_workers,
+        )
+        if args.dynamic_resharding and shard_index is not None:
+            analysis_ids = shard_proteins(
+                needing_ids, shard_index, num_shards, lengths=lengths, data_dir=None if lengths is not None else data_dir
+            )
+            complete_ids = []
+        else:
+            analysis_ids = needing_ids
         logger.info(
             "tar_check central analysis: checked=%d complete=%d needing_work=%d elapsed_seconds=%.3f",
-            len(protein_ids), len(protein_ids) - len(analysis_ids), len(analysis_ids),
+            len(check_candidates), len(check_candidates) - len(needing_ids), len(analysis_ids),
             time.perf_counter() - check_start,
         )
     elif args.tar_protein_dirs:
+        if args.dynamic_resharding and shard_index is not None:
+            analysis_ids = shard_proteins(
+                global_protein_ids, shard_index, num_shards, lengths=lengths, data_dir=None if lengths is not None else data_dir
+            )
         logger.info(
             "tar_check central analysis: checked=%d complete=0 needing_work=%d elapsed_seconds=0.000",
-            len(protein_ids), len(protein_ids),
+            len(analysis_ids), len(analysis_ids),
         )
 
     if args.tar_protein_dirs:
@@ -1382,7 +1400,7 @@ def main() -> None:
         if summary_text is not None:
             results[protein_id] = json.loads(summary_text)
     if args.tar_protein_dirs:
-        stats = pack_protein_dirs(args.inference_dir, protein_ids, delete_after=True)
+        stats = pack_protein_dirs(args.inference_dir, analysis_ids, delete_after=True)
         logger.info("tar_pack central analysis finalization: %s", stats)
     logger.info(f"Done. {len(results)} proteins with analysis metrics.")
 

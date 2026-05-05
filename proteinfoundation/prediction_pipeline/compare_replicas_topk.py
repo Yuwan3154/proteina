@@ -460,6 +460,14 @@ def _aggregate_stats(
 
     ok = ok_all[ok_all["passes_cutoff_either"]].copy() if passing_only else ok_all
 
+    convergence_metric = getattr(args, "convergence_tm_metric", "tm_predictions_TM1")
+    convergence_threshold = float(getattr(args, "convergence_tm_threshold", 0.5))
+    num_passes_cutoff_convergence = (
+        int((ok_all[convergence_metric] > convergence_threshold).sum())
+        if convergence_metric in ok_all.columns and len(ok_all)
+        else 0
+    )
+
     summary: Dict[str, object] = {
         "mode": "self_half_split" if self_mode else "two_replica",
         "replica_a_dir": args.replica_a_dir,
@@ -470,6 +478,8 @@ def _aggregate_stats(
         "tmscore_mode": args.tmscore_mode,
         "ptm_cutoff": args.ptm_cutoff,
         "filter_passing_either": bool(passing_only),
+        "convergence_tm_metric": convergence_metric,
+        "convergence_tm_threshold": convergence_threshold,
         "num_targets_total": int(len(df)),
         "num_targets_ok": int(len(ok_all)),
         "num_targets_compared": int(len(ok)),
@@ -478,6 +488,7 @@ def _aggregate_stats(
         "num_passes_cutoff_b": num_pass_b,
         "num_passes_cutoff_either": num_pass_either,
         "num_passes_cutoff_both": num_pass_both,
+        "num_passes_cutoff_convergence": num_passes_cutoff_convergence,
         "skipped_status_counts": {k: int(v) for k, v in skipped_counts.items()},
     }
     if self_mode:
@@ -487,6 +498,7 @@ def _aggregate_stats(
         summary["use_ground_truth"] = True
         summary["cif_dir"] = args.cif_dir
         summary["num_gt_missing"] = int(ok_all["gt_missing"].sum()) if "gt_missing" in ok_all.columns and len(ok_all) else 0
+
     if ok.empty:
         return summary
 
@@ -689,6 +701,12 @@ def main() -> int:
                         help="Directory containing reference CIFs (layout: <cif_dir>/<pdb_id>.cif "
                              "or <cif_dir>/<sub>/<pdb_id>.cif, where pdb_id = protein_id.split('_')[0]). "
                              "Required with --use_ground_truth.")
+    parser.add_argument("--convergence_tm_threshold", type=float, default=0.5,
+                        help="TM-score threshold above which a protein is considered converged (default: 0.5).")
+    parser.add_argument("--convergence_tm_metric",
+                        choices=["tm_predictions_TM1", "tm_templates_TM1"],
+                        default="tm_predictions_TM1",
+                        help="Column used for the convergence threshold (default: tm_predictions_TM1).")
     args = parser.parse_args()
 
     if args.use_ground_truth and not args.cif_dir:
@@ -821,6 +839,24 @@ def main() -> int:
                         summary["stats_tm_gt_winner_template_TM1"]["median"],
                         f"{summary['pearson_r_templates_vs_gt']:.3f}" if summary.get("pearson_r_templates_vs_gt") is not None else "n/a",
                         f"{summary['pearson_r_predictions_vs_gt']:.3f}" if summary.get("pearson_r_predictions_vs_gt") is not None else "n/a")
+
+    # Emit converged-protein lists as full-row subsets of compare_replicas_topk.csv.
+    threshold = float(args.convergence_tm_threshold)
+    metric = args.convergence_tm_metric
+    converged_all = ok_all[ok_all[metric] > threshold].copy()
+    ok_passing = ok_all[ok_all["passes_cutoff_either"]]
+    converged_passing = ok_passing[ok_passing[metric] > threshold].copy()
+    for label, subset, src_df, path in [
+        ("unfiltered", converged_all, ok_all, out_dir / "compare_replicas_converged.csv"),
+        ("passing", converged_passing, ok_passing, out_dir / "compare_replicas_converged_passing.csv"),
+    ]:
+        subset.to_csv(path, index=False)
+        n_total = len(src_df)
+        frac = (len(subset) / n_total) if n_total else 0.0
+        logger.info(
+            "[converged-%s] %d/%d (%.1f%%) proteins with %s > %.3f written to %s",
+            label, len(subset), n_total, 100.0 * frac, metric, threshold, path,
+        )
     return 0
 
 
