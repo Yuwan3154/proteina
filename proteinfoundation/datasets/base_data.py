@@ -39,6 +39,7 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         prefetch_factor: int = 2,
         cath_code_dir: Optional[str] = None,
         multilabel_mode: Literal["sample", "average", "sum", "transformer"] = "sample",
+        cath_dedupe_codes: bool = True,
         cluster_sampler_v2: bool = True,
         cluster_sampler_seed: int = 0,
     ):
@@ -72,6 +73,7 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         self.sampling_mode = sampling_mode
         self.cath_code_dir = cath_code_dir
         self.multilabel_mode = multilabel_mode
+        self.cath_dedupe_codes = cath_dedupe_codes
         self.transform = (
             self._compose_transforms(transforms) if transforms is not None else None
         )
@@ -169,8 +171,17 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             )
             shuffle = False
         elif self.sampling_mode == "random":
-            sampler = None
-            shuffle = shuffle
+            # Trainer is configured with use_distributed_sampler=False (see train.py)
+            # because our ClusterSampler shards across ranks internally. For the
+            # random-split path we still need a DistributedSampler under DDP, so
+            # construct one manually here to preserve per-rank disjointness.
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                from torch.utils.data.distributed import DistributedSampler
+                sampler = DistributedSampler(dataset, shuffle=shuffle)
+                shuffle = False
+            else:
+                sampler = None
+                shuffle = shuffle
         else:
             raise ValueError(
                 f"Sampling mode is {self.sampling_mode}, but clusterid_to_seqid_mapping is {clusterid_to_seqid_mapping}"
@@ -225,6 +236,9 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
                 kwargs["cath_code_dir"] = self.cath_code_dir
                 kwargs["multilabel_mode"] = getattr(
                     self, "multilabel_mode", "sample"
+                )
+                kwargs["cath_dedupe_codes"] = getattr(
+                    self, "cath_dedupe_codes", True
                 )
 
         return dataloader_class(dataset, **kwargs)

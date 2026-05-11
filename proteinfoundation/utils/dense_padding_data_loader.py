@@ -34,19 +34,55 @@ from torch_scatter import scatter_mean, scatter_sum
 FLOAT_PADDING_VALUE = 1e-8
 NON_FLOAT_PADDING_VALUE = -1
 
+# Fixed pad target for cath_code_indices in multilabel modes that produce a
+# [b, max_labels, 3] tensor. Without a fixed target, max_labels varies per batch
+# (= max-within-batch), every distinct value triggers a torch._dynamo recompile of
+# FoldEmbeddingSeqFeat.forward, and the recompile_limit (8) gets exhausted →
+# torch._dynamo falls back to eager mode → OOM on the val trajectory.
+#
+# Default 32 is the exact global max across all 296,383 SIFTS PDB→CATH-mapped
+# chains (counted *with duplicates* — multiple cath_ids mapping to the same
+# cath_code are kept, matching what `CATHLabelTransform.forward` produces). At
+# this cap no chain is ever truncated. The cost is negligible — fold-embedding
+# lookups scale as O(B * K * fold_emb_dim) = a few tens of KB per batch, vs the
+# ~10^12 ops/batch of the main trunk forward. Memory cost is ~1 KB/batch.
+# Overridable via env var CATH_PAD_MAX_LABELS if a future dataset exceeds 32.
+import os as _os
+_CATH_PAD_MAX_LABELS_DEFAULT = int(_os.environ.get("CATH_PAD_MAX_LABELS", "32"))
+_cath_pad_truncation_warned = False
+
 
 def _apply_cath_multilabel_to_batch(
     batch: Batch,
     cath_code_dir: str,
     multilabel_mode: Literal["sample", "average", "sum", "transformer"],
+    pad_max_labels: int = _CATH_PAD_MAX_LABELS_DEFAULT,
+    dedupe_codes: bool = True,
 ) -> None:
     """Apply multilabel aggregation to batch.cath_code_indices and replace with tensor.
 
     Expects batch.cath_code_indices as list of list of [C_idx, A_idx, T_idx] per sample.
-    Produces batch.cath_code_indices as tensor [b, 3] or [b, max_labels, 3] (transformer).
-    For transformer mode, also sets batch.cath_code_indices_mask [b, max_labels] (True=pad).
+    Produces batch.cath_code_indices as tensor [b, 3] or [b, pad_max_labels, 3].
+    For average/sum/transformer modes, also sets batch.cath_code_indices_mask
+    [b, pad_max_labels] (True=pad).
+
+    pad_max_labels is a fixed cap (default 32) so the output dim 1 is stable across
+    batches — required for torch.compile/dynamo to avoid recompiles on every batch
+    with a different label count. Samples with more labels than the cap have their
+    extra labels truncated (warned on first occurrence).
+
+    dedupe_codes (default True): collapse repeated (C, A, T) triples per sample to
+    a single occurrence each, preserving first-seen order. CATH lists each domain
+    instance separately, so a chain with K repeats of the same fold (e.g.,
+    1n7d_A has 5 LDL-receptor type-A domains all classified as 4.10.400.10)
+    produces K identical triples in the raw list. With dedupe_codes=True we
+    encode "which folds are present" (one embedding contribution per unique
+    fold); with False we keep CATH's per-domain listing so sum-mode weights
+    folds by domain-instance count. Affects average/sum/transformer modes only;
+    'sample' mode is unchanged.
     """
     from proteinfoundation.datasets.cath_utils import load_cath_mapping
+    global _cath_pad_truncation_warned
 
     indices_list = getattr(batch, "cath_code_indices", None)
     if indices_list is None:
@@ -67,40 +103,50 @@ def _apply_cath_multilabel_to_batch(
                 idx = random.randint(0, len(sample_indices) - 1)
                 result.append(sample_indices[idx])
         batch.cath_code_indices = torch.tensor(result, dtype=torch.long)
-    elif multilabel_mode in ("average", "sum"):
-        # Output [b, max_labels, 3] + mask so model can scatter over embeddings.
-        # (We cannot pre-aggregate indices for sum; model does scatter on embeddings.)
-        max_num_label = max(max(len(s), 1) for s in indices_list)
-        padded = []
-        mask = []
-        for sample_indices in indices_list:
-            n = len(sample_indices)
-            if n == 0:
-                padded.append([null_idx] * max_num_label)
-                mask.append([True] * max_num_label)
-            else:
-                row = list(sample_indices) + [null_idx] * (max_num_label - n)
-                padded.append(row)
-                mask.append([False] * n + [True] * (max_num_label - n))
-        batch.cath_code_indices = torch.tensor(padded, dtype=torch.long)
-        batch.cath_code_indices_mask = torch.tensor(mask, dtype=torch.bool)
-    elif multilabel_mode == "transformer":
-        max_num_label = max(len(s) for s in indices_list)
-        padded = []
-        mask = []
-        for sample_indices in indices_list:
-            n = len(sample_indices)
-            if n == 0:
-                padded.append([null_idx] * max_num_label)
-                mask.append([True] * max_num_label)
-            else:
-                row = list(sample_indices) + [null_idx] * (max_num_label - n)
-                padded.append(row)
-                mask.append([False] * n + [True] * (max_num_label - n))
-        batch.cath_code_indices = torch.tensor(padded, dtype=torch.long)
-        batch.cath_code_indices_mask = torch.tensor(mask, dtype=torch.bool)
-    else:
+        return
+
+    if multilabel_mode not in ("average", "sum", "transformer"):
         raise ValueError(f"Unknown multilabel_mode: {multilabel_mode}")
+
+    target_K = max(int(pad_max_labels), 1)
+
+    # Optionally dedupe per-sample (C, A, T) triples, preserving first-seen order.
+    if dedupe_codes:
+        deduped_list = []
+        for sample_indices in indices_list:
+            seen = set()
+            unique = []
+            for triple in sample_indices:
+                key = tuple(triple)
+                if key not in seen:
+                    seen.add(key)
+                    unique.append(triple)
+            deduped_list.append(unique)
+        indices_list = deduped_list
+
+    max_observed = max((len(s) for s in indices_list), default=0)
+    if max_observed > target_K and not _cath_pad_truncation_warned:
+        logger.warning(
+            f"_apply_cath_multilabel_to_batch: a sample has {max_observed} CATH labels "
+            f"(after dedupe={dedupe_codes}) but pad_max_labels={target_K}; truncating "
+            f"extra labels. Raise via env var CATH_PAD_MAX_LABELS=<N> if this happens often."
+        )
+        _cath_pad_truncation_warned = True
+
+    padded = []
+    mask = []
+    for sample_indices in indices_list:
+        truncated = list(sample_indices)[:target_K]
+        n = len(truncated)
+        if n == 0:
+            padded.append([null_idx] * target_K)
+            mask.append([True] * target_K)
+        else:
+            row = truncated + [null_idx] * (target_K - n)
+            padded.append(row)
+            mask.append([False] * n + [True] * (target_K - n))
+    batch.cath_code_indices = torch.tensor(padded, dtype=torch.long)
+    batch.cath_code_indices_mask = torch.tensor(mask, dtype=torch.bool)
 
 
 def _pad_tensor_list(values, padding_value):
@@ -450,6 +496,7 @@ class DensePaddingCollater:
         debug_data_loading: bool = False,
         cath_code_dir: Optional[str] = None,
         multilabel_mode: Literal["sample", "average", "sum", "transformer"] = "sample",
+        cath_dedupe_codes: bool = True,
     ):
         self.dataset = dataset
         self.follow_batch = follow_batch
@@ -458,6 +505,7 @@ class DensePaddingCollater:
         self._debug_data_loading = debug_data_loading
         self.cath_code_dir = cath_code_dir
         self.multilabel_mode = multilabel_mode
+        self.cath_dedupe_codes = cath_dedupe_codes
 
     def __call__(self, batch: List[Any]) -> Any:
         """Collates a python list of data objects to the internal storage format of
@@ -490,7 +538,8 @@ class DensePaddingCollater:
             )
             if self.cath_code_dir is not None and hasattr(out, "cath_code_indices"):
                 _apply_cath_multilabel_to_batch(
-                    out, self.cath_code_dir, self.multilabel_mode
+                    out, self.cath_code_dir, self.multilabel_mode,
+                    dedupe_codes=self.cath_dedupe_codes,
                 )
             if debug:
                 elapsed = time.perf_counter() - t0
@@ -563,6 +612,7 @@ class DensePaddingDataLoader(torch.utils.data.DataLoader):
         debug_data_loading: bool = False,
         cath_code_dir: Optional[str] = None,
         multilabel_mode: Literal["sample", "average", "sum", "transformer"] = "sample",
+        cath_dedupe_codes: bool = True,
         **kwargs,
     ):
         # Remove for PyTorch Lightning:
@@ -580,6 +630,7 @@ class DensePaddingDataLoader(torch.utils.data.DataLoader):
             debug_data_loading=debug_data_loading,
             cath_code_dir=cath_code_dir,
             multilabel_mode=multilabel_mode,
+            cath_dedupe_codes=cath_dedupe_codes,
         )
 
         if isinstance(dataset, OnDiskDataset):

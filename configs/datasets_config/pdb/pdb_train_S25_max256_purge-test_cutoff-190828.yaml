@@ -10,6 +10,7 @@ datamodule:
   sampling_mode: "cluster-random" # sample randomly inside each sequence similarity cluster during training
   cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/  # For CATH index conversion when fold_cond
   multilabel_mode: "sample"  # sample | average | sum | transformer
+  cath_dedupe_codes: True  # collapse repeated (C,A,T) triples per chain before sum/average; CATH lists each domain instance separately. Overridable from model.nn.cath_dedupe_codes.
   transforms: 
     - _target_: "proteinfoundation.datasets.transforms.GlobalRotationTransform" # Transforms to apply to dataset examples
     - _target_: "proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform"

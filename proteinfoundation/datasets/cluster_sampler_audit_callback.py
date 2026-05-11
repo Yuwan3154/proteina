@@ -56,12 +56,30 @@ class ClusterSamplerAuditCallback(L.Callback):
         if train_dl is None:
             return
         sampler = getattr(train_dl, "sampler", None)
+        # Lightning's DistributedSamplerWrapper (auto-applied when
+        # use_distributed_sampler=True) wraps a custom sampler inside a
+        # _DatasetSamplerWrapper. The inner ClusterSampler is reachable at
+        # `wrapper.dataset._sampler`. Peel one level here so the audit still
+        # runs in that scenario — and warn loudly, because the wrapper also
+        # re-shards the materialized indices per rank, which combined with our
+        # ClusterSampler's internal partitioning yields ~1/W² coverage on
+        # multi-GPU. The fix is to set Trainer(use_distributed_sampler=False).
         if not isinstance(sampler, ClusterSampler):
-            logger.info(
-                "[cluster_sampler_audit] train sampler is not ClusterSampler "
-                f"({type(sampler).__name__}); skipping audit."
-            )
-            return
+            inner = getattr(getattr(sampler, "dataset", None), "_sampler", None)
+            if isinstance(inner, ClusterSampler):
+                logger.warning(
+                    f"[cluster_sampler_audit] train sampler is {type(sampler).__name__} "
+                    f"wrapping ClusterSampler — Lightning is auto-wrapping. The DDP partition "
+                    f"will double-shard on multi-GPU. Set Trainer(use_distributed_sampler=False) "
+                    f"to disable Lightning's wrap; ClusterSampler handles DDP internally."
+                )
+                sampler = inner
+            else:
+                logger.info(
+                    "[cluster_sampler_audit] train sampler is not ClusterSampler "
+                    f"({type(getattr(train_dl, 'sampler', None)).__name__}); skipping audit."
+                )
+                return
         # Make sure the sampler has the right epoch (Lightning normally does
         # this via _set_sampler_epoch; we do it explicitly here too).
         sampler.set_epoch(int(trainer.current_epoch))
