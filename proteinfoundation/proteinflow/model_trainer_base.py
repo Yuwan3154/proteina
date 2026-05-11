@@ -14,12 +14,14 @@ import math
 import os
 import random
 import re
+import shutil
+import subprocess
 import tempfile
 import time
 
 from abc import abstractmethod
 from functools import partial
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Tuple
 
 import lightning as L
 import matplotlib.pyplot as plt
@@ -43,6 +45,9 @@ from proteinfoundation.datasets.cath_utils import (
 from proteinfoundation.utils.ff_utils.pdb_utils import (
     mask_seq,
     write_prot_to_pdb,
+)
+from proteinfoundation.af2rank_evaluation.usalign_tabular import (
+    parse_usalign_pair_outfmt2,
 )
 # from proteinfoundation.utils.openfold_inference import OpenFoldTemplateInference, OpenFoldDistogramOnlyInference
 import proteinfoundation.openfold_stub.np.residue_constants as rc
@@ -1365,6 +1370,54 @@ class ModelTrainerBase(L.LightningModule):
                 contact_map_pred = (
                     self._contact_map_to_viz(c_pred_full[0]) if c_pred_full is not None else None
                 )
+                # Phase D: noised inputs (what the model actually saw this step).
+                # x_t/contact_map_t/dssp_t are set during the flow-matching/diffusion
+                # interpolation block earlier in training_step.
+                x_t_local = batch.get("x_t")
+                contact_map_t = batch.get("contact_map_t")
+                contact_map_noised_viz = None
+                if contact_map_t is not None:
+                    try:
+                        contact_map_noised_viz = self._contact_map_to_viz(contact_map_t[0])
+                    except Exception:
+                        contact_map_noised_viz = None
+                dssp_t_local = batch.get("dssp_t")
+                dssp_target_local = batch.get("dssp_target")
+                dssp_logits_local = nn_out.get("dssp_logits") if isinstance(nn_out, dict) else None
+                # Phase C: cheap single-step TMscore (predicted-x1 vs ground-truth x_1, no full trajectory).
+                residue_type_first = (
+                    batch.get("residue_type_unmasked", batch.get("residue_type"))[0]
+                    if batch.get("residue_type_unmasked", batch.get("residue_type")) is not None
+                    else None
+                )
+                if x_1_pred is not None and x_1 is not None and residue_type_first is not None:
+                    tm = self._compute_tmscore_via_usalign(
+                        x_pred=x_1_pred[:1].detach(),
+                        x_gt=x_1[:1].detach(),
+                        residue_type=residue_type_first,
+                        mask=mask[0],
+                    )
+                    if tm is not None:
+                        self.log(
+                            f"{log_prefix}/tmscore_single_step",
+                            float(tm["tm_gt_norm"]),
+                            on_step=not val_step,
+                            on_epoch=True,
+                            logger=True,
+                            batch_size=1,
+                            sync_dist=False,
+                            add_dataloader_idx=False,
+                        )
+                        self.log(
+                            f"{log_prefix}/rmsd_single_step",
+                            float(tm["rmsd"]),
+                            on_step=not val_step,
+                            on_epoch=True,
+                            logger=True,
+                            batch_size=1,
+                            sync_dist=False,
+                            add_dataloader_idx=False,
+                        )
                 self._log_structure_visualization(
                     # Log only the first sample. Passing the full batch here makes
                     # `write_prot_to_pdb` treat batch dim as MODEL index, producing a
@@ -1374,16 +1427,17 @@ class ModelTrainerBase(L.LightningModule):
                     mask=mask[0],
                     log_prefix=log_prefix,
                     pair_logits=nn_out.get("pair_logits")[0] if "pair_logits" in nn_out else None,
-                    residue_type=(
-                        batch.get("residue_type_unmasked", batch.get("residue_type"))[0]
-                        if batch.get("residue_type_unmasked", batch.get("residue_type")) is not None
-                        else None
-                    ),
+                    residue_type=residue_type_first,
                     use_template_inference=(
                         getattr(self.nn, "predict_coords", True) is False
                         and getattr(self, "contact_map_mode", False)
                         and self.cfg_exp.model.nn.get("predict_structure_from_distogram", False)
                     ),
+                    x_noised=x_t_local[:1] if isinstance(x_t_local, torch.Tensor) and x_t_local.numel() > 0 else None,
+                    contact_map_noised=contact_map_noised_viz,
+                    dssp_noised=dssp_t_local[0] if isinstance(dssp_t_local, torch.Tensor) and dssp_t_local.numel() > 0 else None,
+                    dssp_pred=dssp_logits_local[0] if isinstance(dssp_logits_local, torch.Tensor) else None,
+                    dssp_gt=dssp_target_local[0] if isinstance(dssp_target_local, torch.Tensor) and dssp_target_local.numel() > 0 else None,
                 )
                 gt_contact_map = (
                     self._contact_map_to_viz(c_1[0]) if c_1 is not None else None
@@ -1394,16 +1448,134 @@ class ModelTrainerBase(L.LightningModule):
                     mask=mask[0],
                     log_prefix=log_prefix,
                     key_suffix="_gt",
-                    residue_type=(
-                        batch.get("residue_type_unmasked", batch.get("residue_type"))[0]
-                        if batch.get("residue_type_unmasked", batch.get("residue_type"))
-                        is not None
-                        else None
-                    ),
+                    residue_type=residue_type_first,
                 )
 
         return train_loss
     
+    def _coords_to_temp_pdb(
+        self,
+        coords: torch.Tensor,
+        residue_type: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> Optional[str]:
+        """Materialize a [n, 3] / [n, 3, 3] / [n, 14|37, 3] coords tensor to a tempfile PDB.
+
+        Returns the path on success; None if no atoms survived the mask. Caller
+        must delete the file. Mirrors the atom-mask logic in
+        ``_log_structure_visualization`` so per-step USalign calls and the wandb
+        Molecule logged for the same step are derived from the same atoms.
+        """
+        if coords is None:
+            return None
+        coords = coords[:1] if coords.dim() in (3, 4) and coords.shape[0] > 1 else coords
+        if coords.dim() == 4:
+            atom_dim = coords.shape[-2]
+        else:
+            atom_dim = None
+        atom37 = self.samples_to_atom37(coords, residue_type=residue_type).float().detach().cpu().numpy()
+        aatype = residue_type.long().detach().cpu().numpy()
+        mask_np = mask.detach().cpu().numpy().astype(np.float32)
+        if coords.dim() == 3:
+            atom37_mask = np.zeros((aatype.shape[0], 37), dtype=np.float32)
+            atom37_mask[:, rc.atom_order["CA"]] = mask_np
+        elif coords.dim() == 4 and atom_dim == 3:
+            atom37_mask = np.zeros((aatype.shape[0], 37), dtype=np.float32)
+            atom37_mask[:, [rc.atom_order["N"], rc.atom_order["CA"], rc.atom_order["C"]]] = mask_np[:, None]
+        else:
+            atom37_mask = rc.RESTYPE_ATOM37_MASK[aatype] * mask_np[:, None]
+        if atom37_mask.sum() < 1.0:
+            return None
+        with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False) as tmp_pdb:
+            path = tmp_pdb.name
+        write_prot_to_pdb(
+            atom37, path, aatype=aatype, atom37_mask=atom37_mask,
+            overwrite=True, no_indexing=True,
+        )
+        return path
+
+    def _compute_tmscore_via_usalign(
+        self,
+        x_pred: torch.Tensor,
+        x_gt: torch.Tensor,
+        residue_type: torch.Tensor,
+        mask: torch.Tensor,
+        timeout_s: float = 60.0,
+    ) -> Optional[Dict[str, float]]:
+        """Run USalign on the first sample of (x_pred, x_gt). Returns metrics dict or None.
+
+        We use the GT-normalized score (TM2) as the canonical "TMscore vs ground
+        truth"; the dict also exposes TM1 and RMSD so downstream logging can
+        choose. Falls through gracefully if USalign isn't on PATH or the call
+        fails — we never let logging break training.
+        """
+        usalign_bin = shutil.which("USalign") or "/home/ubuntu/.local/bin/USalign"
+        if not os.path.exists(usalign_bin):
+            return None
+        if x_pred is None or x_gt is None or residue_type is None or mask is None:
+            return None
+        # USalign mode: 5 = TMscore-style (residue-index alignment, fixed order — canonical
+        # for structure prediction). 0 = USalign default (TMalign, sequence-independent
+        # optimal alignment). The validation_sampling.tmscore_mode config knob picks.
+        val_cfg = self.cfg_exp.get("validation_sampling", {}) or {}
+        tmscore_mode = int(val_cfg.get("tmscore_mode", 5))
+        pred_pdb = None
+        gt_pdb = None
+        try:
+            pred_pdb = self._coords_to_temp_pdb(x_pred, residue_type, mask)
+            gt_pdb = self._coords_to_temp_pdb(x_gt, residue_type, mask)
+            if pred_pdb is None or gt_pdb is None:
+                return None
+            # One-shot unit-correctness assertion the first time this fires:
+            # PDBs must have coordinates in Å (typical extent 30-300 Å).
+            # Mismatched units (nm leaking through) would produce ~3-30 Å span; flag it.
+            if not getattr(self, "_tmscore_unit_logged", False):
+                try:
+                    with open(pred_pdb) as f_pdb:
+                        xs = []
+                        for ln in f_pdb:
+                            if ln.startswith("ATOM"):
+                                try:
+                                    xs.append(float(ln[30:38]))
+                                except ValueError:
+                                    pass
+                        if xs:
+                            span = max(xs) - min(xs)
+                            logger.info(
+                                f"[tmscore_unit_check] pred PDB x-span={span:.1f} Å "
+                                f"(expect ~30-300 Å for proteins; <10 Å suggests nm leakage)"
+                            )
+                            self._tmscore_unit_logged = True
+                except Exception:
+                    pass
+            argv = [usalign_bin, pred_pdb, gt_pdb, "-outfmt", "2"]
+            if tmscore_mode != 0:
+                argv += ["-TMscore", str(tmscore_mode)]
+            result = subprocess.run(
+                argv, capture_output=True, text=True, timeout=timeout_s,
+            )
+            if result.returncode != 0:
+                return None
+            metrics = parse_usalign_pair_outfmt2(result.stdout)
+            # parse_usalign_pair_outfmt2 returns keys: tms (=TM1, normalized to
+            # structure 1 i.e. predicted), tms2 (=TM2, normalized to structure 2
+            # i.e. ground truth), rms (RMSD), gdt (always NaN with -outfmt 2).
+            return {
+                "tm_pred_norm": float(metrics.get("tms", 0.0)),
+                "tm_gt_norm": float(metrics.get("tms2", 0.0)),
+                "rmsd": float(metrics.get("rms", 0.0)),
+            }
+        except Exception as e:
+            logger.warning(f"USalign TMscore failed: {e!r}")
+            return None
+        finally:
+            for p in (pred_pdb, gt_pdb):
+                if p is not None and os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+
     def _log_structure_visualization(
         self,
         x_1_pred: torch.Tensor,
@@ -1414,6 +1586,11 @@ class ModelTrainerBase(L.LightningModule):
         pair_logits: torch.Tensor = None,
         residue_type: torch.Tensor = None,
         use_template_inference: bool = False,
+        x_noised: torch.Tensor = None,
+        contact_map_noised: torch.Tensor = None,
+        dssp_noised: torch.Tensor = None,
+        dssp_pred: torch.Tensor = None,
+        dssp_gt: torch.Tensor = None,
     ):
         """
         Logs predicted structure (as temporary PDB) and contact map visualizations.
@@ -1495,33 +1672,113 @@ class ModelTrainerBase(L.LightningModule):
                 if os.path.exists(temp_pdb_path):
                     os.remove(temp_pdb_path)
 
-        if contact_map_pred is None:
-            return
+        # Optional noised structure (Phase D — show what the model actually saw).
+        if x_noised is not None and residue_type is not None:
+            noised_pdb = self._coords_to_temp_pdb(x_noised, residue_type, mask)
+            if noised_pdb is not None:
+                try:
+                    self.logger.experiment.log(
+                        {
+                            f"{log_prefix}/structure_noised{key_suffix}": wandb.Molecule(noised_pdb),
+                            "global_step": self.global_step,
+                        }
+                    )
+                finally:
+                    if os.path.exists(noised_pdb):
+                        try:
+                            os.remove(noised_pdb)
+                        except OSError:
+                            pass
 
         mask_np = mask.detach().cpu().numpy()
-        # `contact_map_pred` is expected to already be in [0, 1] for visualization.
-        contact_map_prob = contact_map_pred.float().clamp(0.0, 1.0).detach().cpu().numpy()
         pair_mask_np = mask_np[..., :, None] * mask_np[..., None, :]
-        contact_map_np = contact_map_prob * pair_mask_np
 
-        fig, ax = plt.subplots(figsize=(6, 6))
-        im = ax.imshow(contact_map_np, cmap="viridis", aspect="auto", vmin=0, vmax=1)
-        ax.set_xlabel("Residue j")
-        ax.set_ylabel("Residue i")
-        ax.set_title(f"Contact Map - Step {self.global_step}")
-        plt.colorbar(im, ax=ax, label="Contact probability")
+        def _log_contact_image(cmap_tensor: torch.Tensor, key: str, title: str):
+            cmap_prob = cmap_tensor.float().clamp(0.0, 1.0).detach().cpu().numpy()
+            cmap_np = cmap_prob * pair_mask_np
+            fig, ax = plt.subplots(figsize=(6, 6))
+            im = ax.imshow(cmap_np, cmap="viridis", aspect="auto", vmin=0, vmax=1)
+            ax.set_xlabel("Residue j")
+            ax.set_ylabel("Residue i")
+            ax.set_title(title)
+            plt.colorbar(im, ax=ax, label="Contact probability")
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+            buf.seek(0)
+            img = Image.open(buf)
+            plt.close(fig)
+            self.logger.experiment.log(
+                {key: wandb.Image(img), "global_step": self.global_step}
+            )
 
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
-        buf.seek(0)
-        img_contact = Image.open(buf)
-        plt.close(fig)
+        if contact_map_pred is not None:
+            _log_contact_image(
+                contact_map_pred,
+                f"{log_prefix}/contact_map{key_suffix}",
+                f"Contact Map - Step {self.global_step}",
+            )
 
-        self.logger.experiment.log(
-            {
-                f"{log_prefix}/contact_map{key_suffix}": wandb.Image(img_contact),
-                "global_step": self.global_step,
-            }
+        if contact_map_noised is not None:
+            _log_contact_image(
+                contact_map_noised,
+                f"{log_prefix}/contact_map_noised{key_suffix}",
+                f"Contact Map (noised) - Step {self.global_step}",
+            )
+
+        # DSSP visualization (Phase D). Renders 3-state DSSP as a horizontal strip:
+        # 0=loop (gray), 1=helix (red), 2=strand (gold). -1 (ignore) is rendered black.
+        def _dssp_to_arr(d: torch.Tensor) -> Optional[np.ndarray]:
+            if d is None:
+                return None
+            d = d.detach().cpu()
+            if d.dim() >= 2 and d.shape[-1] in (3, 4):
+                # logits / probabilities — argmax to class indices
+                d = d.argmax(dim=-1)
+            if d.dim() == 0 or d.numel() == 0:
+                return None
+            return d.numpy().reshape(-1)
+
+        def _log_dssp_strip(arr: Optional[np.ndarray], key: str, title: str):
+            if arr is None:
+                return
+            arr = arr.copy()
+            mask_1d = mask_np if mask_np.ndim == 1 else mask_np.reshape(-1)
+            n_show = int(mask_1d.sum()) if mask_1d.size == arr.size else arr.size
+            if n_show <= 0:
+                return
+            # Truncate to valid prefix only — padding on the right is uninformative.
+            arr_show = arr[:n_show]
+            fig, ax = plt.subplots(figsize=(8, 1.0))
+            cmap = plt.matplotlib.colors.ListedColormap(["black", "lightgray", "firebrick", "gold"])
+            # remap: -1 -> 0 (black), 0/1/2 -> 1/2/3
+            im_arr = np.where(arr_show < 0, 0, arr_show + 1).astype(np.int64)[None, :]
+            ax.imshow(im_arr, aspect="auto", cmap=cmap, vmin=0, vmax=3, interpolation="nearest")
+            ax.set_yticks([])
+            ax.set_xlabel("Residue")
+            ax.set_title(title)
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+            buf.seek(0)
+            img = Image.open(buf)
+            plt.close(fig)
+            self.logger.experiment.log(
+                {key: wandb.Image(img), "global_step": self.global_step}
+            )
+
+        _log_dssp_strip(
+            _dssp_to_arr(dssp_noised),
+            f"{log_prefix}/dssp_noised{key_suffix}",
+            f"DSSP (noised) - Step {self.global_step}",
+        )
+        _log_dssp_strip(
+            _dssp_to_arr(dssp_pred),
+            f"{log_prefix}/dssp_pred{key_suffix}",
+            f"DSSP (predicted) - Step {self.global_step}",
+        )
+        _log_dssp_strip(
+            _dssp_to_arr(dssp_gt),
+            f"{log_prefix}/dssp_gt{key_suffix}",
+            f"DSSP (ground truth) - Step {self.global_step}",
         )
 
     @abstractmethod
@@ -1724,6 +1981,58 @@ class ModelTrainerBase(L.LightningModule):
         """
         self.validation_step_data(batch, batch_idx)
 
+    @staticmethod
+    def _concat_val_batches(batches: List) -> dict:
+        """Concatenate a list of PyG-Batch / dict batches along dim 0.
+
+        Tensors are torch.cat'd; lists are extended; nested dicts (e.g.
+        ``mask_dict``) are recursively concatenated by key; everything else
+        falls back to the first batch's value. All input batches MUST share the
+        same padded length N (true under PaddingTransform with fixed max_size).
+
+        Returns a plain dict (good enough for both ``extract_clean_sample`` —
+        which does ``batch["coords"]`` — and ``_run_validation_trajectory`` —
+        which does ``batch.get(...)``).
+        """
+        if not batches:
+            return {}
+
+        def _cat_values(vals):
+            if not vals:
+                return None
+            if all(isinstance(v, torch.Tensor) for v in vals):
+                # All tensors must agree on every dim except 0. If they don't,
+                # something's wrong (e.g. unequal padding) — keep the first.
+                try:
+                    return torch.cat(vals, dim=0)
+                except RuntimeError:
+                    return vals[0]
+            if all(isinstance(v, dict) for v in vals):
+                # Recurse on union of keys.
+                union: Dict = {}
+                for k in {kk for v in vals for kk in v.keys()}:
+                    sub = [v[k] for v in vals if k in v]
+                    union[k] = _cat_values(sub)
+                return union
+            if all(isinstance(v, (list, tuple)) for v in vals):
+                merged: List = []
+                for v in vals:
+                    merged.extend(list(v))
+                return merged
+            return vals[0]
+
+        out: Dict = {}
+        keys = list(batches[0].keys())
+        for k in keys:
+            # PyG Batch internal counters that don't make sense to concat.
+            if k in ("batch", "ptr"):
+                continue
+            vals = [b[k] for b in batches if k in b.keys()]
+            if not vals:
+                continue
+            out[k] = _cat_values(vals)
+        return out
+
     def validation_step_data(self, batch, batch_idx):
         """
         Evaluates the training loss, without auxiliary loss nor logging.
@@ -1736,13 +2045,49 @@ class ModelTrainerBase(L.LightningModule):
             self.validation_output_data.append(loss.item())
 
         val_sampling_cfg = self.cfg_exp.get("validation_sampling", None)
-        if (
-            val_sampling_cfg
-            and batch_idx == 0
-            and self.global_step > 0
-            and self._logged_val_traj_epoch != self.current_epoch
-        ):
-            self._run_validation_trajectory(batch, val_sampling_cfg)
+        if not val_sampling_cfg or self.global_step <= 0:
+            return
+        tmscore_n = int(val_sampling_cfg.get("tmscore_n_samples", 1))
+        every_n = int(val_sampling_cfg.get("tmscore_every_n_val_epochs", 1))
+        if tmscore_n <= 0:
+            return
+        if (self.current_epoch % max(every_n, 1)) != 0:
+            return
+        if self._logged_val_traj_epoch == self.current_epoch:
+            return  # already fired this epoch
+        # Buffer val batches (cloned + detached) until we have N, then concat
+        # along dim 0 and run a single batched full-trajectory pass. This is the
+        # only way to amortize the ~1/dt forward passes across N samples without
+        # changing val batch_size (which would also change loss aggregation).
+        if not hasattr(self, "_val_traj_buffer") or self._val_traj_buffer is None:
+            self._val_traj_buffer = []
+        if len(self._val_traj_buffer) < tmscore_n:
+            # Snapshot each batch into a plain dict; deep-clone tensors so the
+            # buffered copy survives Lightning's per-step memory churn.
+            def _snap_value(v):
+                if isinstance(v, torch.Tensor):
+                    return v.detach().clone()
+                if isinstance(v, dict):
+                    return {kk: _snap_value(vv) for kk, vv in v.items()}
+                if isinstance(v, list):
+                    return [_snap_value(vv) for vv in v]
+                return v
+
+            buffered: Dict = {}
+            for k in batch.keys():
+                if k in ("batch", "ptr"):
+                    continue
+                buffered[k] = _snap_value(batch[k])
+            self._val_traj_buffer.append(buffered)
+        if len(self._val_traj_buffer) == tmscore_n:
+            concat_batch = self._concat_val_batches(self._val_traj_buffer)
+            self._val_traj_buffer = []
+            self._run_validation_trajectory(
+                concat_batch,
+                val_sampling_cfg,
+                log_visualization=True,
+                accumulate_metric=True,
+            )
             self._logged_val_traj_epoch = self.current_epoch
 
     def on_validation_epoch_end(self):
@@ -1752,7 +2097,37 @@ class ModelTrainerBase(L.LightningModule):
         """
         self.on_validation_epoch_end_data()
 
+    def on_validation_epoch_start(self):
+        # Reset the per-epoch TMscore accumulator. This runs on every rank, but
+        # _run_validation_trajectory only appends on rank 0 (the only rank that
+        # holds a logger), so the aggregation is rank-0 local.
+        self._validation_tmscore_results: List[Dict[str, float]] = []
+        # Buffer for batched val-trajectory inference: the first
+        # tmscore_n_samples val batches are accumulated and concatenated, then
+        # one batched generate() call shares the trajectory's NN forward passes
+        # across all of them.
+        self._val_traj_buffer: List[dict] = []
+
     def on_validation_epoch_end_data(self):
+        # Aggregate per-sample TMscores accumulated by _run_validation_trajectory.
+        results = getattr(self, "_validation_tmscore_results", None)
+        if results and self.logger is not None and hasattr(self.logger, "experiment"):
+            if not (hasattr(self.trainer, "is_global_zero") and not self.trainer.is_global_zero):
+                tm_gt = np.array([r["tm_gt_norm"] for r in results], dtype=np.float64)
+                tm_pred = np.array([r["tm_pred_norm"] for r in results], dtype=np.float64)
+                rmsd = np.array([r["rmsd"] for r in results], dtype=np.float64)
+                payload = {
+                    "validation_sampling/tmscore_mean": float(tm_gt.mean()),
+                    "validation_sampling/tmscore_median": float(np.median(tm_gt)),
+                    "validation_sampling/tmscore_min": float(tm_gt.min()),
+                    "validation_sampling/tmscore_max": float(tm_gt.max()),
+                    "validation_sampling/tmscore_pred_norm_mean": float(tm_pred.mean()),
+                    "validation_sampling/rmsd_mean": float(rmsd.mean()),
+                    "validation_sampling/n_samples": int(len(results)),
+                    "global_step": self.global_step,
+                }
+                self.logger.experiment.log(payload)
+        self._validation_tmscore_results = []
         self.validation_output_data = []
 
     def _resolve_validation_length_bounds(self, val_sampling_cfg) -> tuple:
@@ -1794,7 +2169,13 @@ class ModelTrainerBase(L.LightningModule):
         # Default when flag is omitted: enable when bounds are available.
         return min_l is not None and max_l is not None and max_l >= min_l
 
-    def _run_validation_trajectory(self, batch, val_sampling_cfg):
+    def _run_validation_trajectory(
+        self,
+        batch,
+        val_sampling_cfg,
+        log_visualization: bool = True,
+        accumulate_metric: bool = False,
+    ):
         if self.logger is None or not hasattr(self.logger, "experiment"):
             return
         if hasattr(self.trainer, "is_global_zero") and not self.trainer.is_global_zero:
@@ -1808,24 +2189,23 @@ class ModelTrainerBase(L.LightningModule):
         schedule_p = float(val_sampling_cfg.get("schedule_p", 1.0))
         sampling_grid = val_sampling_cfg.get("sampling_grid", None)
 
-        nsamples = 1
-        mask = batch["mask"][:nsamples].to(self.device)
+        # Take ALL samples in the (possibly concat-buffered) batch — the caller
+        # already restricted the batch to tmscore_n_samples via _concat_val_batches.
+        # All samples share trajectory NN forward passes.
+        mask = batch["mask"].to(self.device)
+        nsamples = mask.shape[0]
         n = mask.shape[-1]
         # Use unmasked sequence for validation sampling (training masks residue_type for seq_cond)
         residue_type = batch.get("residue_type_unmasked", batch.get("residue_type"))
         if residue_type is not None:
-            residue_type = residue_type[:nsamples].to(self.device)
+            residue_type = residue_type.to(self.device)
         cath_code = batch.get("cath_code") if self.cfg_exp.training.get("fold_cond", False) else None
         cath_code_indices = batch.get("cath_code_indices")
         cath_code_indices_mask = batch.get("cath_code_indices_mask")
-        if cath_code is not None and isinstance(cath_code, torch.Tensor):
-            cath_code = cath_code[:nsamples]
-        if cath_code is not None and isinstance(cath_code, (list, tuple)):
-            cath_code = cath_code[:nsamples]
         if cath_code_indices is not None:
-            cath_code_indices = cath_code_indices[:nsamples].to(self.device)
+            cath_code_indices = cath_code_indices.to(self.device)
         if cath_code_indices_mask is not None:
-            cath_code_indices_mask = cath_code_indices_mask[:nsamples].to(self.device)
+            cath_code_indices_mask = cath_code_indices_mask.to(self.device)
 
         # Extract motif conditioning: support both (motif_structure, motif_seq_mask) from
         # inference/GenMotifDataset and (x_motif, fixed_sequence_mask, fixed_structure_mask)
@@ -1928,15 +2308,49 @@ class ModelTrainerBase(L.LightningModule):
                 mask,
             )
 
-        self._log_structure_visualization(
-            x_1_pred=coords,
-            contact_map_pred=self._contact_map_to_viz(contact_map).squeeze(0) if contact_map is not None else None,
-            mask=mask.squeeze(0),
-            log_prefix="validation_sampling",
-            pair_logits=distogram.squeeze(0) if distogram is not None else None,
-            residue_type=residue_type.squeeze(0),
-            use_template_inference=predict_from_dist,
-        )
+        # Log visualization for the FIRST sample only (consistent with the prior
+        # single-sample behaviour). Use index 0 of the batched results — squeeze(0)
+        # is wrong for nsamples > 1, so use [0] indexing instead.
+        if log_visualization and coords is not None:
+            cmap_first = None
+            if contact_map is not None:
+                _viz = self._contact_map_to_viz(contact_map)
+                cmap_first = _viz[0] if _viz.dim() >= 2 else _viz
+            self._log_structure_visualization(
+                x_1_pred=coords[:1],
+                contact_map_pred=cmap_first,
+                mask=mask[0],
+                log_prefix="validation_sampling",
+                pair_logits=distogram[0] if distogram is not None else None,
+                residue_type=residue_type[0] if residue_type is not None else None,
+                use_template_inference=predict_from_dist,
+            )
+
+        # Per-sample USalign TMscore loop. Even though we batched the trajectory's
+        # NN forward passes, USalign itself runs per-pair on temp PDBs (it's a
+        # subprocess, not a tensor op) — so we loop here.
+        if accumulate_metric and coords is not None and residue_type is not None:
+            try:
+                x_1_gt, gt_mask, _, _, _ = self.extract_clean_sample(batch)
+            except Exception as e:
+                logger.warning(f"validation_sampling: failed to extract GT for TMscore: {e!r}")
+                x_1_gt = None
+                gt_mask = mask
+            if x_1_gt is not None:
+                if not hasattr(self, "_validation_tmscore_results") or self._validation_tmscore_results is None:
+                    self._validation_tmscore_results = []
+                gt_mask_per = gt_mask if gt_mask.dim() > 1 else gt_mask.unsqueeze(0).expand(nsamples, -1)
+                for s in range(nsamples):
+                    if not bool(mask[s].any()):
+                        continue
+                    tm = self._compute_tmscore_via_usalign(
+                        x_pred=coords[s:s + 1].detach(),
+                        x_gt=x_1_gt[s:s + 1].detach(),
+                        residue_type=residue_type[s] if residue_type.dim() > 1 else residue_type,
+                        mask=gt_mask_per[s] if gt_mask_per.dim() > 1 else gt_mask_per,
+                    )
+                    if tm is not None:
+                        self._validation_tmscore_results.append(tm)
 
     def configure_inference(self, inf_cfg, nn_ag):
         """Sets inference config with all sampling parameters required by the method (dt, etc)

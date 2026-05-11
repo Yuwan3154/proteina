@@ -1,175 +1,220 @@
 """
-DSSP Noise-Level Ablation Script
+DSSP Noise-Level Ablation Script.
 
-Tests DSSP prediction accuracy at various noise levels with a 4-condition ablation:
+Tests DSSP prediction accuracy at varying noise levels with a 4-condition
+ablation matrix:
   1. seq+CATH  — both sequence and CATH provided
-  2. seq only  — sequence provided, CATH masked
+  2. seq only  — sequence provided, CATH masked (all-null)
   3. CATH only — sequence masked (all UNK=20), CATH provided
   4. neither   — both masked
 
-For each condition, the script:
-  - Takes ground-truth protein structures
-  - Applies noise via flow-matching interpolation x_t = (1-t)*x_0 + t*x_1
-  - Runs the model forward to get DSSP logits
-  - Compares to ground-truth DSSP from full backbone coordinates
+For each (protein, t, condition) triple the script runs the trainer's
+training-step forward path (deterministic t, no SC bootstrap) and reports
+DSSP accuracy against TWO ground-truth versions:
+
+- `broken_GT`: targets from the live data pipeline's DSSPTargetTransform.
+  Until the atom-index bug fix in transforms.py is shipped to the model
+  weights via retraining, this matches what `val/dssp_acc` reports during
+  training. After retraining, the two GTs should converge.
+- `fixed_GT`: targets recomputed inline using N/CA/C/O at the correct atom37
+  indices (0,1,2,4). This is the real DSSP signal.
 
 Usage:
-    python scripts/analysis/dssp_noise_ablation.py \
-        --ckpt data/weights/<checkpoint>.ckpt \
-        --n_proteins 20 \
-        --output_dir results/dssp_ablation
+    CUTLASS_PATH=/home/ubuntu/openfold/cutlass \
+    /home/ubuntu/miniforge3/envs/cue_openfold/bin/python \
+        proteina/scripts/analysis/dssp_noise_ablation.py \
+        --ckpt data/weights/<ckpt>.ckpt \
+        [--n_proteins 20] [--output_dir results/dssp_ablation] \
+        [--t_values 0.0 0.05 ... 1.0]
 """
 
 import argparse
-import gzip
+import csv
 import os
 import sys
-
-# Disable torch.compile/dynamo to avoid bool mask issues in pair_bias_attn
-os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
-
-root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-sys.path.insert(0, root)
-
-import glob
-import csv
 from collections import defaultdict
 
+# Disable torch.compile/dynamo to avoid bool-mask issue in pair_bias_attn
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+sys.path.insert(0, ROOT)
+
+import hydra
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from dotenv import load_dotenv
+from omegaconf import OmegaConf
+
 torch.set_float32_matmul_precision("medium")
 
 from proteinfoundation.proteinflow.proteina import Proteina
-from proteinfoundation.utils.dssp_utils import compute_dssp_target
-from proteinfoundation.utils.coors_utils import ang_to_nm
-from proteinfoundation.datasets.cath_utils import (
-    load_cath_mapping,
-    cath_code_strings_to_indices_for_model,
-)
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Data module bootstrap (same path as scripts/analysis/dssp_validation_reproduce.py)
 # ---------------------------------------------------------------------------
 
-def load_cath_code_lookup(cathdata_dir):
-    """Parse cath-b-newest-all.gz to build {pdb_chain: [cath_code, ...]} mapping."""
-    lookup = defaultdict(list)
-    gz_path = os.path.join(cathdata_dir, "cath-b-newest-all.gz")
-    if not os.path.exists(gz_path):
-        print(f"WARNING: {gz_path} not found — CATH codes will be unavailable")
-        return lookup
-    with gzip.open(gz_path, "rt") as f:
-        for line in f:
-            parts = line.strip().split()
-            if len(parts) < 3:
-                continue
-            domain_id = parts[0]      # e.g. "101mA00"
-            cath_code = parts[2]      # e.g. "1.10.490.10"
-            # Extract pdb + chain from domain id (first 4 chars = pdb, 5th = chain)
-            if len(domain_id) < 5:
-                continue
-            pdb = domain_id[:4].lower()
-            chain = domain_id[4].upper()
-            key = f"{pdb}_{chain}"
-            if cath_code not in lookup[key]:
-                lookup[key].append(cath_code)
-    return lookup
+def load_data_module(cfg_exp, num_workers: int = 0):
+    """Instantiate the same PDBLightningDataModule training uses."""
+    dataset_subdir = cfg_exp.get("dataset_config_subdir", None)
+    rel_config_path = os.path.relpath(
+        os.path.join(ROOT, "configs", "datasets_config")
+        + (f"/{dataset_subdir}" if dataset_subdir else ""),
+        os.path.dirname(__file__),
+    )
+    with hydra.initialize(config_path=rel_config_path, version_base=hydra.__version__):
+        cfg_data = hydra.compose(config_name=cfg_exp["dataset"])
+    cfg_data.datamodule.num_workers = num_workers
+    if num_workers == 0:
+        cfg_data.datamodule.prefetch_factor = None
+        cfg_data.datamodule.pin_memory = False
+    multilabel_mode = OmegaConf.select(cfg_exp, "model.nn.multilabel_mode")
+    if multilabel_mode is not None:
+        cfg_data.datamodule.multilabel_mode = multilabel_mode
+    cfg_data.datamodule.batch_size = 1
+    dm = hydra.utils.instantiate(cfg_data.datamodule)
+    if hasattr(dm, "use_multiprocessing"):
+        dm.use_multiprocessing = False
+    return dm
 
 
-def build_batch(pt_data, t_val, x_0, model, device,
-                seq_provided, cath_indices, cath_mask, ext_lig_provided,
-                zero_sin_pos_emb=False):
-    """Build a batch dictionary for a single protein at a given noise level.
+def move_to_device(batch, device):
+    out = {}
+    for k, v in batch.items():
+        if isinstance(v, torch.Tensor):
+            out[k] = v.to(device)
+        elif isinstance(v, dict):
+            out[k] = {kk: (vv.to(device) if isinstance(vv, torch.Tensor) else vv)
+                      for kk, vv in v.items()}
+        else:
+            out[k] = v
+    return out
 
-    Returns (batch, mask_cpu, x_1) where x_1 is the centered clean CA coords in nm.
-    """
-    coords = torch.as_tensor(pt_data.coords, dtype=torch.float32)  # [n, 37, 3] in Å
-    residue_type = torch.as_tensor(pt_data.residue_type, dtype=torch.long)  # [n]
-    n = residue_type.shape[0]
 
-    # Mask (must be bool for pair_bias_attn)
-    coord_mask = torch.as_tensor(pt_data.coord_mask)  # [n, 37]
-    mask = (coord_mask.sum(dim=-1) > 0)  # [n] bool
+def clone_batch(batch):
+    out = {}
+    for k, v in batch.items():
+        if isinstance(v, torch.Tensor):
+            out[k] = v.clone()
+        elif isinstance(v, dict):
+            out[k] = {kk: (vv.clone() if isinstance(vv, torch.Tensor) else vv)
+                      for kk, vv in v.items()}
+        else:
+            out[k] = v
+    return out
 
-    # Clean CA in nm
-    x_1 = ang_to_nm(coords[:, 1, :])  # [n, 3]
 
-    # Center
-    valid = mask.bool()
-    com = x_1[valid].mean(dim=0, keepdim=True)
-    x_1 = x_1 - com
-    x_1 = x_1 * mask[:, None].float()
+# ---------------------------------------------------------------------------
+# Forward path mirroring the trainer (deterministic t, no SC bootstrap, no
+# random seq/extlig masking). Produces nn_out["dssp_logits"] for the given
+# batch at noise level t_val.
+# ---------------------------------------------------------------------------
 
-    # Interpolation: x_t = (1-t)*x_0 + t*x_1
-    t_tensor = torch.tensor([t_val], dtype=torch.float32)
-    x_t = (1.0 - t_val) * x_0[:n, :] + t_val * x_1  # [n, 3]
-    x_t = x_t * mask[:, None].float()
-
-    # Self-conditioning: zeros (no oracle). Model was trained with x_sc=zeros for 50%
-    # of batches, so this is in-distribution. At t=1.0 the positive control comes from
-    # clean x_t (via xt_pair_dists), NOT from oracle x_sc.
-    x_sc = torch.zeros_like(x_t)  # [n, 3]
-
-    # Sequence
-    if seq_provided:
-        seq = residue_type.clone()
-        seq = torch.where(seq == -1, torch.tensor(20, dtype=torch.long), seq)
+def run_forward_at_t(model, batch, t_val: float, use_self_cond: bool = False):
+    x_1, mask, batch_shape, n, dtype = model.extract_clean_sample(batch)
+    x_1 = model.fm._mask_and_zero_com(x_1, mask)
+    t = torch.full(batch_shape, float(t_val), device=model.device, dtype=x_1.dtype)
+    x_0 = model.fm.sample_reference(
+        n=n, shape=batch_shape, device=model.device, dtype=dtype, mask=mask,
+        modality="coordinates",
+    )
+    x_t = model.fm.interpolate(x_0, x_1, t, modality="coordinates")
+    batch["t"] = t
+    batch["mask"] = mask
+    batch["x_t"] = x_t
+    if model.cfg_exp.training.seq_cond:
+        seq = batch["residue_type"]
+        seq = torch.where(seq == -1, torch.tensor(20, device=seq.device, dtype=seq.dtype), seq)
+        if "residue_type_unmasked" not in batch:
+            batch["residue_type_unmasked"] = seq.clone().detach()
+        batch["residue_type"] = seq
     else:
-        seq = torch.full_like(residue_type, 20)  # All UNK
-
-    # ext_lig
-    if ext_lig_provided and hasattr(pt_data, "ext_lig"):
-        ext_lig = torch.as_tensor(pt_data.ext_lig, dtype=torch.long)
-    else:
-        ext_lig = torch.full((n,), 2, dtype=torch.long)  # All unknown
-
-    # Build batch (add batch dim). seq_pos is NOT included: the model reads
-    # batch["residue_pdb_idx"] (not seq_pos) for positional embeddings.
-    batch = {
-        "x_t": x_t.unsqueeze(0).to(device),
-        "t": t_tensor.to(device),
-        "mask": mask.unsqueeze(0).to(device),
-        "x_sc": x_sc.unsqueeze(0).to(device),
-        "residue_type": seq.unsqueeze(0).to(device),
-        "ext_lig": ext_lig.unsqueeze(0).to(device),
-    }
-    # Only zero out positional embedding if the checkpoint was trained that way.
-    # Hardcoding True here would incorrectly ablate positional info for checkpoints
-    # that were NOT trained with zero_sin_pos_emb.
-    if zero_sin_pos_emb:
+        batch.pop("residue_type", None)
+    batch.pop("cath_code", None)
+    if model.cfg_exp.training.get("zero_sin_pos_emb", False):
         batch["_zero_idx_emb"] = True
-
-    # CATH indices
-    if cath_indices is not None:
-        batch["cath_code_indices"] = cath_indices.to(device)
-        if cath_mask is not None:
-            batch["cath_code_indices_mask"] = cath_mask.to(device)
-
-    return batch, mask, x_1
+    model._set_self_cond(batch, x_1, contact_map_mode=False, use_self_cond=use_self_cond)
+    nn_out = model.predict_clean(batch)
+    return nn_out, x_1, mask, t
 
 
-def get_cath_indices_for_protein(protein_id, cath_lookup, cath_code_dir, multilabel_mode, device):
-    """Look up CATH codes for a protein and convert to model indices."""
-    cath_codes = cath_lookup.get(protein_id, [])
-    if not cath_codes:
-        cath_codes = ["x.x.x.x"]
-    # cath_code_strings_to_indices_for_model expects List[List[str]]
-    cath_code_list = [cath_codes]
-    indices, mask = cath_code_strings_to_indices_for_model(
-        cath_code_list, cath_code_dir, multilabel_mode, device=device
-    )
-    return indices, mask
+# ---------------------------------------------------------------------------
+# Ablation overrides (applied after batch arrives, before forward)
+# ---------------------------------------------------------------------------
+
+def apply_ablation(batch, *, mask_seq: bool, mask_cath: bool):
+    """Return a clone of `batch` with ablations applied.
+
+    - mask_seq=True   → all residue_type set to UNK (20)
+    - mask_cath=True  → cath_code_indices/_mask zeroed (all-null fold)
+    """
+    b = clone_batch(batch)
+    if mask_seq and "residue_type" in b:
+        b["residue_type"] = torch.full_like(b["residue_type"], 20)
+    if mask_cath:
+        if "cath_code_indices" in b:
+            b["cath_code_indices"] = torch.zeros_like(b["cath_code_indices"])
+        if "cath_code_indices_mask" in b:
+            b["cath_code_indices_mask"] = torch.zeros_like(b["cath_code_indices_mask"])
+    return b
 
 
-def get_null_cath_indices(cath_code_dir, multilabel_mode, device):
-    """Get fully-masked CATH indices (all null)."""
-    return cath_code_strings_to_indices_for_model(
-        [["x.x.x.x"]], cath_code_dir, multilabel_mode, device=device
-    )
+# ---------------------------------------------------------------------------
+# Dual-GT helpers
+# ---------------------------------------------------------------------------
+
+def _pydssp_at_indices(coords, mask, coord_mask, idx_o):
+    """Run pydssp using atom indices [0,1,2,idx_o] for N/CA/C/O. Returns [b,n]
+    with -1 for invalid, or None if coords don't have enough atoms.
+
+    idx_o:
+      - 4 → real N/CA/C/O on atom37-ordered coords (FIXED behavior)
+      - 3 → BUG path: passes CB to pydssp in place of O (matches what training
+        actually saw, given DSSPTargetTransform's [0,1,2,3] indexing on
+        atom37-ordered coords).
+    """
+    if coords.shape[2] < idx_o + 1:
+        return None
+    import pydssp
+    ncao = coords[:, :, [0, 1, 2, idx_o], :].float()
+    if coord_mask is not None and coord_mask.shape[2] >= idx_o + 1:
+        ncao_valid = (coord_mask[:, :, 0] & coord_mask[:, :, 1]
+                      & coord_mask[:, :, 2] & coord_mask[:, :, idx_o])
+        valid = mask & ncao_valid
+    else:
+        valid = mask
+    out = pydssp.assign(ncao, out_type="index").long()
+    return torch.where(valid, out, torch.full_like(out, -1))
+
+
+def compute_dssp_atom37_inline(coords, mask, coord_mask=None):
+    """Real N/CA/C/O via atom37 indices [0,1,2,4]. None if <5 atoms."""
+    return _pydssp_at_indices(coords, mask, coord_mask, idx_o=4)
+
+
+def compute_dssp_buggy_atom3_inline(coords, mask, coord_mask=None):
+    """N/CA/C/CB via atom37 indices [0,1,2,3] — matches the pre-fix
+    DSSPTargetTransform behavior. Useful for confirming the model learned the
+    broken supervision signal regardless of whether transforms.py is fixed."""
+    return _pydssp_at_indices(coords, mask, coord_mask, idx_o=3)
+
+
+def acc_with_confusion(dssp_logits, dssp_target):
+    valid = dssp_target >= 0
+    if valid.sum().item() == 0:
+        return float("nan"), 0, {"pred": {0: 0, 1: 0, 2: 0}, "gt": {0: 0, 1: 0, 2: 0}}
+    pred = dssp_logits.argmax(dim=-1)
+    correct = (pred == dssp_target) & valid
+    acc = correct.sum().float() / valid.sum().float().clamp(min=1)
+    pred_counts = {c: int((pred[valid] == c).sum().item()) for c in (0, 1, 2)}
+    gt_counts = {c: int((dssp_target[valid] == c).sum().item()) for c in (0, 1, 2)}
+    return float(acc.item()), int(valid.sum().item()), {
+        "pred": pred_counts, "gt": gt_counts,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -183,254 +228,197 @@ def main():
                         help="Number of proteins to evaluate")
     parser.add_argument("--output_dir", default="results/dssp_ablation",
                         help="Output directory for results")
-    parser.add_argument("--data_dir", default="data/pdb_train/processed",
-                        help="Directory with processed .pt files")
-    parser.add_argument("--cathdata_dir", default="data/cathdata",
-                        help="Directory with CATH data")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--t_values", nargs="+", type=float, default=None,
+                        help="Override the default 0..1 in 0.05 steps")
+    parser.add_argument("--split", choices=["val", "train"], default="val",
+                        help="Dataset split to draw proteins from")
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    load_dotenv(os.path.join(ROOT, ".env"))
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load model
-    print(f"Loading checkpoint: {args.ckpt}")
+    # --- Load model ---
+    print(f"[load] {args.ckpt}")
     model = Proteina.load_from_checkpoint(args.ckpt, strict=False)
-    model.eval()
-    model.to(device)
-    print(f"Model loaded on {device}")
+    model.eval().to(device)
 
-    # --- Diagnostic A: Verify dssp_head is trained (not randomly initialized) ---
-    zero_sin_pos_emb_flag = bool(model.cfg_exp.training.get("zero_sin_pos_emb", False))
-    print(f"  Checkpoint zero_sin_pos_emb: {zero_sin_pos_emb_flag}")
-    print(f"  Checkpoint seq_emb_dim: {model.cfg_exp.model.nn.get('seq_emb_dim', 'N/A')}")
-    if hasattr(model.nn, 'dssp_head') and model.nn.dssp_head is not None:
-        ln_mod = model.nn.dssp_head[0]   # LayerNorm(768)
-        lin_mod = model.nn.dssp_head[1]  # Linear(768, 3, bias=True)
-        print(f"  dssp_head LN weight norm: {ln_mod.weight.norm().item():.4f}")
-        print(f"  dssp_head Linear weight norm: {lin_mod.weight.norm().item():.4f}")
-        print(f"  dssp_head Linear bias (L/H/E): {[round(b, 4) for b in lin_mod.bias.tolist()]}")
-    else:
-        print("  WARNING: dssp_head is None — predict_dssp=False in this checkpoint!")
+    # Sanity: dssp head present and loaded
+    raw_sd = torch.load(args.ckpt, map_location="cpu", weights_only=False)["state_dict"]
+    head_w_loaded = model.nn.dssp_head[1].weight.detach().cpu()
+    head_w_disk = raw_sd["nn.dssp_head.1.weight"].detach().cpu()
+    assert torch.allclose(head_w_loaded, head_w_disk), \
+        "dssp_head Linear weight differs between loaded model and ckpt on disk"
+    print(f"[verify] dssp_head loaded OK; "
+          f"bias={[round(b, 4) for b in model.nn.dssp_head[1].bias.tolist()]}")
 
-    # Get model config
-    cath_code_dir = model.cfg_exp.model.nn.get("cath_code_dir", "")
-    if cath_code_dir and "${" in cath_code_dir:
-        # Resolve env var
-        cath_code_dir = os.path.expandvars(cath_code_dir.replace("${oc.env:", "$").replace("}", ""))
-    if not os.path.isabs(cath_code_dir):
-        cath_code_dir = os.path.join(root, cath_code_dir)
-    multilabel_mode = model.cfg_exp.model.nn.get("multilabel_mode", "sample")
+    # --- Build data module + dataloader ---
+    dm = load_data_module(model.cfg_exp, num_workers=0)
+    if hasattr(dm, "prepare_data"):
+        dm.prepare_data()
+    dm.setup(stage="fit")
+    loader = dm.val_dataloader() if args.split == "val" else dm.train_dataloader()
+    print(f"[data] using {args.split} loader (batch_size=1)")
 
-    # Load CATH lookup
-    cath_lookup = load_cath_code_lookup(os.path.join(root, args.cathdata_dir))
-    print(f"Loaded CATH lookup with {len(cath_lookup)} entries")
+    # --- Configure t schedule ---
+    t_values = (args.t_values if args.t_values is not None
+                else [0.0] + [round(0.05 * i, 2) for i in range(1, 21)])
 
-    # Null CATH indices (for masked condition)
-    null_cath_indices, null_cath_mask = get_null_cath_indices(
-        cath_code_dir, multilabel_mode, device
-    )
-
-    # Select proteins
-    pt_files = sorted(glob.glob(os.path.join(root, args.data_dir, "*.pt")))
-    np.random.seed(args.seed)
-    np.random.shuffle(pt_files)
-    pt_files = pt_files[:args.n_proteins]
-    print(f"Selected {len(pt_files)} proteins for evaluation")
-
-    # Noise levels: t=0 (pure noise) to t=0.95 (mostly clean)
-    t_values = [0.0] + [round(0.05 * i, 2) for i in range(1, 21)]  # 0.0, 0.05, ..., 1.0
-
-    # Conditions: (name, seq_provided, cath_provided)
+    # --- 4-condition ablation ---
     conditions = [
-        ("seq+CATH", True, True),
-        ("seq_only", True, False),
-        ("CATH_only", False, True),
-        ("neither", False, False),
+        ("seq+CATH",  False, False),  # mask_seq, mask_cath
+        ("seq_only",  False, True),
+        ("CATH_only", True,  False),
+        ("neither",   True,  True),
     ]
 
-    # Results storage
+    # --- Loop ---
     results = []
+    proteins_seen = 0
+    loader_iter = iter(loader)
+    while proteins_seen < args.n_proteins:
+        try:
+            raw_batch = next(loader_iter)
+        except StopIteration:
+            print(f"[data] loader exhausted after {proteins_seen} proteins")
+            break
 
-    for pi, pt_file in enumerate(pt_files):
-        protein_id = os.path.basename(pt_file).replace(".pt", "")
-        print(f"\n[{pi+1}/{len(pt_files)}] Processing {protein_id}")
-
-        pt_data = torch.load(pt_file, weights_only=False)
-        n = pt_data.residue_type.shape[0]
-        coord_mask = torch.as_tensor(pt_data.coord_mask)  # [n, 37] bool
-        res_mask = (coord_mask.sum(dim=-1) > 0)  # [n] bool
-
-        # Ground-truth DSSP: use pre-stored target (from DSSPTargetTransform) for
-        # exact consistency with training targets; fall back to on-the-fly computation.
-        if hasattr(pt_data, 'dssp_target'):
-            dssp_target = torch.as_tensor(pt_data.dssp_target, dtype=torch.long).to(device)  # [n]
-        else:
-            coords_full = torch.as_tensor(pt_data.coords, dtype=torch.float32).unsqueeze(0)  # [1, n, 37, 3]
-            coord_mask_full = coord_mask.unsqueeze(0)  # [1, n, 37]
-            dssp_target = compute_dssp_target(
-                coords_full, res_mask.unsqueeze(0).bool(), coord_mask_full.bool()
-            )
-            if dssp_target is None:
-                print(f"  Skipping {protein_id}: DSSP target is None (CA-only data?)")
-                continue
-            dssp_target = dssp_target.squeeze(0).to(device)  # [n]
-        valid = dssp_target >= 0
-
-        if valid.sum() == 0:
-            print(f"  Skipping {protein_id}: no valid DSSP residues")
+        if "dssp_target" not in raw_batch:
             continue
 
-        # CATH indices for this protein
-        protein_cath_indices, protein_cath_mask = get_cath_indices_for_protein(
-            protein_id, cath_lookup, cath_code_dir, multilabel_mode, device
-        )
+        raw_batch = move_to_device(raw_batch, device)
+        protein_id = raw_batch.get("protein_id", raw_batch.get("id", ["?"]))
+        if isinstance(protein_id, (list, tuple)):
+            protein_id = str(protein_id[0])
+        coords = raw_batch.get("coords")
+        coord_mask = raw_batch.get("coord_mask")
+        # Mask used by the trainer (extract_clean_sample reads mask_dict)
+        if "mask_dict" in raw_batch and isinstance(raw_batch["mask_dict"], dict):
+            res_mask = raw_batch["mask_dict"]["coords"][..., 0, 0].bool()
+        else:
+            res_mask = (coord_mask.sum(dim=-1) > 0).bool()
 
-        # Fresh independent Gaussian reference x_0 per protein (matches training behavior)
-        x_0 = torch.randn(n, 3, dtype=torch.float32)
-        x_0 = x_0 - x_0[res_mask.bool()].mean(dim=0, keepdim=True)
-        x_0 = x_0 * res_mask[:, None].float()
+        # Compute BOTH GT versions inline (don't trust raw_batch["dssp_target"]
+        # — its correctness depends on whether transforms.py has been fixed).
+        gt_broken = compute_dssp_buggy_atom3_inline(
+            coords, res_mask,
+            coord_mask.bool() if coord_mask is not None else None,
+        )
+        gt_fixed = compute_dssp_atom37_inline(
+            coords, res_mask,
+            coord_mask.bool() if coord_mask is not None else None,
+        )
+        if gt_fixed is None or gt_broken is None:
+            print(f"[skip] {protein_id}: no atom37 backbone (CA-only?)")
+            continue
+
+        n_valid_b = int((gt_broken >= 0).sum().item())
+        n_valid_f = int((gt_fixed >= 0).sum().item())
+        broken_dist = {c: int((gt_broken == c).sum().item()) for c in (0, 1, 2)}
+        fixed_dist = {c: int((gt_fixed == c).sum().item()) for c in (0, 1, 2)}
+        print(f"\n[{proteins_seen+1}/{args.n_proteins}] {protein_id} "
+              f"n_valid(broken={n_valid_b}, fixed={n_valid_f})")
+        print(f"  broken_GT: L={broken_dist[0]} H={broken_dist[1]} E={broken_dist[2]}")
+        print(f"  fixed_GT : L={fixed_dist[0]} H={fixed_dist[1]} E={fixed_dist[2]}")
 
         for t_val in t_values:
-            for cond_name, seq_on, cath_on in conditions:
-                cath_idx = protein_cath_indices if cath_on else null_cath_indices
-                cath_msk = protein_cath_mask if cath_on else null_cath_mask
-
-                batch, mask_cpu, x_1_centered = build_batch(
-                    pt_data, t_val, x_0, model, device,
-                    seq_provided=seq_on,
-                    cath_indices=cath_idx,
-                    cath_mask=cath_msk,
-                    ext_lig_provided=True,
-                    zero_sin_pos_emb=zero_sin_pos_emb_flag,
-                )
-
+            for cond_name, mask_seq, mask_cath in conditions:
+                wbatch = apply_ablation(raw_batch, mask_seq=mask_seq, mask_cath=mask_cath)
                 with torch.no_grad():
-                    nn_out = model.nn(batch)
-
-                dssp_logits = nn_out.get("dssp_logits")
-                if dssp_logits is None:
-                    print(f"  WARNING: No dssp_logits in output for {protein_id}")
+                    nn_out, _, _, _ = run_forward_at_t(
+                        model, wbatch, t_val, use_self_cond=False,
+                    )
+                logits = nn_out.get("dssp_logits")
+                if logits is None:
                     continue
-
-                dssp_pred = dssp_logits.squeeze(0).argmax(dim=-1)  # [n]
-                correct = (dssp_pred == dssp_target) & valid
-                acc = correct.sum().float() / valid.sum().float()
-
-                # At t=1.0, print GT vs predicted DSSP for visual inspection
-                if abs(t_val - 1.0) < 1e-6 and cond_name == "seq+CATH":
-                    _sym = ['L', 'H', 'E']
-                    gt_list = dssp_target.cpu().tolist()
-                    pr_list = dssp_pred.cpu().tolist()
-                    gt_str = ''.join(_sym[v] if v >= 0 else '?' for v in gt_list)
-                    pr_str = ''.join(_sym[v] for v in pr_list)
-                    print(f"  [t=1.0 GT  ] {gt_str[:100]}")
-                    print(f"  [t=1.0 Pred] {pr_str[:100]}")
-                    print(f"  [t=1.0 Acc ] {float(acc.item()):.4f} over {int(valid.sum())} valid residues")
-
-                    # --- Diagnostic B: Logit statistics ---
-                    valid_logits = dssp_logits.squeeze(0)[valid]  # [n_valid, 3]
-                    print(f"  [t=1.0] logit stats: min={valid_logits.min():.3f} "
-                          f"max={valid_logits.max():.3f} std={valid_logits.std():.3f}")
-                    print(f"  [t=1.0] mean per class: L={valid_logits[:,0].mean():.3f} "
-                          f"H={valid_logits[:,1].mean():.3f} E={valid_logits[:,2].mean():.3f}")
-                    # Per-class std tells us if residues differ (large) or all same (near-zero)
-                    print(f"  [t=1.0] std per class:  L={valid_logits[:,0].std():.3f} "
-                          f"H={valid_logits[:,1].std():.3f} E={valid_logits[:,2].std():.3f}")
-                    pred_v = dssp_pred[valid]
-                    tgt_v = dssp_target[valid]
-                    print(f"  [t=1.0] pred: L={int((pred_v==0).sum())} "
-                          f"H={int((pred_v==1).sum())} E={int((pred_v==2).sum())}")
-                    print(f"  [t=1.0] gt:   L={int((tgt_v==0).sum())} "
-                          f"H={int((tgt_v==1).sum())} E={int((tgt_v==2).sum())}")
-
-                    # --- Diagnostic C: Oracle x_sc=x_1 positive control ---
-                    oracle_batch = {k: v for k, v in batch.items()}
-                    oracle_batch["x_sc"] = x_1_centered.unsqueeze(0).to(device)
-                    with torch.no_grad():
-                        oracle_out = model.nn(oracle_batch)
-                    oracle_logits = oracle_out.get("dssp_logits")
-                    if oracle_logits is not None:
-                        oracle_pred = oracle_logits.squeeze(0).argmax(dim=-1)
-                        oracle_acc = ((oracle_pred == dssp_target) & valid).float().sum() / valid.float().sum()
-                        print(f"  [t=1.0 ORACLE x_sc=x_1] Acc: {oracle_acc.item():.4f}")
-
+                acc_b, nv_b, conf_b = acc_with_confusion(logits, gt_broken)
+                acc_f, nv_f, conf_f = acc_with_confusion(logits, gt_fixed)
                 results.append({
                     "protein_id": protein_id,
-                    "n_residues": int(n),
                     "t": t_val,
                     "condition": cond_name,
-                    "dssp_accuracy": float(acc.item()),
-                    "n_valid": int(valid.sum().item()),
+                    "broken_GT_acc": acc_b,
+                    "fixed_GT_acc": acc_f,
+                    "n_valid_broken": nv_b,
+                    "n_valid_fixed": nv_f,
+                    "pred_L": conf_b["pred"][0],
+                    "pred_H": conf_b["pred"][1],
+                    "pred_E": conf_b["pred"][2],
                 })
+            row = results[-len(conditions):]
+            print(f"  t={t_val:.2f}: " + "  ".join(
+                f"{r['condition']}=brok {r['broken_GT_acc']:.3f}/fix {r['fixed_GT_acc']:.3f}"
+                for r in row
+            ))
+        proteins_seen += 1
 
-            # Print progress for this t
-            accs_at_t = {r["condition"]: r["dssp_accuracy"]
-                        for r in results[-4:]}
-            print(f"  t={t_val:.2f}: " + " | ".join(
-                f"{k}={v:.3f}" for k, v in accs_at_t.items()))
+    if not results:
+        print("[abort] no results collected")
+        return
 
-    # Save CSV
+    # --- CSV ---
     csv_path = os.path.join(args.output_dir, "dssp_noise_ablation.csv")
     with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["protein_id", "n_residues", "t",
-                                                "condition", "dssp_accuracy", "n_valid"])
+        writer = csv.DictWriter(f, fieldnames=list(results[0].keys()))
         writer.writeheader()
         writer.writerows(results)
-    print(f"\nResults saved to {csv_path}")
+    print(f"\n[csv] {csv_path}")
 
-    # Plot
-    plot_results(results, args.output_dir)
+    # --- Aggregate + plot ---
+    plot_results(results, args.output_dir, t_values, conditions)
 
 
-def plot_results(results, output_dir):
-    """Plot DSSP accuracy vs noise level for each condition."""
-    conditions = ["seq+CATH", "seq_only", "CATH_only", "neither"]
+def plot_results(results, output_dir, t_values, conditions):
+    """Two side-by-side panels: broken-GT acc vs t, and fixed-GT acc vs t."""
+    cond_names = [c[0] for c in conditions]
     colors = {"seq+CATH": "tab:blue", "seq_only": "tab:orange",
               "CATH_only": "tab:green", "neither": "tab:red"}
 
-    # Aggregate by (t, condition) -> list of accuracies
-    agg = defaultdict(list)
-    for r in results:
-        agg[(r["t"], r["condition"])].append(r["dssp_accuracy"])
+    def aggregate(field):
+        agg = defaultdict(list)
+        for r in results:
+            agg[(r["t"], r["condition"])].append(r[field])
+        return agg
 
-    fig, ax = plt.subplots(figsize=(10, 6))
+    agg_b = aggregate("broken_GT_acc")
+    agg_f = aggregate("fixed_GT_acc")
 
-    for cond in conditions:
-        t_vals = sorted(set(r["t"] for r in results))
-        means = []
-        stds = []
-        for t in t_vals:
-            vals = agg.get((t, cond), [])
-            if vals:
-                means.append(np.mean(vals))
-                stds.append(np.std(vals))
-            else:
-                means.append(float("nan"))
-                stds.append(0)
-        means = np.array(means)
-        stds = np.array(stds)
-        ax.plot(t_vals, means, "o-", label=cond, color=colors[cond], markersize=4)
-        ax.fill_between(t_vals, means - stds, means + stds,
-                        alpha=0.15, color=colors[cond])
-
-    ax.set_xlabel("t (noise level: 0=pure noise, 1=clean)", fontsize=12)
-    ax.set_ylabel("DSSP Prediction Accuracy", fontsize=12)
-    ax.set_title("DSSP Accuracy vs Noise Level — Ablation Matrix", fontsize=13)
-    ax.legend(fontsize=11)
-    ax.set_xlim(-0.02, 1.0)
-    ax.set_ylim(0, 1.05)
-    ax.axhline(y=1/3, color="gray", linestyle=":", alpha=0.5, label="random (1/3)")
-    ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=11)
-
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
+    for ax, agg, title in [
+        (axes[0], agg_b, "broken_GT (matches val/dssp_acc — atom-index bug)"),
+        (axes[1], agg_f, "fixed_GT  (real DSSP via N/CA/C/O at atom37 [0,1,2,4])"),
+    ]:
+        for cond in cond_names:
+            means, stds = [], []
+            for t in t_values:
+                vals = agg.get((t, cond), [])
+                if vals:
+                    means.append(float(np.mean(vals)))
+                    stds.append(float(np.std(vals)))
+                else:
+                    means.append(float("nan"))
+                    stds.append(0.0)
+            means = np.array(means); stds = np.array(stds)
+            ax.plot(t_values, means, "o-", label=cond, color=colors[cond], markersize=4)
+            ax.fill_between(t_values, means - stds, means + stds,
+                            alpha=0.15, color=colors[cond])
+        ax.set_xlabel("t (0=noise, 1=clean)", fontsize=12)
+        ax.set_title(title, fontsize=11)
+        ax.set_xlim(-0.02, 1.0); ax.set_ylim(0, 1.05)
+        ax.axhline(y=1/3, color="gray", linestyle=":", alpha=0.5)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=10)
+    axes[0].set_ylabel("DSSP accuracy", fontsize=12)
+    fig.suptitle("DSSP accuracy vs noise level — broken vs fixed GT", fontsize=13)
+    fig.tight_layout()
     plot_path = os.path.join(output_dir, "dssp_noise_ablation.png")
     fig.savefig(plot_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"Plot saved to {plot_path}")
+    print(f"[plot] {plot_path}")
 
 
 if __name__ == "__main__":

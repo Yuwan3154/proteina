@@ -84,30 +84,43 @@ class DSSPTargetTransform(T.BaseTransform):
     def forward(self, graph: Data) -> Data:
         """Computes DSSP targets and adds to graph.
 
+        IMPORTANT: this transform runs AFTER pdb_data.py:695 reorders
+        graph.coords to OpenFold's atom37 layout, where atom 3 is CB and atom
+        4 is O (the raw PDB layout has O at index 3). pydssp needs N/CA/C/O,
+        so we extract indices [0, 1, 2, 4]. A previous version used [0,1,2,3]
+        and silently fed CB to pydssp in place of O, producing ~all-loop
+        labels and breaking DSSP-supervised training.
+
         Args:
-            graph: PyG Data with coords [L, atoms, 3], coord_mask [L, atoms]
+            graph: PyG Data with coords [L, atoms, 3] (atom37 layout),
+                coord_mask [L, atoms]
 
         Returns:
-            Graph with dssp_target [L] added (or unchanged if CA-only)
+            Graph with dssp_target [L] added (or unchanged if <5 atoms)
         """
+        # Fast path: use pre-computed target from precompute_dssp_targets.py.
+        # Falls through to on-the-fly computation for files not yet processed.
+        if getattr(graph, "dssp_target", None) is not None:
+            return graph
+
         coords = getattr(graph, "coords", None)
         coord_mask = getattr(graph, "coord_mask", None)
-        if coords is None or coords.shape[1] < 4:
+        if coords is None or coords.shape[1] < 5:
             return graph
 
         import pydssp
 
-        # Extract N, CA, C, O (indices 0, 1, 2, 3)
-        ncao = coords[:, [0, 1, 2, 3], :]  # [L, 4, 3]
+        # Extract N, CA, C, O — atom37 indices 0, 1, 2, 4 (NOT 3 = CB)
+        ncao = coords[:, [0, 1, 2, 4], :]  # [L, 4, 3]
         ncao_batch = ncao.unsqueeze(0)  # [1, L, 4, 3] for PyDSSP
 
         dssp_out = pydssp.assign(ncao_batch, out_type="index")  # [1, L]
         dssp_target = dssp_out[0].long().clone()  # [L]
 
         # Mask invalid residues (missing backbone atoms)
-        if coord_mask is not None and coord_mask.shape[1] >= 4:
+        if coord_mask is not None and coord_mask.shape[1] >= 5:
             ncao_valid = (
-                coord_mask[:, 0] & coord_mask[:, 1] & coord_mask[:, 2] & coord_mask[:, 3]
+                coord_mask[:, 0] & coord_mask[:, 1] & coord_mask[:, 2] & coord_mask[:, 4]
             )
             dssp_target = torch.where(
                 ncao_valid, dssp_target, torch.full_like(dssp_target, -1)
@@ -495,10 +508,13 @@ class ContactMapTransform(T.BaseTransform):
         self,
         contact_atom_type: Literal["CA", "CB"] = "CB",
         contact_distance_cutoff: float = 8.0,
-        contact_method: Literal["distance", "confind"] = "distance",
+        contact_method: Literal["distance", "confind", "frame2confind"] = "distance",
         confind_bin: str = "confind",
         confind_rotamer_lib: Optional[str] = None,
         confind_contact_threshold: float = 0.0,
+        frame2confind_checkpoint: Optional[str] = None,
+        frame2confind_amp_dtype: str = "bf16",
+        frame2confind_device: Optional[str] = None,
     ):
         """Initializes the transform.
 
@@ -507,12 +523,19 @@ class ContactMapTransform(T.BaseTransform):
                 "CA" for alpha-carbon, "CB" for beta-carbon (pseudo-CB for Glycine).
             contact_distance_cutoff: Distance threshold in Angstroms for defining contacts.
                 Residue pairs with distance <= cutoff are considered in contact.
-            contact_method: Contact map generation mode ("distance" or "confind").
-                When set to "confind", this transform expects precomputed raw maps
-                in the graph under contact_map_confind.
+            contact_method: Contact map generation mode ("distance", "confind", or
+                "frame2confind"). ``confind`` expects precomputed raw maps in the
+                graph under ``contact_map_confind``.  ``frame2confind`` runs the
+                Frame2ConFind neural predictor on-the-fly from backbone coords.
             confind_bin: Path to the confind binary (kept for config compatibility).
             confind_rotamer_lib: Path to rotamer library directory containing EBL.out/BEBL.out.
-            confind_contact_threshold: Minimum confind contact score to include (>=).
+            confind_contact_threshold: Minimum confind/frame2confind contact score to
+                include (>=).
+            frame2confind_checkpoint: Path to Frame2ConFind best.pt checkpoint.
+                Required when ``contact_method='frame2confind'``.
+            frame2confind_amp_dtype: AMP precision for Frame2ConFind (bf16/fp16/fp32).
+            frame2confind_device: Device for Frame2ConFind inference.  Defaults to
+                CPU inside DataLoader workers and the current CUDA device otherwise.
         """
         self.contact_atom_type = contact_atom_type
         self.contact_distance_cutoff = contact_distance_cutoff
@@ -520,6 +543,9 @@ class ContactMapTransform(T.BaseTransform):
         self.confind_bin = confind_bin
         self.confind_rotamer_lib = confind_rotamer_lib
         self.confind_contact_threshold = confind_contact_threshold
+        self.frame2confind_checkpoint = frame2confind_checkpoint
+        self.frame2confind_amp_dtype = frame2confind_amp_dtype
+        self.frame2confind_device = frame2confind_device
 
     def _compute_pseudo_cb(self, coords: torch.Tensor) -> torch.Tensor:
         """Computes pseudo-CB position for residues (used for Glycine).
@@ -565,8 +591,8 @@ class ContactMapTransform(T.BaseTransform):
             # CA is at index 1
             atom_coords = coords[:, 1, :]  # [L, 3]
         elif self.contact_atom_type == "CB":
-            # CB is at index 4, but Glycine doesn't have CB
-            cb_coords = coords[:, 4, :]  # [L, 3]
+            # CB is at index 3 in OpenFold ordering, but Glycine doesn't have CB
+            cb_coords = coords[:, 3, :]  # [L, 3]
 
             # Check for missing CB (coordinates might be zero or a fill value)
             # Compute pseudo-CB for all residues and use it where CB is missing
@@ -612,6 +638,24 @@ class ContactMapTransform(T.BaseTransform):
             )
         return (raw_map.float() >= self.confind_contact_threshold).to(dtype=graph.coords.dtype)
 
+    def _contact_map_from_frame2confind(self, graph: Data) -> torch.Tensor:
+        """Run Frame2ConFind neural predictor on backbone coords."""
+        from proteinfoundation.utils.frame2confind_utils import (
+            Frame2ConFindTransformPredictor,
+        )
+
+        if self.frame2confind_checkpoint is None:
+            raise ValueError(
+                "frame2confind_checkpoint is required when contact_method='frame2confind'"
+            )
+        predictor = Frame2ConFindTransformPredictor.get_or_create(
+            checkpoint=self.frame2confind_checkpoint,
+            amp_dtype=self.frame2confind_amp_dtype,
+            device=self.frame2confind_device,
+        )
+        raw_map = predictor.predict_graph(graph)  # [L, L] float32, values in [0, 1]
+        return (raw_map >= self.confind_contact_threshold).to(dtype=graph.coords.dtype)
+
     def forward(self, graph: Data) -> Data:
         """Extracts contact map and adds it to the graph.
 
@@ -630,6 +674,10 @@ class ContactMapTransform(T.BaseTransform):
             # Purge raw confind map after use so it is not passed to collation
             if hasattr(graph, "contact_map_confind"):
                 del graph["contact_map_confind"]
+        elif self.contact_method == "frame2confind":
+            if hasattr(graph, "contact_map_confind"):
+                del graph["contact_map_confind"]
+            contact_map = self._contact_map_from_frame2confind(graph)
         else:
             raise ValueError(f"Unknown contact_method: {self.contact_method}")
 

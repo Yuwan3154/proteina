@@ -39,6 +39,8 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         prefetch_factor: int = 2,
         cath_code_dir: Optional[str] = None,
         multilabel_mode: Literal["sample", "average", "sum", "transformer"] = "sample",
+        cluster_sampler_v2: bool = True,
+        cluster_sampler_seed: int = 0,
     ):
         """Initialising the base data module class.
 
@@ -89,6 +91,12 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         self.val_ds = None
         self.test_ds = None
         self.clusterid_to_seqid_mappings = None  # for cluster sampling
+        self.cluster_sampler_v2 = cluster_sampler_v2
+        self.cluster_sampler_seed = cluster_sampler_seed
+        # Last-built samplers kept on the datamodule so on_{train,validation}_epoch_start
+        # can call set_epoch even on Lightning versions that don't auto-propagate.
+        self._train_cluster_sampler: Optional[ClusterSampler] = None
+        self._val_cluster_sampler: Optional[ClusterSampler] = None
 
     def setup(self, stage: Optional[str] = None):
         if stage == "fit" or stage is None:
@@ -156,6 +164,8 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
                 dataset=dataset,
                 clusterid_to_seqid_mapping=clusterid_to_seqid_mapping,
                 sampling_mode=self.sampling_mode,
+                seed=self.cluster_sampler_seed,
+                v2=self.cluster_sampler_v2,
             )
             shuffle = False
         elif self.sampling_mode == "random":
@@ -233,7 +243,18 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             shuffle=shuffle,
             clusterid_to_seqid_mapping=clusterid_to_seqid_mapping,
         )
+        if isinstance(getattr(train_dl, "sampler", None), ClusterSampler):
+            self._train_cluster_sampler = train_dl.sampler
         return train_dl
+
+    def on_train_epoch_start(self) -> None:
+        """Belt-and-braces set_epoch: Lightning normally propagates this via
+        ``_set_sampler_epoch`` for any sampler that exposes ``set_epoch``, but we
+        forward it here too so the seeded generator is correct even on Lightning
+        versions that skip non-DistributedSampler instances."""
+        sampler = self._train_cluster_sampler
+        if sampler is not None and hasattr(self, "trainer") and self.trainer is not None:
+            sampler.set_epoch(int(self.trainer.current_epoch))
 
     def val_dataloader(self) -> DataLoader:
         if self.val_ds is None:
@@ -250,7 +271,22 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             shuffle=shuffle,
             clusterid_to_seqid_mapping=clusterid_to_seqid_mapping,
         )
+        if isinstance(getattr(val_dl, "sampler", None), ClusterSampler):
+            self._val_cluster_sampler = val_dl.sampler
         return val_dl
+
+    def on_validation_epoch_start(self) -> None:
+        """Rotate the val ClusterSampler across val passes.
+
+        Each validation epoch uses a different generator seed so cluster *order*
+        and per-cluster *member* both differ pass-to-pass. We seed by the global
+        training step rather than current_epoch — Lightning's val_check_interval
+        often fires multiple times per training epoch, and current_epoch wouldn't
+        advance between those calls (so the same val ordering would repeat).
+        """
+        sampler = self._val_cluster_sampler
+        if sampler is not None and hasattr(self, "trainer") and self.trainer is not None:
+            sampler.set_epoch(int(self.trainer.global_step))
 
     def test_dataloader(self) -> DataLoader:
         if self.test_ds is None:

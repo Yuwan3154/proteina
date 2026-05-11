@@ -39,6 +39,8 @@ class ClusterSampler(Sampler):
         sampling_mode: Literal["cluster-random", "cluster-reps"],
         shuffle: bool = True,
         drop_last: bool = False,
+        seed: int = 0,
+        v2: bool = True,
     ):
         """
         Initializes the ClusterSampler for selecting sequences during training.
@@ -53,6 +55,13 @@ class ClusterSampler(Sampler):
             drop_last (bool, optional): If ``True``, then the sampler will drop the tail of the data to make it
                 evenly divisible across the number of replicas. If ``False``, the sampler will add extra indices to
                 make the data evenly divisible across the replicas. Default: ``False``.
+            seed (int): Base seed for the per-epoch torch.Generator. Combined with the
+                Lightning-supplied epoch via ``set_epoch`` to derive deterministic-but-distinct
+                shuffles. Default 0.
+            v2 (bool): When True (default), use seeded torch.Generator instances for the
+                cluster-order shuffle (synchronized across DDP ranks → correct partitioning)
+                and per-cluster member draw (rank-distinct → no global RNG contamination).
+                Set False to fall back to the legacy global-RNG behaviour for comparison.
         """
         self.dataset = dataset
         self.clusterid_to_seqid_mapping = clusterid_to_seqid_mapping
@@ -70,6 +79,28 @@ class ClusterSampler(Sampler):
         self.drop_last = drop_last
         self.log_clusters = True
         self.num_replicas = None
+        self.seed = int(seed)
+        self.v2 = bool(v2)
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        """Lightning calls this each train epoch start; used to seed the per-epoch generators."""
+        self.epoch = int(epoch)
+
+    def _make_generator(self, *parts: int) -> torch.Generator:
+        """Build a fresh torch.Generator seeded by (self.seed, self.epoch, *parts).
+
+        Mixed via simple 64-bit combine to avoid pulling in numpy. Same inputs across
+        ranks yields the same generator state — this is the property the cluster-order
+        shuffle relies on for correct DDP partitioning.
+        """
+        s = (self.seed & 0xFFFFFFFF)
+        for p in (self.epoch, *parts):
+            s = ((s * 0x9E3779B97F4A7C15) ^ (int(p) & 0xFFFFFFFFFFFFFFFF)) & 0xFFFFFFFFFFFFFFFF
+        # torch.Generator.manual_seed wants a non-negative 64-bit int.
+        g = torch.Generator()
+        g.manual_seed(s if s != 0 else 1)
+        return g
 
     def __iter__(self):
         """Iterate over clusters in dataset and yield samples depending on sampling_mode."""
@@ -86,13 +117,24 @@ class ClusterSampler(Sampler):
                 f"Distributed sampler is not initialized, assuming single-device setup."
             )
 
+        # Build a rank-synchronized generator for cluster-order shuffling.
+        # The same (seed, epoch) input on every rank yields an identical permutation,
+        # so `indices[rank::num_replicas]` gives a clean partition.
+        if self.v2:
+            shuffle_gen = self._make_generator(0)  # 0 = "shuffle stream"
+        else:
+            shuffle_gen = None
+
         if self.num_replicas is not None:
             self.num_samples = math.ceil(
                 len(self.cluster_names) * 1.0 / self.num_replicas
             )
             self.total_size = self.num_samples * self.num_replicas
             # Distributed mode, deterministically shuffle
-            indices = torch.randperm(len(self.cluster_names)).tolist()
+            if self.v2:
+                indices = torch.randperm(len(self.cluster_names), generator=shuffle_gen).tolist()
+            else:
+                indices = torch.randperm(len(self.cluster_names)).tolist()
 
             # drop samples to make it evenly divisible
             if self.drop_last:
@@ -110,6 +152,9 @@ class ClusterSampler(Sampler):
 
             # subsample
             indices = indices[self.rank : self.total_size : self.num_replicas]
+            # Per-cluster member generator: rank-distinct so members differ across DDP
+            # workers (which is fine — each rank owns a disjoint cluster slice).
+            member_gen = self._make_generator(1, self.rank) if self.v2 else None
             if self.sampling_mode == "cluster-reps":
                 # Assumes that cluster_names are the IDs of the representative (longest) sequences (true for mmseqs2 clusters)
                 for cluster_name_idx in indices:
@@ -119,8 +164,10 @@ class ClusterSampler(Sampler):
                 for cluster_name_idx in indices:
                     cluster_name = self.cluster_names[cluster_name_idx]
                     sequences = self.clusterid_to_seqid_mapping[cluster_name]
-                    # Use torch random generator for reproducibility across DDP
-                    idx = torch.randint(0, len(sequences), (1,)).item()
+                    if self.v2:
+                        idx = torch.randint(0, len(sequences), (1,), generator=member_gen).item()
+                    else:
+                        idx = torch.randint(0, len(sequences), (1,)).item()
                     sequence_id = sequences[idx]
                     if self.log_clusters:
                         # log first sampling
@@ -134,20 +181,29 @@ class ClusterSampler(Sampler):
                     f"Unknown cluster sampling mode {self.sampling_mode} for ClusterSampler, only 'cluster-random' and 'cluster-reps' supported"
                 )
         else:
-            # Non-distributed mode
+            # Non-distributed mode. Build a local copy of the cluster ordering per epoch
+            # so we don't mutate self.cluster_names (legacy code did, which compounded
+            # shuffles across epochs).
             if self.shuffle:
-                # Use torch generator for reproducible shuffling
-                perm = torch.randperm(len(self.cluster_names))
-                self.cluster_names = [self.cluster_names[i] for i in perm]
+                if self.v2:
+                    perm = torch.randperm(len(self.cluster_names), generator=shuffle_gen).tolist()
+                else:
+                    perm = torch.randperm(len(self.cluster_names)).tolist()
+                ordered_cluster_names = [self.cluster_names[i] for i in perm]
+            else:
+                ordered_cluster_names = list(self.cluster_names)
+            member_gen = self._make_generator(1, 0) if self.v2 else None
             if self.sampling_mode == "cluster-reps":
                 # Assumes that cluster_names are the IDs of the representative (longest) sequences (true for mmseqs2 clusters)
-                for cluster_name in self.cluster_names:
+                for cluster_name in ordered_cluster_names:
                     yield self.sequence_id_to_idx[cluster_name]
             elif self.sampling_mode == "cluster-random":
-                for cluster_name in self.cluster_names:
+                for cluster_name in ordered_cluster_names:
                     sequences = self.clusterid_to_seqid_mapping[cluster_name]
-                    # Use torch random generator for reproducibility across DDP
-                    idx = torch.randint(0, len(sequences), (1,)).item()
+                    if self.v2:
+                        idx = torch.randint(0, len(sequences), (1,), generator=member_gen).item()
+                    else:
+                        idx = torch.randint(0, len(sequences), (1,)).item()
                     sequence_id = sequences[idx]
                     if self.log_clusters:
                         # log first sampling

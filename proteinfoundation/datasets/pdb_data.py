@@ -1277,26 +1277,20 @@ class PDBLightningDataModule(BaseLightningDataModule):
                 database_tag=database_tag,
             )
             
+            chunksize = max(1, len(index_pdb_tuples) // (self.num_workers * 4))
+            
             # Use ProcessPoolExecutor for multiprocessing
             with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
-                # Submit all tasks
-                future_to_tuple = {
-                    executor.submit(process_func, tuple_): tuple_ 
-                    for tuple_ in index_pdb_tuples
-                }
-                
-                # Process completed tasks with progress bar
-                with tqdm(total=len(index_pdb_tuples), desc="Processing structures", unit="file") as pbar:
-                    for future in as_completed(future_to_tuple):
-                        try:
-                            result = future.result()
-                            if result is not None:
-                                file_names.append(result)
-                        except Exception as e:
-                            tuple_ = future_to_tuple[future]
-                            logger.warning(f"Failed to process {tuple_}: {e}")
-                        finally:
-                            pbar.update(1)
+                # Use map with chunksize to avoid creating millions of Future objects in memory
+                results = tqdm(
+                    executor.map(process_func, index_pdb_tuples, chunksize=chunksize),
+                    total=len(index_pdb_tuples),
+                    desc="Processing structures",
+                    unit="file"
+                )
+                for result in results:
+                    if result is not None:
+                        file_names.append(result)
         else:
             # Fall back to sequential processing for single files or single worker
             rank_zero_info(f"Processing {len(index_pdb_tuples)} structures sequentially...")

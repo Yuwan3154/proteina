@@ -63,7 +63,11 @@ opt:
   lr: 0.0001
   max_epochs: 500
   accumulate_grad_batches: 128
-  val_check_interval: 1000
+  # Validation cadence is expressed in optimizer steps. The legacy
+  # `val_check_interval` was Lightning's minibatch counter, which conflated
+  # accumulation; this knob is now multiplied by accumulate_grad_batches in
+  # train.py so a value of 1000 here = 1000 gradient updates between val runs.
+  val_check_interval_optim_steps: 1000
   skip_nan_grad: False
   grad_and_weight_analysis: False
   dist_strategy: ddp
@@ -86,6 +90,20 @@ validation_sampling:
   dt: 0.005
   sampling_mode: sc
   sc_scale_noise: 0.45
+  # Buffer the first N val batches each val epoch and run ONE batched full-trajectory
+  # inference (so all N samples share the trajectory's NN forward passes). Logs
+  # validation_sampling/tmscore_{mean,median,min,max} and rmsd_mean.
+  # Set tmscore_n_samples: 0 to disable. Bump tmscore_every_n_val_epochs to amortize cost.
+  tmscore_n_samples: 4
+  tmscore_every_n_val_epochs: 5
+  # USalign mode for predicted-vs-GT scoring. 5 = TMscore-style residue-index alignment
+  # (canonical for structure prediction, prevents inflated scores from sequence-independent
+  # re-alignment). 0 = USalign default (TMalign, sequence-independent — diagnostic only).
+  tmscore_mode: 5
+
+# ClusterSampler DDP fix is on by default (BaseLightningDataModule.cluster_sampler_v2=True).
+# To override per-dataset, set cluster_sampler_v2 / cluster_sampler_seed under
+# `datamodule:` in the corresponding dataset_config yaml.
 
 seed: 42
 

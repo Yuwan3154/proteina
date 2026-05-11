@@ -474,6 +474,14 @@ if __name__ == "__main__":
     log_info(f"Using EMA with decay {cfg_exp.ema.decay}")
     callbacks.append(EMA(**cfg_exp.ema))
 
+    # Runtime audit: verify the train ClusterSampler partitions clusters disjointly
+    # across DDP ranks on the first epoch. Strict mode (raise on duplicates) can be
+    # enabled via env CLUSTER_SAMPLER_AUDIT_STRICT=1.
+    from proteinfoundation.datasets.cluster_sampler_audit_callback import (
+        ClusterSamplerAuditCallback,
+    )
+    callbacks.append(ClusterSamplerAuditCallback())
+
     # Set checkpointing
     if cfg_exp.log.checkpoint and not args.nolog:
         # last_ckpt_every_n_steps: default 1000 when omitted (only-save-last mode)
@@ -567,6 +575,22 @@ if __name__ == "__main__":
     # Train
     plugins = []
     show_prog_bar = args.show_prog_bar
+    # Resolve val cadence: prefer the gradient-step-based knob (val_check_interval_optim_steps);
+    # convert to Lightning's minibatch counter by multiplying by accumulate_grad_batches.
+    # Fall back to the legacy minibatch-based knob (val_check_interval) if the new one is absent.
+    accum = int(cfg_exp.opt.accumulate_grad_batches)
+    val_optim_steps = cfg_exp.opt.get("val_check_interval_optim_steps", None)
+    if val_optim_steps is not None:
+        resolved_val_check_interval = int(val_optim_steps) * accum
+        log_info(
+            f"val_check_interval = {resolved_val_check_interval} minibatches "
+            f"(= {val_optim_steps} optim steps * accumulate_grad_batches={accum})"
+        )
+    else:
+        resolved_val_check_interval = cfg_exp.opt.val_check_interval
+        log_info(
+            f"val_check_interval (legacy minibatch-based): {resolved_val_check_interval}"
+        )
     trainer = L.Trainer(
         max_epochs=cfg_exp.opt.max_epochs,
         accelerator=cfg_exp.hardware.accelerator,
@@ -577,7 +601,7 @@ if __name__ == "__main__":
         log_every_n_steps=cfg_exp.log.get("log_every_n_steps", 100),
         default_root_dir=root_run,
         check_val_every_n_epoch=None,  # Leave like this
-        val_check_interval=cfg_exp.opt.val_check_interval,
+        val_check_interval=resolved_val_check_interval,
         strategy=DDPStrategy(
             process_group_backend=cfg_exp.opt.get("dist_backend", "nccl"),
             find_unused_parameters=False,
