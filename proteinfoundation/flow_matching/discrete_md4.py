@@ -19,23 +19,55 @@ def _symmetrize_matrix(x: Tensor) -> Tensor:
     return upper + upper.transpose(-1, -2) - torch.diag_embed(diag)
 
 
-def _distance_fraction(n: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+def _distance_fraction(
+    n: int, device: torch.device, dtype: torch.dtype, lengths: Tensor,
+) -> Tensor:
+    """Per-sample distance-from-diagonal fraction.
+
+    Returns [B, n, n] where entry [b, i, j] = |i - j| / max(L_b - 1, 1) and
+    L_b = lengths[b] is the real (unpadded) length of sample b. Values are
+    clamped at 1.0 so padded positions (i or j >= L_b) don't blow up the
+    scheduler; those positions are masked out downstream anyway.
+
+    Lengths are required: normalizing by the padded width n is wrong for
+    mixed-length batches and the legacy shared [n, n] shape has been removed.
+    """
     idx = torch.arange(n, device=device, dtype=dtype)
-    dist = (idx[None, :] - idx[:, None]).abs()
-    max_dist = max(n - 1, 1)
-    return dist / max_dist
+    dist = (idx[None, :] - idx[:, None]).abs()                  # [n, n]
+    L = lengths.to(dtype=dtype, device=device).clamp_min(1.0)    # [B]
+    denom = (L - 1.0).clamp_min(1.0)                            # [B]
+    frac = dist[None, :, :] / denom[:, None, None]               # [B, n, n]
+    return frac.clamp(max=1.0)
 
 
 def _distance_w(
-    n: int, w_min: float, w_max: float, device: torch.device, dtype: torch.dtype
+    n: int, w_min: float, w_max: float, device: torch.device, dtype: torch.dtype,
+    lengths: Tensor,
 ) -> Tensor:
     if w_min <= 0 or w_max <= 0:
         raise ValueError(f"w_min and w_max must be > 0, got {w_min}, {w_max}")
+    B = lengths.shape[0]
     if w_min == w_max:
-        return torch.full((n, n), w_min, device=device, dtype=dtype)
-    frac = _distance_fraction(n, device=device, dtype=dtype)
+        return torch.full((B, n, n), w_min, device=device, dtype=dtype)
+    frac = _distance_fraction(n, device=device, dtype=dtype, lengths=lengths)
     ratio = w_max / w_min
     return w_min * ratio**frac
+
+
+def _lengths_from_pair_mask(pair_mask: Tensor) -> Tensor:
+    """Derive per-sample real lengths from a mask.
+
+    Accepts either a 2D mask [B, n] (sequence mask) or a 3D pair mask
+    [B, n, n] (outer product). Returns a [B] float tensor of real lengths.
+    """
+    m = pair_mask.float()
+    if m.dim() == 2:
+        return m.sum(dim=-1).clamp_min(1.0)
+    if m.dim() == 3:
+        return m.sum(dim=(-1, -2)).clamp_min(1.0).sqrt()
+    raise ValueError(
+        f"pair_mask must be 2D [B, n] or 3D [B, n, n], got shape {tuple(pair_mask.shape)}"
+    )
 
 
 def _normalize_position_bias_mode(mode: str) -> str:
@@ -186,9 +218,11 @@ class MD4DiscreteDiffusion(nn.Module):
             schedule_fn_type=noise_schedule_type, eps=eps
         )
 
-    def _position_w(self, n: int, device: torch.device, dtype: torch.dtype) -> Optional[Tensor]:
+    def _position_w(
+        self, n: int, device: torch.device, dtype: torch.dtype, lengths: Tensor,
+    ) -> Tensor:
         if not self.position_bias_enabled:
-            return None
+            raise RuntimeError("_position_w called with position_bias disabled")
         if self.position_bias_mode != "polynomial":
             raise NotImplementedError(
                 f"Unknown position bias mode {self.position_bias_mode}"
@@ -199,30 +233,35 @@ class MD4DiscreteDiffusion(nn.Module):
             self.position_bias_w_max,
             device=device,
             dtype=dtype,
+            lengths=lengths,
         )
 
     def _alpha_and_dgamma(
-        self, t: Tensor, x_shape: tuple, device: torch.device, dtype: torch.dtype
-    ) -> tuple[Tensor, Optional[Tensor]]:
+        self, t: Tensor, x_shape: tuple, device: torch.device, dtype: torch.dtype,
+        pair_mask: Optional[Tensor] = None,
+    ) -> tuple[Tensor, Tensor]:
         alpha = self.noise_schedule.alpha(t)
         alpha = _reverse_broadcast(alpha, len(x_shape))
         if not self.position_bias_enabled:
             dgamma = self.noise_schedule.dgamma_times_alpha(t)
             return alpha, dgamma
+        if pair_mask is None:
+            raise ValueError(
+                "position_bias is enabled; _alpha_and_dgamma requires pair_mask so "
+                "per-sample real lengths can be derived for distance-fraction normalization."
+            )
         n = x_shape[-1]
+        lengths = _lengths_from_pair_mask(pair_mask)
         if self.position_bias_mode == "sigmoid":
             t_ext = _reverse_broadcast(t, len(x_shape))
-            d_pos = _distance_fraction(n, device=device, dtype=dtype)
+            d_pos = _distance_fraction(n, device=device, dtype=dtype, lengths=lengths)
             k = torch.tensor(self.position_bias_k, device=device, dtype=dtype)
             alpha_pos, dalpha = _sigmoid_alpha(
                 t_ext, d_pos, k, self.noise_schedule.eps
             )
             dgamma_pos = dalpha / (1.0 - alpha_pos).clamp_min(1e-8)
             return alpha_pos, dgamma_pos
-        w_pos = self._position_w(n, device=device, dtype=dtype)
-        if w_pos is None:
-            dgamma = self.noise_schedule.dgamma_times_alpha(t)
-            return alpha, dgamma
+        w_pos = self._position_w(n, device=device, dtype=dtype, lengths=lengths)
         t_ext = _reverse_broadcast(t, len(x_shape)).clamp(min=1e-6, max=1.0)
         alpha_pos = 1.0 - t_ext ** w_pos
         alpha_pos = alpha_pos.clamp(
@@ -234,8 +273,12 @@ class MD4DiscreteDiffusion(nn.Module):
     def prior_sample(self, shape: tuple, device: torch.device) -> Tensor:
         return torch.full(shape, self.mask_token, device=device, dtype=torch.long)
 
-    def forward_sample(self, x: Tensor, t: Tensor) -> Tensor:
-        alpha_t, _ = self._alpha_and_dgamma(t, x.shape, x.device, x.dtype)
+    def forward_sample(
+        self, x: Tensor, t: Tensor, pair_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        alpha_t, _ = self._alpha_and_dgamma(
+            t, x.shape, x.device, x.dtype, pair_mask=pair_mask,
+        )
         rand = torch.rand_like(x.float())
         if self.symmetrize:
             rand = _symmetrize_matrix(rand)
@@ -257,7 +300,7 @@ class MD4DiscreteDiffusion(nn.Module):
         t_dtype = pair_mask.dtype if pair_mask.is_floating_point() else torch.float32
         t1 = torch.zeros(batch_size, device=pair_mask.device, dtype=t_dtype)
         alpha_t1, _ = self._alpha_and_dgamma(
-            t1, pair_mask.shape, pair_mask.device, t1.dtype
+            t1, pair_mask.shape, pair_mask.device, t1.dtype, pair_mask=pair_mask,
         )
         mask_prob = (1.0 - alpha_t1) * pair_mask.float()
         loss = mask_prob.sum(dim=tuple(range(1, mask_prob.dim())))
@@ -294,10 +337,10 @@ class MD4DiscreteDiffusion(nn.Module):
             s = t_discrete - (1.0 / self.timesteps)
             if self.position_bias_enabled:
                 alpha_t, _ = self._alpha_and_dgamma(
-                    t_discrete, x.shape, x.device, x.dtype
+                    t_discrete, x.shape, x.device, x.dtype, pair_mask=pair_mask,
                 )
                 alpha_s, _ = self._alpha_and_dgamma(
-                    s, x.shape, x.device, x.dtype
+                    s, x.shape, x.device, x.dtype, pair_mask=pair_mask,
                 )
                 gt = torch.log(alpha_t / (1.0 - alpha_t))
                 gs = torch.log(alpha_s / (1.0 - alpha_s))
@@ -317,7 +360,9 @@ class MD4DiscreteDiffusion(nn.Module):
             )
             return weight * masked_neg_cross_ent
 
-        alpha_t, dgamma = self._alpha_and_dgamma(t, x.shape, x.device, x.dtype)
+        alpha_t, dgamma = self._alpha_and_dgamma(
+            t, x.shape, x.device, x.dtype, pair_mask=pair_mask,
+        )
         if self.position_bias_enabled:
             return (mask * log_p_true * dgamma).sum(dim=tuple(range(1, x.dim())))
         masked_neg_cross_ent = (mask * log_p_true).sum(
@@ -333,7 +378,10 @@ class MD4DiscreteDiffusion(nn.Module):
             s = math.cos(math.pi / 2.0 * (1.0 - s))
         return s, t
 
-    def sample_step(self, zt: Tensor, logits: Tensor, s: float, t: float) -> Tensor:
+    def sample_step(
+        self, zt: Tensor, logits: Tensor, s: float, t: float,
+        pair_mask: Optional[Tensor] = None,
+    ) -> Tensor:
         t_tensor = torch.full(
             (zt.shape[0],), t, device=zt.device, dtype=logits.dtype
         )
@@ -341,10 +389,10 @@ class MD4DiscreteDiffusion(nn.Module):
             (zt.shape[0],), s, device=zt.device, dtype=logits.dtype
         )
         alpha_t, _ = self._alpha_and_dgamma(
-            t_tensor, zt.shape, zt.device, zt.dtype
+            t_tensor, zt.shape, zt.device, zt.dtype, pair_mask=pair_mask,
         )
         alpha_s, _ = self._alpha_and_dgamma(
-            s_tensor, zt.shape, zt.device, zt.dtype
+            s_tensor, zt.shape, zt.device, zt.dtype, pair_mask=pair_mask,
         )
         unmask_prob = (alpha_s - alpha_t) / (1.0 - alpha_t)
         unmask_prob = torch.clamp(unmask_prob, 0.0, 1.0)
@@ -426,9 +474,11 @@ class UDLMDiscreteDiffusion(nn.Module):
             schedule_fn_type=noise_schedule_type, eps=eps
         )
 
-    def _position_w(self, n: int, device: torch.device, dtype: torch.dtype) -> Optional[Tensor]:
+    def _position_w(
+        self, n: int, device: torch.device, dtype: torch.dtype, lengths: Tensor,
+    ) -> Tensor:
         if not self.position_bias_enabled:
-            return None
+            raise RuntimeError("_position_w called with position_bias disabled")
         if self.position_bias_mode != "polynomial":
             raise NotImplementedError(
                 f"Unknown position bias mode {self.position_bias_mode}"
@@ -439,10 +489,12 @@ class UDLMDiscreteDiffusion(nn.Module):
             self.position_bias_w_max,
             device=device,
             dtype=dtype,
+            lengths=lengths,
         )
 
     def _alpha_and_dalpha(
-        self, t: Tensor, x_shape: tuple, device: torch.device, dtype: torch.dtype
+        self, t: Tensor, x_shape: tuple, device: torch.device, dtype: torch.dtype,
+        pair_mask: Optional[Tensor] = None,
     ) -> tuple[Tensor, Tensor]:
         """Return (alpha_t, dalpha_t) with proper broadcasting to data shape."""
         alpha_cos = self.noise_schedule.alpha(t)
@@ -458,9 +510,16 @@ class UDLMDiscreteDiffusion(nn.Module):
                 f"UDLM only supports 'sigmoid' position bias, got '{self.position_bias_mode}'"
             )
 
+        if pair_mask is None:
+            raise ValueError(
+                "position_bias is enabled; _alpha_and_dalpha requires pair_mask so "
+                "per-sample real lengths can be derived for distance-fraction normalization."
+            )
+
         n = x_shape[-1]
+        lengths = _lengths_from_pair_mask(pair_mask)
         t_ext = _reverse_broadcast(t, len(x_shape))
-        d_pos = _distance_fraction(n, device=device, dtype=dtype)
+        d_pos = _distance_fraction(n, device=device, dtype=dtype, lengths=lengths)
         k = torch.tensor(self.position_bias_k, device=device, dtype=dtype)
         alpha_sig, dalpha_sig = _sigmoid_alpha(
             t_ext, d_pos, k, self.noise_schedule.eps
@@ -477,13 +536,17 @@ class UDLMDiscreteDiffusion(nn.Module):
         """Sample from prior: uniform over vocabulary."""
         return torch.randint(0, self.vocab_size, shape, device=device)
 
-    def forward_sample(self, x: Tensor, t: Tensor) -> Tensor:
+    def forward_sample(
+        self, x: Tensor, t: Tensor, pair_mask: Optional[Tensor] = None,
+    ) -> Tensor:
         """Corrupt clean tokens using uniform noise.
 
         Each token is kept with probability alpha(t), replaced with a uniform
         random token from {0, ..., vocab_size-1} with probability 1 - alpha(t).
         """
-        alpha_t, _ = self._alpha_and_dalpha(t, x.shape, x.device, x.dtype)
+        alpha_t, _ = self._alpha_and_dalpha(
+            t, x.shape, x.device, x.dtype, pair_mask=pair_mask,
+        )
         rand_tokens = torch.randint_like(x, 0, self.vocab_size)
         keep_rand = torch.rand_like(x.float())
         if self.symmetrize:
@@ -539,7 +602,9 @@ class UDLMDiscreteDiffusion(nn.Module):
         eps = 1e-8  # numerical stability
 
         # -- noise schedule values --
-        alpha_t, dalpha_t = self._alpha_and_dalpha(t, x.shape, x.device, x.dtype)
+        alpha_t, dalpha_t = self._alpha_and_dalpha(
+            t, x.shape, x.device, x.dtype, pair_mask=pair_mask,
+        )
 
         # -- model prediction as probability distribution --
         if N == 2:
@@ -601,7 +666,10 @@ class UDLMDiscreteDiffusion(nn.Module):
             s = math.cos(math.pi / 2.0 * (1.0 - s))
         return s, t
 
-    def sample_step(self, zt: Tensor, logits: Tensor, s: float, t: float) -> Tensor:
+    def sample_step(
+        self, zt: Tensor, logits: Tensor, s: float, t: float,
+        pair_mask: Optional[Tensor] = None,
+    ) -> Tensor:
         """Denoising step from time t to time s using the UDLM posterior (Eq. 15).
 
         p_theta(z_s | z_t) = Cat(z_s; p_s) where, for each class j:
@@ -621,8 +689,12 @@ class UDLMDiscreteDiffusion(nn.Module):
         s_tensor = torch.full((zt.shape[0],), s, device=zt.device, dtype=logits.dtype)
 
         # Position-dependent alpha (uses product schedule when PB enabled)
-        alpha_t_b, _ = self._alpha_and_dalpha(t_tensor, zt.shape, zt.device, logits.dtype)
-        alpha_s_b, _ = self._alpha_and_dalpha(s_tensor, zt.shape, zt.device, logits.dtype)
+        alpha_t_b, _ = self._alpha_and_dalpha(
+            t_tensor, zt.shape, zt.device, logits.dtype, pair_mask=pair_mask,
+        )
+        alpha_s_b, _ = self._alpha_and_dalpha(
+            s_tensor, zt.shape, zt.device, logits.dtype, pair_mask=pair_mask,
+        )
 
         alpha_ts = (alpha_t_b / alpha_s_b.clamp_min(eps)).clamp(max=1.0)
 
@@ -697,9 +769,11 @@ class GenMD4DiscreteDiffusion(nn.Module):
             eps=eps,
         )
 
-    def _position_w(self, n: int, device: torch.device, dtype: torch.dtype) -> Optional[Tensor]:
+    def _position_w(
+        self, n: int, device: torch.device, dtype: torch.dtype, lengths: Tensor,
+    ) -> Tensor:
         if not self.position_bias_enabled:
-            return None
+            raise RuntimeError("_position_w called with position_bias disabled")
         if self.position_bias_mode != "polynomial":
             raise NotImplementedError(
                 f"Unknown position bias mode {self.position_bias_mode}"
@@ -710,18 +784,29 @@ class GenMD4DiscreteDiffusion(nn.Module):
             self.position_bias_w_max,
             device=device,
             dtype=dtype,
+            lengths=lengths,
         )
 
     def _alpha_and_dgamma(
-        self, t: Tensor, x_shape: tuple, device: torch.device, dtype: torch.dtype
+        self, t: Tensor, x_shape: tuple, device: torch.device, dtype: torch.dtype,
+        pair_mask: Optional[Tensor] = None,
     ) -> tuple[Tensor, Tensor]:
         t_ext = _reverse_broadcast(t, len(x_shape) + 1)
         alpha = self.noise_schedule.alpha(t_ext)
         if not self.position_bias_enabled:
             return alpha, self.noise_schedule.dgamma_times_alpha(t_ext)
+        if pair_mask is None:
+            raise ValueError(
+                "position_bias is enabled; _alpha_and_dgamma requires pair_mask so "
+                "per-sample real lengths can be derived for distance-fraction normalization."
+            )
         n = x_shape[-1]
+        lengths = _lengths_from_pair_mask(pair_mask)
         if self.position_bias_mode == "sigmoid":
-            d_pos = _distance_fraction(n, device=device, dtype=dtype).unsqueeze(0).unsqueeze(-1)
+            # _distance_fraction returns [B, n, n]; add trailing vocab dim → [B, n, n, 1]
+            d_pos = _distance_fraction(
+                n, device=device, dtype=dtype, lengths=lengths
+            ).unsqueeze(-1)
             k = torch.tensor(self.position_bias_k, device=device, dtype=dtype)
             w_vec = self.noise_schedule.power
             k_eff = k * w_vec.view(1, 1, 1, -1)
@@ -730,11 +815,11 @@ class GenMD4DiscreteDiffusion(nn.Module):
             )
             dgamma_pos = dalpha / (1.0 - alpha_pos).clamp_min(1e-8)
             return alpha_pos, dgamma_pos
-        w_pos = self._position_w(n, device=device, dtype=dtype)
-        if w_pos is None:
-            return alpha, self.noise_schedule.dgamma_times_alpha(t_ext)
+        # polynomial: w_pos is [B, n, n]; add trailing vocab dim → [B, n, n, 1]
+        w_pos = self._position_w(
+            n, device=device, dtype=dtype, lengths=lengths
+        ).unsqueeze(-1)
         w_vec = self.noise_schedule.power
-        w_pos = w_pos.unsqueeze(0).unsqueeze(-1)
         w_eff = w_vec.view(1, 1, 1, -1) * w_pos
         t_ext = t_ext.clamp(min=1e-6, max=1.0)
         alpha_pos = 1.0 - (1.0 - self.noise_schedule.eps) * t_ext ** w_eff
@@ -744,8 +829,12 @@ class GenMD4DiscreteDiffusion(nn.Module):
         dgamma_pos = -w_eff / t_ext
         return alpha_pos, dgamma_pos
 
-    def forward_sample(self, x: Tensor, t: Tensor) -> Tensor:
-        alpha_t, _ = self._alpha_and_dgamma(t, x.shape, x.device, x.dtype)
+    def forward_sample(
+        self, x: Tensor, t: Tensor, pair_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        alpha_t, _ = self._alpha_and_dgamma(
+            t, x.shape, x.device, x.dtype, pair_mask=pair_mask,
+        )
         one_hot_x = torch.nn.functional.one_hot(x, self.vocab_size).float()
         unmask_prob = (alpha_t * one_hot_x).sum(dim=-1)
         rand = _symmetrize_matrix(torch.rand_like(unmask_prob))
@@ -756,7 +845,9 @@ class GenMD4DiscreteDiffusion(nn.Module):
     def recon_loss(self, x: Tensor, pair_mask: Optional[Tensor]) -> Tensor:
         batch_size = x.shape[0]
         t1 = torch.full((batch_size,), self.t1, device=x.device, dtype=x.dtype)
-        alpha_t1, _ = self._alpha_and_dgamma(t1, x.shape, x.device, x.dtype)
+        alpha_t1, _ = self._alpha_and_dgamma(
+            t1, x.shape, x.device, x.dtype, pair_mask=pair_mask,
+        )
         one_hot_x = torch.nn.functional.one_hot(x, self.vocab_size).float()
         alpha_x = (alpha_t1 * one_hot_x).sum(dim=-1)
         one_minus = (1.0 - alpha_t1).clamp_min(1e-12)
@@ -788,7 +879,9 @@ class GenMD4DiscreteDiffusion(nn.Module):
         mask = (zt == self.mask_token).float()
         if pair_mask is not None:
             mask = mask * pair_mask.float()
-        _, dgamma = self._alpha_and_dgamma(t, x.shape, x.device, x.dtype)
+        _, dgamma = self._alpha_and_dgamma(
+            t, x.shape, x.device, x.dtype, pair_mask=pair_mask,
+        )
         weighted = integrand * dgamma
         masked_integrand = (mask[..., None] * weighted).sum(
             dim=tuple(range(1, x.dim()))
@@ -813,7 +906,15 @@ class GenMD4DiscreteDiffusion(nn.Module):
         t_ext = _reverse_broadcast(t, x.dim())
         t_ext = t_ext.clamp(min=1e-6, max=1.0)
         if self.position_bias_enabled and self.position_bias_mode == "sigmoid":
-            d_pos = _distance_fraction(x.shape[-1], x.device, x.dtype)
+            if pair_mask is None:
+                raise ValueError(
+                    "position_bias is enabled; reinforce_loss requires pair_mask so "
+                    "per-sample real lengths can be derived for distance-fraction normalization."
+                )
+            lengths = _lengths_from_pair_mask(pair_mask)
+            d_pos = _distance_fraction(
+                x.shape[-1], x.device, x.dtype, lengths=lengths,
+            )
             k = torch.as_tensor(self.position_bias_k, device=x.device, dtype=x.dtype)
             k_eff = k * w_x
             alpha_t_x, _ = _sigmoid_alpha(
@@ -824,9 +925,16 @@ class GenMD4DiscreteDiffusion(nn.Module):
         else:
             w_eff = w_x
             if self.position_bias_enabled:
-                w_pos = self._position_w(x.shape[-1], x.device, x.dtype)
-                if w_pos is not None:
-                    w_eff = w_eff * w_pos
+                if pair_mask is None:
+                    raise ValueError(
+                        "position_bias is enabled; reinforce_loss requires pair_mask so "
+                        "per-sample real lengths can be derived for distance-fraction normalization."
+                    )
+                lengths = _lengths_from_pair_mask(pair_mask)
+                w_pos = self._position_w(
+                    x.shape[-1], x.device, x.dtype, lengths=lengths,
+                )
+                w_eff = w_eff * w_pos
             alpha_t_x = 1.0 - (1.0 - eps) * t_ext ** w_eff
             log_q_mask = math.log(1.0 - eps) + w_eff * torch.log(t_ext)
             log_q_unmask = torch.log(alpha_t_x.clamp_min(1e-12))

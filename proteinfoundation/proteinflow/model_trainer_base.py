@@ -944,9 +944,9 @@ class ModelTrainerBase(L.LightningModule):
                 if self.discrete_diffusion_type == "genmd4":
                     t1 = self.discrete_diffusion.t1
                     t = (1.0 - t1) * t + t1
-                zt = self.discrete_diffusion.forward_sample(c_tokens, t)
+                zt = self.discrete_diffusion.forward_sample(c_tokens, t, pair_mask=pair_mask)
                 if self.discrete_diffusion_type == "genmd4":
-                    zt_2 = self.discrete_diffusion.forward_sample(c_tokens, t)
+                    zt_2 = self.discrete_diffusion.forward_sample(c_tokens, t, pair_mask=pair_mask)
                 contact_map_t_1 = self._contact_tokens_to_input(zt)
                 contact_map_t_1 = self._apply_pair_mask(contact_map_t_1, pair_mask)
                 batch["contact_map_t"] = contact_map_t_1
@@ -994,7 +994,7 @@ class ModelTrainerBase(L.LightningModule):
             # Replace padding (-1) with 0 to avoid indexing errors; mask handles this
             dssp_tokens = dssp_tokens.clamp(min=0)
             dssp_tokens = dssp_tokens * mask.long()
-            dssp_zt = self.dssp_diffusion.forward_sample(dssp_tokens, t)
+            dssp_zt = self.dssp_diffusion.forward_sample(dssp_tokens, t, pair_mask=mask)
             dssp_zt = dssp_zt * mask.long()
             dssp_t_input = self._dssp_tokens_to_input(dssp_zt)
             dssp_t_input = dssp_t_input * mask[..., None].float()
@@ -1140,7 +1140,7 @@ class ModelTrainerBase(L.LightningModule):
                     )
                 if self.discrete_diffusion_type == "genmd4":
                     if zt_2 is None:
-                        zt_2 = self.discrete_diffusion.forward_sample(c_tokens, t)
+                        zt_2 = self.discrete_diffusion.forward_sample(c_tokens, t, pair_mask=pair_mask)
                     contact_map_t_2 = self._contact_tokens_to_input(zt_2)
                     contact_map_t_2 = self._apply_pair_mask(contact_map_t_2, pair_mask)
                     batch["contact_map_t"] = contact_map_t_2
@@ -2199,11 +2199,23 @@ class ModelTrainerBase(L.LightningModule):
         residue_type = batch.get("residue_type_unmasked", batch.get("residue_type"))
         if residue_type is not None:
             residue_type = residue_type.to(self.device)
-        cath_code = batch.get("cath_code") if self.cfg_exp.training.get("fold_cond", False) else None
+        # Prediction-eval semantics: at inference we don't condition on a known fold.
+        # Override CATH to all-unknown (null indices for C, A, T) for every val sample,
+        # regardless of training-time fold_cond. (TODO: also log a parallel set of val
+        # metrics with real CATH conditioning; see project_proteina_val_metrics_todo.)
+        cath_code = None
         cath_code_indices = batch.get("cath_code_indices")
         cath_code_indices_mask = batch.get("cath_code_indices_mask")
         if cath_code_indices is not None:
-            cath_code_indices = cath_code_indices.to(self.device)
+            cath_code_indices = cath_code_indices.to(self.device).clone()
+            cath_code_dir = self.cfg_exp.model.nn.get("cath_code_dir")
+            if cath_code_dir is not None:
+                _, _, _, nC, nA, nT = load_cath_mapping(cath_code_dir)
+                cath_code_indices = apply_fold_mask_to_indices(
+                    cath_code_indices,
+                    mask_T=True, mask_A=True, mask_C=True,
+                    num_classes_C=nC, num_classes_A=nA, num_classes_T=nT,
+                )
         if cath_code_indices_mask is not None:
             cath_code_indices_mask = cath_code_indices_mask.to(self.device)
 
@@ -2660,13 +2672,13 @@ class ModelTrainerBase(L.LightningModule):
                         raise ValueError(
                             "discrete diffusion sampling requires contact_map_logits in model output."
                         )
-                    zt = self.discrete_diffusion.sample_step(zt, c_logits, s, t)
+                    zt = self.discrete_diffusion.sample_step(zt, c_logits, s, t, pair_mask=pair_mask)
 
                 # DSSP sampling step
                 if dssp_diff_enabled:
                     dssp_logits = result.get("dssp_logits")
                     if dssp_logits is not None:
-                        dssp_zt = self.dssp_diffusion.sample_step(dssp_zt, dssp_logits, s, t)
+                        dssp_zt = self.dssp_diffusion.sample_step(dssp_zt, dssp_logits, s, t, pair_mask=mask)
 
                 if return_trajectory and (i % stride == 0) and zt is not None:
                     trajectory_tokens.append(zt.detach().cpu())

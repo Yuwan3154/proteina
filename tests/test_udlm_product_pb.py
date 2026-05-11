@@ -26,19 +26,21 @@ class TestUDLMProductPositionBias(unittest.TestCase):
         
         self.x = torch.randint(0, self.vocab_size, (self.B, self.L, self.L))
         self.logits = torch.randn(self.B, self.L, self.L)
+        # Full pair mask: every position valid (no padding), so per-sample lengths = L.
+        self.pair_mask = torch.ones(self.B, self.L, self.L)
 
     def test_forward_sample_shape(self):
         t = torch.rand(self.B)
-        zt = self.diff_pb.forward_sample(self.x, t)
+        zt = self.diff_pb.forward_sample(self.x, t, pair_mask=self.pair_mask)
         self.assertEqual(zt.shape, self.x.shape)
-        
+
     def test_non_negativity(self):
         for tv in [0.01, 0.1, 0.3, 0.5, 0.7, 0.9, 0.99]:
             t = torch.full((self.B,), tv)
-            zt = self.diff_pb.forward_sample(self.x, t)
+            zt = self.diff_pb.forward_sample(self.x, t, pair_mask=self.pair_mask)
             # Use random logits
-            loss = self.diff_pb.diffusion_loss(self.logits, self.x, zt, t)
-            
+            loss = self.diff_pb.diffusion_loss(self.logits, self.x, zt, t, pair_mask=self.pair_mask)
+
             # Loss sum across all positions for each batch item
             # Should be >= 0 (up to small numerical error)
             self.assertTrue(torch.all(loss >= -1e-5), f"Found negative loss at t={tv}: {loss.min().item()}")
@@ -46,13 +48,13 @@ class TestUDLMProductPositionBias(unittest.TestCase):
     def test_zero_at_perfect_prediction(self):
         for tv in [0.01, 0.1, 0.3, 0.5, 0.7, 0.9, 0.99]:
             t = torch.full((self.B,), tv)
-            zt = self.diff_pb.forward_sample(self.x, t)
-            
+            zt = self.diff_pb.forward_sample(self.x, t, pair_mask=self.pair_mask)
+
             # Create perfect logits
             perfect_logits = torch.where(self.x == 1, 100.0, -100.0).float()
-            
-            loss = self.diff_pb.diffusion_loss(perfect_logits, self.x, zt, t)
-            
+
+            loss = self.diff_pb.diffusion_loss(perfect_logits, self.x, zt, t, pair_mask=self.pair_mask)
+
             # Should be exactly zero (or extremely close)
             self.assertTrue(torch.all(torch.abs(loss) < 1e-4), f"Loss not zero at perfect pred t={tv}: {loss.max().item()}")
 
@@ -60,14 +62,14 @@ class TestUDLMProductPositionBias(unittest.TestCase):
         # We want to verify that all positions get a non-zero gradient
         for tv in [0.1, 0.5, 0.9]:
             t = torch.full((self.B,), tv)
-            zt = self.diff_pb.forward_sample(self.x, t)
-            
+            zt = self.diff_pb.forward_sample(self.x, t, pair_mask=self.pair_mask)
+
             logits = torch.randn(self.B, self.L, self.L, requires_grad=True)
-            loss = self.diff_pb.diffusion_loss(logits, self.x, zt, t)
+            loss = self.diff_pb.diffusion_loss(logits, self.x, zt, t, pair_mask=self.pair_mask)
             loss.mean().backward()
-            
+
             grad = logits.grad.abs()
-            
+
             # Under product model, some positions (like diagonal at t=0.9) will have near-zero grad,
             # but the SUM of gradients across all timesteps should be positive everywhere!
             self.assertTrue(True) # Replaced with a more robust test below
@@ -78,13 +80,13 @@ class TestUDLMProductPositionBias(unittest.TestCase):
         total_loss = 0
         for tv in [0.05, 0.1, 0.3, 0.5, 0.7, 0.9]:
             t = torch.full((self.B,), tv)
-            zt = self.diff_pb.forward_sample(self.x, t)
-            loss = self.diff_pb.diffusion_loss(logits, self.x, zt, t)
+            zt = self.diff_pb.forward_sample(self.x, t, pair_mask=self.pair_mask)
+            loss = self.diff_pb.diffusion_loss(logits, self.x, zt, t, pair_mask=self.pair_mask)
             total_loss = total_loss + loss.mean()
-            
+
         total_loss.backward()
         grad_sum = logits.grad.abs().sum(dim=0)
-        
+
         # Every position should receive some gradient signal during training!
         self.assertTrue(torch.all(grad_sum > 1e-4), f"Found dead gradients integrated over time. Min grad sum: {grad_sum.min().item()}")
 
@@ -98,11 +100,21 @@ class TestUDLMProductPositionBias(unittest.TestCase):
         t_tensor = torch.full((self.L, self.L), t_val)
         s_tensor = torch.full((self.L, self.L), s_val)
         n = self.L
-        d_pos = _distance_fraction(n, device=torch.device('cpu'), dtype=torch.float32)
+        full_lengths = torch.full((1,), float(n))
+        full_pair_mask_1 = torch.ones(1, n, n)
+        d_pos = _distance_fraction(
+            n, device=torch.device('cpu'), dtype=torch.float32, lengths=full_lengths,
+        )
         k = torch.tensor(10.0)
-        
-        alpha_t, _ = self.diff_pb._alpha_and_dalpha(torch.tensor([t_val]), (1, n, n), torch.device('cpu'), torch.float32)
-        alpha_s, _ = self.diff_pb._alpha_and_dalpha(torch.tensor([s_val]), (1, n, n), torch.device('cpu'), torch.float32)
+
+        alpha_t, _ = self.diff_pb._alpha_and_dalpha(
+            torch.tensor([t_val]), (1, n, n), torch.device('cpu'), torch.float32,
+            pair_mask=full_pair_mask_1,
+        )
+        alpha_s, _ = self.diff_pb._alpha_and_dalpha(
+            torch.tensor([s_val]), (1, n, n), torch.device('cpu'), torch.float32,
+            pair_mask=full_pair_mask_1,
+        )
         
         alpha_t = alpha_t[0]
         alpha_s = alpha_s[0]
@@ -135,34 +147,36 @@ class TestUDLMProductPositionBias(unittest.TestCase):
     def test_alpha_decreasing(self):
         n = self.L
         device = torch.device('cpu')
+        pm = torch.ones(1, n, n, device=device)
         t_vals = torch.linspace(0.01, 0.99, steps=20)
         for i in range(len(t_vals) - 1):
             t1 = t_vals[i:i+1]
             t2 = t_vals[i+1:i+2]
-            
-            a1, _ = self.diff_pb._alpha_and_dalpha(t1, (1, n, n), device, torch.float32)
-            a2, _ = self.diff_pb._alpha_and_dalpha(t2, (1, n, n), device, torch.float32)
-            
+
+            a1, _ = self.diff_pb._alpha_and_dalpha(t1, (1, n, n), device, torch.float32, pair_mask=pm)
+            a2, _ = self.diff_pb._alpha_and_dalpha(t2, (1, n, n), device, torch.float32, pair_mask=pm)
+
             # a(t) should decrease as t increases
             self.assertTrue(torch.all(a2 <= a1 + 1e-6))
-            
+
     def test_dalpha_derivative(self):
         n = self.L
         device = torch.device('cpu')
-        
+        pm = torch.ones(1, n, n, device=device)
+
         for tv in [0.1, 0.5, 0.9]:
             t = torch.tensor([tv])
             delta = 1e-5
-            
+
             t_plus = t + delta
             t_minus = t - delta
-            
-            a_t, da_t = self.diff_pb._alpha_and_dalpha(t, (1, n, n), device, torch.float32)
-            a_plus, _ = self.diff_pb._alpha_and_dalpha(t_plus, (1, n, n), device, torch.float32)
-            a_minus, _ = self.diff_pb._alpha_and_dalpha(t_minus, (1, n, n), device, torch.float32)
-            
+
+            a_t, da_t = self.diff_pb._alpha_and_dalpha(t, (1, n, n), device, torch.float32, pair_mask=pm)
+            a_plus, _ = self.diff_pb._alpha_and_dalpha(t_plus, (1, n, n), device, torch.float32, pair_mask=pm)
+            a_minus, _ = self.diff_pb._alpha_and_dalpha(t_minus, (1, n, n), device, torch.float32, pair_mask=pm)
+
             da_numerical = (a_plus - a_minus) / (2 * delta)
-            
+
             # Use smaller test threshold because of clamping and analytical differences
             max_diff = torch.max(torch.abs(da_numerical - da_t))
             self.assertTrue(max_diff < 0.05, f"Derivative mismatch at t={tv}: diff {max_diff.item()} > 0.05")
