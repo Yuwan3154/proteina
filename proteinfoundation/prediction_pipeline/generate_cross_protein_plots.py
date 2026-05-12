@@ -308,6 +308,8 @@ def load_af2rank_on_proteinebm_topk_data(
             protein_dir = Path(score_file).parent.parent.parent
             ebm_csv_path = protein_dir / proteinebm_analysis_subdir / f"proteinebm_scores_{protein_id}.csv"
         min_energy = float("nan")
+        max_proteinebm_ptm_topk = float("nan")
+        min_proteinebm_mean_pae_topk = float("nan")
         if (_is_tar_ref(ebm_csv_path) and read_protein_text(*_parse_tar_ref(ebm_csv_path)) is not None) or (
             not _is_tar_ref(ebm_csv_path) and ebm_csv_path.exists()
         ):
@@ -317,6 +319,14 @@ def load_af2rank_on_proteinebm_topk_data(
                     ebm_staged = ebm_df[ebm_df["structure_file"].astype(str).isin(staged_names)]
                     if len(ebm_staged) > 0:
                         min_energy = float(ebm_staged["energy"].astype(float).min())
+                        if "ptm" in ebm_staged.columns:
+                            ptm_vals = pd.to_numeric(ebm_staged["ptm"], errors="coerce").dropna()
+                            if len(ptm_vals) > 0:
+                                max_proteinebm_ptm_topk = float(ptm_vals.max())
+                        if "mean_pae" in ebm_staged.columns:
+                            pae_vals = pd.to_numeric(ebm_staged["mean_pae"], errors="coerce").dropna()
+                            if len(pae_vals) > 0:
+                                min_proteinebm_mean_pae_topk = float(pae_vals.min())
             except Exception as e:
                 logger.debug(f"Could not read ProteinEBM scores for {protein_id}: {e}")
 
@@ -337,6 +347,8 @@ def load_af2rank_on_proteinebm_topk_data(
             "min_energy_topk": min_energy,
             # max_ptm_topk = top_1_ptm (top-1 by pTM is the max pTM)
             "max_ptm_topk": m1_metrics["top_1_ptm"],
+            "max_proteinebm_ptm_topk": max_proteinebm_ptm_topk,
+            "min_proteinebm_mean_pae_topk": min_proteinebm_mean_pae_topk,
         }
         m2_exists = (
             read_protein_text(*_parse_tar_ref(m2_path)) is not None
@@ -695,6 +707,48 @@ def create_af2rank_on_proteinebm_topk_plots(df: pd.DataFrame, output_dir: str, t
     if "min_top_1_ptm" in df.columns:
         _plot_variant(df, "min", "min", {"ptm": "min(pTM)", "composite": "min(composite)", "plddt": "min(pLDDT)"})
 
+    # ── Cross-protein ProteinEBM-pTM vs AF2Rank-pTM scatter (one dot per protein) ─
+    if "max_proteinebm_ptm_topk" in df.columns and (
+        "min_max_ptm_topk" in df.columns or "max_ptm_topk" in df.columns
+    ):
+        # Prefer min-across-models AF2Rank pTM if available; else single-model max.
+        af2_col = "min_max_ptm_topk" if "min_max_ptm_topk" in df.columns else "max_ptm_topk"
+        af2_label = "Best AF2Rank pTM (min across m1, m2)" if af2_col == "min_max_ptm_topk" else "Best AF2Rank pTM (m1)"
+        valid_pp = df.dropna(subset=["max_proteinebm_ptm_topk", af2_col, "in_train", "length"])
+        if len(valid_pp) > 0:
+            fig, ax = plt.subplots(figsize=(8, 8))
+            ax.scatter(
+                valid_pp["max_proteinebm_ptm_topk"], valid_pp[af2_col],
+                alpha=0.35,
+                c=valid_pp["in_train"].map({True: "blue", False: "red"}),
+                s=valid_pp["length"] / 1.5,
+            )
+            lo = float(min(valid_pp["max_proteinebm_ptm_topk"].min(), valid_pp[af2_col].min(), 0.0))
+            hi = float(max(valid_pp["max_proteinebm_ptm_topk"].max(), valid_pp[af2_col].max(), 1.0))
+            ax.plot([lo, hi], [lo, hi], color="black", linestyle="--", alpha=0.6, label="y = x")
+            ax.set_xlim(lo, hi)
+            ax.set_ylim(lo, hi)
+            ax.set_xlabel("Best ProteinEBM pTM (max in top-k)", fontsize=12)
+            ax.set_ylabel(af2_label, fontsize=12)
+            title_extra = ""
+            if len(valid_pp) > 2:
+                r = float(np.corrcoef(valid_pp["max_proteinebm_ptm_topk"], valid_pp[af2_col])[0, 1])
+                title_extra = f" | Pearson R = {r:.3f}"
+            ax.set_title(
+                f"ProteinEBM vs AF2Rank pTM on top-{int(top_k)} templates (one dot per protein, n={len(valid_pp)}){title_extra}",
+                fontsize=13,
+            )
+            ax.legend(loc="upper left", fontsize=10)
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            out_path = os.path.join(
+                output_dir,
+                f"cross_protein_af2rank_on_proteinebm_top_k_proteinebm_ptm_vs_af2rank_ptm_top{int(top_k)}.png",
+            )
+            plt.savefig(out_path, dpi=900, bbox_inches="tight")
+            logger.info(f"Saved AF2Rank-vs-ProteinEBM pTM cross-protein plot: {out_path}")
+            plt.close()
+
 
 def load_summary_data(summary_files: List[str], dataset_file: str, id_col: str, tms_col: str) -> pd.DataFrame:
     """
@@ -802,7 +856,7 @@ def load_proteinebm_data(score_files: List[str], dataset_file: str, id_col: str,
 
         t_vals = scores_df["t"].unique().tolist() if "t" in scores_df.columns else []
 
-        data.append({
+        row = {
             "protein_id": protein_id,
             "n_structures": n,
             "t_values": t_vals,
@@ -812,7 +866,31 @@ def load_proteinebm_data(score_files: List[str], dataset_file: str, id_col: str,
             "max_energy": float(energies.max()),
             "std_energy": float(energies.std()),
             "scores_csv": str(score_file),
-        })
+        }
+
+        # New PAE-model metrics: ProteinEBM pTM (higher better) + mean pAE (lower better)
+        if "ptm" in scores_df.columns:
+            ptm = pd.to_numeric(scores_df["ptm"], errors="coerce").dropna()
+            if len(ptm) > 0:
+                row.update({
+                    "max_ptm": float(ptm.max()),
+                    "mean_ptm": float(ptm.mean()),
+                    "median_ptm": float(ptm.median()),
+                    "min_ptm_pebm": float(ptm.min()),
+                    "std_ptm": float(ptm.std()),
+                })
+        if "mean_pae" in scores_df.columns:
+            pae = pd.to_numeric(scores_df["mean_pae"], errors="coerce").dropna()
+            if len(pae) > 0:
+                row.update({
+                    "min_mean_pae": float(pae.min()),
+                    "mean_mean_pae": float(pae.mean()),
+                    "median_mean_pae": float(pae.median()),
+                    "max_mean_pae": float(pae.max()),
+                    "std_mean_pae": float(pae.std()),
+                })
+
+        data.append(row)
 
     df = pd.DataFrame(data)
     logger.info(f"Loaded {len(df)} proteins from ProteinEBM results (filtered by dataset)")
@@ -968,6 +1046,123 @@ def create_proteinebm_plots(df: pd.DataFrame, output_dir: str, tms_col: str) -> 
     plt.savefig(plot_path, dpi=900, bbox_inches="tight")
     logger.info(f"Saved cross-protein ProteinEBM plot: {plot_path}")
     plt.close()
+
+
+def _four_panel_metric_plot(
+    df: pd.DataFrame,
+    tms_col: str,
+    best_col: str,
+    mean_col: str,
+    std_col: str,
+    output_path: str,
+    metric_label: str,
+    best_label: str,
+    best_panel_title: str,
+    mean_panel_title: str,
+    length_panel_title: str,
+    dispersion_panel_title: str,
+) -> None:
+    """4-panel cross-protein plot mirroring the energy analysis layout.
+
+    Top-left: TM_ref vs ``best_col``; top-right: TM_ref vs ``mean_col``;
+    bottom-left: length vs ``best_col``; bottom-right: ``best_col`` vs ``std_col``.
+    Panel content is skipped per-panel when the relevant columns are missing/NaN.
+    """
+    plt.style.use("default")
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(18, 18))
+
+    if best_col in df.columns:
+        valid_1 = df.dropna(subset=[tms_col, best_col, "in_train", "length"])
+        if len(valid_1) > 0:
+            ax1.scatter(valid_1[tms_col], valid_1[best_col], alpha=0.3,
+                        c=valid_1["in_train"].map({True: "blue", False: "red"}),
+                        s=valid_1["length"] / 1.5)
+            ax1.set_xlabel("Reference TM Score", fontsize=12)
+            ax1.set_ylabel(best_label, fontsize=12)
+            ax1.set_title(best_panel_title, fontsize=15)
+            ax1.grid(True, alpha=0.3)
+            if len(valid_1) > 2:
+                corr = np.corrcoef(valid_1[tms_col], valid_1[best_col])[0, 1]
+                ax1.text(0.05, 0.95, f"R = {corr:.3f}", transform=ax1.transAxes,
+                         bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+
+    if mean_col in df.columns:
+        valid_2 = df.dropna(subset=[tms_col, mean_col, "in_train", "length"])
+        if len(valid_2) > 0:
+            ax2.scatter(valid_2[tms_col], valid_2[mean_col], alpha=0.3,
+                        c=valid_2["in_train"].map({True: "blue", False: "red"}),
+                        s=valid_2["length"] / 1.5)
+            ax2.set_xlabel("Reference TM Score", fontsize=12)
+            ax2.set_ylabel(f"Mean ProteinEBM {metric_label}", fontsize=12)
+            ax2.set_title(mean_panel_title, fontsize=15)
+            ax2.grid(True, alpha=0.3)
+            if len(valid_2) > 2:
+                corr = np.corrcoef(valid_2[tms_col], valid_2[mean_col])[0, 1]
+                ax2.text(0.05, 0.95, f"R = {corr:.3f}", transform=ax2.transAxes,
+                         bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+
+    if best_col in df.columns:
+        valid_3 = df.dropna(subset=["length", best_col, "in_train"])
+        if len(valid_3) > 0:
+            ax3.scatter(valid_3["length"], valid_3[best_col], alpha=0.3,
+                        c=valid_3["in_train"].map({True: "blue", False: "red"}), s=60)
+            ax3.set_xlabel("Protein length", fontsize=12)
+            ax3.set_ylabel(best_label, fontsize=12)
+            ax3.set_title(length_panel_title, fontsize=15)
+            ax3.grid(True, alpha=0.3)
+
+    if best_col in df.columns and std_col in df.columns:
+        valid_4 = df.dropna(subset=[best_col, std_col, "in_train"])
+        if len(valid_4) > 0:
+            ax4.scatter(valid_4[best_col], valid_4[std_col], alpha=0.3,
+                        c=valid_4["in_train"].map({True: "blue", False: "red"}), s=60)
+            ax4.set_xlabel(best_label, fontsize=12)
+            ax4.set_ylabel(f"Std ProteinEBM {metric_label}", fontsize=12)
+            ax4.set_title(dispersion_panel_title, fontsize=15)
+            ax4.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=900, bbox_inches="tight")
+    logger.info(f"Saved cross-protein ProteinEBM plot: {output_path}")
+    plt.close()
+
+
+def create_proteinebm_mean_pae_plots(df: pd.DataFrame, output_dir: str, tms_col: str) -> None:
+    """4-panel cross-protein plot for ProteinEBM mean pAE (lower is better)."""
+    if "min_mean_pae" not in df.columns:
+        logger.info("Skipping mean-pAE cross-protein plot: column 'min_mean_pae' absent (legacy ProteinEBM model?)")
+        return
+    os.makedirs(output_dir, exist_ok=True)
+    _four_panel_metric_plot(
+        df=df, tms_col=tms_col,
+        best_col="min_mean_pae", mean_col="mean_mean_pae", std_col="std_mean_pae",
+        output_path=os.path.join(output_dir, "cross_protein_proteinebm_mean_pae_analysis.png"),
+        metric_label="Mean pAE (Å)",
+        best_label="Min ProteinEBM Mean pAE (Å, lower is better)",
+        best_panel_title="Reference TM Score vs. Best (Min) ProteinEBM Mean pAE",
+        mean_panel_title="Reference TM Score vs. Mean ProteinEBM Mean pAE",
+        length_panel_title="Protein length vs. Best (Min) ProteinEBM Mean pAE",
+        dispersion_panel_title="Mean pAE dispersion vs. best mean pAE (per protein)",
+    )
+
+
+def create_proteinebm_ptm_plots(df: pd.DataFrame, output_dir: str, tms_col: str) -> None:
+    """4-panel cross-protein plot for ProteinEBM pTM (higher is better)."""
+    if "max_ptm" not in df.columns:
+        logger.info("Skipping pTM cross-protein plot: column 'max_ptm' absent (legacy ProteinEBM model?)")
+        return
+    os.makedirs(output_dir, exist_ok=True)
+    _four_panel_metric_plot(
+        df=df, tms_col=tms_col,
+        best_col="max_ptm", mean_col="mean_ptm", std_col="std_ptm",
+        output_path=os.path.join(output_dir, "cross_protein_proteinebm_ptm_analysis.png"),
+        metric_label="pTM",
+        best_label="Max ProteinEBM pTM (higher is better)",
+        best_panel_title="Reference TM Score vs. Best (Max) ProteinEBM pTM",
+        mean_panel_title="Reference TM Score vs. Mean ProteinEBM pTM",
+        length_panel_title="Protein length vs. Best (Max) ProteinEBM pTM",
+        dispersion_panel_title="pTM dispersion vs. best pTM (per protein)",
+    )
 
 
 def save_proteinebm_statistics(df: pd.DataFrame, output_dir: str, tms_col: str) -> None:
@@ -1672,6 +1867,9 @@ def main():
         else:
             # Energy-based diagnostic plots.
             create_proteinebm_plots(df, args.output_dir, args.tms_col)
+            # PAE-model metrics (skipped per-function when columns absent)
+            create_proteinebm_mean_pae_plots(df, args.output_dir, args.tms_col)
+            create_proteinebm_ptm_plots(df, args.output_dir, args.tms_col)
             save_proteinebm_statistics(df, args.output_dir, args.tms_col)
 
     # ── Diversity-vs-quality cross-protein plot ───────────────────────────────

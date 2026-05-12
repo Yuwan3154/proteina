@@ -143,7 +143,7 @@ def _proteinebm_csv_complete(scores_csv: Path, pdb_files: list) -> bool:
         return False
     with open(scores_csv, "r") as f:
         header = (f.readline() or "").strip()
-        required_cols = ["protein_id", "structure_file", "structure_path", "t", "energy"]
+        required_cols = ["protein_id", "structure_file", "structure_path", "t", "energy", "ptm", "mean_pae"]
         if not all(col in header for col in required_cols):
             return False
         n_scored = sum(1 for line in f if line.strip())

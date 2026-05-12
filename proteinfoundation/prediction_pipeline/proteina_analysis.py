@@ -508,59 +508,117 @@ def load_diversity_data(inference_dir: str, subdir: str = "proteina_diversity") 
 
 
 def _plot_proteinebm_results(results: List[Dict[str, object]], output_dir: str, protein_id: str) -> Dict[str, str]:
+    """Per-protein ProteinEBM diagnostic plots.
+
+    Always-emitted plots (independent of ground truth):
+      - proteinebm_{id}_energy_hist.png
+      - proteinebm_{id}_ptm_hist.png         (only when ``ptm`` column present and non-empty)
+      - proteinebm_{id}_mean_pae_hist.png    (only when ``mean_pae`` column present and non-empty)
+
+    Emitted only when ``tm_ref_template`` is available (ground-truth CIF):
+      - proteinebm_{id}_score_vs_true_quality.png       (score = -energy)
+      - proteinebm_{id}_tm_hist.png
+      - proteinebm_{id}_ptm_vs_true_quality.png         (only when ``ptm`` present)
+      - proteinebm_{id}_mean_pae_vs_true_quality.png    (only when ``mean_pae`` present)
+    """
     energies = np.asarray([float(r["energy"]) for r in results], dtype=np.float64)
-    tm = np.asarray([float(r["tm_ref_template"]) for r in results], dtype=np.float64)
-    score = -energies
+    tm = np.asarray([float(r.get("tm_ref_template", np.nan)) for r in results], dtype=np.float64)
+    ptm = np.asarray([float(r.get("ptm", np.nan)) for r in results], dtype=np.float64)
+    mean_pae = np.asarray([float(r.get("mean_pae", np.nan)) for r in results], dtype=np.float64)
+    has_gt = np.any(~np.isnan(tm))
+    has_ptm = np.any(~np.isnan(ptm))
+    has_mean_pae = np.any(~np.isnan(mean_pae))
 
     os.makedirs(output_dir, exist_ok=True)
+    plot_paths: Dict[str, str] = {}
 
-    fig = plt.figure(figsize=(8, 6), dpi=120)
-    plt.scatter(tm, score, s=18, alpha=0.5)
-    rho = _spearmanr(tm.tolist(), score.tolist()) if len(tm) > 1 else float("nan")
-    plt.title(f"ProteinEBM: score(-energy) vs TM(ref, decoy)\n{protein_id} | Spearman rho={rho:.3f}")
-    plt.xlabel("TM-score (Reference vs Decoy) [tm_ref_template]")
-    plt.ylabel("ProteinEBM score (-energy, higher is better)")
-    plt.grid(True, alpha=0.3)
-    score_plot = os.path.join(output_dir, f"proteinebm_{protein_id}_score_vs_true_quality.png")
-    plt.tight_layout()
-    plt.savefig(score_plot, dpi=300, bbox_inches="tight")
-    plt.close(fig)
+    def _hist(values: np.ndarray, title: str, xlabel: str, filename: str) -> None:
+        valid = values[~np.isnan(values)]
+        fig = plt.figure(figsize=(8, 6), dpi=120)
+        if len(valid) > 0:
+            plt.hist(valid, bins=30, alpha=0.8)
+        else:
+            plt.text(0.5, 0.5, "No valid values (all NaN)", ha="center", va="center", transform=plt.gca().transAxes)
+        plt.title(title)
+        plt.xlabel(xlabel)
+        plt.ylabel("Count")
+        plt.grid(True, alpha=0.3)
+        out = os.path.join(output_dir, filename)
+        plt.tight_layout()
+        plt.savefig(out, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        plot_paths[filename.replace(f"proteinebm_{protein_id}_", "").replace(".png", "")] = os.path.abspath(out)
 
-    valid_energies = energies[~np.isnan(energies)]
-    fig = plt.figure(figsize=(8, 6), dpi=120)
-    if len(valid_energies) > 0:
-        plt.hist(valid_energies, bins=30, alpha=0.8)
-    else:
-        plt.text(0.5, 0.5, "No valid energies (all NaN)", ha="center", va="center", transform=plt.gca().transAxes)
-    plt.title(f"ProteinEBM energy histogram\n{protein_id}")
-    plt.xlabel("Energy (lower is better)")
-    plt.ylabel("Count")
-    plt.grid(True, alpha=0.3)
-    energy_hist = os.path.join(output_dir, f"proteinebm_{protein_id}_energy_hist.png")
-    plt.tight_layout()
-    plt.savefig(energy_hist, dpi=300, bbox_inches="tight")
-    plt.close(fig)
+    def _scatter_vs_quality(x: np.ndarray, xlabel: str, title: str, filename: str) -> None:
+        valid_mask = (~np.isnan(x)) & (~np.isnan(tm))
+        fig = plt.figure(figsize=(8, 6), dpi=120)
+        if valid_mask.sum() > 1:
+            plt.scatter(x[valid_mask], tm[valid_mask], s=18, alpha=0.5)
+            rho = _spearmanr(x[valid_mask].tolist(), tm[valid_mask].tolist())
+            plt.title(f"{title}\n{protein_id} | Spearman rho={rho:.3f}")
+        else:
+            plt.scatter(x, tm, s=18, alpha=0.5)
+            plt.title(f"{title}\n{protein_id} | insufficient data for Spearman")
+        plt.xlabel(xlabel)
+        plt.ylabel("TM-score (Reference vs Decoy) [tm_ref_template]")
+        plt.grid(True, alpha=0.3)
+        out = os.path.join(output_dir, filename)
+        plt.tight_layout()
+        plt.savefig(out, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        plot_paths[filename.replace(f"proteinebm_{protein_id}_", "").replace(".png", "")] = os.path.abspath(out)
 
-    valid_tm = tm[~np.isnan(tm)]
-    fig = plt.figure(figsize=(8, 6), dpi=120)
-    if len(valid_tm) > 0:
-        plt.hist(valid_tm, bins=30, alpha=0.8)
-    else:
-        plt.text(0.5, 0.5, "No valid TM scores (all NaN)", ha="center", va="center", transform=plt.gca().transAxes)
-    plt.title(f"TM(ref, decoy) histogram\n{protein_id}")
-    plt.xlabel("TM-score (Reference vs Decoy)")
-    plt.ylabel("Count")
-    plt.grid(True, alpha=0.3)
-    tm_hist = os.path.join(output_dir, f"proteinebm_{protein_id}_tm_hist.png")
-    plt.tight_layout()
-    plt.savefig(tm_hist, dpi=300, bbox_inches="tight")
-    plt.close(fig)
+    # ── score = -energy vs TM (GT only) ──
+    if has_gt:
+        score = -energies
+        valid_mask = (~np.isnan(score)) & (~np.isnan(tm))
+        fig = plt.figure(figsize=(8, 6), dpi=120)
+        if valid_mask.sum() > 1:
+            plt.scatter(tm[valid_mask], score[valid_mask], s=18, alpha=0.5)
+            rho = _spearmanr(tm[valid_mask].tolist(), score[valid_mask].tolist())
+            plt.title(f"ProteinEBM: score(-energy) vs TM(ref, decoy)\n{protein_id} | Spearman rho={rho:.3f}")
+        else:
+            plt.scatter(tm, score, s=18, alpha=0.5)
+            plt.title(f"ProteinEBM: score(-energy) vs TM(ref, decoy)\n{protein_id} | insufficient data for Spearman")
+        plt.xlabel("TM-score (Reference vs Decoy) [tm_ref_template]")
+        plt.ylabel("ProteinEBM score (-energy, higher is better)")
+        plt.grid(True, alpha=0.3)
+        score_plot = os.path.join(output_dir, f"proteinebm_{protein_id}_score_vs_true_quality.png")
+        plt.tight_layout()
+        plt.savefig(score_plot, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        plot_paths["score_vs_true_quality"] = os.path.abspath(score_plot)
 
-    return {
-        "score_vs_true_quality": os.path.abspath(score_plot),
-        "energy_hist": os.path.abspath(energy_hist),
-        "tm_hist": os.path.abspath(tm_hist),
-    }
+    # ── Histograms (always emitted, even without GT) ──
+    _hist(energies, f"ProteinEBM energy histogram\n{protein_id}", "Energy (lower is better)",
+          f"proteinebm_{protein_id}_energy_hist.png")
+    if has_ptm:
+        _hist(ptm, f"ProteinEBM pTM histogram\n{protein_id}", "pTM (higher is better)",
+              f"proteinebm_{protein_id}_ptm_hist.png")
+    if has_mean_pae:
+        _hist(mean_pae, f"ProteinEBM mean pAE histogram\n{protein_id}", "Mean pAE (Å, lower is better)",
+              f"proteinebm_{protein_id}_mean_pae_hist.png")
+    if has_gt:
+        _hist(tm, f"TM(ref, decoy) histogram\n{protein_id}", "TM-score (Reference vs Decoy)",
+              f"proteinebm_{protein_id}_tm_hist.png")
+
+    # ── pTM / mean pAE vs TM(ref, decoy) (GT only) ──
+    if has_gt and has_ptm:
+        _scatter_vs_quality(
+            ptm,
+            xlabel="ProteinEBM pTM (higher is better)",
+            title="ProteinEBM pTM vs TM(ref, decoy)",
+            filename=f"proteinebm_{protein_id}_ptm_vs_true_quality.png",
+        )
+    if has_gt and has_mean_pae:
+        _scatter_vs_quality(
+            mean_pae,
+            xlabel="ProteinEBM mean pAE (Å, lower is better)",
+            title="ProteinEBM mean pAE vs TM(ref, decoy)",
+            filename=f"proteinebm_{protein_id}_mean_pae_vs_true_quality.png",
+        )
+
+    return plot_paths
 
 
 def _rescale(a: np.ndarray, amin: Optional[float] = None, amax: Optional[float] = None) -> np.ndarray:
@@ -806,23 +864,52 @@ def _build_proteinebm_summary(
     plot_paths: Dict[str, str],
 ) -> Dict[str, object]:
     spearman_rho_energy = None
+    spearman_rho_ptm = None
+    spearman_rho_mean_pae = None
     max_tm_ref_template = None
     tm_ref_template_at_min_energy = None
+    tm_ref_template_at_max_ptm = None
+    tm_ref_template_at_min_mean_pae = None
     top_1_tm_ref_template = None
     top_5_tm_ref_template = None
+    best_ptm = None
+    best_mean_pae = None
 
-    if len(results) > 1:
-        tm_vals = [float(row["tm_ref_template"]) for row in results if pd.notna(row.get("tm_ref_template"))]
-        energy_vals = [float(row["energy"]) for row in results if pd.notna(row.get("tm_ref_template"))]
-        if len(tm_vals) > 1:
-            score_vals = [-energy for energy in energy_vals]
-            spearman_rho_energy = _spearmanr(tm_vals, score_vals)
-            max_tm_ref_template = float(max(tm_vals))
-            best_idx = int(np.argmin(np.asarray(energy_vals)))
-            tm_ref_template_at_min_energy = float(tm_vals[best_idx])
+    arr_tm  = np.asarray([float(row.get("tm_ref_template", np.nan)) for row in results], dtype=np.float64)
+    arr_e   = np.asarray([float(row.get("energy", np.nan))            for row in results], dtype=np.float64)
+    arr_ptm = np.asarray([float(row.get("ptm", np.nan))               for row in results], dtype=np.float64)
+    arr_pae = np.asarray([float(row.get("mean_pae", np.nan))          for row in results], dtype=np.float64)
+
+    if np.any(~np.isnan(arr_ptm)):
+        best_ptm = float(np.nanmax(arr_ptm))
+    if np.any(~np.isnan(arr_pae)):
+        best_mean_pae = float(np.nanmin(arr_pae))
+
+    if len(results) > 1 and np.any(~np.isnan(arr_tm)):
+        mask_e = (~np.isnan(arr_tm)) & (~np.isnan(arr_e))
+        if mask_e.sum() > 1:
+            tm_v = arr_tm[mask_e].tolist()
+            e_v  = arr_e[mask_e].tolist()
+            spearman_rho_energy = _spearmanr(tm_v, [-x for x in e_v])
+            max_tm_ref_template = float(max(tm_v))
+            best_idx = int(np.argmin(np.asarray(e_v)))
+            tm_ref_template_at_min_energy = float(tm_v[best_idx])
             top_1_tm_ref_template = tm_ref_template_at_min_energy
-            top5_idx = np.argsort(np.asarray(energy_vals))[:5]
-            top_5_tm_ref_template = float(max([tm_vals[int(i)] for i in top5_idx]))
+            top5_idx = np.argsort(np.asarray(e_v))[:5]
+            top_5_tm_ref_template = float(max([tm_v[int(i)] for i in top5_idx]))
+
+        mask_ptm = (~np.isnan(arr_tm)) & (~np.isnan(arr_ptm))
+        if mask_ptm.sum() > 1:
+            spearman_rho_ptm = _spearmanr(arr_tm[mask_ptm].tolist(), arr_ptm[mask_ptm].tolist())
+            best_ptm_idx = int(np.argmax(arr_ptm[mask_ptm]))
+            tm_ref_template_at_max_ptm = float(arr_tm[mask_ptm][best_ptm_idx])
+
+        mask_pae = (~np.isnan(arr_tm)) & (~np.isnan(arr_pae))
+        if mask_pae.sum() > 1:
+            # Lower pAE → higher quality, so use negative correlation framing as score = -mean_pae
+            spearman_rho_mean_pae = _spearmanr(arr_tm[mask_pae].tolist(), (-arr_pae[mask_pae]).tolist())
+            best_pae_idx = int(np.argmin(arr_pae[mask_pae]))
+            tm_ref_template_at_min_mean_pae = float(arr_tm[mask_pae][best_pae_idx])
 
     return {
         "protein_id": protein_id,
@@ -839,9 +926,15 @@ def _build_proteinebm_summary(
         "plots": plot_paths,
         "spearman_correlation_rho_composite": spearman_rho_energy,
         "spearman_correlation_rho_energy": spearman_rho_energy,
+        "spearman_correlation_rho_ptm": spearman_rho_ptm,
+        "spearman_correlation_rho_mean_pae": spearman_rho_mean_pae,
         "max_tm_ref_template": max_tm_ref_template,
         "tm_ref_template_at_max_composite": tm_ref_template_at_min_energy,
         "tm_ref_template_at_min_energy": tm_ref_template_at_min_energy,
+        "tm_ref_template_at_max_ptm": tm_ref_template_at_max_ptm,
+        "tm_ref_template_at_min_mean_pae": tm_ref_template_at_min_mean_pae,
+        "best_ptm": best_ptm,
+        "best_mean_pae": best_mean_pae,
         "top_1_tm_ref_template": top_1_tm_ref_template,
         "top_5_tm_ref_template": top_5_tm_ref_template,
         "status": "completed",

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 Parity test: Compare OpenFold vs ColabDesign AF2Rank scoring on the same decoys.
-Run with: ./run_with_proteina_env.sh python test_parity.py
+Run with:
+    proteinfoundation/prediction_pipeline/run_with_proteina_env.sh \\
+        python proteinfoundation/tests/test_parity.py
 
 This script:
 1. Scores 3 decoys with OpenFold (model_1_ptm and model_2_ptm)
@@ -18,9 +20,11 @@ import warnings
 
 os.environ["OPENMM_PLUGIN_DIR"] = "/dev/null"
 warnings.filterwarnings("ignore")
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from af2rank_openfold_scorer import OpenFoldAF2Rank
+import proteinfoundation.prediction_pipeline as _pf_pp
+PRED_PIPELINE_DIR = os.path.dirname(_pf_pp.__file__)
+
+from proteinfoundation.prediction_pipeline.af2rank_openfold_scorer import OpenFoldAF2Rank
 
 INFERENCE_DIR = (
     "/home/ubuntu/proteina/inference/"
@@ -67,7 +71,7 @@ def run_colabdesign_scoring(model_name="model_1_ptm"):
     py_code = f"""
 import os, sys, json
 os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.3'
-sys.path.insert(0, {os.path.dirname(os.path.abspath(__file__))!r})
+sys.path.insert(0, {PRED_PIPELINE_DIR!r})
 
 from af2rank_scorer import ModernAF2Rank, suppress_stdout
 
@@ -101,10 +105,10 @@ print(json.dumps(results))
     print(f"ColabDesign scoring ({model_name}) - {len(decoy_pdbs)} decoys")
     print(f"{'='*60}")
 
-    wrapper = os.path.join(os.path.dirname(__file__), "run_with_colabdesign_env.sh")
+    wrapper = os.path.join(PRED_PIPELINE_DIR, "run_with_colabdesign_env.sh")
     result = subprocess.run(
         [wrapper, "python", "-c", py_code],
-        cwd=os.path.dirname(__file__),
+        cwd=PRED_PIPELINE_DIR,
         capture_output=True, text=True, timeout=600,
     )
 

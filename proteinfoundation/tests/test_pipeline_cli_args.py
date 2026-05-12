@@ -6,9 +6,15 @@ The historical `run_full_pipeline.py` has been merged into
 merged driver.
 """
 
+import math
+
+import numpy as np
+import torch
+
 from proteinfoundation.prediction_pipeline import pipeline_cli_utils
 from proteinfoundation.prediction_pipeline import run_prediction_pipeline as rpp
 from proteinfoundation.prediction_pipeline.run_prediction_pipeline import build_parser
+from proteinfoundation.prediction_pipeline.proteinebm_scorer import compute_mean_pae
 
 
 def test_parallel_incremental_filter_args():
@@ -207,3 +213,55 @@ def test_step_af2rank_topk_no_cif_dir(monkeypatch):
     )
     cmd = captured["cmd"]
     assert "--cif_dir" not in cmd
+
+
+def test_proteinebm_defaults_point_at_pae_model():
+    """Default checkpoint/config point at the new PAE-enabled model."""
+    p = build_parser()
+    a = p.parse_args([
+        "--input", "in.fasta",
+        "--inference_config", "cfg",
+        "--output_dir", "/tmp/out",
+    ])
+    assert a.proteinebm_config.endswith("/pae_config.yaml"), a.proteinebm_config
+    assert a.proteinebm_checkpoint.endswith("/pae.ckpt"), a.proteinebm_checkpoint
+    # Analysis subdir intentionally unchanged: same EBM trunk, just +PAE head
+    assert a.proteinebm_analysis_subdir == "proteinebm_v2_cathmd_analysis"
+
+
+def test_compute_mean_pae_uniform_distribution():
+    """Uniform PAE distribution over [0, max_dist] -> mean pAE ≈ max_dist / 2."""
+    B, N, num_bins, max_dist = 1, 4, 64, 32.0
+    logits = torch.zeros(B, N, N, num_bins)  # softmax(zeros) → uniform
+    mask = torch.ones(B, N)
+    mean_pae = compute_mean_pae(logits, mask, max_dist=max_dist)
+    # Bin centers: 0.25, 0.75, ..., 31.75 → arithmetic mean = max_dist/2 - bin_width/2 + bin_width/2 = max_dist/2 - bin_width/2 ≈ max_dist/2
+    expected = float(np.arange(0.5 * max_dist / num_bins, max_dist, max_dist / num_bins).mean())
+    assert mean_pae.shape == (B,)
+    assert math.isclose(float(mean_pae[0]), expected, abs_tol=1e-4), (float(mean_pae[0]), expected)
+
+
+def test_compute_mean_pae_peaked_distribution():
+    """Logits peaked at the first bin -> mean pAE ≈ first bin center."""
+    B, N, num_bins, max_dist = 1, 3, 64, 32.0
+    logits = torch.full((B, N, N, num_bins), -50.0)
+    logits[..., 0] = 50.0  # massive mass on the first bin → softmax ≈ delta at bin 0
+    mask = torch.ones(B, N)
+    mean_pae = compute_mean_pae(logits, mask, max_dist=max_dist)
+    expected_center = 0.5 * max_dist / num_bins  # 0.25 Å
+    assert math.isclose(float(mean_pae[0]), expected_center, abs_tol=1e-3), float(mean_pae[0])
+
+
+def test_compute_mean_pae_respects_mask():
+    """Padding residues (mask=0) must not contribute to the average."""
+    B, N, num_bins, max_dist = 1, 4, 64, 32.0
+    logits = torch.full((B, N, N, num_bins), -50.0)
+    # Real residues 0-1: peak at bin 0 (low pAE).  Padding residues 2-3: peak at last bin (high pAE).
+    logits[..., :2, :2, 0] = 50.0
+    logits[..., 2:, :, -1] = 50.0
+    logits[..., :, 2:, -1] = 50.0
+    mask = torch.zeros(B, N)
+    mask[..., :2] = 1.0
+    mean_pae = compute_mean_pae(logits, mask, max_dist=max_dist)
+    expected_center = 0.5 * max_dist / num_bins
+    assert math.isclose(float(mean_pae[0]), expected_center, abs_tol=1e-3), float(mean_pae[0])

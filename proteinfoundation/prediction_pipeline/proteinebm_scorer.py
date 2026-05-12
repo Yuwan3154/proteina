@@ -34,6 +34,7 @@ from protein_ebm.data.protein_utils import residues_to_features
 from protein_ebm.model.boltz_utils import center_random_augmentation
 from protein_ebm.model.ebm import ProteinEBM
 from protein_ebm.model.r3_diffuser import R3Diffuser
+from protein_ebm.model.loss import compute_ptm
 
 from proteinfoundation.prediction_pipeline.cif_chain_mapping import (
     resolve_biopython_chain_for_structure,
@@ -89,13 +90,37 @@ def _check_model_weights(model: torch.nn.Module) -> None:
     print(f"Model weight check: {n_params} params,  nan_params={n_nan}  inf_params={n_inf}", flush=True)
 
 
-def load_proteinebm_model(config_path: str, checkpoint_path: str, device: torch.device) -> Tuple[ProteinEBM, ConfigDict]:
+def load_proteinebm_model(config_path: str, checkpoint_path: str, device: torch.device) -> Tuple[torch.nn.Module, ConfigDict]:
+    """Load ProteinEBM with optional PAE/pTM head.
+
+    Auto-detects model type from the config file:
+    - If the config has a ``regression_head`` section (e.g. ``pae_config.yaml``),
+      loads ``ProteinRegressionTrainer`` which adds a PAE head on top of a frozen
+      EBM backbone. Forward returns ``(out, energy_pred, pae_logits, _, _)``.
+    - Otherwise loads the legacy ``ProteinEBM`` directly. Forward via
+      ``model.compute_energy(feats)`` returns ``out`` only.
+
+    Use ``is_regression_model(model)`` to branch on the model type downstream.
+    """
     config_path = os.path.abspath(os.path.expanduser(config_path))
     checkpoint_path = os.path.abspath(os.path.expanduser(checkpoint_path))
 
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
     config = ConfigDict(config)
+
+    if "regression_head" in config:
+        from protein_ebm.model.heads import ProteinRegressionTrainer
+        # weights_only=False: checkpoint contains a saved ml_collections.ConfigDict
+        # which the default safe-pickle path rejects. Trusted local file.
+        model = ProteinRegressionTrainer.load_from_checkpoint(
+            checkpoint_path,
+            config=config,
+            ebm_checkpoint_path=None,
+            map_location=device,
+            weights_only=False,
+        ).to(device).eval()
+        return model, config
 
     diffuser = R3Diffuser(config.diffuser)
     model = ProteinEBM(config.model, diffuser).to(device)
@@ -106,6 +131,38 @@ def load_proteinebm_model(config_path: str, checkpoint_path: str, device: torch.
     model.eval()
 
     return model, config
+
+
+def is_regression_model(model: torch.nn.Module) -> bool:
+    """Return True if ``model`` is a ProteinRegressionTrainer (has a PAE head)."""
+    return hasattr(model, "ebm") and hasattr(model, "pae_head")
+
+
+def get_ebm(model: torch.nn.Module) -> ProteinEBM:
+    """Return the underlying ProteinEBM backbone (handles wrapped + bare cases)."""
+    return model.ebm if is_regression_model(model) else model
+
+
+def compute_mean_pae(logits: torch.Tensor, mask: torch.Tensor, max_dist: float = 32.0) -> torch.Tensor:
+    """Expected pAE averaged over all valid residue pairs (i, j).
+
+    Parameters
+    ----------
+    logits : [B, N, N, num_bins]   PAE bin logits (output of the PAE head).
+    mask   : [B, N]                Residue validity mask (1 = real, 0 = pad).
+    max_dist : float               Upper bound matching the PAE loss binning.
+
+    Returns
+    -------
+    mean_pae : [B]   Average expected pAE (Å) over valid (i, j) pairs.
+    """
+    num_bins = logits.shape[-1]
+    bin_width = max_dist / num_bins
+    bin_centers = torch.arange(0.5 * bin_width, max_dist, bin_width, device=logits.device)
+    probs = torch.softmax(logits, dim=-1)                     # [B, N, N, num_bins]
+    expected = (probs * bin_centers).sum(dim=-1)              # [B, N, N]
+    pair_mask = mask.unsqueeze(2) * mask.unsqueeze(1)         # [B, N, N]
+    return (expected * pair_mask).sum(dim=(1, 2)) / (pair_mask.sum(dim=(1, 2)) + 1e-5)
 
 
 def _pdb_to_chain_residues(pdb_path: str):
@@ -368,7 +425,7 @@ def plot_proteinebm_results(results: List[Dict[str, object]], output_dir: str, p
 
 def build_input_feats_from_pdb(
     pdb_path: str,
-    model: ProteinEBM,
+    model: torch.nn.Module,
     t: float,
     template_self_condition: bool,
     device: torch.device,
@@ -386,7 +443,7 @@ def build_input_feats_from_pdb(
     chain_encoding = torch.zeros((1, n_res), dtype=torch.long, device=device)
     external_contacts = torch.zeros((1, n_res), dtype=torch.long, device=device)
 
-    if model.diffuse_sidechain:
+    if get_ebm(model).diffuse_sidechain:
         # Flatten atom37 -> augment -> reshape to [B, N, 37*3]
         flat_coords = atom_positions.reshape(1, n_res * 37, 3)
         flat_mask = atom_mask.reshape(1, n_res * 37)
@@ -420,13 +477,34 @@ def build_input_feats_from_pdb(
     return input_feats
 
 
+def _forward_model(model: torch.nn.Module, feats: Dict[str, torch.Tensor]):
+    """Run the model forward and return (energy_tensor, pae_logits_or_None).
+
+    Both legacy ``ProteinEBM`` and ``ProteinRegressionTrainer`` are supported.
+    """
+    if is_regression_model(model):
+        out, _, pae_logits, _, _ = model(feats)
+        return out["energy"], pae_logits
+    out = model.compute_energy(feats)
+    return out["energy"], None
+
+
+def _pae_max_dist(model: torch.nn.Module, default: float = 32.0) -> float:
+    """Return the model's pae_max_dist, falling back to the default for legacy models."""
+    return float(getattr(model, "pae_max_dist", default))
+
+
 def score_decoy_pdb(
     pdb_path: str,
-    model: ProteinEBM,
+    model: torch.nn.Module,
     t: float,
     template_self_condition: bool,
     device: torch.device,
-) -> float:
+) -> Tuple[float, float, float]:
+    """Score a single decoy. Returns (energy, ptm, mean_pae).
+
+    pTM and mean_pae are NaN if the model lacks a PAE head (legacy ``ProteinEBM``).
+    """
     input_feats = build_input_feats_from_pdb(
         pdb_path=pdb_path,
         model=model,
@@ -436,20 +514,26 @@ def score_decoy_pdb(
     )
 
     with torch.no_grad():
-        out = model.compute_energy(input_feats)
-    return float(out["energy"].detach().cpu().item())
+        energy_t, pae_logits = _forward_model(model, input_feats)
+    energy = float(energy_t.detach().cpu().item())
+    if pae_logits is None:
+        return energy, float("nan"), float("nan")
+    max_dist = _pae_max_dist(model)
+    ptm = float(compute_ptm(pae_logits, input_feats["mask"], max_dist=max_dist).detach().cpu().item())
+    mean_pae = float(compute_mean_pae(pae_logits, input_feats["mask"], max_dist=max_dist).detach().cpu().item())
+    return energy, ptm, mean_pae
 
 
 def score_decoy_pdbs_batched(
     pdb_paths: List[str],
-    model: ProteinEBM,
+    model: torch.nn.Module,
     t: float,
     template_self_condition: bool,
     device: torch.device,
     batch_size: int = 32,
     batch_size_ref: "List[int] | None" = None,
     verbose: bool = False,
-) -> Dict[int, float]:
+) -> Dict[int, Dict[str, float]]:
     """Score multiple decoy PDBs using batched inference.
 
     All PDBs should have the same residue count (true for decoys of one protein).
@@ -462,11 +546,18 @@ def score_decoy_pdbs_batched(
             because memory consumption is monotonic with protein length.
 
     Returns:
-        Dict mapping pdb_path index -> energy.
+        Dict mapping pdb_path index -> {"energy": float, "ptm": float, "mean_pae": float}.
+        ``ptm`` and ``mean_pae`` are NaN when the model lacks a PAE head.
     """
+    has_pae_head = is_regression_model(model)
+    max_dist = _pae_max_dist(model) if has_pae_head else 32.0
     # Phase 1: Build per-PDB features (sequential PDB parsing)
     feats_list: List[Tuple[int, Dict[str, torch.Tensor]]] = []
-    results: Dict[int, float] = {}
+    results: Dict[int, Dict[str, float]] = {}
+
+    def _record(idx: int, energy: float, ptm: float = float("nan"), mean_pae: float = float("nan")) -> None:
+        results[idx] = {"energy": energy, "ptm": ptm, "mean_pae": mean_pae}
+
     for i, pdb_path in enumerate(pdb_paths):
         try:
             feats = build_input_feats_from_pdb(pdb_path, model, t, template_self_condition, device)
@@ -498,8 +589,14 @@ def score_decoy_pdbs_batched(
             for idx, feats in chunk:
                 try:
                     with torch.no_grad():
-                        out = model.compute_energy(feats)
-                    results[idx] = float(out["energy"].detach().cpu().item())
+                        energy_t, pae_logits = _forward_model(model, feats)
+                    energy = float(energy_t.detach().cpu().item())
+                    if pae_logits is not None:
+                        ptm = float(compute_ptm(pae_logits, feats["mask"], max_dist=max_dist).detach().cpu().item())
+                        mean_pae = float(compute_mean_pae(pae_logits, feats["mask"], max_dist=max_dist).detach().cpu().item())
+                        _record(idx, energy, ptm, mean_pae)
+                    else:
+                        _record(idx, energy)
                 except Exception as e:
                     print(f"  Warning: scoring failed for index {idx}: {e}", flush=True)
             continue
@@ -511,11 +608,21 @@ def score_decoy_pdbs_batched(
                 batched[key] = torch.cat([feats[key] for _, feats in chunk], dim=0)
 
             with torch.no_grad():
-                out = model.compute_energy(batched)
+                energy_t, pae_logits = _forward_model(model, batched)
 
-            energies = out["energy"].detach().cpu()
+            energies = energy_t.detach().cpu()
+            if pae_logits is not None:
+                ptms = compute_ptm(pae_logits, batched["mask"], max_dist=max_dist).detach().cpu()
+                mean_paes = compute_mean_pae(pae_logits, batched["mask"], max_dist=max_dist).detach().cpu()
+            else:
+                ptms = None
+                mean_paes = None
             for j, idx in enumerate(indices):
-                results[idx] = float(energies[j].item())
+                if ptms is not None:
+                    _record(idx, float(energies[j].item()), float(ptms[j].item()), float(mean_paes[j].item()))
+                else:
+                    _record(idx, float(energies[j].item()))
+            out = {"energy": energy_t}  # kept for the diagnostic block below
 
             # --- Diagnostic: print energy stats for this batch (verbose only) ---
             e_arr = energies.float().numpy()
@@ -556,7 +663,7 @@ def score_decoy_pdbs_batched(
                     for key, val in single.items():
                         print(f"    {key}: {_tensor_stats(key, val)}", flush=True)
                     with torch.no_grad():
-                        model.compute_energy(single)
+                        _forward_model(model, single)
                 finally:
                     for h in hooks:
                         h.remove()
@@ -633,14 +740,16 @@ def run_proteinebm_scoring_for_protein(
     for i, pdb_path in enumerate(pdb_files):
         if i not in energy_map:
             continue
-        energy = energy_map[i]
+        row = energy_map[i]
         results.append(
             {
                 "protein_id": protein_id,
                 "structure_file": pdb_path.name,
                 "structure_path": str(pdb_path),
                 "t": t,
-                "energy": energy,
+                "energy": row["energy"],
+                "ptm": row.get("ptm", float("nan")),
+                "mean_pae": row.get("mean_pae", float("nan")),
             }
         )
 
@@ -648,7 +757,7 @@ def run_proteinebm_scoring_for_protein(
     with open(scores_csv_path, "w", newline="") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["protein_id", "structure_file", "structure_path", "t", "energy"],
+            fieldnames=["protein_id", "structure_file", "structure_path", "t", "energy", "ptm", "mean_pae"],
         )
         writer.writeheader()
         writer.writerows(results)

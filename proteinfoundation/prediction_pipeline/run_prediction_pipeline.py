@@ -540,6 +540,8 @@ def step_collect_results(
                 "best_ptm": float("nan"),
                 "best_plddt": float("nan"),
                 "best_energy": float("nan"),
+                "best_proteinebm_ptm": float("nan"),
+                "best_proteinebm_mean_pae": float("nan"),
                 "best_template": "",
                 "best_prediction": "",
                 "passes_cutoff": False,
@@ -555,9 +557,13 @@ def step_collect_results(
         )
         merged["min_ptm"] = merged[["ptm_m1", "ptm_m2"]].min(axis=1)
 
-        # Also get energy from ProteinEBM scores
+        # Also get energy / ProteinEBM pTM / ProteinEBM mean pAE from ProteinEBM scores
         ebm_csv = protein_dir / proteinebm_analysis_subdir / f"proteinebm_scores_{protein_id}.csv"
-        energy_map = {}
+        energy_map: dict = {}
+        proteinebm_ptm_map: dict = {}
+        proteinebm_mean_pae_map: dict = {}
+        proteinebm_best_ptm = float("nan")
+        proteinebm_best_mean_pae = float("nan")
         ebm_text = read_protein_text(
             inference_base,
             protein_id,
@@ -566,6 +572,22 @@ def step_collect_results(
         if ebm_text is not None:
             ebm_df = pd.read_csv(io.StringIO(ebm_text))
             energy_map = dict(zip(ebm_df["structure_file"].astype(str), ebm_df["energy"].astype(float)))
+            if "ptm" in ebm_df.columns:
+                proteinebm_ptm_map = dict(zip(
+                    ebm_df["structure_file"].astype(str),
+                    pd.to_numeric(ebm_df["ptm"], errors="coerce").astype(float),
+                ))
+                ptm_values_all = pd.to_numeric(ebm_df["ptm"], errors="coerce").dropna()
+                if len(ptm_values_all) > 0:
+                    proteinebm_best_ptm = float(ptm_values_all.max())
+            if "mean_pae" in ebm_df.columns:
+                proteinebm_mean_pae_map = dict(zip(
+                    ebm_df["structure_file"].astype(str),
+                    pd.to_numeric(ebm_df["mean_pae"], errors="coerce").astype(float),
+                ))
+                pae_values_all = pd.to_numeric(ebm_df["mean_pae"], errors="coerce").dropna()
+                if len(pae_values_all) > 0:
+                    proteinebm_best_mean_pae = float(pae_values_all.min())
 
         merged["energy"] = merged["structure_file"].map(energy_map).fillna(float("nan"))
 
@@ -577,6 +599,8 @@ def step_collect_results(
                 "best_ptm": float("nan"),
                 "best_plddt": float("nan"),
                 "best_energy": float("nan"),
+                "best_proteinebm_ptm": proteinebm_best_ptm,
+                "best_proteinebm_mean_pae": proteinebm_best_mean_pae,
                 "best_template": "",
                 "best_prediction": "",
                 "passes_cutoff": False,
@@ -642,6 +666,8 @@ def step_collect_results(
             "best_ptm": best_ptm,
             "best_plddt": best_plddt,
             "best_energy": best_energy,
+            "best_proteinebm_ptm": proteinebm_best_ptm,
+            "best_proteinebm_mean_pae": proteinebm_best_mean_pae,
             "best_template": os.path.basename(dest_template) if dest_template else "",
             "best_prediction": os.path.basename(dest_prediction) if dest_prediction else "",
             "passes_cutoff": passes,
@@ -653,7 +679,12 @@ def step_collect_results(
 
     # Write prediction_summary.csv
     summary_csv_path = os.path.join(output_dir, "prediction_summary.csv")
-    fieldnames = ["protein_id", "sequence_length", "num_generated", "best_ptm", "best_plddt", "best_energy", "best_template", "best_prediction", "passes_cutoff"]
+    fieldnames = [
+        "protein_id", "sequence_length", "num_generated",
+        "best_ptm", "best_plddt", "best_energy",
+        "best_proteinebm_ptm", "best_proteinebm_mean_pae",
+        "best_template", "best_prediction", "passes_cutoff",
+    ]
     with open(summary_csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -661,8 +692,26 @@ def step_collect_results(
     logger.info(f"Summary CSV written to {summary_csv_path}")
 
     # Write prediction_summary.json
-    ptm_values = [r["best_ptm"] for r in results if not (isinstance(r["best_ptm"], float) and math.isnan(r["best_ptm"]))]
+    def _finite(values: list) -> list:
+        return [v for v in values if not (isinstance(v, float) and math.isnan(v))]
+
+    ptm_values = _finite([r["best_ptm"] for r in results])
+    proteinebm_ptm_values = _finite([r.get("best_proteinebm_ptm", float("nan")) for r in results])
+    proteinebm_mean_pae_values = _finite([r.get("best_proteinebm_mean_pae", float("nan")) for r in results])
     num_passing = sum(1 for r in results if r["passes_cutoff"])
+
+    def _stats(values: list):
+        if not values:
+            return None
+        arr = np.asarray(values, dtype=float)
+        return {
+            "mean": float(np.mean(arr)),
+            "median": float(np.median(arr)),
+            "std": float(np.std(arr)),
+            "min": float(np.min(arr)),
+            "max": float(np.max(arr)),
+        }
+
     summary_json = {
         "total_proteins": len(results),
         "num_passing_cutoff": num_passing,
@@ -673,6 +722,8 @@ def step_collect_results(
         "ptm_std": float(np.std(ptm_values)) if ptm_values else None,
         "ptm_min": float(np.min(ptm_values)) if ptm_values else None,
         "ptm_max": float(np.max(ptm_values)) if ptm_values else None,
+        "proteinebm_ptm": _stats(proteinebm_ptm_values),
+        "proteinebm_mean_pae": _stats(proteinebm_mean_pae_values),
     }
 
     # Add analysis pairwise TM metrics if available
@@ -831,10 +882,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use_cuequivariance_multiplicative_update", action=argparse.BooleanOptionalAction, default=False,
                         help="Use cuEquivariance multiplicative update (openfold backend, default: False)")
     parser.add_argument("--recycles", type=int, default=3, help="AF2 recycles for AF2Rank (default: 3)")
-    parser.add_argument("--proteinebm_config", default="/home/ubuntu/ProteinEBM/protein_ebm/config/proteinebm_v2_cathmd_config.yaml",
-                        help="Path to ProteinEBM config YAML")
-    parser.add_argument("--proteinebm_checkpoint", default="/home/ubuntu/ProteinEBM/weights/proteinebm_v2_cathmd_weights.pt",
-                        help="Path to ProteinEBM checkpoint")
+    parser.add_argument("--proteinebm_config", default="/home/ubuntu/ProteinEBM/protein_ebm/config/pae_config.yaml",
+                        help="Path to ProteinEBM config YAML (default: pae_config.yaml — adds PAE head for pTM/mean_pae)")
+    parser.add_argument("--proteinebm_checkpoint", default="/home/ubuntu/ProteinEBM/weights/pae.ckpt",
+                        help="Path to ProteinEBM checkpoint (default: pae.ckpt — same EBM trunk as v2_cathmd, plus a PAE head)")
     parser.add_argument("--proteinebm_t", type=float, default=0.05, help="Diffusion time for ProteinEBM (default: 0.05)")
     parser.add_argument("--proteinebm_analysis_subdir", default="proteinebm_v2_cathmd_analysis",
                         help="Per-protein subdir for ProteinEBM outputs")

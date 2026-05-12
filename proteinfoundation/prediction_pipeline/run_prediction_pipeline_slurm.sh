@@ -37,12 +37,12 @@ cd /home/gridsan/cou/proteina
 #     --proteinebm_checkpoint /home/gridsan/cou/ProteinEBM/weights/proteinebm_v2_cathmd_weights.pt \
 #     --proteinebm_config /home/gridsan/cou/ProteinEBM/protein_ebm/config/proteinebm_v2_cathmd_config.yaml \
 #     --proteinebm_t 0.05 \
-#     --top_k 16 \
+#     --af2rank_top_k 16 \
 #     --no-use_deepspeed_evoformer_attention \
 #     --use_cuequivariance_attention \
 #     --use_cuequivariance_multiplicative_update \
-#     --force_compile \
-#     --backend openfold \
+#     --proteina_force_compile \
+#     --af2rank_backend openfold \
 #     --recycles 6 \
 #     --proteinebm_batch_size 16 \
 #     --direct_python \
@@ -58,12 +58,12 @@ python proteinfoundation/prediction_pipeline/run_prediction_pipeline.py \
     --proteinebm_checkpoint /home/gridsan/cou/ProteinEBM/weights/proteinebm_v2_cathmd_weights.pt \
     --proteinebm_config /home/gridsan/cou/ProteinEBM/protein_ebm/config/proteinebm_v2_cathmd_config.yaml \
     --proteinebm_t 0.05 \
-    --top_k 16 \
+    --af2rank_top_k 16 \
     --no-use_deepspeed_evoformer_attention \
     --use_cuequivariance_attention \
     --use_cuequivariance_multiplicative_update \
-    --force_compile \
-    --backend openfold \
+    --proteina_force_compile \
+    --af2rank_backend openfold \
     --recycles 6 \
     --proteinebm_batch_size 16 \
     --direct_python \

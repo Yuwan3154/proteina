@@ -38,14 +38,14 @@ python proteinfoundation/prediction_pipeline/run_prediction_pipeline.py \
     --proteinebm_config /home/gridsan/cou/ProteinEBM/protein_ebm/config/proteinebm_v2_cathmd_config.yaml \
     --proteinebm_t 0.05 \
     --skip_diversity \
-    --top_k 8 \
+    --af2rank_top_k 8 \
     --no-use_deepspeed_evoformer_attention \
     --use_cuequivariance_attention \
     --use_cuequivariance_multiplicative_update \
     --proteinebm_batch_size 16 \
     --recycles 6 \
-    --force_compile \
-    --backend openfold \
+    --proteina_force_compile \
+    --af2rank_backend openfold \
     --direct_python \
     --num_gpus 2 
 
@@ -61,13 +61,13 @@ python proteinfoundation/prediction_pipeline/run_prediction_pipeline.py \
     --proteinebm_config /home/gridsan/cou/ProteinEBM/protein_ebm/config/proteinebm_v2_cathmd_config.yaml \
     --proteinebm_t 0.05 \
     --skip_diversity \
-    --top_k 8 \
+    --af2rank_top_k 8 \
     --no-use_deepspeed_evoformer_attention \
     --use_cuequivariance_attention \
     --use_cuequivariance_multiplicative_update \
     --proteinebm_batch_size 16 \
     --recycles 6 \
-    --force_compile \
-    --backend openfold \
+    --proteina_force_compile \
+    --af2rank_backend openfold \
     --direct_python \
     --num_gpus 2 

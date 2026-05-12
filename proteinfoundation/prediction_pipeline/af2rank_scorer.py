@@ -1024,7 +1024,7 @@ def rescale(a, amin=None, amax=None):
 def plot_metric(scores, x="ptm", y="composite", 
                 title=None, diag=False, scale_axis=True, 
                 save_path=None, **kwargs):
-    """Create a comprehensive AF2Rank analysis plot following af2rank_cli.py approach."""
+    """Create a comprehensive AF2Rank analysis plot comprehensive AF2Rank plot."""
     
     plt.figure(figsize=(8, 6), dpi=100)
     if title is not None: 
@@ -1100,7 +1100,7 @@ def plot_metric(scores, x="ptm", y="composite",
 
 
 def plot_af2rank_results(scores: List[Dict], output_dir: str, protein_id: str):
-    """Generate comprehensive AF2Rank analysis plots following af2rank_cli.py approach."""
+    """Generate comprehensive AF2Rank analysis plots comprehensive AF2Rank plot."""
     
     # Generate plots focused on AF2Rank analysis (AF2 confidence vs structural quality)
     plot_configs = [

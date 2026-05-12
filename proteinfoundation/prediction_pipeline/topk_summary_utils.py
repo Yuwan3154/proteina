@@ -1,18 +1,21 @@
 """
 Shared utilities for generating the per-protein AF2Rank top-k summary CSV.
 
-Used by both:
-  - prediction_pipeline/run_af2rank_prediction.py  (no ground truth)
-  - prediction_pipeline/run_af2rank_on_proteinebm_topk.py  (with ground truth)
+Used by prediction_pipeline/run_af2rank_prediction.py (ground-truth optional,
+controlled by --cif_dir).
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -219,6 +222,13 @@ def generate_topk_summary_csv(
     topk_df["template_file"] = topk_df["structure_path"].apply(lambda p: Path(str(p)).name)
     staged_filenames = set(topk_df["template_file"].astype(str))
 
+    # Rename ProteinEBM-side ptm/mean_pae before joining with AF2Rank scores,
+    # which also have a ``ptm`` column — keep both signals side-by-side.
+    if "ptm" in topk_df.columns:
+        topk_df = topk_df.rename(columns={"ptm": "proteinebm_ptm"})
+    if "mean_pae" in topk_df.columns:
+        topk_df = topk_df.rename(columns={"mean_pae": "proteinebm_mean_pae"})
+
     # ── Merge AF2Rank metrics per template ──────────────────────────────────
     metric_cols = [
         "structure_file",
@@ -292,6 +302,8 @@ def generate_topk_summary_csv(
         "structure_path",
         "cg2all_path",
         "energy",
+        "proteinebm_ptm",
+        "proteinebm_mean_pae",
         "cg2all_rmsd_to_original",
         "cg2all_tm_to_original",
         "m1_tm_ref_template",
@@ -316,12 +328,60 @@ def generate_topk_summary_csv(
     merged.to_csv(out_path, index=False)
     logger.info(f"{protein_id}: wrote {len(merged)}-row topk summary to {out_path}")
 
+    # ── Per-protein scatter: ProteinEBM pTM vs AF2Rank pTM (min across m1/m2) ─
+    _plot_proteinebm_vs_af2rank_ptm(merged, out_dir, protein_id)
+
     # ── Write protein-level summary JSON ────────────────────────────────────
     summary = {"protein_id": protein_id, "n_templates": len(merged)}
     summary.update({f"m1_{k}": v for k, v in m1_agg.items()})
     summary.update({f"m2_{k}": v for k, v in m2_agg.items()})
     summary.update({f"min_{k}": v for k, v in min_agg.items()})
+    # Add ProteinEBM best metrics (best across top-k templates)
+    if "proteinebm_ptm" in merged.columns:
+        ptm_values = pd.to_numeric(merged["proteinebm_ptm"], errors="coerce").dropna()
+        summary["proteinebm_best_ptm"] = float(ptm_values.max()) if len(ptm_values) > 0 else None
+    if "proteinebm_mean_pae" in merged.columns:
+        pae_values = pd.to_numeric(merged["proteinebm_mean_pae"], errors="coerce").dropna()
+        summary["proteinebm_best_mean_pae"] = float(pae_values.min()) if len(pae_values) > 0 else None
     json_path = out_dir / f"af2rank_topk_protein_summary_{protein_id}.json"
     with open(json_path, "w") as f:
         json.dump(summary, f, indent=2)
     logger.info(f"{protein_id}: wrote protein-level summary to {json_path}")
+
+
+def _plot_proteinebm_vs_af2rank_ptm(merged: pd.DataFrame, out_dir: Path, protein_id: str) -> None:
+    """Per-protein scatter of ProteinEBM pTM vs AF2Rank pTM (min across m1/m2).
+
+    One dot per top-k template. Writes ``af2rank_topk_{id}_proteinebm_ptm_vs_af2rank_ptm.png``
+    in ``out_dir`` (the ``af2rank_on_proteinebm_top_k/`` directory). Skipped when either
+    column is absent or fully NaN.
+    """
+    if "proteinebm_ptm" not in merged.columns or "min_ptm" not in merged.columns:
+        return
+    proteinebm_ptm = pd.to_numeric(merged["proteinebm_ptm"], errors="coerce").to_numpy()
+    af2rank_ptm = pd.to_numeric(merged["min_ptm"], errors="coerce").to_numpy()
+    mask = (~np.isnan(proteinebm_ptm)) & (~np.isnan(af2rank_ptm))
+    if mask.sum() < 1:
+        return
+
+    out_path = out_dir / f"af2rank_topk_{protein_id}_proteinebm_ptm_vs_af2rank_ptm.png"
+    fig, ax = plt.subplots(figsize=(7, 7), dpi=120)
+    ax.scatter(proteinebm_ptm[mask], af2rank_ptm[mask], s=40, alpha=0.7, edgecolors="black", linewidths=0.5)
+    lo = float(min(proteinebm_ptm[mask].min(), af2rank_ptm[mask].min(), 0.0))
+    hi = float(max(proteinebm_ptm[mask].max(), af2rank_ptm[mask].max(), 1.0))
+    ax.plot([lo, hi], [lo, hi], color="black", linestyle="--", alpha=0.5, label="y = x")
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    ax.set_xlabel("ProteinEBM pTM")
+    ax.set_ylabel("AF2Rank pTM (min across m1, m2)")
+    title_extra = ""
+    if mask.sum() >= 2:
+        r = float(np.corrcoef(proteinebm_ptm[mask], af2rank_ptm[mask])[0, 1])
+        title_extra = f" | Pearson R = {r:.3f}"
+    ax.set_title(f"ProteinEBM vs AF2Rank pTM on top-k\n{protein_id} (n={int(mask.sum())}){title_extra}")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper left", fontsize=10)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"{protein_id}: wrote {out_path.name}")
