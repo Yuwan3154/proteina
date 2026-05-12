@@ -38,7 +38,7 @@ import os
 import time
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import torch
 from omegaconf import OmegaConf
@@ -52,6 +52,36 @@ def _iter_processed_files(processed_dir: Path) -> Iterable[Path]:
     for name in os.listdir(processed_dir):
         if name.endswith(".pt"):
             yield processed_dir / name
+
+
+def _read_skip_csv(path: Path) -> Tuple[Set[str], List[Dict[str, str]]]:
+    """Read a previous-run output CSV and return its filenames + raw rows.
+
+    Returns:
+        (skip_names, inherited_rows)
+        - skip_names: set of ``file`` values to filter out before dispatch.
+        - inherited_rows: list of full row dicts in original order. Written
+          verbatim to the head of a fresh output CSV so the new CSV is a
+          strict superset of the input (chains across SLURM allocations).
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"--skip-from-csv path not found: {path}")
+    names: Set[str] = set()
+    rows: List[Dict[str, str]] = []
+    with open(path, "r", newline="") as fh:
+        reader = csv.DictReader(fh)
+        if "file" not in (reader.fieldnames or []):
+            raise ValueError(
+                f"{path} is missing the 'file' column; "
+                "expected the dssp_precompute.csv format."
+            )
+        for row in reader:
+            fname = row.get("file")
+            if not fname:
+                continue
+            names.add(fname)
+            rows.append(row)
+    return names, rows
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +382,7 @@ def run_precompute(
     log_path: Optional[Path] = None,
     log_every: int = 200,
     log_every_sec: float = 60.0,
+    skip_from_csv: Optional[Path] = None,
 ) -> Dict:
     if workers is None:
         workers = int(os.getenv("SLURM_CPUS_PER_TASK") or os.cpu_count() or 1)
@@ -372,6 +403,16 @@ def run_precompute(
         log_path=log_path,
     )
 
+    skip_names: Set[str] = set()
+    inherited_rows: List[Dict[str, str]] = []
+    if skip_from_csv is not None:
+        skip_names, inherited_rows = _read_skip_csv(skip_from_csv)
+        _log_message(
+            f"Skip-from-csv: {skip_from_csv} -> {len(skip_names)} filenames to skip "
+            f"({len(inherited_rows)} rows inherited)",
+            log_path=log_path,
+        )
+
     files = list(_iter_processed_files(processed_dir))
     _log_message(f"Found {len(files)} .pt files", log_path=log_path)
 
@@ -383,15 +424,42 @@ def run_precompute(
         files = files[offset:]
     if limit and limit > 0:
         files = files[:limit]
+
+    if skip_names:
+        before = len(files)
+        files = [f for f in files if f.name not in skip_names]
+        _log_message(
+            f"After skip-from-csv: {len(files)} files ({before - len(files)} filtered)",
+            log_path=log_path,
+        )
     _log_message(f"Processing {len(files)} files", log_path=log_path)
 
-    # Open streaming CSV
+    # Open streaming CSV. When --skip-from-csv is given AND the output CSV is
+    # fresh (and is a *different* file from the skip CSV), copy the inherited
+    # rows in first so the new CSV is a strict superset and can be chained as
+    # the next allocation's skip list.
     output_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    fresh_output = (not output_csv_path.exists()) or output_csv_path.stat().st_size == 0
+    same_in_out = (
+        skip_from_csv is not None
+        and output_csv_path.exists()
+        and skip_from_csv.resolve() == output_csv_path.resolve()
+    )
+    need_inherit = bool(inherited_rows) and fresh_output and not same_in_out
+
     csv_handle = open(output_csv_path, "a", newline="")
     fieldnames = ["file", "status", "load_sec", "dssp_sec", "save_sec", "total_sec", "error"]
     csv_writer = csv.DictWriter(csv_handle, fieldnames=fieldnames, extrasaction="ignore")
-    if output_csv_path.stat().st_size == 0:
+    if fresh_output:
         csv_writer.writeheader()
+    if need_inherit:
+        for row in inherited_rows:
+            csv_writer.writerow(row)
+        csv_handle.flush()
+        _log_message(
+            f"Wrote {len(inherited_rows)} inherited rows into fresh {output_csv_path}",
+            log_path=log_path,
+        )
 
     def _write_row(result: Dict) -> None:
         csv_writer.writerow(result)
@@ -502,6 +570,14 @@ def main() -> None:
         default=60.0,
         help="Also log every N seconds.",
     )
+    parser.add_argument(
+        "--skip-from-csv",
+        default=None,
+        help="Previous run's progress CSV; every file listed there is skipped "
+             "this run. If the output CSV is fresh, it is initialized with all "
+             "rows from this CSV so the new CSV stays a strict superset and "
+             "can chain into the next allocation as --skip-from-csv.",
+    )
     args = parser.parse_args()
 
     if args.config is None and args.processed_dir is None:
@@ -533,6 +609,7 @@ def main() -> None:
         log_path=Path(args.log_path) if args.log_path else None,
         log_every=args.log_every,
         log_every_sec=args.log_every_sec,
+        skip_from_csv=Path(args.skip_from_csv) if args.skip_from_csv else None,
     )
 
 

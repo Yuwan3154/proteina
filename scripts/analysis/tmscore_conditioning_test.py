@@ -39,7 +39,7 @@ from proteinfoundation.proteinflow.proteina import Proteina
 from proteinfoundation.utils.coors_utils import trans_nm_to_atom37
 from proteinfoundation.utils.ff_utils.pdb_utils import write_prot_to_pdb
 from proteinfoundation.datasets.cath_utils import cath_code_strings_to_indices_for_model
-from proteinfoundation.af2rank_evaluation.proteinebm_scorer import tmscore_pdb_paths
+from proteinfoundation.prediction_pipeline.proteinebm_scorer import tmscore_pdb_paths
 
 
 # ---------------------------------------------------------------------------

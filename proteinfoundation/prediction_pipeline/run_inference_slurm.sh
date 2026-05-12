@@ -26,7 +26,7 @@ cd /home/gridsan/cou/proteina
 # Each array task runs on 1 node with 2 GPUs, processing its shard
 # of proteins sorted by length for balanced workload.
 # OOM errors automatically halve max_nsamples and retry.
-python af2rank_evaluation/parallel_proteina_inference.py \
+python proteinfoundation/prediction_pipeline/parallel_proteina_inference.py \
     --csv_file /home/gridsan/cou/data/bad_afdb/pdb_70_cluster_reps_aligned_confidence_aggregate_monomer_length_50-640_tm-05_cutoff-190828_in-train.csv \
     --csv_col pdb \
     --cif_dir /home/gridsan/cou/data/bad_afdb/pdb \

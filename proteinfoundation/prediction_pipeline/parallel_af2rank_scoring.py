@@ -65,7 +65,7 @@ def get_proteina_base_dir():
     # Try common locations
     possible_dirs = [
         os.path.expanduser('~/proteina'),
-        os.path.join(os.getcwd(), '..')  # Assume we're in af2rank_evaluation
+        os.path.join(os.getcwd(), '..')  # Assume we're in prediction_pipeline
     ]
     
     for dir_path in possible_dirs:
@@ -236,11 +236,11 @@ def run_af2rank_scoring(
 ):
     """Run AF2Rank scoring for a single protein."""
     if backend == "openfold":
-        wrapper_script = os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation', 'run_with_proteina_env.sh')
+        wrapper_script = os.path.join(PROTEINA_BASE_DIR, 'proteinfoundation', 'prediction_pipeline', 'run_with_proteina_env.sh')
         python_code = f"""
 import sys
 import os
-sys.path.append('{os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation')}')
+sys.path.append('{os.path.join(PROTEINA_BASE_DIR, 'proteinfoundation', 'prediction_pipeline')}')
 
 from af2rank_openfold_scorer import run_af2rank_analysis_openfold
 
@@ -274,11 +274,11 @@ else:
     sys.exit(1)
 """
     else:
-        wrapper_script = os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation', 'run_with_colabdesign_env.sh')
+        wrapper_script = os.path.join(PROTEINA_BASE_DIR, 'proteinfoundation', 'prediction_pipeline', 'run_with_colabdesign_env.sh')
         python_code = f"""
 import sys
 import os
-sys.path.append('{os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation')}')
+sys.path.append('{os.path.join(PROTEINA_BASE_DIR, 'proteinfoundation', 'prediction_pipeline')}')
 
 # Import AF2Rank components
 from af2rank_scorer import run_af2rank_analysis
@@ -321,7 +321,7 @@ else:
     # Don't capture output - let it stream to terminal for real-time progress and full error tracebacks
     result = subprocess.run(
         cmd,
-        cwd=os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation')
+        cwd=os.path.join(PROTEINA_BASE_DIR, 'proteinfoundation', 'prediction_pipeline')
     )
     return result
 
@@ -337,11 +337,11 @@ def run_af2rank_plot_only(
 ):
     """Regenerate plots only for existing AF2Rank scores and update summary."""
     if backend == "openfold":
-        wrapper_script = os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation', 'run_with_proteina_env.sh')
+        wrapper_script = os.path.join(PROTEINA_BASE_DIR, 'proteinfoundation', 'prediction_pipeline', 'run_with_proteina_env.sh')
         python_code = f"""
 import sys
 import os
-sys.path.append('{os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation')}')
+sys.path.append('{os.path.join(PROTEINA_BASE_DIR, 'proteinfoundation', 'prediction_pipeline')}')
 
 from af2rank_openfold_scorer import run_af2rank_plot_only_openfold
 
@@ -372,11 +372,11 @@ else:
     sys.exit(1)
 """
     else:
-        wrapper_script = os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation', 'run_with_colabdesign_env.sh')
+        wrapper_script = os.path.join(PROTEINA_BASE_DIR, 'proteinfoundation', 'prediction_pipeline', 'run_with_colabdesign_env.sh')
         python_code = f"""
 import sys
 import os
-sys.path.append('{os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation')}')
+sys.path.append('{os.path.join(PROTEINA_BASE_DIR, 'proteinfoundation', 'prediction_pipeline')}')
 
 # Import AF2Rank components
 from af2rank_scorer import run_af2rank_plot_only
@@ -410,7 +410,7 @@ else:
     cmd = [wrapper_script, 'python', '-u', '-c', python_code]
     result = subprocess.run(
         cmd,
-        cwd=os.path.join(PROTEINA_BASE_DIR, 'af2rank_evaluation'),
+        cwd=os.path.join(PROTEINA_BASE_DIR, 'proteinfoundation', 'prediction_pipeline'),
         capture_output=False,
         text=True
     )

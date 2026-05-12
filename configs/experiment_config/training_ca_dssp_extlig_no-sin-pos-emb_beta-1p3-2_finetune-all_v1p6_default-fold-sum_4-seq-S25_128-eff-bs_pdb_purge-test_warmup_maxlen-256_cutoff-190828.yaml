@@ -80,7 +80,7 @@ opt:
   max_epochs: 200
   batch_size: 8
   accumulate_grad_batches: 16
-  val_check_interval_optim_steps: 200  # counted in optim steps (= 200 * 16 = 3200 mini-batches); ~228 optim steps/epoch with this dataset so val fires ~once/epoch. DDP-safe: per-GPU mini-batch count = optim_steps * accumulate_grad_batches, independent of world size.
+  val_check_interval_optim_steps: 50  # counted in optim steps (= 200 * 16 = 3200 mini-batches); ~228 optim steps/epoch with this dataset so val fires ~once/epoch. DDP-safe: per-GPU mini-batch count = optim_steps * accumulate_grad_batches, independent of world size.
   skip_nan_grad: False
   grad_and_weight_analysis: False
   dist_strategy: ddp
@@ -95,17 +95,24 @@ log:
   wandb_project: protein_transformer_big_runs
   log_wandb: True
   log_every_n_steps: 1
-  log_structure_every_n_steps: 100
+  log_structure_every_n_steps: 50
   checkpoint: True
-  last_ckpt_every_n_steps: 500
+  last_ckpt_every_n_steps: 200
 
 validation_sampling:
   dt: 0.005
   sampling_mode: sc
   sc_scale_noise: 0.45
+  # NOTE: tmscore_n_samples counts BATCHES (not samples). 8 batches of val_batch_size
+  # = 8 samples each → 64 samples in the concatenated val trajectory. Each chunk then
+  # runs at training-batch memory (see tmscore_traj_chunk_size).
   tmscore_n_samples: 8
   tmscore_every_n_val_epochs: 1
   tmscore_mode: 5
+  # Cap the per-trajectory NN forward at training-batch memory. Defaults to
+  # opt.batch_size when omitted. With tmscore_n_samples=8 and batch_size=8, this
+  # turns one OOMing B=64 trajectory call into 8 successive B=8 calls.
+  tmscore_traj_chunk_size: 8
   # Prediction-eval semantics: use each val sample's real length (from its own mask),
   # not a random L drawn from dataselector bounds. Default would auto-enable when
   # dataselector exposes min/max length, which is wrong for prediction eval — and

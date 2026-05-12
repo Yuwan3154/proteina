@@ -21,14 +21,14 @@ from pathlib import Path
 
 from cg2all.lib.libconfig import MODEL_HOME
 
-# Import the shared downloader from the af2rank_evaluation module.
+# Import the shared downloader from the prediction_pipeline module.
 # Adjust the sys.path so this script can be run from any working directory.
 _script_dir = Path(__file__).resolve().parent
 _pkg_root = _script_dir.parent
 if str(_pkg_root) not in sys.path:
     sys.path.insert(0, str(_pkg_root))
 
-from proteinfoundation.af2rank_evaluation.cg2all_reconstruct import download_ckpt_file
+from proteinfoundation.prediction_pipeline.cg2all_reconstruct import download_ckpt_file
 
 # Models required by the proteina pipeline.
 MODELS_TO_DOWNLOAD = [

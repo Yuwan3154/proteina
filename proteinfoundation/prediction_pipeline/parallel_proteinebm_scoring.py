@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 from typing import Dict, List
 
-from proteinfoundation.af2rank_evaluation.sharding_utils import (
+from proteinfoundation.prediction_pipeline.sharding_utils import (
     add_shard_args,
     default_progress_check_workers,
     filter_proteins_threaded,
@@ -31,7 +31,7 @@ from proteinfoundation.af2rank_evaluation.sharding_utils import (
     resolve_shard_args,
     shard_proteins,
 )
-from proteinfoundation.af2rank_evaluation.protein_tar_utils import (
+from proteinfoundation.prediction_pipeline.protein_tar_utils import (
     pack_protein_dirs,
     protein_glob_members,
     read_protein_text,
@@ -67,7 +67,7 @@ def get_proteina_base_dir():
     """Auto-detect proteina base directory."""
     possible_dirs = [
         os.path.expanduser("~/proteina"),
-        os.path.join(os.getcwd(), ".."),  # Assume we're in af2rank_evaluation
+        os.path.join(os.getcwd(), ".."),  # Assume we're in prediction_pipeline
     ]
     for dir_path in possible_dirs:
         abs_path = os.path.abspath(dir_path)

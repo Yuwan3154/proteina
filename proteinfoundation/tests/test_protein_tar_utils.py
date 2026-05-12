@@ -4,7 +4,7 @@ import tarfile
 
 import pytest
 
-from proteinfoundation.af2rank_evaluation.protein_tar_utils import (
+from proteinfoundation.prediction_pipeline.protein_tar_utils import (
     ensure_protein_tar,
     list_protein_members,
     pack_protein_dir,
@@ -189,7 +189,7 @@ def test_relative_path_exists_streams_member_names(tmp_path):
 
 
 def test_inference_completeness_from_tar(tmp_path, monkeypatch):
-    from proteinfoundation.af2rank_evaluation import parallel_proteina_inference as mod
+    from proteinfoundation.prediction_pipeline import parallel_proteina_inference as mod
 
     root = tmp_path / "root"
     inference_dir = root / "inference" / "cfg"
@@ -212,7 +212,7 @@ def test_inference_completeness_from_tar(tmp_path, monkeypatch):
 
 
 def test_proteinebm_completeness_from_tar(tmp_path, monkeypatch):
-    from proteinfoundation.af2rank_evaluation import parallel_proteinebm_scoring as mod
+    from proteinfoundation.prediction_pipeline import parallel_proteinebm_scoring as mod
 
     root = tmp_path / "root"
     inference_dir = root / "inference" / "cfg"
@@ -257,7 +257,7 @@ def test_af2rank_topk_completeness_from_tar(tmp_path):
 
 
 def test_central_analysis_completeness_from_tar(tmp_path):
-    from proteinfoundation.af2rank_evaluation.proteina_analysis import analysis_complete_in_tar_or_dir
+    from proteinfoundation.prediction_pipeline.proteina_analysis import analysis_complete_in_tar_or_dir
 
     protein_id = "protein_A"
     protein_dir = tmp_path / protein_id

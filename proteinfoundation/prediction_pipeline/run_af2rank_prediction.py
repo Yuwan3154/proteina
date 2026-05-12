@@ -37,7 +37,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import torch
 
-from proteinfoundation.af2rank_evaluation.sharding_utils import (
+from proteinfoundation.prediction_pipeline.sharding_utils import (
     add_shard_args,
     default_progress_check_workers,
     filter_proteins_threaded,
@@ -45,7 +45,7 @@ from proteinfoundation.af2rank_evaluation.sharding_utils import (
     resolve_shard_args,
     shard_proteins,
 )
-from proteinfoundation.af2rank_evaluation.protein_tar_utils import (
+from proteinfoundation.prediction_pipeline.protein_tar_utils import (
     list_protein_members,
     pack_protein_dirs,
     read_protein_text,
@@ -175,7 +175,7 @@ def _batch_reconstruct_all_proteins(
     logger.info(
         f"Pre-reconstructing {len(all_ca_paths)} CA-only templates via cg2all ..."
     )
-    from proteinfoundation.af2rank_evaluation.af2rank_openfold_scorer import (
+    from proteinfoundation.prediction_pipeline.af2rank_openfold_scorer import (
         _get_cg2all_reconstructor,
     )
     reconstructor = _get_cg2all_reconstructor()
@@ -495,7 +495,7 @@ def main() -> None:
     logger.info(f"{len(protein_configs)} proteins to score")
 
     # ── Import scorer (requires proteina / openfold env) ────────────────────
-    from proteinfoundation.af2rank_evaluation.af2rank_openfold_scorer import OpenFoldAF2Rank
+    from proteinfoundation.prediction_pipeline.af2rank_openfold_scorer import OpenFoldAF2Rank
 
     # ── Pre-reconstruct CA-only templates ONCE (shared across both model passes)
     allatom_map = _batch_reconstruct_all_proteins(protein_configs)
@@ -537,7 +537,7 @@ def main() -> None:
     )
 
     # ── Generate per-protein summary CSVs ────────────────────────────────────
-    from proteinfoundation.af2rank_evaluation.topk_summary_utils import generate_topk_summary_csv
+    from proteinfoundation.prediction_pipeline.topk_summary_utils import generate_topk_summary_csv
 
     for cfg in protein_configs:
         protein_id = cfg["protein_id"]

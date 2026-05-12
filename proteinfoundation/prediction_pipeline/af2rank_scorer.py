@@ -49,8 +49,8 @@ from colabdesign.af.alphafold.common import residue_constants
 from loguru import logger
 from tqdm import tqdm
 
-from proteinfoundation.af2rank_evaluation.cif_chain_mapping import resolve_biopython_chain_for_structure
-from proteinfoundation.af2rank_evaluation.usalign_tabular import parse_usalign_pair_outfmt2
+from proteinfoundation.prediction_pipeline.cif_chain_mapping import resolve_biopython_chain_for_structure
+from proteinfoundation.prediction_pipeline.usalign_tabular import parse_usalign_pair_outfmt2
 from scipy.stats import spearmanr
 
 

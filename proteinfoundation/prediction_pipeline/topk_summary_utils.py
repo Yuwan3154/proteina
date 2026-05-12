@@ -3,7 +3,7 @@ Shared utilities for generating the per-protein AF2Rank top-k summary CSV.
 
 Used by both:
   - prediction_pipeline/run_af2rank_prediction.py  (no ground truth)
-  - af2rank_evaluation/run_af2rank_on_proteinebm_topk.py  (with ground truth)
+  - prediction_pipeline/run_af2rank_on_proteinebm_topk.py  (with ground truth)
 """
 
 from __future__ import annotations
@@ -75,7 +75,7 @@ def _compute_cg2all_metrics(orig_ca_path: str, allatom_path: str) -> Dict[str, f
 
     # TM-score via USalign (falls back to 0.0 if USalign not in PATH)
     try:
-        from proteinfoundation.af2rank_evaluation.af2rank_openfold_scorer import tmscore
+        from proteinfoundation.prediction_pipeline.af2rank_openfold_scorer import tmscore
         tm_out = tmscore(orig_ca, recon_ca)
         result["cg2all_tm_to_original"] = float(tm_out.get("tms", nan))
     except Exception as e:

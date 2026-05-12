@@ -430,7 +430,7 @@ def benchmark_featurization(infer: OpenFoldTemplateInference, seq_len: int = 50,
     if not getattr(infer, "skip_template_alignment", False):
         p("    WARNING: infer.skip_template_alignment is False; full_template path will call kalign")
     try:
-        from proteinfoundation.af2rank_evaluation.af2rank_openfold_scorer import convert_pdb_to_cif
+        from proteinfoundation.prediction_pipeline.af2rank_openfold_scorer import convert_pdb_to_cif
         pdb_path = _make_synthetic_allatom_pdb(seq_len)
         cif_path = convert_pdb_to_cif(pdb_path, chain_id="A")
 

@@ -28,7 +28,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from loguru import logger
 
-from proteinfoundation.af2rank_evaluation.protein_tar_utils import protein_glob_members, read_protein_text
+from proteinfoundation.prediction_pipeline.protein_tar_utils import protein_glob_members, read_protein_text
 
 
 TAR_REF_PREFIX = "tar://"
@@ -1446,8 +1446,8 @@ def load_diversity_summary_data(inference_dir: str, protein_ids: List[str] | Non
     Columns: protein_id, mean_tem_to_tem_tm, std_tem_to_tem_tm, median_tem_to_tem_tm,
              min_tem_to_tem_tm, max_tem_to_tem_tm, n_samples, n_pairs
     """
-    from proteinfoundation.af2rank_evaluation.proteina_analysis import find_analysis_summaries
-    from proteinfoundation.af2rank_evaluation.proteina_diversity import find_diversity_summaries
+    from proteinfoundation.prediction_pipeline.proteina_analysis import find_analysis_summaries
+    from proteinfoundation.prediction_pipeline.proteina_diversity import find_diversity_summaries
 
     summary_files = find_diversity_summaries(inference_dir, subdir)
     summary_files += find_analysis_summaries(inference_dir, "proteina_analysis")

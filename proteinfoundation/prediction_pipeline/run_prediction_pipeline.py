@@ -1,25 +1,37 @@
 #!/usr/bin/env python3
 """
-Prediction Pipeline (No Ground-Truth)
+Prediction Pipeline (unified prediction + evaluation driver).
 
-Given protein sequences (CSV or FASTA), this pipeline:
-1. Creates PT files from sequences
-2. Runs Proteina inference (structure generation)
-3. Scores with ProteinEBM (energy-based ranking)
-4. Refines top-k with AF2Rank (pTM-based quality)
-5. Collects best predictions and generates summary
-6. Plots pTM distribution across all proteins
+Given either a sequence file (CSV/FASTA via --input) or a dataset CSV with
+pre-existing PT files (--dataset_file), this pipeline:
 
-Usage:
+  1. (optional) Parses sequences and creates PT files   -- --input mode only
+  2. Runs Proteina inference (structure generation)
+  3. Scores with ProteinEBM (energy) OR AF2Rank, per --scorer
+  4. Optionally refines ProteinEBM top-k with AF2Rank (run_af2rank_prediction.py)
+  5. Runs central per-protein analysis (proteina_analysis.py)
+  6. Collects best predictions and writes prediction_summary.{csv,json}
+  7. Generates cross-protein plots (only when --cif_dir is supplied)
+  8. Plots the pTM distribution histogram
+
+Ground-truth analysis turns on when --cif_dir is supplied. Without --cif_dir
+the pipeline runs in pure prediction mode: no GT comparisons, no cross-protein
+plots.
+
+Usage (prediction mode, no GT):
     python run_prediction_pipeline.py \\
-        --input sequences.fasta \\
-        --inference_config config_name \\
-        --output_dir /path/to/output \\
-        --num_gpus 4
+        --input sequences.fasta --inference_config <config> \\
+        --output_dir /path/to/output --num_gpus 4
 
-Shared flags with run_full_pipeline.py include --af2rank_backend, --af2rank_top_k, --proteina_force_compile,
---proteinebm_batch_size, --proteinebm_template_self_condition, --af2rank_topk_filter_existing, and sharding options.
-The AF2Rank refinement step uses OpenFold only (run_af2rank_prediction.py); only --af2rank_backend openfold is effective.
+Usage (evaluation mode, with GT):
+    python run_prediction_pipeline.py \\
+        --dataset_file data.csv --id_col pdb \\
+        --cif_dir /path/to/cif --tms_col tms_single \\
+        --inference_config <config> --output_dir /path/to/output --num_gpus 4
+
+The AF2Rank top-k refinement step (run_af2rank_prediction.py) is OpenFold-only;
+--af2rank_backend is honoured by the dedicated AF2Rank scoring step
+(parallel_af2rank_scoring.py) when --scorer=af2rank.
 """
 
 import argparse
@@ -42,8 +54,8 @@ import numpy as np
 import pandas as pd
 import torch
 
-from proteinfoundation.af2rank_evaluation.pipeline_cli_utils import parallel_incremental_filter_args
-from proteinfoundation.af2rank_evaluation.sharding_utils import (
+from proteinfoundation.prediction_pipeline.pipeline_cli_utils import parallel_incremental_filter_args
+from proteinfoundation.prediction_pipeline.sharding_utils import (
     add_shard_args,
     build_shard_cli_args,
     lengths_from_csv,
@@ -52,7 +64,7 @@ from proteinfoundation.af2rank_evaluation.sharding_utils import (
     wait_for_completion,
     wait_for_step,
 )
-from proteinfoundation.af2rank_evaluation.protein_tar_utils import (
+from proteinfoundation.prediction_pipeline.protein_tar_utils import (
     ensure_protein_tar,
     pack_protein_dirs,
     protein_glob_members,
@@ -68,10 +80,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-import proteinfoundation.af2rank_evaluation as _pf_af2rank
+import proteinfoundation.prediction_pipeline as _pf_pp
 
-# af2rank_evaluation lives inside the installed proteinfoundation package
-AF2RANK_EVAL_DIR = os.path.dirname(_pf_af2rank.__file__)
+# prediction_pipeline lives inside the installed proteinfoundation package
+PRED_PIPELINE_DIR = os.path.dirname(_pf_pp.__file__)
 # Assume the script is always run from the proteina root directory
 PROTEINA_BASE_DIR = os.getcwd()
 
@@ -113,9 +125,9 @@ def run_with_conda_env(env_name: str, command_list: list, cwd: str | None = None
             return False
 
     wrapper_map = {
-        "proteina": os.path.join(AF2RANK_EVAL_DIR, "run_with_proteina_env.sh"),
-        "colabdesign": os.path.join(AF2RANK_EVAL_DIR, "run_with_colabdesign_env.sh"),
-        "proteinebm": os.path.join(AF2RANK_EVAL_DIR, "run_with_proteinebm_env.sh"),
+        "proteina": os.path.join(PRED_PIPELINE_DIR, "run_with_proteina_env.sh"),
+        "colabdesign": os.path.join(PRED_PIPELINE_DIR, "run_with_colabdesign_env.sh"),
+        "proteinebm": os.path.join(PRED_PIPELINE_DIR, "run_with_proteinebm_env.sh"),
     }
     wrapper_script = wrapper_map.get(env_name)
     if not wrapper_script or not os.path.exists(wrapper_script):
@@ -146,9 +158,13 @@ def step_parse_input(input_file: str, id_col: str, sequence_col: str, output_dir
 # ── Step 2: Proteina inference ────────────────────────────────────────────────
 
 def step_proteina_inference(
-    working_csv: str,
+    csv_file: str,
+    csv_col: str,
     inference_config: str,
     num_gpus: int,
+    cif_dir: str | None = None,
+    skip_pt_conversion: bool = True,
+    usalign_path: str | None = None,
     proteina_force_compile: bool = True,
     shard_args: list | None = None,
     direct_python: bool = False,
@@ -157,16 +173,30 @@ def step_proteina_inference(
     dynamic_resharding: bool = True,
     progress_check_workers: int | None = None,
 ) -> bool:
-    """Run Proteina inference on all proteins."""
+    """Run Proteina inference on all proteins.
+
+    When skip_pt_conversion=True (default), PT files are assumed to already
+    exist in DATA_PATH/pdb_train/processed/. This is the --input mode flow.
+    When skip_pt_conversion=False, --cif_dir is required and the inference
+    script converts CIF → PT before inference.
+    """
     logger.info("Starting Proteina inference...")
     cmd = [
-        "python", os.path.join(AF2RANK_EVAL_DIR, "parallel_proteina_inference.py"),
-        "--csv_file", working_csv,
-        "--csv_col", "id",
+        "python", os.path.join(PRED_PIPELINE_DIR, "parallel_proteina_inference.py"),
+        "--csv_file", csv_file,
+        "--csv_col", csv_col,
         "--inference_config", inference_config,
         "--num_gpus", str(num_gpus),
-        "--skip_pt_conversion",
     ]
+    if skip_pt_conversion:
+        cmd.append("--skip_pt_conversion")
+    else:
+        if not cif_dir:
+            logger.error("step_proteina_inference: --cif_dir required when skip_pt_conversion=False")
+            return False
+        cmd.extend(["--cif_dir", cif_dir])
+    if usalign_path:
+        cmd.extend(["--usalign_path", usalign_path])
     if not rerun:
         cmd.append("--skip_existing")
     if proteina_force_compile:
@@ -181,11 +211,13 @@ def step_proteina_inference(
 # ── Step 3: ProteinEBM scoring ────────────────────────────────────────────────
 
 def step_proteinebm_scoring(
-    working_csv: str,
+    csv_file: str,
+    csv_col: str,
     inference_config: str,
     num_gpus: int,
     proteinebm_config: str,
     proteinebm_checkpoint: str,
+    cif_dir: str | None = None,
     proteinebm_t: float = 0.05,
     proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
     proteinebm_batch_size: int = 32,
@@ -198,12 +230,13 @@ def step_proteinebm_scoring(
     dynamic_resharding: bool = True,
     progress_check_workers: int | None = None,
 ) -> bool:
-    """Run ProteinEBM scoring (energy only, no ground-truth TM-score)."""
+    """Run ProteinEBM scoring. When cif_dir is given, ground-truth TM-score
+    columns are added to the per-protein scores CSVs."""
     logger.info("Starting ProteinEBM scoring...")
     cmd = [
-        "python", os.path.join(AF2RANK_EVAL_DIR, "parallel_proteinebm_scoring.py"),
-        "--csv_file", working_csv,
-        "--csv_col", "id",
+        "python", os.path.join(PRED_PIPELINE_DIR, "parallel_proteinebm_scoring.py"),
+        "--csv_file", csv_file,
+        "--csv_col", csv_col,
         "--inference_config", inference_config,
         "--num_gpus", str(num_gpus),
         *parallel_incremental_filter_args(not rerun),
@@ -212,8 +245,9 @@ def step_proteinebm_scoring(
         "--proteinebm_t", str(proteinebm_t),
         "--proteinebm_analysis_subdir", proteinebm_analysis_subdir,
         "--proteinebm_batch_size", str(proteinebm_batch_size),
-        # No --cif_dir: skips TM-score computation
     ]
+    if cif_dir:
+        cmd.extend(["--cif_dir", cif_dir])
     if num_workers is not None:
         cmd.extend(["--num_workers", str(num_workers)])
     if not proteinebm_template_self_condition:
@@ -227,6 +261,58 @@ def step_proteinebm_scoring(
     return run_with_conda_env("proteinebm", cmd, direct_python=direct_python)
 
 
+# ── Step 3 (alt): AF2Rank scoring (when --scorer=af2rank) ────────────────────
+
+def step_af2rank_scoring(
+    csv_file: str,
+    csv_col: str,
+    cif_dir: str,
+    inference_config: str,
+    num_gpus: int,
+    recycles: int = 3,
+    regenerate_plots: bool = False,
+    backend: str = "colabdesign",
+    use_deepspeed_evoformer_attention: bool = True,
+    use_cuequivariance_attention: bool = True,
+    use_cuequivariance_multiplicative_update: bool = True,
+    shard_args: list | None = None,
+    direct_python: bool = False,
+    rerun: bool = False,
+    tar_protein_dirs: bool = True,
+    dynamic_resharding: bool = True,
+    progress_check_workers: int | None = None,
+) -> bool:
+    """Run AF2Rank scoring (parallel_af2rank_scoring.py). Requires --cif_dir
+    because AF2Rank always needs a reference structure for scoring."""
+    logger.info(f"Starting AF2Rank scoring (backend={backend})...")
+    cmd = [
+        "python", os.path.join(PRED_PIPELINE_DIR, "parallel_af2rank_scoring.py"),
+        "--csv_file", csv_file,
+        "--csv_col", csv_col,
+        "--cif_dir", cif_dir,
+        "--inference_config", inference_config,
+        "--num_gpus", str(num_gpus),
+        "--recycles", str(recycles),
+        *parallel_incremental_filter_args(not rerun),
+        "--af2rank_backend", backend,
+    ]
+    if regenerate_plots:
+        cmd.append("--regenerate_plots")
+    if backend == "openfold":
+        if not use_deepspeed_evoformer_attention:
+            cmd.append("--no-use_deepspeed_evoformer_attention")
+        if not use_cuequivariance_attention:
+            cmd.append("--no-use_cuequivariance_attention")
+        if not use_cuequivariance_multiplicative_update:
+            cmd.append("--no-use_cuequivariance_multiplicative_update")
+    if shard_args:
+        cmd.extend(shard_args)
+    cmd.extend(_tar_cli_args(tar_protein_dirs))
+    cmd.extend(_dynamic_cli_args(dynamic_resharding, progress_check_workers))
+    env_name = "proteina" if backend == "openfold" else "colabdesign"
+    return run_with_conda_env(env_name, cmd, direct_python=direct_python)
+
+
 # ── Step 4: AF2Rank on ProteinEBM top-k ──────────────────────────────────────
 
 def step_af2rank_topk(
@@ -236,6 +322,7 @@ def step_af2rank_topk(
     num_gpus: int,
     csv_file: str,
     csv_col: str = "id",
+    cif_dir: str | None = None,
     proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
     use_deepspeed_evoformer_attention: bool = True,
     use_cuequivariance_attention: bool = True,
@@ -252,13 +339,13 @@ def step_af2rank_topk(
     Uses run_af2rank_prediction.py which initialises each AF2Rank model variant
     exactly once across all proteins (instead of once per protein), and reads
     top-k templates directly from the ProteinEBM scores CSV without requiring
-    a summary JSON file.
+    a summary JSON file. When --cif_dir is given, ground-truth TM-score columns
+    are added to the output CSVs.
     """
     logger.info(f"Starting AF2Rank on ProteinEBM top-{af2rank_top_k} ...")
     inference_dir = os.path.join(PROTEINA_BASE_DIR, "inference", inference_config)
-    prediction_pipeline_dir = os.path.dirname(os.path.abspath(__file__))
     cmd = [
-        "python", os.path.join(prediction_pipeline_dir, "run_af2rank_prediction.py"),
+        "python", os.path.join(PRED_PIPELINE_DIR, "run_af2rank_prediction.py"),
         "--inference_dir", inference_dir,
         "--csv_file", csv_file,
         "--csv_col", csv_col,
@@ -266,6 +353,8 @@ def step_af2rank_topk(
         "--recycles", str(recycles),
         "--proteinebm_analysis_subdir", proteinebm_analysis_subdir,
     ]
+    if cif_dir:
+        cmd.extend(["--cif_dir", cif_dir])
     if filter_existing:
         cmd.append("--filter_existing")
     else:
@@ -287,6 +376,7 @@ def step_central_analysis(
     inference_config: str,
     csv_file: str,
     csv_col: str = "id",
+    cif_dir: str | None = None,
     proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
     num_workers: int | None = None,
     shard_args: list | None = None,
@@ -297,11 +387,13 @@ def step_central_analysis(
     dynamic_resharding: bool = True,
     progress_check_workers: int | None = None,
 ) -> bool:
-    """Run centralized TM analysis after scorer outputs and prediction PDBs exist."""
+    """Run centralized TM analysis after scorer outputs and prediction PDBs exist.
+    When cif_dir is provided, GT TM-score columns are added to the per-protein
+    enriched CSVs."""
     inference_dir = os.path.join(PROTEINA_BASE_DIR, "inference", inference_config)
     cmd = [
         "python",
-        os.path.join(AF2RANK_EVAL_DIR, "proteina_analysis.py"),
+        os.path.join(PRED_PIPELINE_DIR, "proteina_analysis.py"),
         "--inference_dir",
         inference_dir,
         "--csv_file",
@@ -311,6 +403,8 @@ def step_central_analysis(
         "--proteinebm_analysis_subdir",
         proteinebm_analysis_subdir,
     ]
+    if cif_dir:
+        cmd.extend(["--cif_dir", cif_dir])
     if num_workers is not None:
         cmd.extend(["--num_workers", str(num_workers)])
     if shard_args:
@@ -322,6 +416,58 @@ def step_central_analysis(
     cmd.extend(_tar_cli_args(tar_protein_dirs))
     cmd.extend(_dynamic_cli_args(dynamic_resharding, progress_check_workers))
     return run_with_conda_env("proteina", cmd, direct_python=direct_python)
+
+
+# ── Step 5b: Cross-protein plots (only when --cif_dir is supplied) ───────────
+
+def step_cross_protein_plots(
+    inference_config: str,
+    output_dir: str,
+    scorer: str,
+    dataset_file: str,
+    id_col: str,
+    tms_col: str,
+    af2rank_top_k: int,
+    proteinebm_plot_mode: str = "tm",
+    proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
+    direct_python: bool = False,
+    skip_af2rank_on_top_k: bool = False,
+) -> bool:
+    """Generate cross-protein plots (TM-vs-pTM / TM-vs-energy scatters).
+
+    Always requires ground-truth (a dataset_file with tms_col). Runs once for
+    the primary scorer; if scorer=proteinebm and af2rank_top_k > 0, runs a
+    second time for the af2rank_on_proteinebm_topk plots.
+    """
+    inference_dir = os.path.join(PROTEINA_BASE_DIR, "inference", inference_config)
+
+    def _one(scorer_name: str) -> bool:
+        cmd = [
+            "python",
+            os.path.join(PRED_PIPELINE_DIR, "generate_cross_protein_plots.py"),
+            "--inference_dir", inference_dir,
+            "--output_dir", output_dir,
+            "--scorer", scorer_name,
+            "--dataset_file", dataset_file,
+            "--id_col", id_col,
+            "--tms_col", tms_col,
+            "--proteinebm_analysis_subdir", proteinebm_analysis_subdir,
+        ]
+        if scorer_name == "proteinebm":
+            cmd.extend(["--proteinebm_plot_mode", proteinebm_plot_mode])
+        if scorer_name == "af2rank_on_proteinebm_topk":
+            cmd.extend(["--af2rank_top_k", str(int(af2rank_top_k))])
+        return run_with_conda_env("proteina", cmd, cwd=PRED_PIPELINE_DIR, direct_python=direct_python)
+
+    ok = _one(scorer)
+    if not ok:
+        logger.error("Cross-protein plotting failed (primary scorer)")
+        return False
+    if scorer == "proteinebm" and int(af2rank_top_k) > 0 and not skip_af2rank_on_top_k:
+        ok2 = _one("af2rank_on_proteinebm_topk")
+        if not ok2:
+            logger.warning("Cross-protein plotting skipped/failed (af2rank_on_proteinebm_topk)")
+    return True
 
 
 # ── Step 5: Collect results ───────────────────────────────────────────────────
@@ -530,7 +676,7 @@ def step_collect_results(
     }
 
     # Add analysis pairwise TM metrics if available
-    from proteinfoundation.af2rank_evaluation.proteina_analysis import load_analysis_data
+    from proteinfoundation.prediction_pipeline.proteina_analysis import load_analysis_data
     inference_base = os.path.join(PROTEINA_BASE_DIR, "inference", inference_config)
     analysis_data = load_analysis_data(inference_base)
     if analysis_data:
@@ -620,15 +766,47 @@ def step_plot_distribution(results: list, output_dir: str, ptm_cutoff: float) ->
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """CLI aligned with run_full_pipeline.py for shared options."""
-    parser = argparse.ArgumentParser(description="Prediction Pipeline (No Ground-Truth)")
-    parser.add_argument("--input", required=True, help="Input CSV or FASTA file with protein sequences")
-    parser.add_argument("--id_col", default="id", help="Column name for protein ID in CSV (default: id)")
-    parser.add_argument("--sequence_col", default="sequence", help="Column name for sequence in CSV (default: sequence)")
+    """Unified CLI: prediction mode (--input) or evaluation mode (--dataset_file + --cif_dir)."""
+    parser = argparse.ArgumentParser(description="Prediction Pipeline (unified prediction + evaluation driver)")
+
+    # Input: --input (FASTA/CSV of sequences) XOR --dataset_file (CSV with pre-built PT files)
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument("--input", default=None,
+                             help="Input CSV/FASTA with protein sequences (prediction mode). "
+                                  "Triggers PT-file creation via input_parser.py.")
+    input_group.add_argument("--dataset_file", default=None,
+                             help="Dataset CSV with pre-existing PT files (evaluation mode). "
+                                  "Mutually exclusive with --input.")
+    parser.add_argument("--id_col", default="id",
+                        help="Column name for protein ID in --input or --dataset_file (default: id)")
+    parser.add_argument("--sequence_col", default="sequence",
+                        help="Column name for sequence in --input CSV (default: sequence, ignored for FASTA)")
+
+    # Ground-truth mode: optional --cif_dir + --tms_col. When --cif_dir is set,
+    # downstream steps add GT TM-score columns; when --tms_col is also set (with
+    # --dataset_file), cross-protein plots are generated.
+    parser.add_argument("--cif_dir", default=None,
+                        help="Optional: directory of reference CIF files. Presence enables ground-truth "
+                             "analysis (GT TM-score columns added to per-protein CSVs).")
+    parser.add_argument("--tms_col", default=None,
+                        help="Dataset column with reference TM-scores. Required (with --cif_dir + --dataset_file) "
+                             "for cross-protein plot generation.")
+
+    parser.add_argument("--scorer", choices=["af2rank", "proteinebm"], default="proteinebm",
+                        help="Primary scoring backend (default: proteinebm). When proteinebm + "
+                             "--af2rank_top_k>0, an AF2Rank top-k refinement step runs afterward.")
     parser.add_argument("--inference_config", required=True, help="Proteina inference configuration name")
     parser.add_argument("--num_gpus", type=int, default=1, help="Number of GPUs to use")
     parser.add_argument("--output_dir", required=True, help="Output directory for predictions and summary")
     parser.add_argument("--ptm_cutoff", type=float, default=0.7, help="pTM threshold for filtering (default: 0.7)")
+    parser.add_argument(
+        "--proteinebm_cross_protein_plot_mode",
+        choices=["tm", "energy"],
+        default="tm",
+        help="When --scorer=proteinebm and cross-protein plots run, which mode to use (default: tm).",
+    )
+    parser.add_argument("--usalign_path", default=None,
+                        help="Optional: path to USalign binary (passed to parallel_proteina_inference).")
     parser.add_argument(
         "--af2rank_top_k",
         "--top_k",
@@ -694,6 +872,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip AF2Rank-on-ProteinEBM-top-k step. Alias: --skip_af2rank.",
     )
+    parser.add_argument("--skip_cross_protein_plots", action="store_true",
+                        help="Skip cross-protein plot generation (even when --cif_dir is set).")
+    parser.add_argument("--skip_distribution_plot", action="store_true",
+                        help="Skip pTM distribution histogram.")
+    parser.add_argument("--skip_collect_results", action="store_true",
+                        help="Skip prediction_summary.{csv,json} + best_templates/ + best_predictions/.")
+    parser.add_argument("--regenerate_plots", action="store_true",
+                        help="Regenerate AF2Rank plots even if scoring already completed (--scorer=af2rank)")
     parser.add_argument("--rerun_proteina", action="store_true",
                         help="Force re-run Proteina inference even if outputs already exist")
     parser.add_argument("--rerun_score", action="store_true",
@@ -742,14 +928,40 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None):
     args = build_parser().parse_args(argv)
 
+    # Resolve input mode and validate flag combinations
+    if args.input is not None:
+        input_mode = "input"
+        input_path = args.input
+        # In --input mode, the working_csv is created downstream; tms_col/cif_dir
+        # are still allowed but cross-protein plots cannot run (no tms_col on a
+        # working_csv).
+    else:
+        input_mode = "dataset"
+        input_path = args.dataset_file
+    if not os.path.exists(input_path):
+        logger.error(f"Input file not found: {input_path}")
+        sys.exit(1)
+    if args.cif_dir and not os.path.exists(args.cif_dir):
+        logger.error(f"CIF directory not found: {args.cif_dir}")
+        sys.exit(1)
+
+    has_gt = bool(args.cif_dir)
+    can_cross_protein_plot = bool(
+        has_gt
+        and input_mode == "dataset"
+        and args.tms_col
+        and not args.skip_cross_protein_plots
+    )
+    if has_gt and input_mode == "input" and not args.skip_cross_protein_plots:
+        logger.warning(
+            "--cif_dir is set with --input (sequence file); cross-protein plots "
+            "require --dataset_file + --tms_col and will not run."
+        )
+
     shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
     shard_cli_args = build_shard_cli_args(shard_index, num_shards, len_col=args.len_col)
     if shard_index is not None:
         logger.info(f"Sharding enabled: shard {shard_index} of {num_shards}")
-
-    if not os.path.exists(args.input):
-        logger.error(f"Input file not found: {args.input}")
-        sys.exit(1)
 
     output_dir_path = Path(args.output_dir)
     output_dir_path.mkdir(parents=True, exist_ok=True)
@@ -763,32 +975,51 @@ def main(argv: list[str] | None = None):
     success = True
 
     logger.info("=" * 60)
-    logger.info("PREDICTION PIPELINE (No Ground-Truth)")
+    logger.info(f"PREDICTION PIPELINE ({'WITH GT' if has_gt else 'NO GT'})")
     logger.info("=" * 60)
-    logger.info(f"Input: {args.input}")
+    logger.info(f"Input mode: {input_mode}  ({input_path})")
+    logger.info(f"Scorer: {args.scorer}")
+    logger.info(f"CIF dir: {args.cif_dir or '(none — prediction mode)'}")
+    if has_gt:
+        logger.info(f"TM-score column: {args.tms_col or '(none)'}")
+        logger.info(f"Cross-protein plots: {'enabled' if can_cross_protein_plot else 'disabled'}")
     logger.info(f"Inference config: {args.inference_config}")
     logger.info(f"GPUs: {args.num_gpus}")
     logger.info(f"pTM cutoff: {args.ptm_cutoff}")
     logger.info(f"AF2Rank top-k: {args.af2rank_top_k}")
-    logger.info(f"AF2Rank backend (prediction step is openfold-only): {args.af2rank_backend}")
+    logger.info(f"AF2Rank backend: {args.af2rank_backend}")
     logger.info(f"Output: {args.output_dir}")
     logger.info(f"Tar protein dirs: {args.tar_protein_dirs}")
     logger.info(f"Dynamic re-sharding: {args.dynamic_resharding}")
-    from proteinfoundation.af2rank_evaluation.proteina_analysis import resolve_num_workers
+    from proteinfoundation.prediction_pipeline.proteina_analysis import resolve_num_workers
     logger.info(f"num_workers (CPU, analysis etc.): {resolve_num_workers(args.num_workers)}")
     skip_analysis = args.skip_analysis
 
-    # ── Step 1: Parse input and create PT files ──
-    logger.info("\n" + "=" * 60)
-    logger.info("STEP 1: PARSE INPUT & CREATE PT FILES")
-    logger.info("=" * 60)
-    df, working_csv = step_parse_input(args.input, args.id_col, args.sequence_col, args.output_dir)
-    protein_ids = df["id"].tolist()
-    logger.info(f"Parsed {len(protein_ids)} proteins")
+    # ── Step 1: Resolve working CSV (parse --input or use --dataset_file directly) ──
+    if input_mode == "input":
+        logger.info("\n" + "=" * 60)
+        logger.info("STEP 1: PARSE INPUT & CREATE PT FILES")
+        logger.info("=" * 60)
+        df, working_csv = step_parse_input(args.input, args.id_col, args.sequence_col, args.output_dir)
+        protein_ids = df["id"].tolist()
+        working_csv_id_col = "id"
+    else:
+        logger.info("\n" + "=" * 60)
+        logger.info("STEP 1: LOADING DATASET CSV")
+        logger.info("=" * 60)
+        df = pd.read_csv(args.dataset_file)
+        if args.id_col not in df.columns:
+            logger.error(f"Dataset CSV missing --id_col '{args.id_col}'. Columns: {sorted(df.columns)}")
+            sys.exit(1)
+        protein_ids = [str(p).strip() for p in df[args.id_col].dropna().unique() if str(p).strip()]
+        working_csv = args.dataset_file
+        working_csv_id_col = args.id_col
+    logger.info(f"Loaded {len(protein_ids)} proteins")
+
     inference_base = os.path.join(PROTEINA_BASE_DIR, "inference", args.inference_config)
     shard_protein_ids_for_tar = list(protein_ids)
     if shard_index is not None:
-        lengths = lengths_from_csv(working_csv, "id", args.len_col)
+        lengths = lengths_from_csv(working_csv, working_csv_id_col, args.len_col)
         if lengths is not None:
             shard_protein_ids_for_tar = shard_proteins(protein_ids, shard_index, num_shards, lengths=lengths)
         else:
@@ -804,13 +1035,22 @@ def main(argv: list[str] | None = None):
         logger.info("\n" + "=" * 60)
         logger.info("STEP 2: PROTEINA INFERENCE")
         logger.info("=" * 60)
+        # --input mode → PT files already created by step_parse_input → skip_pt_conversion=True
+        # --dataset_file mode → use --cif_dir to convert CIF → PT (if PT files don't exist)
+        # When --dataset_file mode AND --cif_dir set, run CIF→PT conversion.
+        # When --dataset_file mode AND no --cif_dir, assume PT files exist (skip_pt_conversion=True).
+        skip_pt = (input_mode == "input") or (not has_gt)
         if not step_proteina_inference(
-            working_csv,
-            args.inference_config,
-            args.num_gpus,
-            args.proteina_force_compile,
-            shard_cli_args,
-            args.direct_python,
+            csv_file=working_csv,
+            csv_col=working_csv_id_col,
+            inference_config=args.inference_config,
+            num_gpus=args.num_gpus,
+            cif_dir=args.cif_dir,
+            skip_pt_conversion=skip_pt,
+            usalign_path=args.usalign_path,
+            proteina_force_compile=args.proteina_force_compile,
+            shard_args=shard_cli_args,
+            direct_python=args.direct_python,
             rerun=args.rerun_proteina,
             tar_protein_dirs=args.tar_protein_dirs,
             dynamic_resharding=args.dynamic_resharding,
@@ -828,58 +1068,93 @@ def main(argv: list[str] | None = None):
             poll_interval=args.shard_poll_interval, timeout=args.shard_timeout,
         ) and success
 
-    # ── Step 3: ProteinEBM scoring ──
+    # ── Step 3: Scoring (AF2Rank or ProteinEBM, per --scorer) ──
     if not args.skip_scoring and success:
         logger.info("\n" + "=" * 60)
-        logger.info("STEP 3: PROTEINEBM SCORING")
-        logger.info("=" * 60)
-        if not step_proteinebm_scoring(
-            working_csv,
-            args.inference_config,
-            args.num_gpus,
-            args.proteinebm_config,
-            args.proteinebm_checkpoint,
-            args.proteinebm_t,
-            args.proteinebm_analysis_subdir,
-            proteinebm_batch_size=args.proteinebm_batch_size,
-            proteinebm_template_self_condition=args.proteinebm_template_self_condition,
-            num_workers=args.num_workers,
-            shard_args=shard_cli_args,
-            direct_python=args.direct_python,
-            rerun=args.rerun_score,
-            tar_protein_dirs=args.tar_protein_dirs,
-            dynamic_resharding=args.dynamic_resharding,
-            progress_check_workers=args.progress_check_workers,
-        ):
-            logger.error("ProteinEBM scoring failed")
-            success = False
+        if args.scorer == "af2rank":
+            logger.info("STEP 3: AF2RANK SCORING")
         else:
-            logger.info("ProteinEBM scoring completed successfully")
+            logger.info("STEP 3: PROTEINEBM SCORING")
+        logger.info("=" * 60)
+        if args.scorer == "af2rank":
+            if not has_gt:
+                logger.error("--scorer=af2rank requires --cif_dir (AF2Rank needs a reference).")
+                success = False
+            else:
+                scoring_ok = step_af2rank_scoring(
+                    csv_file=working_csv,
+                    csv_col=working_csv_id_col,
+                    cif_dir=args.cif_dir,
+                    inference_config=args.inference_config,
+                    num_gpus=args.num_gpus,
+                    recycles=args.recycles,
+                    regenerate_plots=args.regenerate_plots,
+                    backend=args.af2rank_backend,
+                    use_deepspeed_evoformer_attention=args.use_deepspeed_evoformer_attention,
+                    use_cuequivariance_attention=args.use_cuequivariance_attention,
+                    use_cuequivariance_multiplicative_update=args.use_cuequivariance_multiplicative_update,
+                    shard_args=shard_cli_args,
+                    direct_python=args.direct_python,
+                    rerun=args.rerun_score,
+                    tar_protein_dirs=args.tar_protein_dirs,
+                    dynamic_resharding=args.dynamic_resharding,
+                    progress_check_workers=args.progress_check_workers,
+                )
+                if not scoring_ok:
+                    logger.error("AF2Rank scoring failed")
+                    success = False
+        else:
+            if not step_proteinebm_scoring(
+                csv_file=working_csv,
+                csv_col=working_csv_id_col,
+                inference_config=args.inference_config,
+                num_gpus=args.num_gpus,
+                proteinebm_config=args.proteinebm_config,
+                proteinebm_checkpoint=args.proteinebm_checkpoint,
+                cif_dir=args.cif_dir,
+                proteinebm_t=args.proteinebm_t,
+                proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
+                proteinebm_batch_size=args.proteinebm_batch_size,
+                proteinebm_template_self_condition=args.proteinebm_template_self_condition,
+                num_workers=args.num_workers,
+                shard_args=shard_cli_args,
+                direct_python=args.direct_python,
+                rerun=args.rerun_score,
+                tar_protein_dirs=args.tar_protein_dirs,
+                dynamic_resharding=args.dynamic_resharding,
+                progress_check_workers=args.progress_check_workers,
+            ):
+                logger.error("ProteinEBM scoring failed")
+                success = False
+            else:
+                logger.info("ProteinEBM scoring completed successfully")
     elif args.skip_scoring:
-        logger.info("Skipping ProteinEBM scoring")
+        logger.info(f"Skipping scoring stage ({args.scorer})")
     if args.dynamic_resharding and shard_index is not None and num_shards is not None:
         success = wait_for_step(
-            output_dir_path, "proteinebm", num_shards, shard_index, success,
+            output_dir_path, "scoring", num_shards, shard_index, success,
             poll_interval=args.shard_poll_interval, timeout=args.shard_timeout,
         ) and success
 
-    # ── Step 4: AF2Rank on ProteinEBM top-k ──
-    if not args.skip_af2rank_on_top_k and success:
+    # ── Step 4: AF2Rank on ProteinEBM top-k (only when --scorer=proteinebm + top-k>0) ──
+    if (success and not args.skip_scoring and not args.skip_af2rank_on_top_k
+            and args.scorer == "proteinebm" and int(args.af2rank_top_k) > 0):
         logger.info("\n" + "=" * 60)
         logger.info("STEP 4: AF2RANK ON PROTEINEBM TOP-K")
         logger.info("=" * 60)
         if args.af2rank_backend != "openfold":
             logger.warning(
-                f"--af2rank_backend {args.af2rank_backend!r} is ignored: the prediction pipeline always uses "
-                "run_af2rank_prediction.py which is openfold-only."
+                f"--af2rank_backend {args.af2rank_backend!r} is ignored at step 4: "
+                "the top-k refinement uses run_af2rank_prediction.py which is openfold-only."
             )
         if not step_af2rank_topk(
-            args.inference_config,
-            args.af2rank_top_k,
-            args.recycles,
-            args.num_gpus,
-            working_csv,
-            "id",
+            inference_config=args.inference_config,
+            af2rank_top_k=args.af2rank_top_k,
+            recycles=args.recycles,
+            num_gpus=args.num_gpus,
+            csv_file=working_csv,
+            csv_col=working_csv_id_col,
+            cif_dir=args.cif_dir,
             proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
             use_deepspeed_evoformer_attention=args.use_deepspeed_evoformer_attention,
             use_cuequivariance_attention=args.use_cuequivariance_attention,
@@ -891,15 +1166,15 @@ def main(argv: list[str] | None = None):
             dynamic_resharding=args.dynamic_resharding,
             progress_check_workers=args.progress_check_workers,
         ):
-            logger.error("AF2Rank step failed")
+            logger.error("AF2Rank top-k step failed")
             success = False
         else:
-            logger.info("AF2Rank step completed successfully")
+            logger.info("AF2Rank top-k step completed successfully")
     elif args.skip_af2rank_on_top_k:
-        logger.info("Skipping AF2Rank step")
+        logger.info("Skipping AF2Rank top-k step")
     if args.dynamic_resharding and shard_index is not None and num_shards is not None:
         success = wait_for_step(
-            output_dir_path, "af2rank", num_shards, shard_index, success,
+            output_dir_path, "af2rank_topk", num_shards, shard_index, success,
             poll_interval=args.shard_poll_interval, timeout=args.shard_timeout,
         ) and success
 
@@ -912,7 +1187,8 @@ def main(argv: list[str] | None = None):
             if not step_central_analysis(
                 inference_config=args.inference_config,
                 csv_file=working_csv,
-                csv_col="id",
+                csv_col=working_csv_id_col,
+                cif_dir=args.cif_dir,
                 proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
                 num_workers=args.num_workers,
                 shard_args=shard_cli_args,
@@ -972,8 +1248,10 @@ def main(argv: list[str] | None = None):
                 logger.error("%d shard(s) reported failure: %s", len(failed_shards), failed_shards)
                 success = False
 
-    # ── Step 6: Collect results ──
-    if success:
+    results = []
+
+    # ── Step 6: Collect results (best per protein + summary CSV/JSON) ──
+    if success and not args.skip_collect_results and args.scorer == "proteinebm":
         logger.info("\n" + "=" * 60)
         logger.info("STEP 6: COLLECT RESULTS")
         logger.info("=" * 60)
@@ -982,12 +1260,45 @@ def main(argv: list[str] | None = None):
             args.ptm_cutoff, args.proteinebm_analysis_subdir,
             tar_protein_dirs=args.tar_protein_dirs,
         )
+    elif args.skip_collect_results:
+        logger.info("Skipping result collection / summary writeout")
+    elif args.scorer != "proteinebm":
+        logger.info(
+            f"Skipping result collection (--scorer={args.scorer} — collect_results "
+            "expects AF2Rank-on-ProteinEBM-topk outputs)"
+        )
 
-        # ── Step 7: Plot distribution ──
+    # ── Step 7: Cross-protein plots (only when --cif_dir + --tms_col + --dataset_file) ──
+    if success and can_cross_protein_plot:
         logger.info("\n" + "=" * 60)
-        logger.info("STEP 7: PTM DISTRIBUTION PLOT")
+        logger.info("STEP 7: CROSS-PROTEIN PLOTS")
+        logger.info("=" * 60)
+        if not step_cross_protein_plots(
+            inference_config=args.inference_config,
+            output_dir=args.output_dir,
+            scorer=args.scorer,
+            dataset_file=args.dataset_file,
+            id_col=args.id_col,
+            tms_col=args.tms_col,
+            af2rank_top_k=int(args.af2rank_top_k),
+            proteinebm_plot_mode=args.proteinebm_cross_protein_plot_mode,
+            proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
+            direct_python=args.direct_python,
+            skip_af2rank_on_top_k=args.skip_af2rank_on_top_k,
+        ):
+            logger.error("Cross-protein plotting failed")
+            success = False
+    elif has_gt and args.skip_cross_protein_plots:
+        logger.info("Skipping cross-protein plots (--skip_cross_protein_plots)")
+
+    # ── Step 8: pTM distribution histogram ──
+    if success and results and not args.skip_distribution_plot:
+        logger.info("\n" + "=" * 60)
+        logger.info("STEP 8: PTM DISTRIBUTION PLOT")
         logger.info("=" * 60)
         step_plot_distribution(results, args.output_dir, args.ptm_cutoff)
+    elif args.skip_distribution_plot:
+        logger.info("Skipping pTM distribution plot")
 
     # ── Summary ──
     total_time = time.time() - start_time
@@ -996,10 +1307,14 @@ def main(argv: list[str] | None = None):
     logger.info("=" * 60)
 
     if success:
-        num_passing = sum(1 for r in results if r["passes_cutoff"])
-        logger.info(f"Pipeline completed in {total_time:.1f}s")
-        logger.info(f"Proteins processed: {len(protein_ids)}")
-        logger.info(f"Passing pTM >= {args.ptm_cutoff}: {num_passing}/{len(results)}")
+        if results:
+            num_passing = sum(1 for r in results if r["passes_cutoff"])
+            logger.info(f"Pipeline completed in {total_time:.1f}s")
+            logger.info(f"Proteins processed: {len(protein_ids)}")
+            logger.info(f"Passing pTM >= {args.ptm_cutoff}: {num_passing}/{len(results)}")
+        else:
+            logger.info(f"Pipeline completed in {total_time:.1f}s")
+            logger.info(f"Proteins processed: {len(protein_ids)}")
         logger.info(f"Results: {args.output_dir}")
     else:
         logger.error(f"Pipeline failed after {total_time:.1f}s")

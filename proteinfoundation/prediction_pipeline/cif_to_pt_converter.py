@@ -26,7 +26,7 @@ from Bio.PDB import PDBParser, MMCIFParser
 from loguru import logger
 from dotenv import load_dotenv
 
-from proteinfoundation.af2rank_evaluation.cif_chain_mapping import resolve_biopython_chain_for_structure
+from proteinfoundation.prediction_pipeline.cif_chain_mapping import resolve_biopython_chain_for_structure
 
 # Import Proteina's exact amino acid encoding to ensure consistency
 from proteinfoundation.openfold_stub.np.residue_constants import (

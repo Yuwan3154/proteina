@@ -36,7 +36,7 @@ from tqdm import tqdm
 from Bio.PDB import MMCIFParser, PDBIO, Select
 import warnings
 from Bio import BiopythonWarning
-from proteinfoundation.af2rank_evaluation.cif_chain_mapping import resolve_ground_truth_usalign_chain
+from proteinfoundation.prediction_pipeline.cif_chain_mapping import resolve_ground_truth_usalign_chain
 warnings.simplefilter('ignore', BiopythonWarning)
 
 

@@ -57,9 +57,9 @@ _REPO_ROOT = _HERE.parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from proteinfoundation.af2rank_evaluation.cif_chain_mapping import resolve_ground_truth_usalign_chain
-from proteinfoundation.af2rank_evaluation.protein_tar_utils import protein_tar_path, read_protein_text
-from proteinfoundation.af2rank_evaluation.usalign_tabular import iter_usalign_outfmt2_rows
+from proteinfoundation.prediction_pipeline.cif_chain_mapping import resolve_ground_truth_usalign_chain
+from proteinfoundation.prediction_pipeline.protein_tar_utils import protein_tar_path, read_protein_text
+from proteinfoundation.prediction_pipeline.usalign_tabular import iter_usalign_outfmt2_rows
 
 logger = logging.getLogger(__name__)
 

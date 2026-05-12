@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from proteinfoundation.af2rank_evaluation.sharding_utils import (
+from proteinfoundation.prediction_pipeline.sharding_utils import (
     filter_proteins_threaded,
     shard_proteins,
     step_sentinel_path,

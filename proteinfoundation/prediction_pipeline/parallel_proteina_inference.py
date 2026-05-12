@@ -29,8 +29,8 @@ try:
 except ImportError:
     load_dotenv = None
 
-from proteinfoundation.af2rank_evaluation.cif_to_pt_converter import convert_from_csv
-from proteinfoundation.af2rank_evaluation.sharding_utils import (
+from proteinfoundation.prediction_pipeline.cif_to_pt_converter import convert_from_csv
+from proteinfoundation.prediction_pipeline.sharding_utils import (
     add_shard_args,
     default_progress_check_workers,
     filter_proteins_threaded,
@@ -39,7 +39,7 @@ from proteinfoundation.af2rank_evaluation.sharding_utils import (
     resolve_shard_args,
     shard_proteins,
 )
-from proteinfoundation.af2rank_evaluation.protein_tar_utils import (
+from proteinfoundation.prediction_pipeline.protein_tar_utils import (
     pack_protein_dirs,
     protein_glob_members,
     restore_selected_protein_dirs,
@@ -72,7 +72,7 @@ def get_proteina_base_dir():
     # Try common locations
     possible_dirs = [
         os.path.expanduser('~/proteina'),
-        os.path.join(os.getcwd(), '..')  # Assume we're in af2rank_evaluation
+        os.path.join(os.getcwd(), '..')  # Assume we're in prediction_pipeline
     ]
     
     for dir_path in possible_dirs:

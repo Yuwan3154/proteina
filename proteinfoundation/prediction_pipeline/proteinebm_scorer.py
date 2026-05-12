@@ -35,11 +35,11 @@ from protein_ebm.model.boltz_utils import center_random_augmentation
 from protein_ebm.model.ebm import ProteinEBM
 from protein_ebm.model.r3_diffuser import R3Diffuser
 
-from proteinfoundation.af2rank_evaluation.cif_chain_mapping import (
+from proteinfoundation.prediction_pipeline.cif_chain_mapping import (
     resolve_biopython_chain_for_structure,
     resolve_ground_truth_usalign_chain,
 )
-from proteinfoundation.af2rank_evaluation.usalign_tabular import parse_usalign_pair_outfmt2
+from proteinfoundation.prediction_pipeline.usalign_tabular import parse_usalign_pair_outfmt2
 
 
 _USALIGN_PARALLEL_ENV = {

@@ -14,7 +14,7 @@ Run with the cue_openfold conda interpreter (adjust path if your conda root diff
 
   cd /path/to/proteina
   PYTHONPATH=. /home/ubuntu/miniforge3/envs/cue_openfold/bin/python \\
-    proteinfoundation/af2rank_evaluation/benchmark_pairwise_tm_serial_vs_parallel.py \\
+    proteinfoundation/prediction_pipeline/benchmark_pairwise_tm_serial_vs_parallel.py \\
     --protein_dir inference/.../6U1O_A --protein_id 6U1O_A
 """
 
@@ -29,11 +29,11 @@ from itertools import combinations
 
 import numpy as np
 
-from proteinfoundation.af2rank_evaluation.proteina_diversity import (
+from proteinfoundation.prediction_pipeline.proteina_diversity import (
     _pairwise_tm_via_usalign_dir,
     resolve_num_workers,
 )
-from proteinfoundation.af2rank_evaluation.proteinebm_scorer import tmscore_pdb_paths
+from proteinfoundation.prediction_pipeline.proteinebm_scorer import tmscore_pdb_paths
 
 _USALIGN_PARALLEL_ENV = {
     "OMP_NUM_THREADS": "1",

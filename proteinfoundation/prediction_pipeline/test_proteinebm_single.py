@@ -99,7 +99,7 @@ def main() -> None:
     # ── Load model ──────────────────────────────────────────────────────────
     banner("Loading ProteinEBM model")
     sys.path.insert(0, "/home/gridsan/cou/ProteinEBM")
-    from proteinfoundation.af2rank_evaluation.proteinebm_scorer import (
+    from proteinfoundation.prediction_pipeline.proteinebm_scorer import (
         load_proteinebm_model,
         build_input_feats_from_pdb,
     )

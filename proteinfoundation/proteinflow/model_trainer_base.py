@@ -46,7 +46,7 @@ from proteinfoundation.utils.ff_utils.pdb_utils import (
     mask_seq,
     write_prot_to_pdb,
 )
-from proteinfoundation.af2rank_evaluation.usalign_tabular import (
+from proteinfoundation.prediction_pipeline.usalign_tabular import (
     parse_usalign_pair_outfmt2,
 )
 # from proteinfoundation.utils.openfold_inference import OpenFoldTemplateInference, OpenFoldDistogramOnlyInference
@@ -2082,13 +2082,45 @@ class ModelTrainerBase(L.LightningModule):
         if len(self._val_traj_buffer) == tmscore_n:
             concat_batch = self._concat_val_batches(self._val_traj_buffer)
             self._val_traj_buffer = []
-            self._run_validation_trajectory(
-                concat_batch,
-                val_sampling_cfg,
-                log_visualization=True,
-                accumulate_metric=True,
-            )
+            # Memory guard: the val-trajectory NN forward has the same per-tensor cost
+            # as training at the same batch dim. With tmscore_n_samples > 1, the
+            # concatenated batch has tmscore_n_samples × val_batch_size samples — for
+            # the user's config that's 8 × 8 = 64, and pair tensors [B, n, n, d] blow up
+            # 8x vs training's B=8 (8.6 GiB per LayerNorm with bf16→fp32 promotion).
+            # Chunk along dim 0 to keep each trajectory call's NN forward at training-
+            # memory parity. Default chunk_size = training batch_size from cfg.opt; the
+            # user can override via validation_sampling.tmscore_traj_chunk_size.
+            opt_batch_size = int(self.cfg_exp.opt.get("batch_size", 1))
+            chunk_size = int(val_sampling_cfg.get("tmscore_traj_chunk_size", opt_batch_size))
+            chunk_size = max(1, chunk_size)
+            nsamples_total = concat_batch["mask"].shape[0]
+            for chunk_idx, start in enumerate(range(0, nsamples_total, chunk_size)):
+                end = min(start + chunk_size, nsamples_total)
+                chunk_batch = self._slice_concat_batch(concat_batch, start, end)
+                # Visualization fires only for the first chunk's first sample;
+                # subsequent chunks just accumulate TM-scores into the shared list.
+                self._run_validation_trajectory(
+                    chunk_batch,
+                    val_sampling_cfg,
+                    log_visualization=(chunk_idx == 0),
+                    accumulate_metric=True,
+                )
             self._logged_val_traj_epoch = self.current_epoch
+
+    @staticmethod
+    def _slice_concat_batch(batch: dict, start: int, end: int) -> dict:
+        """Slice a concat'd val-traj batch dict along dim 0. Tensors are sliced;
+        lists are sliced as Python lists; nested dicts are recursed; other types
+        pass through unchanged (they don't carry a batch dim)."""
+        def _slice(v):
+            if isinstance(v, torch.Tensor):
+                return v[start:end] if v.dim() >= 1 and v.shape[0] >= end else v
+            if isinstance(v, list):
+                return v[start:end] if len(v) >= end else v
+            if isinstance(v, dict):
+                return {kk: _slice(vv) for kk, vv in v.items()}
+            return v
+        return {k: _slice(v) for k, v in batch.items()}
 
     def on_validation_epoch_end(self):
         """

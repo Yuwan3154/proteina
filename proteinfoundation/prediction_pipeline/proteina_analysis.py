@@ -39,14 +39,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from proteinfoundation.af2rank_evaluation.cif_chain_mapping import resolve_ground_truth_usalign_chain
-from proteinfoundation.af2rank_evaluation.protein_tar_utils import (
+from proteinfoundation.prediction_pipeline.cif_chain_mapping import resolve_ground_truth_usalign_chain
+from proteinfoundation.prediction_pipeline.protein_tar_utils import (
     pack_protein_dirs,
     protein_glob_members,
     read_protein_text,
     restore_selected_protein_dirs,
 )
-from proteinfoundation.af2rank_evaluation.sharding_utils import (
+from proteinfoundation.prediction_pipeline.sharding_utils import (
     add_shard_args,
     default_progress_check_workers,
     filter_proteins_threaded,
@@ -54,8 +54,8 @@ from proteinfoundation.af2rank_evaluation.sharding_utils import (
     resolve_shard_args,
     shard_proteins,
 )
-from proteinfoundation.af2rank_evaluation.topk_summary_utils import generate_topk_summary_csv
-from proteinfoundation.af2rank_evaluation.usalign_tabular import (
+from proteinfoundation.prediction_pipeline.topk_summary_utils import generate_topk_summary_csv
+from proteinfoundation.prediction_pipeline.usalign_tabular import (
     normalize_usalign_structure_name,
     parse_usalign_outfmt2_named_rows,
     parse_usalign_pair_outfmt2,

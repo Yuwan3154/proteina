@@ -32,8 +32,8 @@ import openfold.np.residue_constants as rc
 from openfold.np import protein as openfold_protein
 from proteinfoundation.utils.openfold_inference import OpenFoldTemplateInference
 from proteinfoundation.utils.ff_utils.pdb_utils import write_prot_to_pdb
-from proteinfoundation.af2rank_evaluation.cif_chain_mapping import resolve_biopython_chain_for_structure
-from proteinfoundation.af2rank_evaluation.usalign_tabular import parse_usalign_pair_outfmt2
+from proteinfoundation.prediction_pipeline.cif_chain_mapping import resolve_biopython_chain_for_structure
+from proteinfoundation.prediction_pipeline.usalign_tabular import parse_usalign_pair_outfmt2
 from scipy.stats import spearmanr
 
 

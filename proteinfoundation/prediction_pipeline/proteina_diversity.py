@@ -13,7 +13,7 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
-from proteinfoundation.af2rank_evaluation.proteina_analysis import (
+from proteinfoundation.prediction_pipeline.proteina_analysis import (
     compute_diversity_for_proteins,
     compute_pairwise_tm,
     find_diversity_summaries,

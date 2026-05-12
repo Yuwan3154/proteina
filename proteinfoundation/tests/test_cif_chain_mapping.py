@@ -2,11 +2,11 @@ from pathlib import Path
 
 import pytest
 
-from proteinfoundation.af2rank_evaluation.cif_chain_mapping import (
+from proteinfoundation.prediction_pipeline.cif_chain_mapping import (
     cif_label_to_auth_chain,
     resolve_ground_truth_usalign_chain,
 )
-from proteinfoundation.af2rank_evaluation import proteina_analysis
+from proteinfoundation.prediction_pipeline import proteina_analysis
 from proteinfoundation.prediction_pipeline import compare_replicas_topk
 
 
@@ -149,7 +149,7 @@ def test_resolve_ground_truth_usalign_chain_alias(tmp_path):
 
 
 def test_proteinebm_tmscore_pdb_paths_converts_only_reference_side(tmp_path, monkeypatch):
-    proteinebm_scorer = pytest.importorskip("proteinfoundation.af2rank_evaluation.proteinebm_scorer")
+    proteinebm_scorer = pytest.importorskip("proteinfoundation.prediction_pipeline.proteinebm_scorer")
     gt_path = tmp_path / "1h4a.cif"
     pred_path = tmp_path / "prediction.pdb"
     _write_label_a_auth_x_cif(gt_path)

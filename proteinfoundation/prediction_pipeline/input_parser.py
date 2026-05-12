@@ -13,7 +13,7 @@ from pathlib import Path
 import pandas as pd
 import torch
 
-from proteinfoundation.af2rank_evaluation.cif_to_pt_converter import sequence_to_pt_data
+from proteinfoundation.prediction_pipeline.cif_to_pt_converter import sequence_to_pt_data
 from proteinfoundation.utils.cluster_utils import fasta_to_df
 
 logger = logging.getLogger(__name__)
