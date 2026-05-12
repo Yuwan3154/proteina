@@ -492,6 +492,7 @@ if __name__ == "__main__":
     }
     if torch.cuda.is_available():
         rng_state_to_save["cuda_rng_state"] = torch.cuda.get_rng_state()
+    os.makedirs(root_path, exist_ok=True)
     torch.save(rng_state_to_save, rng_state_path)
     logger.info(f"Saved RNG state to {rng_state_path} (total samples completed: {cfg.nsamples_per_len})")
 

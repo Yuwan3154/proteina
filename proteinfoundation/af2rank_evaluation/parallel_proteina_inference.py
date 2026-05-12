@@ -628,7 +628,7 @@ def main():
                 logger.info(f"  - {result['protein']} [{error_type}]: {error_preview}")
 
     if args.tar_protein_dirs:
-        stats = pack_protein_dirs(inference_base_dir, shard_protein_names_for_tar, delete_after=True)
+        stats = pack_protein_dirs(inference_base_dir, protein_names_for_tar, delete_after=True)
         logger.info("tar_pack inference finalization: %s", stats)
     
     # Return appropriate exit code
