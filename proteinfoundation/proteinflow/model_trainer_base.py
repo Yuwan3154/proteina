@@ -2200,24 +2200,33 @@ class ModelTrainerBase(L.LightningModule):
         if residue_type is not None:
             residue_type = residue_type.to(self.device)
         # Prediction-eval semantics: at inference we don't condition on a known fold.
-        # Override CATH to all-unknown (null indices for C, A, T) for every val sample,
-        # regardless of training-time fold_cond. (TODO: also log a parallel set of val
+        # Build fresh all-unknown CATH from scratch instead of reading the buffered
+        # cath_code_indices: with tmscore_n_samples>1 the val-traj buffer concatenates
+        # multiple val batches along dim 0, but cath_code_indices has shape
+        # [B, max_labels, 3] with per-batch-varying max_labels — so torch.cat fails on
+        # the inner dim, _cat_values silently returns vals[0], and the model receives
+        # B=batch_size_val (not B=nsamples) for the fold-embedding path. Constructing
+        # [nsamples, 1, 3] all-null indices here sidesteps that entirely, and matches
+        # the prediction-eval intent anyway. (TODO: also log a parallel set of val
         # metrics with real CATH conditioning; see project_proteina_val_metrics_todo.)
         cath_code = None
-        cath_code_indices = batch.get("cath_code_indices")
-        cath_code_indices_mask = batch.get("cath_code_indices_mask")
-        if cath_code_indices is not None:
-            cath_code_indices = cath_code_indices.to(self.device).clone()
+        cath_code_indices = None
+        cath_code_indices_mask = None
+        if self.cfg_exp.training.get("fold_cond", False):
             cath_code_dir = self.cfg_exp.model.nn.get("cath_code_dir")
             if cath_code_dir is not None:
                 _, _, _, nC, nA, nT = load_cath_mapping(cath_code_dir)
-                cath_code_indices = apply_fold_mask_to_indices(
-                    cath_code_indices,
-                    mask_T=True, mask_A=True, mask_C=True,
-                    num_classes_C=nC, num_classes_A=nA, num_classes_T=nT,
+                cath_code_indices = torch.zeros(
+                    (nsamples, 1, 3), device=self.device, dtype=torch.long
                 )
-        if cath_code_indices_mask is not None:
-            cath_code_indices_mask = cath_code_indices_mask.to(self.device)
+                cath_code_indices[:, 0, 0] = nC
+                cath_code_indices[:, 0, 1] = nA
+                cath_code_indices[:, 0, 2] = nT
+                # cath_code_indices_mask is True for PADDED (invalid) positions; one
+                # valid null label per sample → all-False mask.
+                cath_code_indices_mask = torch.zeros(
+                    (nsamples, 1), device=self.device, dtype=torch.bool
+                )
 
         # Extract motif conditioning: support both (motif_structure, motif_seq_mask) from
         # inference/GenMotifDataset and (x_motif, fixed_sequence_mask, fixed_structure_mask)

@@ -30,6 +30,13 @@ defaults:
 model:
   nn:
     multilabel_mode: "sum"
+    # CATH lists each structural domain as a separate entry (e.g., 1n7d_A has
+    # 5 LDL-receptor type-A domains all classified as 4.10.400.10). With
+    # cath_dedupe_codes: True we collapse repeated (C, A, T) triples per chain
+    # so each unique fold contributes once to the sum (= "which folds are
+    # present" semantics). Set False to keep CATH's per-domain listing and
+    # weight folds by domain-instance count.
+    cath_dedupe_codes: True
     residue_type_emb_init_seq: True
     residue_type_emb_cond_seq: True
     residue_type_emb_init_pair: True
@@ -71,9 +78,9 @@ lora:
 opt:
   lr: 0.0001
   max_epochs: 200
-  batch_size: 4
-  accumulate_grad_batches: 32
-  val_check_interval: 1000
+  batch_size: 8
+  accumulate_grad_batches: 16
+  val_check_interval_optim_steps: 200  # counted in optim steps (= 200 * 16 = 3200 mini-batches); ~228 optim steps/epoch with this dataset so val fires ~once/epoch. DDP-safe: per-GPU mini-batch count = optim_steps * accumulate_grad_batches, independent of world size.
   skip_nan_grad: False
   grad_and_weight_analysis: False
   dist_strategy: ddp
@@ -99,6 +106,11 @@ validation_sampling:
   tmscore_n_samples: 8
   tmscore_every_n_val_epochs: 1
   tmscore_mode: 5
+  # Prediction-eval semantics: use each val sample's real length (from its own mask),
+  # not a random L drawn from dataselector bounds. Default would auto-enable when
+  # dataselector exposes min/max length, which is wrong for prediction eval — and
+  # changing L per val epoch also triggers torch._dynamo recompiles.
+  variable_length_sampling: False
 
 seed: 42
 

@@ -333,6 +333,12 @@ if __name__ == "__main__":
         multilabel_mode = OmegaConf.select(cfg_exp, "model.nn.multilabel_mode")
         if multilabel_mode is not None:
             cfg_data.datamodule.multilabel_mode = multilabel_mode
+        # Propagate cath_dedupe_codes: when True, collapse repeated (C,A,T) triples
+        # per sample so each unique fold contributes once. CATH lists each domain
+        # instance separately; without dedupe, sum-mode weights folds by domain count.
+        cath_dedupe_codes = OmegaConf.select(cfg_exp, "model.nn.cath_dedupe_codes")
+        if cath_dedupe_codes is not None:
+            cfg_data.datamodule.cath_dedupe_codes = cath_dedupe_codes
         batch_size = cfg_exp.opt.get("batch_size")
         if batch_size is not None:
             cfg_data.datamodule.batch_size = batch_size
@@ -602,6 +608,11 @@ if __name__ == "__main__":
         default_root_dir=root_run,
         check_val_every_n_epoch=None,  # Leave like this
         val_check_interval=resolved_val_check_interval,
+        # ClusterSampler handles per-rank partitioning itself (seeded torch.Generator
+        # via set_epoch). Lightning's default DistributedSamplerWrapper would re-shard
+        # the already-partitioned indices, causing ~1/W² coverage on multi-GPU.
+        # See cluster_utils.ClusterSampler v2 logic and audit_cluster_sampler.py.
+        use_distributed_sampler=False,
         strategy=DDPStrategy(
             process_group_backend=cfg_exp.opt.get("dist_backend", "nccl"),
             find_unused_parameters=False,
