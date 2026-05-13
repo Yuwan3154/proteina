@@ -345,6 +345,11 @@ def main() -> None:
                              "When absent the top-energy decoy is used as self-reference.")
     parser.add_argument("--filter_existing", action=argparse.BooleanOptionalAction, default=True,
                         help="Skip proteins whose AF2Rank CSVs already cover all desired templates (default: True)")
+    parser.add_argument("--force_regenerate_topk_summary", action="store_true", default=False,
+                        help="Regenerate the per-protein af2rank_topk_summary_*.csv and the "
+                             "ProteinEBM-vs-AF2Rank-pTM scatter for proteins skipped by --filter_existing. "
+                             "Re-reads the (potentially updated) ProteinEBM scores CSV without re-running "
+                             "AF2Rank inference. Useful after --rerun_score adds new ProteinEBM columns.")
     parser.add_argument("--use_deepspeed_evoformer_attention",
                         action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use_cuequivariance_attention",
@@ -392,6 +397,7 @@ def main() -> None:
     check_start = time.perf_counter() if "time" in globals() else None
     check_candidates = global_protein_ids if args.dynamic_resharding and shard_index is not None else protein_ids
     skipped_complete = 0
+    complete_ids: List[str] = []  # preserved for optional --force_regenerate_topk_summary regen
     if args.filter_existing:
         def _af2rank_topk_complete(protein_id: str) -> bool:
             scores_rel = Path(args.proteinebm_analysis_subdir) / f"proteinebm_scores_{protein_id}.csv"
@@ -480,7 +486,11 @@ def main() -> None:
             len(check_candidates), skipped_complete, len(protein_configs), elapsed,
         )
 
-    if not protein_configs:
+    # Decide whether to short-circuit. We must NOT short-circuit when the caller
+    # asked for --force_regenerate_topk_summary and there are skipped-complete
+    # proteins whose summaries should be refreshed.
+    will_regen_summary_only = bool(args.force_regenerate_topk_summary and complete_ids)
+    if not protein_configs and not will_regen_summary_only:
         logger.info("No proteins to score.")
         if args.tar_protein_dirs:
             stats = pack_protein_dirs(inference_base, protein_ids, delete_after=True)
@@ -488,75 +498,130 @@ def main() -> None:
         return
 
     protein_ids_for_tar = [str(cfg["protein_id"]) for cfg in protein_configs]
-    if args.tar_protein_dirs:
+    if protein_configs and args.tar_protein_dirs:
         stats = restore_selected_protein_dirs(inference_base, protein_ids_for_tar)
         logger.info("tar_restore AF2Rank top-k prediction: %s", stats)
 
-    logger.info(f"{len(protein_configs)} proteins to score")
+    if protein_configs:
+        logger.info(f"{len(protein_configs)} proteins to score")
+    else:
+        logger.info("No proteins to score; will only regenerate top-k summaries for complete proteins.")
 
-    # ── Import scorer (requires proteina / openfold env) ────────────────────
-    from proteinfoundation.prediction_pipeline.af2rank_openfold_scorer import OpenFoldAF2Rank
-
-    # ── Pre-reconstruct CA-only templates ONCE (shared across both model passes)
-    allatom_map = _batch_reconstruct_all_proteins(protein_configs)
-
-    # ── Persist cg2all outputs to per-protein cg2all_topk_structures/ dirs ──
-    # Temp files are moved to persistent locations; any leftover temps are cleaned up.
-    allatom_map = _persist_allatom_files(allatom_map, protein_configs, inference_base)
-
-    has_ground_truth = cif_dir is not None
-
-    # ── Model 1: model_1_ptm ─────────────────────────────────────────────────
-    _run_model_pass(
-        protein_configs=protein_configs,
-        model_name="model_1_ptm",
-        out_dir_key="out_dir_m1",
-        recycles=args.recycles,
-        filter_existing=args.filter_existing,
-        use_deepspeed_evoformer_attention=args.use_deepspeed_evoformer_attention,
-        use_cuequivariance_attention=args.use_cuequivariance_attention,
-        use_cuequivariance_multiplicative_update=args.use_cuequivariance_multiplicative_update,
-        OpenFoldAF2Rank=OpenFoldAF2Rank,
-        allatom_map=allatom_map,
-        has_ground_truth=has_ground_truth,
-    )
-
-    # ── Model 2: model_2_ptm ─────────────────────────────────────────────────
-    _run_model_pass(
-        protein_configs=protein_configs,
-        model_name="model_2_ptm",
-        out_dir_key="out_dir_m2",
-        recycles=args.recycles,
-        filter_existing=args.filter_existing,
-        use_deepspeed_evoformer_attention=args.use_deepspeed_evoformer_attention,
-        use_cuequivariance_attention=args.use_cuequivariance_attention,
-        use_cuequivariance_multiplicative_update=args.use_cuequivariance_multiplicative_update,
-        OpenFoldAF2Rank=OpenFoldAF2Rank,
-        allatom_map=allatom_map,
-        has_ground_truth=has_ground_truth,
-    )
-
-    # ── Generate per-protein summary CSVs ────────────────────────────────────
     from proteinfoundation.prediction_pipeline.topk_summary_utils import generate_topk_summary_csv
 
-    for cfg in protein_configs:
-        protein_id = cfg["protein_id"]
-        out_dir = inference_base / protein_id / "af2rank_on_proteinebm_top_k"
-        m1_csv = out_dir / "af2rank_analysis" / f"af2rank_scores_{protein_id}.csv"
-        m2_csv = out_dir / "af2rank_analysis_model_2_ptm" / f"af2rank_scores_{protein_id}.csv"
-        if not m1_csv.exists() or not m2_csv.exists():
-            logger.warning(f"{protein_id}: AF2Rank score CSVs not found; skipping summary CSV")
-            continue
-        try:
-            generate_topk_summary_csv(
-                protein_id, cfg["topk_df"], m1_csv, m2_csv,
-                allatom_map, out_dir,
-            )
-        except Exception as e:
-            logger.warning(f"{protein_id}: summary CSV generation failed: {e}")
+    # ── Score (only when there are proteins needing work) ───────────────────
+    allatom_map: Dict[str, str] = {}
+    if protein_configs:
+        # Import scorer (requires proteina / openfold env)
+        from proteinfoundation.prediction_pipeline.af2rank_openfold_scorer import OpenFoldAF2Rank
+
+        # Pre-reconstruct CA-only templates ONCE (shared across both model passes)
+        allatom_map = _batch_reconstruct_all_proteins(protein_configs)
+
+        # Persist cg2all outputs to per-protein cg2all_topk_structures/ dirs.
+        # Temp files are moved to persistent locations; any leftover temps are cleaned up.
+        allatom_map = _persist_allatom_files(allatom_map, protein_configs, inference_base)
+
+        has_ground_truth = cif_dir is not None
+
+        # ── Model 1: model_1_ptm ─────────────────────────────────────────────
+        _run_model_pass(
+            protein_configs=protein_configs,
+            model_name="model_1_ptm",
+            out_dir_key="out_dir_m1",
+            recycles=args.recycles,
+            filter_existing=args.filter_existing,
+            use_deepspeed_evoformer_attention=args.use_deepspeed_evoformer_attention,
+            use_cuequivariance_attention=args.use_cuequivariance_attention,
+            use_cuequivariance_multiplicative_update=args.use_cuequivariance_multiplicative_update,
+            OpenFoldAF2Rank=OpenFoldAF2Rank,
+            allatom_map=allatom_map,
+            has_ground_truth=has_ground_truth,
+        )
+
+        # ── Model 2: model_2_ptm ─────────────────────────────────────────────
+        _run_model_pass(
+            protein_configs=protein_configs,
+            model_name="model_2_ptm",
+            out_dir_key="out_dir_m2",
+            recycles=args.recycles,
+            filter_existing=args.filter_existing,
+            use_deepspeed_evoformer_attention=args.use_deepspeed_evoformer_attention,
+            use_cuequivariance_attention=args.use_cuequivariance_attention,
+            use_cuequivariance_multiplicative_update=args.use_cuequivariance_multiplicative_update,
+            OpenFoldAF2Rank=OpenFoldAF2Rank,
+            allatom_map=allatom_map,
+            has_ground_truth=has_ground_truth,
+        )
+
+        # ── Generate per-protein summary CSVs (for the scored proteins) ─────
+        for cfg in protein_configs:
+            protein_id = cfg["protein_id"]
+            out_dir = inference_base / protein_id / "af2rank_on_proteinebm_top_k"
+            m1_csv = out_dir / "af2rank_analysis" / f"af2rank_scores_{protein_id}.csv"
+            m2_csv = out_dir / "af2rank_analysis_model_2_ptm" / f"af2rank_scores_{protein_id}.csv"
+            if not m1_csv.exists() or not m2_csv.exists():
+                logger.warning(f"{protein_id}: AF2Rank score CSVs not found; skipping summary CSV")
+                continue
+            try:
+                generate_topk_summary_csv(
+                    protein_id, cfg["topk_df"], m1_csv, m2_csv,
+                    allatom_map, out_dir,
+                )
+            except Exception as e:
+                logger.warning(f"{protein_id}: summary CSV generation failed: {e}")
+
+    # ── Optional: regenerate summary CSVs for previously-complete proteins ──
+    # Triggered by --force_regenerate_topk_summary (typically when --rerun_score
+    # updated proteinebm_scores_*.csv with new ptm / mean_pae columns but the
+    # AF2Rank top-k step itself was skipped).
+    if will_regen_summary_only:
+        regen_protein_ids = list(complete_ids)
+        logger.info(f"Force-regenerating top-k summaries for {len(regen_protein_ids)} complete proteins")
+        regen_for_tar = [pid for pid in regen_protein_ids if pid not in set(protein_ids_for_tar)]
+        if args.tar_protein_dirs and regen_for_tar:
+            stats = restore_selected_protein_dirs(inference_base, regen_for_tar)
+            logger.info("tar_restore force_regenerate_topk_summary: %s", stats)
+        for protein_id in regen_protein_ids:
+            protein_dir = inference_base / protein_id
+            scores_rel = Path(args.proteinebm_analysis_subdir) / f"proteinebm_scores_{protein_id}.csv"
+            scores_text = read_protein_text(inference_base, protein_id, scores_rel)
+            if scores_text is None:
+                logger.warning(f"{protein_id}: ProteinEBM scores CSV missing, skipping summary regen")
+                continue
+            try:
+                topk_df = _select_topk_df(pd.read_csv(io.StringIO(scores_text)), protein_dir, args.top_k)
+            except Exception as e:
+                logger.warning(f"{protein_id}: top-k selection failed during summary regen: {e}")
+                continue
+            out_dir = protein_dir / "af2rank_on_proteinebm_top_k"
+            m1_csv = out_dir / "af2rank_analysis" / f"af2rank_scores_{protein_id}.csv"
+            m2_csv = out_dir / "af2rank_analysis_model_2_ptm" / f"af2rank_scores_{protein_id}.csv"
+            if not m1_csv.exists() or not m2_csv.exists():
+                logger.warning(f"{protein_id}: AF2Rank CSVs missing under {out_dir}, skipping summary regen")
+                continue
+            # Rebuild allatom_map for this protein from existing persisted cg2all PDBs
+            cg2all_dir = out_dir / "cg2all_topk_structures"
+            local_allatom_map: Dict[str, str] = {}
+            if cg2all_dir.exists():
+                for _, row in topk_df.iterrows():
+                    orig = str(row["structure_path"])
+                    candidate = cg2all_dir / f"{Path(orig).stem}_allatom.pdb"
+                    if candidate.exists():
+                        local_allatom_map[orig] = str(candidate)
+            try:
+                generate_topk_summary_csv(
+                    protein_id, topk_df, m1_csv, m2_csv,
+                    local_allatom_map, out_dir,
+                )
+            except Exception as e:
+                logger.warning(f"{protein_id}: summary CSV regeneration failed: {e}")
+        if args.tar_protein_dirs and regen_for_tar:
+            stats = pack_protein_dirs(inference_base, regen_for_tar, delete_after=True)
+            logger.info("tar_pack force_regenerate_topk_summary: %s", stats)
 
     logger.info("AF2Rank prediction scoring complete.")
-    if args.tar_protein_dirs:
+    if protein_configs and args.tar_protein_dirs:
         stats = pack_protein_dirs(inference_base, protein_ids_for_tar, delete_after=True)
         logger.info("tar_pack AF2Rank top-k prediction finalization: %s", stats)
 

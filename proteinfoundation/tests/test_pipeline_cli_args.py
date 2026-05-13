@@ -213,6 +213,35 @@ def test_step_af2rank_topk_no_cif_dir(monkeypatch):
     )
     cmd = captured["cmd"]
     assert "--cif_dir" not in cmd
+    # Default: no forced summary regen
+    assert "--force_regenerate_topk_summary" not in cmd
+
+
+def test_step_af2rank_topk_force_regenerate_topk_summary(monkeypatch):
+    """When force_regenerate_topk_summary=True is passed, the flag must be
+    forwarded so previously-complete proteins get their summary CSV +
+    per-protein af2rank-vs-proteinebm pTM scatter rebuilt."""
+    captured = {}
+
+    def fake_run(env_name, command_list, cwd=None, direct_python=False):
+        captured["cmd"] = command_list
+        return True
+
+    monkeypatch.setattr(rpp, "run_with_conda_env", fake_run)
+    monkeypatch.setattr(rpp, "PRED_PIPELINE_DIR", "/pp")
+    monkeypatch.setattr(rpp, "PROTEINA_BASE_DIR", "/proteina")
+
+    rpp.step_af2rank_topk(
+        inference_config="cfg",
+        af2rank_top_k=5,
+        recycles=3,
+        num_gpus=1,
+        csv_file="d.csv",
+        csv_col="pdb",
+        force_regenerate_topk_summary=True,
+    )
+    cmd = captured["cmd"]
+    assert "--force_regenerate_topk_summary" in cmd
 
 
 def test_proteinebm_defaults_point_at_pae_model():

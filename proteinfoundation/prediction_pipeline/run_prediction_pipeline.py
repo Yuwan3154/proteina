@@ -333,6 +333,7 @@ def step_af2rank_topk(
     tar_protein_dirs: bool = True,
     dynamic_resharding: bool = True,
     progress_check_workers: int | None = None,
+    force_regenerate_topk_summary: bool = False,
 ) -> bool:
     """Run AF2Rank on ProteinEBM top-k templates.
 
@@ -359,6 +360,8 @@ def step_af2rank_topk(
         cmd.append("--filter_existing")
     else:
         cmd.append("--no-filter_existing")
+    if force_regenerate_topk_summary:
+        cmd.append("--force_regenerate_topk_summary")
     if not use_deepspeed_evoformer_attention:
         cmd.append("--no-use_deepspeed_evoformer_attention")
     if not use_cuequivariance_attention:
@@ -1216,6 +1219,11 @@ def main(argv: list[str] | None = None):
             tar_protein_dirs=args.tar_protein_dirs,
             dynamic_resharding=args.dynamic_resharding,
             progress_check_workers=args.progress_check_workers,
+            # When ProteinEBM was re-scored, the per-decoy CSV gains new
+            # ptm/mean_pae columns. Force-regenerate the top-k summary CSV
+            # + per-protein af2rank-vs-proteinebm pTM scatter even for
+            # proteins whose AF2Rank scoring is already complete.
+            force_regenerate_topk_summary=bool(args.rerun_score),
         ):
             logger.error("AF2Rank top-k step failed")
             success = False
