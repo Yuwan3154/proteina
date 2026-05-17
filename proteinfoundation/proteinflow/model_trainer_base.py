@@ -2159,6 +2159,21 @@ class ModelTrainerBase(L.LightningModule):
                     "global_step": self.global_step,
                 }
                 self.logger.experiment.log(payload)
+                # Also publish through Lightning's metric system so ModelCheckpoint
+                # can see these values in callback_metrics (the direct wandb call
+                # above goes only to wandb, not to Lightning's metric dict).
+                # rank_zero_only + sync_dist=False because we're already inside
+                # the rank-0 guard above.
+                for k, v in payload.items():
+                    if k == "global_step":
+                        continue
+                    self.log(
+                        k, float(v),
+                        on_step=False, on_epoch=True,
+                        prog_bar=False, logger=False,
+                        rank_zero_only=True, sync_dist=False,
+                        add_dataloader_idx=False,
+                    )
         self._validation_tmscore_results = []
         self.validation_output_data = []
 
@@ -2361,6 +2376,21 @@ class ModelTrainerBase(L.LightningModule):
                 mask,
             )
 
+        # Extract GT once (used for both visualization and per-sample TMscore).
+        # `extract_clean_sample` returns the same `x_1` the training loop uses as
+        # the prediction target, so logging it here gives the user a side-by-side
+        # comparison of "what the model produced" vs "what it was trying to hit"
+        # for the same residue_type / fold-conditioning / random-noise init.
+        x_1_gt = None
+        gt_mask = mask
+        if coords is not None or log_visualization:
+            try:
+                x_1_gt, gt_mask, _, _, _ = self.extract_clean_sample(batch)
+            except Exception as e:
+                logger.warning(f"validation_sampling: failed to extract GT: {e!r}")
+                x_1_gt = None
+                gt_mask = mask
+
         # Log visualization for the FIRST sample only (consistent with the prior
         # single-sample behaviour). Use index 0 of the batched results — squeeze(0)
         # is wrong for nsamples > 1, so use [0] indexing instead.
@@ -2369,6 +2399,16 @@ class ModelTrainerBase(L.LightningModule):
             if contact_map is not None:
                 _viz = self._contact_map_to_viz(contact_map)
                 cmap_first = _viz[0] if _viz.dim() >= 2 else _viz
+            # GT DSSP from the batch (present whenever DSSPTargetTransform runs;
+            # values in {0,1,2,-1}). The val trajectory doesn't predict DSSP itself,
+            # so we slot the GT into the `dssp_gt` strip (logs cleanly as
+            # `validation_sampling/dssp_gt`).
+            dssp_target_raw = batch.get("dssp_target") if isinstance(batch, dict) else None
+            dssp_gt_first = (
+                dssp_target_raw[0]
+                if isinstance(dssp_target_raw, torch.Tensor) and dssp_target_raw.numel() > 0
+                else None
+            )
             self._log_structure_visualization(
                 x_1_pred=coords[:1],
                 contact_map_pred=cmap_first,
@@ -2377,18 +2417,39 @@ class ModelTrainerBase(L.LightningModule):
                 pair_logits=distogram[0] if distogram is not None else None,
                 residue_type=residue_type[0] if residue_type is not None else None,
                 use_template_inference=predict_from_dist,
+                dssp_gt=dssp_gt_first,
             )
+
+            # GT visualization (target structure + GT contact map). Same sample
+            # index 0, so the user can visually compare the prediction quality
+            # against the actual target. DSSP is already covered above as
+            # `dssp_gt`, so we don't pass it again here (which would log under
+            # the awkward `dssp_gt_gt` key).
+            gt_contact_map_viz = None
+            if getattr(self, "contact_map_mode", False):
+                try:
+                    c_1_gt = self.extract_clean_contact_map(batch, mask)
+                    if c_1_gt is not None and c_1_gt.numel() > 0:
+                        gt_contact_map_viz = self._contact_map_to_viz(c_1_gt[0])
+                except Exception as e:
+                    logger.warning(
+                        f"validation_sampling: failed to extract GT contact map: {e!r}"
+                    )
+                    gt_contact_map_viz = None
+            if x_1_gt is not None:
+                self._log_structure_visualization(
+                    x_1_pred=x_1_gt[:1],
+                    contact_map_pred=gt_contact_map_viz,
+                    mask=mask[0],
+                    log_prefix="validation_sampling",
+                    key_suffix="_gt",
+                    residue_type=residue_type[0] if residue_type is not None else None,
+                )
 
         # Per-sample USalign TMscore loop. Even though we batched the trajectory's
         # NN forward passes, USalign itself runs per-pair on temp PDBs (it's a
         # subprocess, not a tensor op) — so we loop here.
         if accumulate_metric and coords is not None and residue_type is not None:
-            try:
-                x_1_gt, gt_mask, _, _, _ = self.extract_clean_sample(batch)
-            except Exception as e:
-                logger.warning(f"validation_sampling: failed to extract GT for TMscore: {e!r}")
-                x_1_gt = None
-                gt_mask = mask
             if x_1_gt is not None:
                 if not hasattr(self, "_validation_tmscore_results") or self._validation_tmscore_results is None:
                     self._validation_tmscore_results = []

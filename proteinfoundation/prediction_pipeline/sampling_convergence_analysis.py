@@ -681,6 +681,13 @@ def _summary_stats(long_df: pd.DataFrame, cutoffs: List[int], ptm_cutoff: float,
 def _plot_distribution(
     long_df: pd.DataFrame, cutoffs: List[int], metric: str, path: Path,
 ) -> None:
+    """Per-cutoff box plot with mean overlaid as a connecting line.
+
+    Replaces the older separate "violin distribution" + "mean/median + IQR curve"
+    pair.  Each cutoff column shows a single box (Q1–Q3 with median line and
+    whiskers); the mean across proteins is plotted as a connected line on top,
+    so the eye can follow the trend.
+    """
     if long_df.empty or metric not in long_df.columns:
         return
     data = [
@@ -689,101 +696,54 @@ def _plot_distribution(
     ]
     if not any(len(a) for a in data):
         return
+
     fig, ax = plt.subplots(figsize=(max(6, 1.5 * len(cutoffs)), 5), dpi=120)
     positions = np.arange(len(cutoffs)) + 1
-    parts = ax.violinplot([d if len(d) else np.array([np.nan]) for d in data], positions=positions, showmedians=True, showextrema=False)
-    for pc in parts["bodies"]:
-        pc.set_facecolor("tab:blue")
-        pc.set_edgecolor("black")
-        pc.set_alpha(0.45)
-    ax.boxplot(
-        [d if len(d) else np.array([np.nan]) for d in data],
-        positions=positions, widths=0.18, showfliers=True,
-        patch_artist=False, medianprops={"color": "black"},
+    box_data = [d if len(d) else np.array([np.nan]) for d in data]
+    bp = ax.boxplot(
+        box_data,
+        positions=positions,
+        widths=0.55,
+        showfliers=True,
+        patch_artist=True,
+        medianprops={"color": "black", "linewidth": 1.6},
+        flierprops={"marker": "o", "markersize": 3, "alpha": 0.4, "markeredgecolor": "none"},
+        whiskerprops={"color": "black"},
+        capprops={"color": "black"},
     )
+    for box in bp["boxes"]:
+        box.set(facecolor="tab:blue", alpha=0.40, edgecolor="black")
+
+    # Jittered individual points (low alpha) so distribution shape is visible
     for i, arr in enumerate(data):
         if len(arr):
             x = np.full_like(arr, positions[i], dtype=float)
-            x += (np.random.RandomState(0).rand(len(arr)) - 0.5) * 0.18
-            ax.scatter(x, arr, s=8, color="black", alpha=0.35, linewidths=0)
+            x += (np.random.RandomState(0).rand(len(arr)) - 0.5) * 0.30
+            ax.scatter(x, arr, s=8, color="black", alpha=0.30, linewidths=0)
+
+    # Mean across proteins, connected by a line
+    means = [float(arr.mean()) if len(arr) else np.nan for arr in data]
+    ns = [len(arr) for arr in data]
+    ax.plot(
+        positions, means,
+        marker="D", markersize=8, markerfacecolor="tab:red", markeredgecolor="black",
+        markeredgewidth=0.8,
+        color="tab:red", linewidth=2.0, label="mean",
+    )
+
+    # Annotate each cutoff with its protein count
+    yshow_min = np.nanmin([np.min(a) for a in data if len(a)])
+    for pos, n in zip(positions, ns):
+        ax.text(pos, max(0.0, yshow_min - 0.05), f"n={n}", ha="center", va="top", fontsize=8, color="dimgray")
+
     ax.set_xticks(positions)
     ax.set_xticklabels([str(int(N)) for N in cutoffs])
     ax.set_xlabel("sample count cutoff (N)")
     ax.set_ylabel(METRIC_LABELS.get(metric, metric))
-    ax.set_title(f"{METRIC_LABELS.get(metric, metric)} distribution across proteins")
+    ax.set_title(f"{METRIC_LABELS.get(metric, metric)} vs. sample count")
     ax.set_ylim(0.0, 1.0)
     ax.grid(True, axis="y", alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(path, dpi=200)
-    plt.close(fig)
-    logger.info("Wrote %s", path)
-
-
-def _plot_mean_curve(
-    long_df: pd.DataFrame, cutoffs: List[int], metric: str, path: Path,
-) -> None:
-    if long_df.empty or metric not in long_df.columns:
-        return
-    means, medians, p25s, p75s, ns = [], [], [], [], []
-    for N in cutoffs:
-        arr = pd.to_numeric(long_df[long_df["cutoff"] == int(N)][metric], errors="coerce").dropna().to_numpy()
-        ns.append(len(arr))
-        if len(arr):
-            means.append(arr.mean())
-            medians.append(np.median(arr))
-            p25s.append(np.percentile(arr, 25))
-            p75s.append(np.percentile(arr, 75))
-        else:
-            means.append(np.nan); medians.append(np.nan); p25s.append(np.nan); p75s.append(np.nan)
-    if not any(n > 0 for n in ns):
-        return
-    fig, ax = plt.subplots(figsize=(8, 5), dpi=120)
-    x = np.asarray(cutoffs, dtype=float)
-    ax.fill_between(x, p25s, p75s, color="tab:blue", alpha=0.18, label="IQR (p25–p75)")
-    ax.plot(x, means, marker="o", color="tab:blue", linewidth=2, label="mean")
-    ax.plot(x, medians, marker="s", color="tab:orange", linewidth=1.6, label="median")
-    ax.set_xscale("log", base=2)
-    ax.set_xticks(x)
-    ax.get_xaxis().set_major_formatter(matplotlib.ticker.ScalarFormatter())
-    ax.set_xlabel("sample count cutoff (N) — log₂ scale")
-    ax.set_ylabel(METRIC_LABELS.get(metric, metric))
-    ax.set_ylim(0.0, 1.0)
-    ax.set_title(f"{METRIC_LABELS.get(metric, metric)} vs. sample count")
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc="lower right")
-    fig.tight_layout()
-    fig.savefig(path, dpi=200)
-    plt.close(fig)
-    logger.info("Wrote %s", path)
-
-
-def _plot_heatmap(
-    long_df: pd.DataFrame, cutoffs: List[int], metric: str, path: Path,
-) -> None:
-    if long_df.empty or metric not in long_df.columns:
-        return
-    pivot = long_df.pivot_table(index="protein_id", columns="cutoff", values=metric, aggfunc="first")
-    pivot = pivot.reindex(columns=[int(N) for N in cutoffs])
-    if pivot.empty:
-        return
-    largest = pivot.columns.max()
-    pivot = pivot.sort_values(by=largest, ascending=False)
-    n_proteins, n_cuts = pivot.shape
-    fig_h = max(4.0, min(0.20 * n_proteins, 32.0))
-    fig, ax = plt.subplots(figsize=(max(4, 0.8 * n_cuts + 2), fig_h), dpi=120)
-    im = ax.imshow(pivot.to_numpy(dtype=float), aspect="auto", cmap="viridis", vmin=0.0, vmax=1.0, interpolation="nearest")
-    ax.set_xticks(np.arange(n_cuts))
-    ax.set_xticklabels([str(int(N)) for N in pivot.columns])
-    ax.set_xlabel("sample count cutoff (N)")
-    if n_proteins <= 60:
-        ax.set_yticks(np.arange(n_proteins))
-        ax.set_yticklabels(pivot.index.astype(str).tolist(), fontsize=max(4, min(8, 350 // max(n_proteins, 1))))
-    else:
-        ax.set_yticks([])
-    ax.set_ylabel(f"proteins (sorted by metric at N={int(largest)})")
-    ax.set_title(f"{METRIC_LABELS.get(metric, metric)} heatmap")
-    cbar = fig.colorbar(im, ax=ax, shrink=0.7)
-    cbar.set_label(METRIC_LABELS.get(metric, metric))
+    ax.legend(loc="lower right", fontsize=10)
     fig.tight_layout()
     fig.savefig(path, dpi=200)
     plt.close(fig)
@@ -880,9 +840,10 @@ def _generate_all_plots(
         metrics.append((SECONDARY_METRIC, tm_cutoff))
     for metric, threshold in metrics:
         prefix = PLOT_PREFIX[metric]
-        _plot_distribution(long_df, cutoffs, metric, output_dir / f"{prefix}_distribution.png")
-        _plot_mean_curve(long_df, cutoffs, metric, output_dir / f"{prefix}_mean_curve.png")
-        _plot_heatmap(long_df, cutoffs, metric, output_dir / f"{prefix}_heatmap.png")
+        # Main convergence plot: per-cutoff box plot with mean overlaid as a
+        # connecting line.  Replaces the older separate "distribution" + "mean
+        # curve" pair, and the (visually noisy) heatmap.
+        _plot_distribution(long_df, cutoffs, metric, output_dir / f"{prefix}_box_plus_mean.png")
         _plot_fraction_passing(long_df, cutoffs, metric, threshold, output_dir / f"{prefix}_fraction_passing.png")
         _plot_gain(long_df, cutoffs, metric, output_dir / f"{prefix}_gain.png")
 

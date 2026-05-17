@@ -521,6 +521,30 @@ if __name__ == "__main__":
             checkpoint_callback = EmaModelCheckpoint(**args_ckpt)
             callbacks.append(checkpoint_callback)
 
+        # Best-of-validation-sampling TM-score checkpoint. Fires at end of each
+        # val epoch (the only time `validation_sampling/tmscore_median` is logged
+        # in on_validation_epoch_end_data). save_top_k=1 keeps just the best
+        # checkpoint and removes worse ones, so disk usage stays bounded. Disabled
+        # by setting `log.checkpoint_best_tmscore_median: False`.
+        if cfg_exp.log.get("checkpoint_best_tmscore_median", True):
+            args_ckpt_best_tm = {
+                "dirpath": checkpoint_path_store,
+                "save_last": False,
+                "save_weights_only": False,
+                "filename": "chk_best_tmscore_median_{epoch:08d}_{step:012d}",
+                "monitor": "validation_sampling/tmscore_median",
+                "save_top_k": int(cfg_exp.log.get("checkpoint_best_tmscore_save_top_k", 1)),
+                "mode": "max",  # higher TM-score = better
+                # Only attempt to save when the monitored metric is actually present
+                # in callback_metrics (it is logged once per val epoch from
+                # on_validation_epoch_end_data); ModelCheckpoint will silently skip
+                # epochs where the metric is missing (e.g. very early steps when
+                # _val_traj_buffer hasn't filled yet).
+                "save_on_train_epoch_end": False,
+            }
+            checkpoint_callback_best_tm = EmaModelCheckpoint(**args_ckpt_best_tm)
+            callbacks.append(checkpoint_callback_best_tm)
+
         # Save and log config files
         path_configs = [
             (

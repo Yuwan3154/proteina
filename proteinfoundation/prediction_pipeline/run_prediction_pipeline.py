@@ -545,6 +545,7 @@ def step_collect_results(
                 "best_energy": float("nan"),
                 "best_proteinebm_ptm": float("nan"),
                 "best_proteinebm_mean_pae": float("nan"),
+                "best_ref_pred_tm": float("nan"),
                 "best_template": "",
                 "best_prediction": "",
                 "passes_cutoff": False,
@@ -554,9 +555,17 @@ def step_collect_results(
         m1_df = pd.read_csv(io.StringIO(m1_text))
         m2_df = pd.read_csv(io.StringIO(m2_text))
 
-        # Merge across models: take min pTM per structure (conservative)
-        merged = m1_df[["structure_file", "ptm", "plddt"]].merge(
-            m2_df[["structure_file", "ptm"]], on="structure_file", suffixes=("_m1", "_m2"),
+        # Merge across models: take min pTM per structure (conservative).
+        # Also bring in tm_ref_pred (GT TM-score for AF2Rank's prediction) when
+        # present — populated by proteina_analysis.py --cif_dir.
+        m1_cols = ["structure_file", "ptm", "plddt"]
+        if "tm_ref_pred" in m1_df.columns:
+            m1_cols.append("tm_ref_pred")
+        m2_cols = ["structure_file", "ptm"]
+        if "tm_ref_pred" in m2_df.columns:
+            m2_cols.append("tm_ref_pred")
+        merged = m1_df[m1_cols].merge(
+            m2_df[m2_cols], on="structure_file", suffixes=("_m1", "_m2"),
         )
         merged["min_ptm"] = merged[["ptm_m1", "ptm_m2"]].min(axis=1)
 
@@ -604,6 +613,7 @@ def step_collect_results(
                 "best_energy": float("nan"),
                 "best_proteinebm_ptm": proteinebm_best_ptm,
                 "best_proteinebm_mean_pae": proteinebm_best_mean_pae,
+                "best_ref_pred_tm": float("nan"),
                 "best_template": "",
                 "best_prediction": "",
                 "passes_cutoff": False,
@@ -618,6 +628,18 @@ def step_collect_results(
         best_energy = float(best_row.get("energy", float("nan")))
         best_file = str(best_row["structure_file"])
         passes = best_ptm >= ptm_cutoff
+        # Match ref_pred_TM to the model whose pTM equals min_ptm, so
+        # (best_ptm, best_ref_pred_tm) come from the same AF2Rank model.
+        best_ref_pred_tm = float("nan")
+        if "tm_ref_pred_m1" in best_row.index and "tm_ref_pred_m2" in best_row.index:
+            ptm_m1_val = float(best_row.get("ptm_m1", float("inf")))
+            ptm_m2_val = float(best_row.get("ptm_m2", float("inf")))
+            use_m1 = ptm_m1_val <= ptm_m2_val
+            chosen = best_row["tm_ref_pred_m1"] if use_m1 else best_row["tm_ref_pred_m2"]
+            try:
+                best_ref_pred_tm = float(chosen)
+            except (TypeError, ValueError):
+                best_ref_pred_tm = float("nan")
 
         # ── Save best cg2all template ──────────────────────────────────────────
         if tar_protein_dirs and not protein_dir.exists():
@@ -671,6 +693,7 @@ def step_collect_results(
             "best_energy": best_energy,
             "best_proteinebm_ptm": proteinebm_best_ptm,
             "best_proteinebm_mean_pae": proteinebm_best_mean_pae,
+            "best_ref_pred_tm": best_ref_pred_tm,
             "best_template": os.path.basename(dest_template) if dest_template else "",
             "best_prediction": os.path.basename(dest_prediction) if dest_prediction else "",
             "passes_cutoff": passes,
@@ -686,6 +709,7 @@ def step_collect_results(
         "protein_id", "sequence_length", "num_generated",
         "best_ptm", "best_plddt", "best_energy",
         "best_proteinebm_ptm", "best_proteinebm_mean_pae",
+        "best_ref_pred_tm",
         "best_template", "best_prediction", "passes_cutoff",
     ]
     with open(summary_csv_path, "w", newline="") as f:
@@ -701,6 +725,7 @@ def step_collect_results(
     ptm_values = _finite([r["best_ptm"] for r in results])
     proteinebm_ptm_values = _finite([r.get("best_proteinebm_ptm", float("nan")) for r in results])
     proteinebm_mean_pae_values = _finite([r.get("best_proteinebm_mean_pae", float("nan")) for r in results])
+    ref_pred_tm_values = _finite([r.get("best_ref_pred_tm", float("nan")) for r in results])
     num_passing = sum(1 for r in results if r["passes_cutoff"])
 
     def _stats(values: list):
@@ -715,6 +740,28 @@ def step_collect_results(
             "max": float(np.max(arr)),
         }
 
+    # Calibration at the configured cutoff: among proteins with pTM >= cutoff,
+    # what fraction have ref_pred_TM >= pTM? Both vals must be present (GT mode).
+    calibration_pairs = [
+        (float(r["best_ptm"]), float(r.get("best_ref_pred_tm", float("nan"))))
+        for r in results
+        if not (isinstance(r["best_ptm"], float) and math.isnan(r["best_ptm"]))
+        and not (isinstance(r.get("best_ref_pred_tm", float("nan")), float)
+                 and math.isnan(r.get("best_ref_pred_tm", float("nan"))))
+    ]
+    n_pass_c = sum(1 for ptm, _ in calibration_pairs if ptm >= ptm_cutoff)
+    n_cal_c = sum(1 for ptm, gt in calibration_pairs if ptm >= ptm_cutoff and gt >= ptm)
+    calibration_block = (
+        {
+            "ptm_cutoff": ptm_cutoff,
+            "num_passing_cutoff": n_pass_c,
+            "num_calibrated": n_cal_c,
+            "fraction_calibrated": (n_cal_c / n_pass_c) if n_pass_c else None,
+        }
+        if calibration_pairs
+        else None
+    )
+
     summary_json = {
         "total_proteins": len(results),
         "num_passing_cutoff": num_passing,
@@ -727,6 +774,8 @@ def step_collect_results(
         "ptm_max": float(np.max(ptm_values)) if ptm_values else None,
         "proteinebm_ptm": _stats(proteinebm_ptm_values),
         "proteinebm_mean_pae": _stats(proteinebm_mean_pae_values),
+        "ref_pred_tm": _stats(ref_pred_tm_values),
+        "calibration_at_cutoff": calibration_block,
     }
 
     # Add analysis pairwise TM metrics if available
@@ -814,6 +863,71 @@ def step_plot_distribution(results: list, output_dir: str, ptm_cutoff: float) ->
     plt.savefig(plot_path, dpi=300, bbox_inches="tight")
     plt.close()
     logger.info(f"pTM distribution plot saved to {plot_path}")
+
+
+def step_plot_ptm_calibration_curve(results: list, output_dir: str, ptm_cutoff: float) -> None:
+    """Calibration curve: fraction of proteins with ref_pred_TM >= pTM,
+    among those with pTM >= τ, as τ sweeps [0, 1].
+
+    Skipped silently when no protein has both best_ptm and best_ref_pred_tm
+    (no-GT mode). Writes ``ptm_calibration_curve.png`` in ``output_dir``.
+    """
+    pairs = [
+        (float(r["best_ptm"]), float(r.get("best_ref_pred_tm", float("nan"))))
+        for r in results
+        if not (isinstance(r["best_ptm"], float) and math.isnan(r["best_ptm"]))
+        and not (isinstance(r.get("best_ref_pred_tm", float("nan")), float)
+                 and math.isnan(r.get("best_ref_pred_tm", float("nan"))))
+    ]
+    if not pairs:
+        logger.info("Skipping calibration curve: no GT-aware best_ref_pred_tm available")
+        return
+
+    ptms = np.array([p for p, _ in pairs], dtype=float)
+    gts = np.array([g for _, g in pairs], dtype=float)
+    taus = np.linspace(0.0, 1.0, 101)
+    fracs = np.full_like(taus, np.nan, dtype=float)
+    n_passing = np.zeros_like(taus, dtype=int)
+    for i, tau in enumerate(taus):
+        mask = ptms >= tau
+        n = int(mask.sum())
+        n_passing[i] = n
+        if n > 0:
+            fracs[i] = float(((gts[mask] >= ptms[mask])).sum()) / n
+
+    # Fraction at the configured cutoff (for the highlighted marker + annotation)
+    mask_c = ptms >= ptm_cutoff
+    n_pass_c = int(mask_c.sum())
+    n_cal_c = int(((gts[mask_c] >= ptms[mask_c])).sum()) if n_pass_c else 0
+    frac_c = (n_cal_c / n_pass_c) if n_pass_c else float("nan")
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(taus, fracs, color="#4C72B0", linewidth=2,
+            label="P(ref_pred_TM ≥ pTM | pTM ≥ τ)")
+    ax.axvline(ptm_cutoff, color="red", linestyle="--", linewidth=2,
+               label=f"pTM cutoff = {ptm_cutoff}")
+    if not math.isnan(frac_c):
+        ax.plot([ptm_cutoff], [frac_c], "ro", markersize=8, zorder=5)
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.05)
+    ax.set_xlabel("pTM cutoff τ", fontsize=12)
+    ax.set_ylabel("Fraction with ref_pred_TM ≥ pTM\n(among proteins with pTM ≥ τ)", fontsize=12)
+    ax.set_title("Calibration: AF2Rank pTM vs actual TM(ref, prediction)", fontsize=13)
+    annotation = (
+        f"At τ = {ptm_cutoff}:\n  {n_cal_c}/{n_pass_c} proteins ({frac_c:.0%}) calibrated"
+        if n_pass_c
+        else f"At τ = {ptm_cutoff}: no proteins pass cutoff"
+    )
+    ax.annotate(annotation, xy=(0.04, 0.96), xycoords="axes fraction",
+                ha="left", va="top", fontsize=10,
+                bbox=dict(boxstyle="round,pad=0.4", facecolor="lightyellow", edgecolor="gray"))
+    ax.legend(loc="lower left", fontsize=10)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plot_path = os.path.join(output_dir, "ptm_calibration_curve.png")
+    plt.savefig(plot_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    logger.info(f"pTM calibration curve saved to {plot_path}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -1350,12 +1464,16 @@ def main(argv: list[str] | None = None):
     elif has_gt and args.skip_cross_protein_plots:
         logger.info("Skipping cross-protein plots (--skip_cross_protein_plots)")
 
-    # ── Step 8: pTM distribution histogram ──
+    # ── Step 8: pTM distribution histogram + calibration curve ──
     if success and results and not args.skip_distribution_plot:
         logger.info("\n" + "=" * 60)
         logger.info("STEP 8: PTM DISTRIBUTION PLOT")
         logger.info("=" * 60)
         step_plot_distribution(results, args.output_dir, args.ptm_cutoff)
+        # Calibration curve runs only when ground-truth TM-scores are present
+        # in the per-protein results (i.e. GT-evaluation mode); the helper
+        # silently skips otherwise.
+        step_plot_ptm_calibration_curve(results, args.output_dir, args.ptm_cutoff)
     elif args.skip_distribution_plot:
         logger.info("Skipping pTM distribution plot")
 

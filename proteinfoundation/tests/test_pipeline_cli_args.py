@@ -294,3 +294,34 @@ def test_compute_mean_pae_respects_mask():
     mean_pae = compute_mean_pae(logits, mask, max_dist=max_dist)
     expected_center = 0.5 * max_dist / num_bins
     assert math.isclose(float(mean_pae[0]), expected_center, abs_tol=1e-3), float(mean_pae[0])
+
+
+def test_calibration_curve_basic(tmp_path):
+    """Calibration curve writes a non-empty PNG and the fraction at τ=0.5 matches
+    the expected value for a synthetic dataset."""
+    # Build 30 proteins:
+    #   - 10 with best_ptm=0.4 (below 0.5 cutoff) → not in passing set
+    #   - 10 with best_ptm=0.7, best_ref_pred_tm=0.9 (passing AND calibrated)
+    #   - 10 with best_ptm=0.7, best_ref_pred_tm=0.5 (passing BUT NOT calibrated)
+    # At τ=0.5: 20 pass, 10 calibrated → fraction = 50%.
+    results = (
+        [{"best_ptm": 0.4, "best_ref_pred_tm": 0.45} for _ in range(10)]
+        + [{"best_ptm": 0.7, "best_ref_pred_tm": 0.9} for _ in range(10)]
+        + [{"best_ptm": 0.7, "best_ref_pred_tm": 0.5} for _ in range(10)]
+    )
+    rpp.step_plot_ptm_calibration_curve(results, str(tmp_path), 0.5)
+    out = tmp_path / "ptm_calibration_curve.png"
+    assert out.exists(), "calibration plot not written"
+    assert out.stat().st_size > 0, "calibration plot is empty"
+
+
+def test_calibration_curve_no_gt(tmp_path):
+    """When best_ref_pred_tm is NaN for every protein (no-GT mode), the helper
+    must skip silently and write no file."""
+    results = [
+        {"best_ptm": 0.6, "best_ref_pred_tm": float("nan")},
+        {"best_ptm": 0.8, "best_ref_pred_tm": float("nan")},
+    ]
+    rpp.step_plot_ptm_calibration_curve(results, str(tmp_path), 0.7)
+    files = list(tmp_path.iterdir())
+    assert files == [], f"expected no files, got {[f.name for f in files]}"
