@@ -148,6 +148,17 @@ class Proteina(ModelTrainerBase):
             self.nn_sc = copy.deepcopy(self.nn)
             for p in self.nn_sc.parameters():
                 p.requires_grad = False
+            # Force the self-cond copy to eager mode. It runs once per training
+            # step under torch.no_grad() (see model_trainer_base._set_self_cond);
+            # if it goes through torch.compile, Dynamo sees the SAME _forward_impl
+            # code object with grad_mode=False (here) AND grad_mode=True (real
+            # training step). Each inner frame then specializes on grad_mode,
+            # blowing past `cache_size_limit=8` and forcing repeated recompiles.
+            # See TORCH_LOGS=recompiles trace: every recompile reads
+            # `GLOBAL_STATE changed: grad_mode`. Setting use_torch_compile=False
+            # on nn_sc only removes the toggle: the training nn's compiled
+            # frames now only ever see grad_mode=True.
+            self.nn_sc.use_torch_compile = False
         self.non_contact_value = cfg_exp.model.nn.get("non_contact_value", 0)
         if self.non_contact_value not in (0, -1):
             raise ValueError(f"non_contact_value must be 0 or -1, got {self.non_contact_value}")

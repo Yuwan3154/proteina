@@ -779,9 +779,60 @@ class ProteinTransformerAF3(torch.nn.Module):
         elif self.predict_coords == "ipa":
             self.ipa_token_dim = kwargs.get("ipa_token_dim", kwargs["token_dim"])
             self.ipa_pair_repr_dim = kwargs.get("ipa_pair_repr_dim", kwargs["pair_repr_dim"])
-            
+
             self.ipa_linear_s = torch.nn.Linear(kwargs["token_dim"], self.ipa_token_dim, bias=True)
             self.ipa_linear_z = torch.nn.Linear(kwargs["pair_repr_dim"], self.ipa_pair_repr_dim, bias=True)
+
+            # Optional alternative initialization of the IPA projectors. The
+            # frozen-IPA + projector-only setup struggles when these projectors
+            # use the default Kaiming-uniform init — random outputs feed garbage
+            # to AF2-pretrained IPA, which expects c_s/c_z features with specific
+            # semantics. See project_proteina_data_engineering_plan.md (FAPE/IPA
+            # debug section) for the rationale and which experiments to run.
+            init_ipa_proj = kwargs.get("init_ipa_proj", "default")
+            if init_ipa_proj == "default":
+                pass  # keep PyTorch's Kaiming-uniform default
+            elif init_ipa_proj == "identity_pad":
+                # Near-identity pad: zero-init weight + bias, then copy a small-scale
+                # eye onto the leading min(token_dim, ipa_token_dim) sub-block. AF2
+                # IPA initially sees mostly zeros (its "no-feature" prior), with
+                # only a faint reflection of the trunk's first features.
+                with torch.no_grad():
+                    self.ipa_linear_s.weight.zero_()
+                    self.ipa_linear_s.bias.zero_()
+                    k_s = min(kwargs["token_dim"], self.ipa_token_dim)
+                    self.ipa_linear_s.weight[:k_s, :k_s] = torch.eye(k_s) * 0.1
+                    self.ipa_linear_z.weight.zero_()
+                    self.ipa_linear_z.bias.zero_()
+                    k_z = min(kwargs["pair_repr_dim"], self.ipa_pair_repr_dim)
+                    self.ipa_linear_z.weight[:k_z, :k_z] = torch.eye(k_z) * 0.1
+            elif init_ipa_proj == "xavier_small":
+                # Xavier with gain 0.1 → small-magnitude random projection. Frozen
+                # IPA sees something close to its no-template prior in expectation.
+                torch.nn.init.xavier_uniform_(self.ipa_linear_s.weight, gain=0.1)
+                torch.nn.init.zeros_(self.ipa_linear_s.bias)
+                torch.nn.init.xavier_uniform_(self.ipa_linear_z.weight, gain=0.1)
+                torch.nn.init.zeros_(self.ipa_linear_z.bias)
+            elif init_ipa_proj == "af2_linear_in":
+                # Placeholder: real implementation would copy AF2's `linear_in`
+                # weights (target_feat → c_s) from the loaded npz. The current
+                # weight-loader (import_weights.py) only loads StructureModule
+                # params, not the c_s entry projection. Implementing this
+                # requires inspecting which keys are in the npz and either
+                # zero-padding into our 128→384 shape or projecting through a
+                # small lookup. Left as a no-op (= default Kaiming) for now;
+                # raise so a user explicitly opting in knows it's unimplemented.
+                raise NotImplementedError(
+                    "init_ipa_proj='af2_linear_in' requires extending "
+                    "openfold_stub/utils/import_weights.py to load AF2's "
+                    "linear_in weights. Use 'identity_pad' or 'xavier_small' "
+                    "for now."
+                )
+            else:
+                raise ValueError(
+                    f"Unknown init_ipa_proj={init_ipa_proj!r}; expected one of "
+                    "'default', 'identity_pad', 'xavier_small', 'af2_linear_in'."
+                )
             
             sm_cfg = kwargs.get("structure_module_cfg", {})
             self.structure_module_cfg = {
@@ -919,25 +970,23 @@ class ProteinTransformerAF3(torch.nn.Module):
         return seqs[:, r:, :], pair[:, r:, r:, :], mask[:, r:]
 
     def forward(self, batch_nn: Dict[str, torch.Tensor], force_compile: bool = False):
-        # TorchDynamo treats `requires_grad` / grad-mode as a compile guard. If a single
-        # compiled artifact is shared across grad-enabled (training) and `torch.no_grad()`
-        # (validation) contexts, Dynamo will keep recompiling on these mode switches until
-        # hitting `recompile_limit` and then fall back to eager.
+        # TorchDynamo's frame cache is keyed by the underlying Python code object,
+        # NOT by the OptimizedModule wrapper. So wrapping the same _forward_impl
+        # in two separate torch.compile() calls (one for train, one for eval) does
+        # NOT isolate them — each INNER frame Dynamo identifies inside _forward_impl
+        # is still shared between the two wrappers. When training and no-grad
+        # forwards both touch the same inner frame, Dynamo specializes on
+        # `grad_mode` for each invocation, and the cache_size_limit (8 by default)
+        # is quickly exhausted. TORCH_LOGS=recompiles shows dozens of
+        # `GLOBAL_STATE changed: grad_mode` events under the previous setup.
         #
-        # Strategy: maintain TWO separate compiled artifacts — one for grad-enabled contexts
-        # (training) and one for no-grad contexts (validation/inference). Each gets its own
-        # independent guard cache so switching between train/eval never triggers recompilation.
-        if self.use_torch_compile:
-            if torch.is_grad_enabled():
-                # Training path: grad-enabled compiled artifact
-                if getattr(self, "_forward_compiled_train", None) is None:
-                    self._forward_compiled_train = torch.compile(self._forward_impl)
-                return self._forward_compiled_train(batch_nn)
-            else:
-                # Validation/inference path: no-grad compiled artifact
-                if getattr(self, "_forward_compiled_eval", None) is None:
-                    self._forward_compiled_eval = torch.compile(self._forward_impl)
-                return self._forward_compiled_eval(batch_nn)
+        # Fix: keep compile ONLY for the grad-enabled training path. Validation,
+        # sanity-check, and self-cond no-grad forwards all run eager. Val/sanity
+        # are < 1% of training wall-time, so we lose nothing material.
+        if self.use_torch_compile and torch.is_grad_enabled():
+            if getattr(self, "_forward_compiled_train", None) is None:
+                self._forward_compiled_train = torch.compile(self._forward_impl)
+            return self._forward_compiled_train(batch_nn)
         return self._forward_impl(batch_nn)
 
     def _forward_impl(self, batch_nn: Dict[str, torch.Tensor]):

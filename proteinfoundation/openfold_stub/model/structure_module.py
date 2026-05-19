@@ -357,8 +357,17 @@ class InvariantPointAttention(nn.Module):
         # [*, N_res, N_res, H]
         pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
         # [*, N_res, N_res]
-        square_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
-        square_mask = self.inf * (~square_mask)
+        # NOTE: must produce -inf at invalid pairs (= mask out) and 0 at valid.
+        # Adding this to attention logits pre-softmax suppresses invalid entries
+        # to ≈0 after softmax. The previous version `self.inf * (~square_mask)`
+        # had the OPPOSITE sign (+inf at invalid → attention concentrates on
+        # padding), which silently zeroed `ipa_linear_z.weight.grad` because
+        # the gradient flowed exclusively to padding-row entries of z where
+        # pair_rep is always 0 due to the trunk's pair-mask gating.
+        # Cast to float because proteina passes mask as bool; bool tensors
+        # don't support subtraction with int.
+        square_mask = mask.float().unsqueeze(-1) * mask.float().unsqueeze(-2)
+        square_mask = self.inf * (square_mask - 1)
 
         # [*, H, N_res, N_res]
         pt_att = permute_final_dims(pt_att, (2, 0, 1))
@@ -393,22 +402,21 @@ class InvariantPointAttention(nn.Module):
         # [*, N_res, H * C_hidden]
         o = flatten_final_dims(o, 2)
 
-        # [*, H, 3, N_res, P_v] 
-        if(inplace_safe):
-            v_pts = permute_final_dims(v_pts, (1, 3, 0, 2))
-            o_pt = [
-                torch.matmul(a, v.to(a.dtype)) 
-                for v in torch.unbind(v_pts, dim=-3)
-            ]
-            o_pt = torch.stack(o_pt, dim=-3)
-        else:
-            o_pt = torch.sum(
-                (
-                    a[..., None, :, :, None]
-                    * permute_final_dims(v_pts, (1, 3, 0, 2))[..., None, :, :]
-                ),
-                dim=-2,
-            )
+        # [*, H, 3, N_res, P_v]
+        # Compute o_pt as 3 small batched matmuls (one per spatial axis) instead
+        # of the previous broadcast-multiply-sum, which materialized a
+        # [..., H, 3, N, N, P_v] intermediate that's both memory-heavy and
+        # hostile to Inductor fusion. The two formulations are mathematically
+        # identical; the matmul form was previously gated on `inplace_safe=True`
+        # but the in-place flag never affected this op — it only affected
+        # `pt_att` and `a` accumulation upstream. See:
+        # https://github.com/aqlaboratory/openfold (same pattern).
+        v_pts = permute_final_dims(v_pts, (1, 3, 0, 2))
+        o_pt = [
+            torch.matmul(a, v.to(a.dtype))
+            for v in torch.unbind(v_pts, dim=-3)
+        ]
+        o_pt = torch.stack(o_pt, dim=-3)
 
         # [*, N_res, H, P_v, 3]
         o_pt = permute_final_dims(o_pt, (2, 0, 3, 1))
@@ -594,11 +602,34 @@ class StructureModule(nn.Module):
         self.epsilon = epsilon
         self.inf = inf
 
-        # Buffers to be lazily initialized later
-        # self.default_frames
-        # self.group_idx
-        # self.atom_mask
-        # self.lit_positions
+        # Residue-constant buffers — registered eagerly here (instead of
+        # lazily in _init_residue_constants on first forward) so the compiled
+        # forward graph never has to deal with register_buffer side-effects,
+        # which Dynamo handles via a graph break. The float dtype defaults to
+        # float32; `.to(dtype=...)` on the module cascades to these buffers.
+        # The original lazy-init signatures took (float_dtype, device) so the
+        # buffers landed on the correct device with the correct dtype; we now
+        # initialize on CPU/fp32 and rely on `.to(...)` to migrate.
+        self.register_buffer(
+            "default_frames",
+            torch.from_numpy(restype_rigid_group_default_frame).to(dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "group_idx",
+            torch.from_numpy(restype_atom14_to_rigid_group).to(dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "atom_mask",
+            torch.from_numpy(restype_atom14_mask).to(dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "lit_positions",
+            torch.from_numpy(restype_atom14_rigid_group_positions).to(dtype=torch.float32),
+            persistent=False,
+        )
 
         self.layer_norm_s = LayerNorm(self.c_s)
         self.layer_norm_z = LayerNorm(self.c_z)
@@ -682,13 +713,29 @@ class StructureModule(nn.Module):
         s = self.linear_in(s)
 
         # [*, N]
+        # Pin quaternion dtype to fp32. Under bf16-mixed autocast, `s.dtype`
+        # may be either bf16 (inside autocast region) or fp32 (outside),
+        # which makes Dynamo specialize Rigid/Rotation on dtype — observed
+        # ~3 dtype-mismatch recompiles during first compile. Quaternion math
+        # (composition, normalization, rot_to_quat) is precision-sensitive
+        # anyway, and AF2's reference StructureModule runs in fp32 throughout.
+        # Forcing fp32 here removes the recompile and matches AF2 semantics.
         rigids = Rigid.identity(
-            s.shape[:-1], 
-            s.dtype, 
-            s.device, 
+            s.shape[:-1],
+            torch.float32,
+            s.device,
             self.training,
             fmt="quat",
         )
+        # Pre-detach the initial rotation. Inside the loop (line ~755) we
+        # always call `rigids.stop_rot_gradient()` AFTER appending preds, so
+        # iter 0 enters `compose_q_update_vec` with rots.requires_grad=True
+        # while iter 1+ see requires_grad=False. Dynamo then specializes
+        # the `compose_q_update_vec` frame on requires_grad → recompile.
+        # Detaching at the entry point unifies the state: identity rotation
+        # is a constant anyway, so there's no gradient to flow back.
+        if self.training:
+            rigids = rigids.stop_rot_gradient()
         outputs = []
         for i in range(self.no_blocks):
             # [*, N, C_s]
@@ -764,66 +811,24 @@ class StructureModule(nn.Module):
 
         return outputs
 
+    # _init_residue_constants is no longer needed — buffers are registered
+    # eagerly in __init__. Kept as a no-op for backwards compatibility in
+    # case any external caller still invokes it.
     def _init_residue_constants(self, float_dtype, device):
-        if not hasattr(self, "default_frames"):
-            self.register_buffer(
-                "default_frames",
-                torch.from_numpy(restype_rigid_group_default_frame).to(dtype=float_dtype, device=device),
-                # torch.tensor(
-                #     restype_rigid_group_default_frame,
-                #     dtype=float_dtype,
-                #     device=device,
-                #     requires_grad=False,
-                # ),
-                persistent=False,
-            )
-        if not hasattr(self, "group_idx"):
-            self.register_buffer(
-                "group_idx",
-                torch.from_numpy(restype_atom14_to_rigid_group).to(dtype=int, device=device),
-                # torch.tensor(
-                #     restype_atom14_to_rigid_group,
-                #     device=device,
-                #     requires_grad=False,
-                # ),
-                persistent=False,
-            )
-        if not hasattr(self, "atom_mask"):
-            self.register_buffer(
-                "atom_mask",
-                torch.from_numpy(restype_atom14_mask).to(dtype=float_dtype, device=device),
-                # torch.tensor(
-                #     restype_atom14_mask,
-                #     dtype=float_dtype,
-                #     device=device,
-                #     requires_grad=False,
-                # ),
-                persistent=False,
-            )
-        if not hasattr(self, "lit_positions"):
-            self.register_buffer(
-                "lit_positions",
-                torch.from_numpy(restype_atom14_rigid_group_positions).to(dtype=float_dtype, device=device),
-                # torch.tensor(
-                #     restype_atom14_rigid_group_positions,
-                #     dtype=float_dtype,
-                #     device=device,
-                #     requires_grad=False,
-                # ),
-                persistent=False,
-            )
+        # Cast existing buffers to the requested dtype/device if they
+        # disagree. Cheap no-op when they already match.
+        if self.default_frames.dtype != float_dtype or self.default_frames.device != device:
+            self.default_frames = self.default_frames.to(dtype=float_dtype, device=device)
+            self.atom_mask = self.atom_mask.to(dtype=float_dtype, device=device)
+            self.lit_positions = self.lit_positions.to(dtype=float_dtype, device=device)
+            self.group_idx = self.group_idx.to(device=device)
 
     def torsion_angles_to_frames(self, r, alpha, f):
-        # Lazily initialize the residue constants on the correct device
-        self._init_residue_constants(alpha.dtype, alpha.device)
-        # Separated purely to make testing less annoying
         return torsion_angles_to_frames(r, alpha, f, self.default_frames)
 
     def frames_and_literature_positions_to_atom14_pos(
         self, r, f  # [*, N, 8]  # [*, N]
     ):
-        # Lazily initialize the residue constants on the correct device
-        self._init_residue_constants(r.get_rots().dtype, r.get_rots().device)
         return frames_and_literature_positions_to_atom14_pos(
             r,
             f,

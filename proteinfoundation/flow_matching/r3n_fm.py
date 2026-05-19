@@ -443,6 +443,7 @@ class _CoordinateFlowMatcher:
         fixed_structure_mask = None,
         dtype: Optional[torch.dtype] = None,
         verbose: bool = False,
+        zero_sin_pos_emb: bool = False,
     ) -> Dict[str, Tensor]:
         """
         Generates samples by simulating the full process starting from
@@ -469,6 +470,9 @@ class _CoordinateFlowMatcher:
                 log: ts = (1.0 - np.logspace(schedule_p, 0, num=nsteps)[::-1])
                      ts = ts / ts[-1]  # to make sure it goes exactly from 0 to 1
             dtype (optional): dtype used for the simulation
+            zero_sin_pos_emb: when True, set ``nn_in["_zero_idx_emb"] = True`` so
+                ``SeqPosEmbFeature`` zeros out the sinusoidal positional embedding
+                at every trajectory step (matches training-time setting).
             kwargs contains extra sampling parameters.
 
         Returns:
@@ -533,6 +537,8 @@ class _CoordinateFlowMatcher:
                         "fixed_structure_mask": fixed_structure_mask,
                         "x_motif": x_motif
                     }
+                if zero_sin_pos_emb:
+                    nn_in["_zero_idx_emb"] = True
 
                 if cath_code_indices is not None:
                     nn_in["cath_code_indices"] = cath_code_indices
@@ -980,6 +986,7 @@ class _ContactMapFlowMatcher:
         fixed_structure_mask = None,
         predict_coords: bool = False,
         verbose: bool = False,
+        zero_sin_pos_emb: bool = False,
     ) -> Dict[str, Optional[Tensor]]:
         """
         Full simulation for contact map generation with optional coordinate tracking.
@@ -1042,6 +1049,8 @@ class _ContactMapFlowMatcher:
                     "t": t,
                     "mask": mask,
                 }
+                if zero_sin_pos_emb:
+                    nn_in["_zero_idx_emb"] = True
 
                 if cath_code_indices is not None:
                     nn_in["cath_code_indices"] = cath_code_indices
@@ -1301,6 +1310,7 @@ class FlowMatcher:
         modality: Optional[str] = None,
         predict_coords: bool = True,
         verbose: bool = False,
+        zero_sin_pos_emb: bool = False,
     ) -> Dict[str, Optional[Tensor]]:
         """
         Full simulation supporting both coordinate and contact map modalities.
@@ -1338,6 +1348,7 @@ class FlowMatcher:
                 x_motif=x_motif, fixed_sequence_mask=fixed_sequence_mask,
                 fixed_structure_mask=fixed_structure_mask,
                 verbose=verbose,
+                zero_sin_pos_emb=zero_sin_pos_emb,
             )
             return {"coords": x, "contact_map": None, "distogram": None}
 
@@ -1354,5 +1365,6 @@ class FlowMatcher:
             x_motif=x_motif, fixed_sequence_mask=fixed_sequence_mask,
             fixed_structure_mask=fixed_structure_mask,
             predict_coords=predict_coords,
+            zero_sin_pos_emb=zero_sin_pos_emb,
             verbose=verbose,
         )

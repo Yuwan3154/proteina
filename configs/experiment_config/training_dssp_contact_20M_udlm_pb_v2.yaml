@@ -1,4 +1,4 @@
-run_name_: dssp_contact_20M_udlm_pb_v1
+run_name_: dssp_contact_20M_udlm_pb_v2
 
 # Initialize IPA from AF2 model 1 ptm at epoch 0
 af2_ipa_weights_path: /home/ubuntu/params/params_model_1_ptm.npz
@@ -11,7 +11,7 @@ hardware:
   ncpus_per_task_train_: 16
   ncpus_per_task_prepro_: 16
   accelerator: gpu
-  ngpus_per_node_: 1
+  ngpus_per_node_: 4  # STAGE 2: 4-GPU setup. Effective batch = 4 * 4 micro * 1 accum = 16.
   nnodes_: 1
 
 loss:
@@ -66,8 +66,12 @@ model:
     ext_lig_emb_cond_seq: True
     ext_lig_emb_dim: 3
 
-# Dataset: PDB only (purge-test, no mixed d_FS)
-dataset: pdb_train_contact-CB-10A_S25_max256_purge-test_cutoff-190828
+# Dataset: PDB only (purge-test, no mixed d_FS).
+# v2 vs v1: ConFind-derived contacts at threshold 0.01 (rotamer-based, more physical)
+# instead of CB-distance-10Å contacts (v1). Max length 256 unchanged. The
+# ContactMapTransform reads precomputed `contact_map_confind` from .pt files and
+# binarizes at the threshold declared in the dataset YAML.
+dataset: pdb_train_contact-confind_S25_max256_purge-test_cutoff-190828
 dataset_config_subdir: pdb
 
 force_precision_f32: False
@@ -84,9 +88,9 @@ training:
   mask_T_prob: 0.5
   mask_A_prob: 0.5
   mask_C_prob: 0.5
-  fold_label_sample_ratio: [0.5, 0.1, 0.15, 0.25]
+  fold_label_sample_ratio: [0.67, 0.13, 0.2, 0.0]
   mask_seq_proportion: 0.15
-  mask_extlig_proportion: 0.15
+  mask_extlig_proportion: 0.3
   finetune_seq_cond_lora_only: False
   self_cond_use_copy: True
   self_cond_copy_update_every: 10
@@ -101,12 +105,19 @@ lora:
 
 opt:
   lr: 0.0001
-  max_epochs: 1000
-  batch_size: 4
-  accumulate_grad_batches: 4  # effective batch = 4 * 4 = 16
+  # STAGE 2: finetune from Stage-1 best ckpt. Targets 80K optim steps (~1.3M
+  # samples at effective batch 16). max_epochs is a loose upper-bound; max_steps
+  # is the hard stop.
+  max_epochs: 200
+  max_steps: 80000
+  batch_size: 4  # per-GPU micro-batch
+  accumulate_grad_batches: 1  # effective = 4 GPU * 4 micro * 1 accum = 16
   optimizer: muon
-  val_check_interval_optim_steps: 100  # counted in optim steps (= 100 * 4 = 400 minibatches); DDP-safe (per-rank optim_steps * accum, independent of world size).
+  val_check_interval_optim_steps: 100  # counted in optim steps (= 100 * 1 = 100 minibatches per GPU); DDP-safe.
   skip_nan_grad: False
+  # Set True to print ipa_linear_s/z grad norms + frames_pred stats every 100
+  # train steps. For the FAPE/IPA debug experiments only — keep False in prod.
+  debug_log_grads: False
   grad_and_weight_analysis: False
   dist_strategy: ddp
   dist_backend: gloo

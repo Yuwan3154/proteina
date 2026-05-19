@@ -245,7 +245,7 @@ class PDBDataSelector:
         # NOTE: We do NOT apply exclude_ids here anymore!
         # Exclusion is handled in PDBDataSplitter.split_data() to support cluster-aware exclusion
         # where we exclude entire clusters if any member is in exclude_ids
-        
+
         self.df_data = pdb_manager.df
         return self.df_data
 
@@ -1220,14 +1220,45 @@ class PDBLightningDataModule(BaseLightningDataModule):
             self.datasplitter.split_data(self.df_data, file_identifier)
         )
         
-        # In overfit mode with very few samples, val/test splits may be empty.
-        # Copy train data to val/test to avoid issues with empty dataloaders.
+        # In overfit mode with very few samples, the cluster-based split may
+        # place chains into val/test instead of train (or some splits may end
+        # up empty with broken column schema, e.g. missing 'pdb'/'chain').
+        # Bypass the split entirely: force all overfit chains into ALL splits.
         if self.overfit_pdb_chains is not None:
-            if len(self.dfs_splits.get("val", [])) == 0:
-                rank_zero_info("Overfit mode: val split empty, using train data for validation")
-                self.dfs_splits["val"] = self.dfs_splits["train"].copy()
-            if len(self.dfs_splits.get("test", [])) == 0:
-                self.dfs_splits["test"] = self.dfs_splits["train"].copy()
+            rank_zero_info(
+                "Overfit mode: bypassing cluster split — pushing all overfit "
+                "chains into train + val + test."
+            )
+            # df_data already has the right columns (id, pdb, chain, length, ...).
+            # Reset the dfs_splits to the filtered df_data for every split.
+            full_overfit_df = self.df_data.reset_index(drop=True)
+            self.dfs_splits["train"] = full_overfit_df
+            self.dfs_splits["val"] = full_overfit_df.copy()
+            self.dfs_splits["test"] = full_overfit_df.copy()
+            # Build a synthetic cluster mapping so the `cluster-random` sampler
+            # can operate (without this it errors on empty cluster mapping).
+            # The sampler yields one sequence per cluster per epoch, so the
+            # number of cluster entries determines the per-epoch sample count.
+            # We REPLICATE each chain into multiple cluster entries so the
+            # epoch length is >= batch_size — otherwise the DataLoader can't
+            # build a full batch and GPU utilization suffers.
+            base_ids = full_overfit_df["id"].tolist()
+            replication = max(1, -(-int(self.batch_size) // max(1, len(base_ids))))
+            synthetic_mapping = {}
+            for rep in range(replication):
+                for cid in base_ids:
+                    synthetic_mapping[f"{cid}__clu{rep}"] = [cid]
+            rank_zero_info(
+                f"Overfit mode: built synthetic cluster mapping with "
+                f"{len(synthetic_mapping)} entries "
+                f"({len(base_ids)} unique chains × {replication} replicas) "
+                f"to keep epoch length ≥ batch_size={self.batch_size}."
+            )
+            self.clusterid_to_seqid_mappings = {
+                "train": synthetic_mapping,
+                "val": dict(synthetic_mapping),
+                "test": dict(synthetic_mapping),
+            }
 
         # create appropriate datasets based on the selected stage
         if stage == "fit" or stage is None:

@@ -298,7 +298,11 @@ class Rotation:
         to mimic the behavior of a torch Tensor, almost as if each Rotation
         object were a tensor of rotations, in one format or another.
     """
-    @torch.compiler.disable
+    # NOTE: previous version had @torch.compiler.disable here to dodge a
+    # recompile-limit error. We re-enabled it after verifying with
+    # scripts/test_ipa_compile.py that recompilations stay under
+    # cache_size_limit. The decorator was the dominant graph-break source
+    # (~5 breaks per IPA block × no_blocks). See task #18/#19.
     def __init__(self,
         rot_mats: Optional[torch.Tensor] = None,
         quats: Optional[torch.Tensor] = None,
@@ -855,8 +859,9 @@ class Rigid:
         Designed to behave approximately like a single torch tensor with the 
         shape of the shared batch dimensions of its component parts.
     """
-    @torch.compiler.disable
-    def __init__(self, 
+    # NOTE: see Rotation.__init__ for why we no longer have
+    # @torch.compiler.disable here.
+    def __init__(self,
         rots: Optional[Rotation],
         trans: Optional[torch.Tensor],
     ):

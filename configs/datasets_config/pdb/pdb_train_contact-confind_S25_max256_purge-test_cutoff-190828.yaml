@@ -10,6 +10,8 @@ datamodule:
   sampling_mode: "cluster-random" # sample randomly inside each sequence similarity cluster during training
   cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/  # For CATH index conversion when fold_cond
   multilabel_mode: "sample"  # sample | average | sum | transformer
+  cath_dedupe_codes: True  # collapse repeated (C,A,T) triples per chain before sum/average; CATH lists each domain instance separately. Overridable from model.nn.cath_dedupe_codes.
+  overfit_pdb_chains: null  # Set to a list of chain IDs (e.g., ["5c39_A", "1r4a_E", "1hcg_B"]) to restrict the train pool — used by the FAPE/IPA 3-chain overfit harness via `cfg_exp.opt.overfit_pdb_chains` propagation in train.py.
   transforms: 
     - _target_: "proteinfoundation.datasets.transforms.GlobalRotationTransform" # Transforms to apply to dataset examples
     - _target_: "proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform"

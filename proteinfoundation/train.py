@@ -342,6 +342,41 @@ if __name__ == "__main__":
         batch_size = cfg_exp.opt.get("batch_size")
         if batch_size is not None:
             cfg_data.datamodule.batch_size = batch_size
+        # Propagate overfit_pdb_chains (FAPE/IPA 3-chain debug harness). When
+        # set, the datamodule filters df_data to just these chain IDs before
+        # splitting, and copies train→val/test if those splits are empty. See
+        # PDBLightningDataModule.setup for the logic.
+        overfit_chains = cfg_exp.opt.get("overfit_pdb_chains", None)
+        if overfit_chains is not None:
+            cfg_data.datamodule.overfit_pdb_chains = list(overfit_chains)
+            log_info(
+                f"Propagating overfit_pdb_chains from cfg_exp.opt → cfg_data.datamodule: "
+                f"{list(overfit_chains)}"
+            )
+        # Propagate padding_max_size to the PaddingTransform inside the dataset
+        # transforms list. When chains are short (e.g., overfit subset), set
+        # this to a small value (e.g., 64) so the IPA triangle-multiplication
+        # tensors are O(L^3 d) on the *real* L, not 256. This shrinks both
+        # memory footprint and per-step compute dramatically.
+        pad_max = cfg_exp.opt.get("padding_max_size", None)
+        if pad_max is not None:
+            transforms_cfg = cfg_data.datamodule.get("transforms", None)
+            if transforms_cfg is not None:
+                pad_target = "proteinfoundation.datasets.transforms.PaddingTransform"
+                updated = False
+                for idx, t in enumerate(transforms_cfg):
+                    if t.get("_target_", None) == pad_target:
+                        cfg_data.datamodule.transforms[idx].max_size = int(pad_max)
+                        updated = True
+                        log_info(
+                            f"Propagated padding_max_size={pad_max} → transforms[{idx}].max_size"
+                        )
+                        break
+                if not updated:
+                    log_info(
+                        f"padding_max_size={pad_max} requested but no PaddingTransform "
+                        f"found in transforms list — leaving untouched."
+                    )
         if cfg_data.get("exclude_id_pkl_path") is not None:
             with open(cfg_data.exclude_id_pkl_path, "rb") as fin:
                 exclude_ids = pickle.load(fin)
@@ -403,7 +438,7 @@ if __name__ == "__main__":
             if t.get("contact_method") == "confind":
                 confind_transform = t
                 break
-    if confind_transform is not None:
+    if confind_transform is not None and not os.environ.get("SKIP_CONFIND_PRECOMPUTE"):
         @rank_zero_only
         def _run_confind_precompute():
             log_info("Confind contact maps requested; precomputing raw maps...")
@@ -621,8 +656,16 @@ if __name__ == "__main__":
         log_info(
             f"val_check_interval (legacy minibatch-based): {resolved_val_check_interval}"
         )
+    # `max_steps` is the hard stop when set; `max_epochs` remains as the cosine
+    # annealer's horizon (approximate alignment is OK per project convention).
+    # Lightning treats max_steps=-1 as unbounded — falls back to max_epochs.
+    resolved_max_steps = int(cfg_exp.opt.get("max_steps", -1))
+    log_info(
+        f"max_steps = {resolved_max_steps} (hard stop; -1 = unbounded, falls back to max_epochs)"
+    )
     trainer = L.Trainer(
         max_epochs=cfg_exp.opt.max_epochs,
+        max_steps=resolved_max_steps,
         accelerator=cfg_exp.hardware.accelerator,
         devices=cfg_exp.hardware.ngpus_per_node_,  # This is number of gpus per node, not total
         num_nodes=cfg_exp.hardware.nnodes_,

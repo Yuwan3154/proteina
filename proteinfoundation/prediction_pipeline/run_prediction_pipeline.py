@@ -740,8 +740,9 @@ def step_collect_results(
             "max": float(np.max(arr)),
         }
 
-    # Calibration at the configured cutoff: among proteins with pTM >= cutoff,
-    # what fraction have ref_pred_TM >= pTM? Both vals must be present (GT mode).
+    # Yield at the configured cutoff: among proteins with pTM >= cutoff,
+    # what fraction have ref_pred_TM >= cutoff (same threshold τ on both sides)?
+    # Both vals must be present (GT mode).
     calibration_pairs = [
         (float(r["best_ptm"]), float(r.get("best_ref_pred_tm", float("nan"))))
         for r in results
@@ -750,13 +751,13 @@ def step_collect_results(
                  and math.isnan(r.get("best_ref_pred_tm", float("nan"))))
     ]
     n_pass_c = sum(1 for ptm, _ in calibration_pairs if ptm >= ptm_cutoff)
-    n_cal_c = sum(1 for ptm, gt in calibration_pairs if ptm >= ptm_cutoff and gt >= ptm)
+    n_cal_c = sum(1 for ptm, gt in calibration_pairs if ptm >= ptm_cutoff and gt >= ptm_cutoff)
     calibration_block = (
         {
             "ptm_cutoff": ptm_cutoff,
             "num_passing_cutoff": n_pass_c,
-            "num_calibrated": n_cal_c,
-            "fraction_calibrated": (n_cal_c / n_pass_c) if n_pass_c else None,
+            "num_meeting_actual_threshold": n_cal_c,
+            "fraction_meeting_actual_threshold": (n_cal_c / n_pass_c) if n_pass_c else None,
         }
         if calibration_pairs
         else None
@@ -866,9 +867,14 @@ def step_plot_distribution(results: list, output_dir: str, ptm_cutoff: float) ->
 
 
 def step_plot_ptm_calibration_curve(results: list, output_dir: str, ptm_cutoff: float) -> None:
-    """Calibration curve: fraction of proteins with ref_pred_TM >= pTM,
-    among those with pTM >= τ, as τ sweeps [0, 1].
+    """Calibration / yield curve: among proteins passing the pTM filter
+    (best_ptm ≥ τ), what fraction actually achieve quality at or above the
+    same threshold (best_ref_pred_tm ≥ τ)?
 
+    Y(τ) = P(ref_pred_TM ≥ τ | pTM ≥ τ)
+
+    Both thresholds are the **same** value τ — the curve answers "does the
+    pTM filter buy me proteins that hit the corresponding actual-TM bar?".
     Skipped silently when no protein has both best_ptm and best_ref_pred_tm
     (no-GT mode). Writes ``ptm_calibration_curve.png`` in ``output_dir``.
     """
@@ -893,17 +899,17 @@ def step_plot_ptm_calibration_curve(results: list, output_dir: str, ptm_cutoff: 
         n = int(mask.sum())
         n_passing[i] = n
         if n > 0:
-            fracs[i] = float(((gts[mask] >= ptms[mask])).sum()) / n
+            fracs[i] = float((gts[mask] >= tau).sum()) / n
 
     # Fraction at the configured cutoff (for the highlighted marker + annotation)
     mask_c = ptms >= ptm_cutoff
     n_pass_c = int(mask_c.sum())
-    n_cal_c = int(((gts[mask_c] >= ptms[mask_c])).sum()) if n_pass_c else 0
+    n_cal_c = int((gts[mask_c] >= ptm_cutoff).sum()) if n_pass_c else 0
     frac_c = (n_cal_c / n_pass_c) if n_pass_c else float("nan")
 
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(taus, fracs, color="#4C72B0", linewidth=2,
-            label="P(ref_pred_TM ≥ pTM | pTM ≥ τ)")
+            label="P(ref_pred_TM ≥ τ | pTM ≥ τ)")
     ax.axvline(ptm_cutoff, color="red", linestyle="--", linewidth=2,
                label=f"pTM cutoff = {ptm_cutoff}")
     if not math.isnan(frac_c):
@@ -911,10 +917,10 @@ def step_plot_ptm_calibration_curve(results: list, output_dir: str, ptm_cutoff: 
     ax.set_xlim(0.0, 1.0)
     ax.set_ylim(0.0, 1.05)
     ax.set_xlabel("pTM cutoff τ", fontsize=12)
-    ax.set_ylabel("Fraction with ref_pred_TM ≥ pTM\n(among proteins with pTM ≥ τ)", fontsize=12)
-    ax.set_title("Calibration: AF2Rank pTM vs actual TM(ref, prediction)", fontsize=13)
+    ax.set_ylabel("Fraction with ref_pred_TM ≥ τ\n(among proteins with pTM ≥ τ)", fontsize=12)
+    ax.set_title("Yield at threshold: actual TM ≥ τ given predicted pTM ≥ τ", fontsize=13)
     annotation = (
-        f"At τ = {ptm_cutoff}:\n  {n_cal_c}/{n_pass_c} proteins ({frac_c:.0%}) calibrated"
+        f"At τ = {ptm_cutoff}:\n  {n_cal_c}/{n_pass_c} proteins ({frac_c:.0%}) have ref_pred_TM ≥ {ptm_cutoff}"
         if n_pass_c
         else f"At τ = {ptm_cutoff}: no proteins pass cutoff"
     )

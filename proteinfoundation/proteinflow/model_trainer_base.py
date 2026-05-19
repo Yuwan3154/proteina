@@ -236,11 +236,136 @@ class ModelTrainerBase(L.LightningModule):
             self._self_cond_copy_last_step = step
 
     def on_after_backward(self) -> None:
-        """Clears gradients when a non-finite loss was detected for this backward."""
+        """Clears gradients when a non-finite loss was detected for this backward.
+
+        Also implements the FAPE/IPA debug logging — when
+        ``opt.debug_log_grads`` is True, prints per-N-step gradient norms for
+        ``ipa_linear_s`` / ``ipa_linear_z`` plus the captured activation
+        gradients (``pair_rep`` going into the IPA pair projector, and the
+        projector output itself). Use this to confirm the frozen-IPA-with-
+        trainable-projectors setup actually receives gradient signal on the
+        projector layers (see project_proteina_data_engineering_plan.md →
+        FAPE/IPA debug).
+
+        When ``opt.debug_log_unused_params`` is True, also dumps a one-shot
+        listing of parameters that received `grad is None` or `grad == 0`
+        after the FIRST backward. Used to debug the DDP
+        find_unused_parameters requirement.
+        """
         if getattr(self, "global_rank", 0) != 0:
             return
         if getattr(self, "_skip_update_due_to_nonfinite_loss", False):
             self.zero_grad()
+
+        # Unused-params diagnostic: scan EVERY step. The first step prints a
+        # full report. Subsequent steps print only newly-unused params (sticky
+        # accumulator) so we catch stochastic cases (e.g. self_cond ON vs OFF,
+        # aux_loss_t_lim threshold).
+        if bool(self.cfg_exp.opt.get("debug_log_unused_params", False)):
+            self._dump_unused_params_sticky()
+
+        if not bool(self.cfg_exp.opt.get("debug_log_grads", False)):
+            return
+        # Cadence: 1 (every step) is useful for the smoke test; higher for prod.
+        cadence = int(self.cfg_exp.opt.get("debug_log_grads_every", 100))
+        if cadence < 1:
+            cadence = 1
+        if int(self.global_step) % cadence != 0:
+            return
+
+        parts = [f"[FAPE-IPA-debug step={int(self.global_step)}]"]
+        # Projector weight + bias gradients (leaf-param grads accumulate after
+        # backward). Reports both so a zero weight.grad with a nonzero bias.grad
+        # can be spotted — that was the smoking gun for the IPA-mask sign bug
+        # (see openfold_stub/model/structure_module.py:361).
+        for name in ("ipa_linear_s", "ipa_linear_z"):
+            lin = getattr(self.nn, name, None)
+            if lin is None or getattr(lin, "weight", None) is None:
+                parts.append(f"{name}=missing")
+                continue
+            wg = lin.weight.grad
+            bg = lin.bias.grad if lin.bias is not None else None
+            parts.append(
+                f"{name}.weight |grad|={(wg.norm().item() if wg is not None else float('nan')):.4e} "
+                f"{name}.bias |grad|={(bg.norm().item() if bg is not None else float('nan')):.4e}"
+            )
+        print(" ".join(parts))
+
+    def _dump_unused_params_sticky(self) -> None:
+        """Run-every-step unused-params tracker.
+
+        Maintains two cumulative sets across steps:
+          - `_dbg_none_ever`: parameter names whose `.grad` was `None` on at
+            least one step. These are the DDP `find_unused_parameters`
+            culprits.
+          - `_dbg_seen_nonzero`: parameter names that have received a non-zero
+            gradient at least once. Param NOT in this set means it never got a
+            real gradient (always zero).
+        """
+        step = int(getattr(self, "global_step", 0))
+        if not hasattr(self, "_dbg_none_ever"):
+            self._dbg_none_ever = set()
+            self._dbg_seen_nonzero = set()
+            self._dbg_first_step_dumped = False
+        new_none = []
+        for name, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+            g = p.grad
+            if g is None:
+                if name not in self._dbg_none_ever:
+                    new_none.append(name)
+                self._dbg_none_ever.add(name)
+            else:
+                if g.abs().sum().item() > 0:
+                    self._dbg_seen_nonzero.add(name)
+        if not self._dbg_first_step_dumped:
+            self._dbg_first_step_dumped = True
+            self._dump_unused_params()  # full report on step 0
+        if new_none:
+            print(f"[unused-params-debug step={step}] NEW grad-is-None params (n={len(new_none)}):")
+            for nm in new_none[:20]:
+                print(f"    NONE  {nm}")
+
+    def _dump_unused_params(self) -> None:
+        """List parameters that didn't receive a gradient on the first backward.
+
+        Distinguishes three states:
+          - `grad is None`: parameter was NOT touched by backward → DDP "unused"
+          - `grad.abs().sum() == 0`: touched but gradient is identically zero
+            (e.g. multiplied by 0.0 in a forward-graph tying trick)
+          - `grad.abs().sum() > 0`: real gradient flow
+
+        DDP without ``find_unused_parameters=True`` errors out on params in the
+        first category (grad is None). Knowing which they are lets us either
+        rewrite the forward to always touch them, or accept ``find_unused_parameters=True``.
+        """
+        from collections import defaultdict
+        none_grad = []
+        zero_grad = []
+        for name, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.grad is None:
+                none_grad.append((name, tuple(p.shape)))
+            elif p.grad.abs().sum().item() == 0.0:
+                zero_grad.append((name, tuple(p.shape)))
+        print(f"\n[unused-params-debug] === parameter gradient status after first backward ===")
+        print(f"[unused-params-debug] total trainable params: "
+              f"{sum(1 for _, p in self.named_parameters() if p.requires_grad)}")
+        print(f"[unused-params-debug] grad is None: {len(none_grad)}")
+        for nm, sh in none_grad[:40]:
+            print(f"    NONE  {nm}  shape={sh}")
+        if len(none_grad) > 40:
+            print(f"    ... and {len(none_grad) - 40} more (suppressed)")
+        # Group zero-grad by top-level module prefix to make the output readable.
+        zero_by_prefix = defaultdict(list)
+        for nm, sh in zero_grad:
+            zero_by_prefix[nm.split(".")[0] + "." + (nm.split(".")[1] if "." in nm[len(nm.split(".")[0]):] else "")].append(nm)
+        print(f"[unused-params-debug] grad == 0 (touched but zero): {len(zero_grad)}")
+        for pfx, names in list(zero_by_prefix.items())[:20]:
+            print(f"    ZERO  prefix={pfx!r}  count={len(names)}  example={names[0]}")
+        print(f"[unused-params-debug] ====================================================\n")
 
     def _nn_out_to_x_clean(self, nn_out, batch):
         """
@@ -1666,6 +1791,7 @@ class ModelTrainerBase(L.LightningModule):
                             temp_pdb_path
                         ),
                         "global_step": self.global_step,
+                        "epoch": self.current_epoch,
                     }
                 )
             finally:
@@ -1681,6 +1807,7 @@ class ModelTrainerBase(L.LightningModule):
                         {
                             f"{log_prefix}/structure_noised{key_suffix}": wandb.Molecule(noised_pdb),
                             "global_step": self.global_step,
+                            "epoch": self.current_epoch,
                         }
                     )
                 finally:
@@ -1708,7 +1835,7 @@ class ModelTrainerBase(L.LightningModule):
             img = Image.open(buf)
             plt.close(fig)
             self.logger.experiment.log(
-                {key: wandb.Image(img), "global_step": self.global_step}
+                {key: wandb.Image(img), "global_step": self.global_step, "epoch": self.current_epoch}
             )
 
         if contact_map_pred is not None:
@@ -1762,7 +1889,7 @@ class ModelTrainerBase(L.LightningModule):
             img = Image.open(buf)
             plt.close(fig)
             self.logger.experiment.log(
-                {key: wandb.Image(img), "global_step": self.global_step}
+                {key: wandb.Image(img), "global_step": self.global_step, "epoch": self.current_epoch}
             )
 
         _log_dssp_strip(
@@ -2134,6 +2261,9 @@ class ModelTrainerBase(L.LightningModule):
         # _run_validation_trajectory only appends on rank 0 (the only rank that
         # holds a logger), so the aggregation is rank-0 local.
         self._validation_tmscore_results: List[Dict[str, float]] = []
+        # Per-epoch contact-map metrics accumulator (only populated in contact_map_mode
+        # with discrete diffusion). Same per-sample-dict pattern as tmscore.
+        self._validation_contact_results: List[Dict[str, float]] = []
         # Buffer for batched val-trajectory inference: the first
         # tmscore_n_samples val batches are accumulated and concatenated, then
         # one batched generate() call shares the trajectory's NN forward passes
@@ -2157,15 +2287,52 @@ class ModelTrainerBase(L.LightningModule):
                     "validation_sampling/rmsd_mean": float(rmsd.mean()),
                     "validation_sampling/n_samples": int(len(results)),
                     "global_step": self.global_step,
+                    "epoch": self.current_epoch,
                 }
                 self.logger.experiment.log(payload)
                 # Also publish through Lightning's metric system so ModelCheckpoint
                 # can see these values in callback_metrics (the direct wandb call
                 # above goes only to wandb, not to Lightning's metric dict).
                 # rank_zero_only + sync_dist=False because we're already inside
-                # the rank-0 guard above.
+                # the rank-0 guard above. Skip "global_step"/"epoch" — Lightning
+                # attaches its own versions of those keys to every logged metric.
                 for k, v in payload.items():
-                    if k == "global_step":
+                    if k in ("global_step", "epoch"):
+                        continue
+                    self.log(
+                        k, float(v),
+                        on_step=False, on_epoch=True,
+                        prog_bar=False, logger=False,
+                        rank_zero_only=True, sync_dist=False,
+                        add_dataloader_idx=False,
+                    )
+
+        # Aggregate per-sample contact-map metrics (only present in contact_map_mode
+        # with discrete diffusion). Mean over the per-sample dicts. Each metric key
+        # is logged independently so a sample missing one metric (e.g. no long-range
+        # pairs at all) doesn't poison the rest.
+        contact_results = getattr(self, "_validation_contact_results", None)
+        if contact_results and self.logger is not None and hasattr(self.logger, "experiment"):
+            if not (hasattr(self.trainer, "is_global_zero") and not self.trainer.is_global_zero):
+                # Collect all metric keys across the samples (some are optional).
+                all_keys = set()
+                for r in contact_results:
+                    all_keys.update(r.keys())
+                payload_c: Dict[str, float] = {
+                    "global_step": self.global_step,
+                    "epoch": self.current_epoch,
+                }
+                for k in sorted(all_keys):
+                    vals = [r[k] for r in contact_results if k in r]
+                    if not vals:
+                        continue
+                    arr = np.array(vals, dtype=np.float64)
+                    payload_c[f"validation_sampling/{k}_mean"] = float(arr.mean())
+                    payload_c[f"validation_sampling/{k}_median"] = float(np.median(arr))
+                payload_c["validation_sampling/contact_n_samples"] = int(len(contact_results))
+                self.logger.experiment.log(payload_c)
+                for k, v in payload_c.items():
+                    if k in ("global_step", "epoch"):
                         continue
                     self.log(
                         k, float(v),
@@ -2175,6 +2342,7 @@ class ModelTrainerBase(L.LightningModule):
                         add_dataloader_idx=False,
                     )
         self._validation_tmscore_results = []
+        self._validation_contact_results = []
         self.validation_output_data = []
 
     def _resolve_validation_length_bounds(self, val_sampling_cfg) -> tuple:
@@ -2348,6 +2516,9 @@ class ModelTrainerBase(L.LightningModule):
                 x_motif=x_motif,
                 fixed_sequence_mask=fixed_sequence_mask,
                 fixed_structure_mask=fixed_structure_mask,
+                # Keep val trajectory's pos-emb behavior consistent with training:
+                # if training zeros sinusoidal pos embs, val must too (and vice versa).
+                zero_sin_pos_emb=bool(self.cfg_exp.training.get("zero_sin_pos_emb", False)),
             )
         finally:
             if prev_sampling_grid is not None:
@@ -2465,6 +2636,146 @@ class ModelTrainerBase(L.LightningModule):
                     )
                     if tm is not None:
                         self._validation_tmscore_results.append(tm)
+
+        # Per-sample contact-map prediction-quality metrics. Only in contact_map_mode
+        # with discrete diffusion (we need final-step logits from generate). All metrics
+        # operate on the upper triangle with sequence separation >= 6 (the standard
+        # contact-prediction convention — short-range trivial pairs are excluded).
+        if (
+            accumulate_metric
+            and getattr(self, "contact_map_mode", False)
+            and result is not None
+            and result.get("contact_map_logits") is not None
+        ):
+            c_logits_pred = result["contact_map_logits"]  # [B, n, n]
+            try:
+                c_1_gt_full = self.extract_clean_contact_map(batch, mask)
+            except Exception as e:
+                logger.warning(
+                    f"validation_sampling: failed to extract GT contact map for metrics: {e!r}"
+                )
+                c_1_gt_full = None
+            if c_1_gt_full is not None:
+                if (
+                    not hasattr(self, "_validation_contact_results")
+                    or self._validation_contact_results is None
+                ):
+                    self._validation_contact_results = []
+                for s in range(nsamples):
+                    if not bool(mask[s].any()):
+                        continue
+                    metrics_s = self._compute_contact_map_metrics(
+                        logits=c_logits_pred[s],
+                        gt=c_1_gt_full[s],
+                        mask_1d=mask[s],
+                    )
+                    if metrics_s is not None:
+                        self._validation_contact_results.append(metrics_s)
+
+    @staticmethod
+    def _compute_contact_map_metrics(
+        logits: torch.Tensor,
+        gt: torch.Tensor,
+        mask_1d: torch.Tensor,
+        min_sep: int = 6,
+        long_range_sep: int = 24,
+        medium_range_sep: int = 12,
+    ) -> Optional[Dict[str, float]]:
+        """Per-sample contact-map prediction-quality metrics.
+
+        Args:
+            logits: [n, n] real-valued (sigmoid → contact probability) — binary
+                contact model (vocab_size=2 in MD4/UDLM).
+            gt: [n, n] in {0, 1} (contact / no-contact) — masked outside valid pairs.
+            mask_1d: [n] bool — valid residues.
+            min_sep: minimum sequence separation for any pair to count (default 6 —
+                the standard cutoff in contact-prediction literature; short-range
+                pairs are trivial).
+            long_range_sep: |i-j| >= 24 → long-range (CASP standard).
+            medium_range_sep: 12 <= |i-j| < 24 → medium-range.
+
+        Returns a dict of scalar metrics, or None if no valid pairs exist:
+            contact_bce: mean BCE over valid upper-triangle pairs (sep >= min_sep)
+            contact_accuracy: pixel-wise accuracy of (sigmoid(logits) >= 0.5) vs gt
+            contact_recall, contact_precision, contact_f1: at threshold 0.5
+            contact_precision_at_L,  _at_L2,  _at_L5: top-L, L/2, L/5 precision
+                (k = valid_length / divisor, ranked by sigmoid(logits)) — pairs in
+                the upper triangle with sep >= min_sep
+            contact_long_range_precision_at_L5: same but pairs with sep >= long_range_sep
+            contact_medium_range_precision_at_L5: medium-range only
+        """
+        logits = logits.float().detach()
+        gt = gt.float().detach()
+        n = int(logits.shape[-1])
+        mask_1d = mask_1d.bool().detach()
+        L_real = int(mask_1d.sum().item())
+        if L_real < min_sep + 1:
+            return None
+        # Pair mask: both residues valid AND in upper triangle AND sep >= min_sep
+        idx = torch.arange(n, device=logits.device)
+        sep = (idx[None, :] - idx[:, None]).abs()
+        pair_valid = mask_1d[:, None] & mask_1d[None, :]
+        upper = idx[None, :] > idx[:, None]
+        eval_mask = pair_valid & upper & (sep >= min_sep)
+        long_mask = eval_mask & (sep >= long_range_sep)
+        med_mask = eval_mask & (sep >= medium_range_sep) & (sep < long_range_sep)
+        n_pairs = int(eval_mask.sum().item())
+        if n_pairs <= 0:
+            return None
+        probs = torch.sigmoid(logits)
+        # --- BCE over all valid upper-triangle pairs (sep >= min_sep) ---
+        bce_full = torch.nn.functional.binary_cross_entropy_with_logits(
+            logits, gt, reduction="none"
+        )
+        bce_mean = (bce_full * eval_mask.float()).sum() / max(n_pairs, 1)
+        # --- Pixel-wise accuracy at threshold 0.5 ---
+        pred_bin = (probs >= 0.5).float()
+        correct = (pred_bin == gt).float() * eval_mask.float()
+        accuracy = correct.sum() / max(n_pairs, 1)
+        # --- Threshold-0.5 precision/recall/F1 over eval pairs ---
+        tp = (pred_bin * gt * eval_mask.float()).sum()
+        fp = (pred_bin * (1 - gt) * eval_mask.float()).sum()
+        fn = ((1 - pred_bin) * gt * eval_mask.float()).sum()
+        precision = (tp / (tp + fp).clamp_min(1.0)).item() if (tp + fp).item() > 0 else 0.0
+        recall = (tp / (tp + fn).clamp_min(1.0)).item() if (tp + fn).item() > 0 else 0.0
+        f1 = (2 * precision * recall / max(precision + recall, 1e-12)) if (precision + recall) > 0 else 0.0
+        # --- Top-K precision: rank pairs by prob, take top-K, count true contacts ---
+        def _topk_precision(mask_for_k: torch.Tensor, k: int) -> Optional[float]:
+            if k <= 0:
+                return None
+            flat_probs = probs[mask_for_k]
+            flat_gt = gt[mask_for_k]
+            if flat_probs.numel() == 0:
+                return None
+            topk = min(k, flat_probs.numel())
+            top_idx = torch.topk(flat_probs, topk).indices
+            return float(flat_gt[top_idx].mean().item())
+
+        prec_L = _topk_precision(eval_mask, L_real)
+        prec_L2 = _topk_precision(eval_mask, max(L_real // 2, 1))
+        prec_L5 = _topk_precision(eval_mask, max(L_real // 5, 1))
+        long_prec_L5 = _topk_precision(long_mask, max(L_real // 5, 1))
+        med_prec_L5 = _topk_precision(med_mask, max(L_real // 5, 1))
+        out = {
+            "contact_bce": float(bce_mean.item()),
+            "contact_accuracy": float(accuracy.item()),
+            "contact_precision": float(precision),
+            "contact_recall": float(recall),
+            "contact_f1": float(f1),
+            "n_pairs": int(n_pairs),
+            "L_real": int(L_real),
+        }
+        if prec_L is not None:
+            out["contact_precision_at_L"] = prec_L
+        if prec_L2 is not None:
+            out["contact_precision_at_L2"] = prec_L2
+        if prec_L5 is not None:
+            out["contact_precision_at_L5"] = prec_L5
+        if long_prec_L5 is not None:
+            out["contact_long_range_precision_at_L5"] = long_prec_L5
+        if med_prec_L5 is not None:
+            out["contact_medium_range_precision_at_L5"] = med_prec_L5
+        return out
 
     def configure_inference(self, inf_cfg, nn_ag):
         """Sets inference config with all sampling parameters required by the method (dt, etc)
@@ -2650,9 +2961,17 @@ class ModelTrainerBase(L.LightningModule):
         return_trajectory: bool = False,
         trajectory_stride: int = 1,
         verbose: bool = False,
+        zero_sin_pos_emb: bool = False,
     ) -> Dict[str, Tensor]:
         """
         Generates samples by integrating ODE with learned vector field.
+
+        Args:
+            zero_sin_pos_emb: when True, set ``nn_in["_zero_idx_emb"] = True`` so
+                ``SeqPosEmbFeature`` zeros out the sinusoidal positional embedding
+                at every trajectory step. Must match the training-time setting
+                (``training.zero_sin_pos_emb``) to keep train/val/inference
+                forward semantics consistent.
 
         Returns:
             Dictionary with keys:
@@ -2717,6 +3036,8 @@ class ModelTrainerBase(L.LightningModule):
                     "t": t_tensor,
                     "mask": mask,
                 }
+                if zero_sin_pos_emb:
+                    nn_in["_zero_idx_emb"] = True
 
                 # Contact map input
                 if discrete_enabled:
@@ -2803,6 +3124,11 @@ class ModelTrainerBase(L.LightningModule):
                 contact_map = self._contact_tokens_to_output(z0)
                 contact_map = self._apply_pair_mask(contact_map, pair_mask)
                 gen_result["contact_map"] = contact_map
+                # Expose the final-step logits so the val trajectory can compute
+                # contact-map prediction-quality metrics (BCE, top-L precision, etc.)
+                # against the GT contact map. Detach: we never need gradients here
+                # (val runs under no_grad in the trainer anyway).
+                gen_result["contact_map_logits"] = c_logits.detach()
             if dssp_diff_enabled and dssp_logits is not None:
                 dssp_z0 = self.dssp_diffusion.decode(dssp_zt, dssp_logits)
                 gen_result["dssp"] = self._dssp_tokens_to_output(dssp_z0)
@@ -2843,6 +3169,7 @@ class ModelTrainerBase(L.LightningModule):
             modality=modality,
             predict_coords=predict_coords,
             verbose=verbose,
+            zero_sin_pos_emb=zero_sin_pos_emb,
         )
 
 

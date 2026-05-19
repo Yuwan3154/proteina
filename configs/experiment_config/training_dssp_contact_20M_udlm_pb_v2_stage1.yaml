@@ -1,4 +1,4 @@
-run_name_: dssp_contact_20M_udlm_pb_v1
+run_name_: dssp_contact_20M_udlm_pb_v2_stage1
 
 # Initialize IPA from AF2 model 1 ptm at epoch 0
 af2_ipa_weights_path: /home/ubuntu/params/params_model_1_ptm.npz
@@ -11,7 +11,7 @@ hardware:
   ncpus_per_task_train_: 16
   ncpus_per_task_prepro_: 16
   accelerator: gpu
-  ngpus_per_node_: 1
+  ngpus_per_node_: 4  # STAGE 1: 4-GPU setup. Effective batch = 4 * 8 micro * 4 accum = 128.
   nnodes_: 1
 
 loss:
@@ -55,10 +55,18 @@ model:
     # collapse repeated (C, A, T) triples per chain so each unique fold contributes
     # once to the sum. See also `validation_sampling.cath` plumbing.
     cath_dedupe_codes: True
-    residue_type_emb_init_seq: True
-    residue_type_emb_cond_seq: True
-    residue_type_emb_init_pair: True
-    residue_type_emb_cond_pair: True
+    # STAGE 1: disable all four residue_type embedding paths (init seq/pair +
+    # cond seq/pair). The trunk's feature factories don't pull `residue_type`
+    # from the batch under these flags (see feature_factory.py:812-815 — the
+    # `use_residue_type_emb` gate). residue_type is still present in the batch
+    # (kept by the contact_map_mode + predict_coords=ipa exception in
+    # model_trainer_base.py:1055-1061), so IPA's atom-mask logic and downstream
+    # logging (USalign TMscore, PDB structure viz) work unchanged. Restored to
+    # True in the Stage-2 fine-tune config.
+    residue_type_emb_init_seq: False
+    residue_type_emb_cond_seq: False
+    residue_type_emb_init_pair: False
+    residue_type_emb_cond_pair: False
     seq_emb_dim: 2
     predict_dssp: true
     dssp_diffusion_mode: true # For transformer native embedding
@@ -66,15 +74,22 @@ model:
     ext_lig_emb_cond_seq: True
     ext_lig_emb_dim: 3
 
-# Dataset: PDB only (purge-test, no mixed d_FS)
-dataset: pdb_train_contact-CB-10A_S25_max256_purge-test_cutoff-190828
+# Dataset: PDB only (purge-test, no mixed d_FS).
+# ConFind-derived contacts at threshold 0.01 (rotamer-based, more physical).
+# Stage-1 data expansion (length cap, AFDB mix, S30 cluster, etc.) is a deferred
+# TODO — see project_proteina_stage1_data_todo.md.
+dataset: pdb_train_contact-confind_S25_max256_purge-test_cutoff-190828
 dataset_config_subdir: pdb
 
 force_precision_f32: False
 
 training:
+  # STAGE 1: no sequence conditioning. training_step pops `residue_type_unmasked`
+  # writing and the masking branch; with contact_map_mode + predict_coords=ipa,
+  # `residue_type` itself stays in the batch (line 1055-1061) so IPA still
+  # functions and validation logging that needs a PDB still works.
   self_cond: True
-  seq_cond: True
+  seq_cond: False
   fold_cond: True
   # Enable UDLM position bias for wavefront curriculum
   position_bias:
@@ -84,13 +99,19 @@ training:
   mask_T_prob: 0.5
   mask_A_prob: 0.5
   mask_C_prob: 0.5
-  fold_label_sample_ratio: [0.5, 0.1, 0.15, 0.25]
+  fold_label_sample_ratio: [0.67, 0.13, 0.2, 0.0]
   mask_seq_proportion: 0.15
-  mask_extlig_proportion: 0.15
+  mask_extlig_proportion: 0.3
   finetune_seq_cond_lora_only: False
   self_cond_use_copy: True
   self_cond_copy_update_every: 10
-  zero_sin_pos_emb: True
+  # STAGE 1: USE sinusoidal positional embeddings as a learning crutch. The model
+  # has no sequence info (residue_type embeddings disabled), so positional indices
+  # are one of the few stable training signals available. Restored to True
+  # (zero out pos emb) in the Stage-2 finetune to match the inference setting
+  # there. Note: validation trajectory + r3n_fm.full_simulation now propagate this
+  # flag (fix applied in P0-4 below), so val sampling matches training.
+  zero_sin_pos_emb: False
 
 lora:
   use: False
@@ -101,12 +122,19 @@ lora:
 
 opt:
   lr: 0.0001
-  max_epochs: 1000
-  batch_size: 4
-  accumulate_grad_batches: 4  # effective batch = 4 * 4 = 16
+  # STAGE 1: backbone pretraining. Targets 150K optim steps (~19M samples at
+  # effective batch 128). max_epochs is a loose upper-bound for the cosine
+  # annealer's horizon; max_steps is the hard stop.
+  max_epochs: 2500
+  max_steps: 150000
+  batch_size: 8  # per-GPU micro-batch
+  accumulate_grad_batches: 4  # effective = 4 GPU * 8 micro * 4 accum = 128
   optimizer: muon
-  val_check_interval_optim_steps: 100  # counted in optim steps (= 100 * 4 = 400 minibatches); DDP-safe (per-rank optim_steps * accum, independent of world size).
+  val_check_interval_optim_steps: 500  # 300 val cycles over 150K steps. Val-traj at chunk=8 is sampling-heavy, so leaner cadence saves compute.
   skip_nan_grad: False
+  # Set True to print ipa_linear_s/z grad norms + frames_pred stats every 100
+  # train steps. For the FAPE/IPA debug experiments only — keep False in prod.
+  debug_log_grads: False
   grad_and_weight_analysis: False
   dist_strategy: ddp
   dist_backend: gloo
@@ -138,16 +166,17 @@ validation_sampling:
   tmscore_n_samples: 8
   tmscore_every_n_val_epochs: 1
   tmscore_mode: 5
-  # Cap the per-trajectory NN forward at training-batch memory. Defaults to
-  # opt.batch_size when omitted. With tmscore_n_samples=8 and batch_size=4, this
-  # turns one B=32 trajectory call into 8 successive B=4 calls — each call's
-  # memory profile matches a training mini-batch.
-  tmscore_traj_chunk_size: 4
-  # Prediction-eval semantics: use each val sample's real length (from its own mask),
-  # not a random L drawn from dataselector bounds. Default would auto-enable when
-  # dataselector exposes min/max length, which is wrong for prediction eval — and
-  # changing L per val epoch also triggers torch._dynamo recompiles.
-  variable_length_sampling: False
+  # Cap the per-trajectory NN forward at training-batch memory. Stage 1 uses
+  # per-GPU micro-batch=8, so chunk at 8 to match training memory profile per
+  # trajectory call. With tmscore_n_samples=8 batches buffered * 8 = 64 total
+  # samples in stats, run as 8 chunks of 8 each.
+  tmscore_traj_chunk_size: 8
+  # STAGE 1: random L per val epoch (drawn from dataselector min/max_length =
+  # 50/256). Stage 1 is generative-style pretraining without sequence info, so
+  # evaluating across lengths is more informative than evaluating on each
+  # protein's real length. Mask shape stays [B, 256] (value-only change), so no
+  # torch._dynamo recompile from this. Restored to False in Stage 2.
+  variable_length_sampling: True
 
 seed: 42
 

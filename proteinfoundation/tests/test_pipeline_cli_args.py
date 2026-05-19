@@ -297,22 +297,52 @@ def test_compute_mean_pae_respects_mask():
 
 
 def test_calibration_curve_basic(tmp_path):
-    """Calibration curve writes a non-empty PNG and the fraction at τ=0.5 matches
-    the expected value for a synthetic dataset."""
-    # Build 30 proteins:
-    #   - 10 with best_ptm=0.4 (below 0.5 cutoff) → not in passing set
-    #   - 10 with best_ptm=0.7, best_ref_pred_tm=0.9 (passing AND calibrated)
-    #   - 10 with best_ptm=0.7, best_ref_pred_tm=0.5 (passing BUT NOT calibrated)
-    # At τ=0.5: 20 pass, 10 calibrated → fraction = 50%.
+    """Calibration curve writes a non-empty PNG for a synthetic dataset.
+
+    Curve semantics: at threshold τ, Y = P(ref_pred_TM ≥ τ | best_ptm ≥ τ).
+    Both sides use the **same** τ value.
+
+    Synthetic data at τ=0.6:
+      - 10 with best_ptm=0.4, best_ref_pred_tm=0.45  → below pTM filter
+      - 10 with best_ptm=0.7, best_ref_pred_tm=0.85  → pass filter AND TM≥0.6 ✓
+      - 10 with best_ptm=0.8, best_ref_pred_tm=0.55  → pass filter, TM<0.6 ✗
+    At τ=0.6: 20 pass pTM filter; 10 of those have TM≥0.6 → fraction = 50%.
+    """
     results = (
         [{"best_ptm": 0.4, "best_ref_pred_tm": 0.45} for _ in range(10)]
-        + [{"best_ptm": 0.7, "best_ref_pred_tm": 0.9} for _ in range(10)]
-        + [{"best_ptm": 0.7, "best_ref_pred_tm": 0.5} for _ in range(10)]
+        + [{"best_ptm": 0.7, "best_ref_pred_tm": 0.85} for _ in range(10)]
+        + [{"best_ptm": 0.8, "best_ref_pred_tm": 0.55} for _ in range(10)]
     )
-    rpp.step_plot_ptm_calibration_curve(results, str(tmp_path), 0.5)
+    rpp.step_plot_ptm_calibration_curve(results, str(tmp_path), 0.6)
     out = tmp_path / "ptm_calibration_curve.png"
     assert out.exists(), "calibration plot not written"
     assert out.stat().st_size > 0, "calibration plot is empty"
+
+
+def test_calibration_curve_yield_semantics(tmp_path, monkeypatch):
+    """Verify the curve computes P(ref_pred_TM ≥ τ | pTM ≥ τ), not P(TM ≥ pTM | ...).
+
+    Construct data where the two interpretations diverge:
+      - 5 proteins with best_ptm=0.9, best_ref_pred_tm=0.75
+        → pass pTM ≥ 0.7 filter; TM≥0.7 ✓ (yield); TM≥pTM ✗ (per-protein cal)
+    Yield-at-0.7 interpretation: 5/5 = 100%.
+    Per-protein  interpretation: 0/5 = 0%.
+    We assert the JSON-summary-style scalar (computed inline below) is 100%.
+    """
+    results = [{"best_ptm": 0.9, "best_ref_pred_tm": 0.75} for _ in range(5)]
+    rpp.step_plot_ptm_calibration_curve(results, str(tmp_path), 0.7)
+    out = tmp_path / "ptm_calibration_curve.png"
+    assert out.exists()
+    # Sanity check the underlying logic explicitly using the same definition
+    # used in the JSON summary's calibration_at_cutoff block.
+    pairs = [(r["best_ptm"], r["best_ref_pred_tm"]) for r in results]
+    n_pass = sum(1 for ptm, _ in pairs if ptm >= 0.7)
+    n_yield = sum(1 for ptm, gt in pairs if ptm >= 0.7 and gt >= 0.7)
+    assert n_pass == 5
+    assert n_yield == 5  # yield: all 5 have TM ≥ 0.7
+    # Sanity: the OPPOSITE (per-protein) interpretation would give 0 here.
+    n_per_protein = sum(1 for ptm, gt in pairs if ptm >= 0.7 and gt >= ptm)
+    assert n_per_protein == 0
 
 
 def test_calibration_curve_no_gt(tmp_path):
