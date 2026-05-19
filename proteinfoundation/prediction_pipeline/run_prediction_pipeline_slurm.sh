@@ -34,8 +34,8 @@ python proteinfoundation/prediction_pipeline/run_prediction_pipeline.py \
     --id_col accession_id \
     --inference_config inference_seq_cond_sampling_ca_dssp_extlig_no-sin-pos-emb_beta-2.5-2.0_finetune-all_v1.6_default-fold_21-seq-S25_128-eff-bs_pdb_last_045-noise \
     --output_dir ~/proteina/prediction/inference_seq_cond_sampling_ca_dssp_extlig_no-sin-pos-emb_beta-2.5-2.0_finetune-all_v1.6_default-fold_21-seq-S25_128-eff-bs_pdb_last_045-noise/ \
-    --proteinebm_checkpoint /~/ProteinEBM/weights/proteinebm_v2_cathmd_weights.pt \
-    --proteinebm_config ~/ProteinEBM/protein_ebm/config/proteinebm_v2_cathmd_config.yaml \
+    --proteinebm_checkpoint /~/ProteinEBM/weights/pae.ckpt \
+    --proteinebm_config ~/ProteinEBM/protein_ebm/config/pae_config.yaml \
     --proteinebm_t 0.05 \
     --af2rank_top_k 16 \
     --no-use_deepspeed_evoformer_attention \
@@ -55,8 +55,8 @@ python proteinfoundation/prediction_pipeline/run_prediction_pipeline.py \
     --id_col accession_id \
     --inference_config inference_seq_cond_sampling_ca_dssp_extlig_no-sin-pos-emb_beta-2.5-2.0_finetune-all_v1.6_default-fold_4-seq-S25_128-eff-bs_pdb_last_045-noise \
     --output_dir ~/proteina/prediction/inference_seq_cond_sampling_ca_dssp_extlig_no-sin-pos-emb_beta-2.5-2.0_finetune-all_v1.6_default-fold_4-seq-S25_128-eff-bs_pdb_last_045-noise/ \
-    --proteinebm_checkpoint ~/ProteinEBM/weights/proteinebm_v2_cathmd_weights.pt \
-    --proteinebm_config ~/ProteinEBM/protein_ebm/config/proteinebm_v2_cathmd_config.yaml \
+    --proteinebm_checkpoint ~/ProteinEBM/weights/pae.ckpt \
+    --proteinebm_config ~/ProteinEBM/protein_ebm/config/pae_config.yaml \
     --proteinebm_t 0.05 \
     --af2rank_top_k 16 \
     --no-use_deepspeed_evoformer_attention \
