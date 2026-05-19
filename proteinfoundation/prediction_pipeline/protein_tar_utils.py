@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import tarfile
@@ -9,6 +10,8 @@ import time
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Iterable
+
+logger = logging.getLogger(__name__)
 
 
 def protein_tar_path(inference_dir: str | Path, protein_id: str) -> Path:
@@ -157,11 +160,30 @@ def safe_extract_protein_tar(inference_dir: str | Path, protein_id: str) -> bool
 
     with tarfile.open(tar_path, "r:") as tf:
         members = tf.getmembers()
-        for member in members:
-            _validate_member(member, protein_id)
         if not members:
             return False
-        tf.extractall(inference_path)
+        safe_members: list[tarfile.TarInfo] = []
+        skipped_links = 0
+        for member in members:
+            _validate_member_name(member.name, protein_id)
+            if member.issym() or member.islnk():
+                # Legacy tars packed before `dereference=True` landed in
+                # `pack_protein_dir` can contain symlinks (e.g. the af2rank
+                # `staged_topk_templates/` entries). Skip extracting them:
+                # the link target is normally stored as a regular file in the
+                # same tar, and downstream code re-creates the staging symlinks
+                # itself if needed.
+                skipped_links += 1
+                continue
+            safe_members.append(member)
+        if skipped_links:
+            logger.warning(
+                "safe_extract_protein_tar: skipped %d legacy link member(s) in %s.tar",
+                skipped_links, protein_id,
+            )
+        if not safe_members:
+            return False
+        tf.extractall(inference_path, members=safe_members)
     return True
 
 

@@ -134,8 +134,26 @@ def test_metadata_readers_ignore_legacy_symlink_members(tmp_path):
     assert read_protein_text(tmp_path, protein_id, "real.txt") == "x\n"
     assert read_protein_text(tmp_path, protein_id, "linked.txt") is None
 
-    with pytest.raises(ValueError):
-        safe_extract_protein_tar(tmp_path, protein_id)
+    # safe_extract_protein_tar tolerates legacy symlink members by skipping them
+    # while still extracting the regular files alongside.
+    assert safe_extract_protein_tar(tmp_path, protein_id)
+    protein_dir = tmp_path / protein_id
+    assert (protein_dir / "real.txt").read_text() == "x\n"
+    assert not (protein_dir / "linked.txt").exists()
+
+
+def test_safe_extract_returns_false_when_only_symlinks(tmp_path):
+    protein_id = "protein_A"
+    tar_path = protein_tar_path(tmp_path, protein_id)
+    link_info = tarfile.TarInfo(f"{protein_id}/linked.txt")
+    link_info.type = tarfile.SYMTYPE
+    link_info.linkname = "real.txt"
+    with tarfile.open(tar_path, "w") as tf:
+        tf.addfile(link_info)
+
+    # No regular members survive filtering -> nothing to extract -> returns False.
+    assert safe_extract_protein_tar(tmp_path, protein_id) is False
+    assert not (tmp_path / protein_id).exists()
 
 
 def test_list_members_from_loose_and_tar(tmp_path):
