@@ -565,7 +565,7 @@ if __name__ == "__main__":
             args_ckpt_best_tm = {
                 "dirpath": checkpoint_path_store,
                 "save_last": False,
-                "save_weights_only": False,
+                "save_weights_only": True,
                 "filename": "chk_best_tmscore_median_{epoch:08d}_{step:012d}",
                 "monitor": "validation_sampling/tmscore_median",
                 "save_top_k": int(cfg_exp.log.get("checkpoint_best_tmscore_save_top_k", 1)),

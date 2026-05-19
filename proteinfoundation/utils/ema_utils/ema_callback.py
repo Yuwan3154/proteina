@@ -448,3 +448,45 @@ class EmaModelCheckpoint(ModelCheckpoint):
                 super()._save_checkpoint(trainer, filepath)
         else:
             super()._save_checkpoint(trainer, filepath)
+
+    def _remove_checkpoint(self, trainer: "pl.Trainer", filepath: str) -> None:
+        """Delete a checkpoint AND its EMA companion.
+
+        Lightning's ModelCheckpoint calls ``_remove_checkpoint(trainer, filepath)``
+        when top-k rotation kicks out an old checkpoint. The base class only
+        knows about the single ``filepath``, but our ``_save_checkpoint`` also
+        writes a companion ``-EMA.ckpt`` next to every regular ``.ckpt``. Without
+        this override, the companion is orphaned and disk usage grows without
+        bound (e.g., 14 stale ``chk_best_tmscore_median_*-EMA.ckpt`` files at
+        1.5 GB each = 21 GB observed in a 200-epoch run with save_top_k=1).
+
+        Both removals are wrapped in tolerant try/excepts: the worst-case
+        outcome of a "missing file at delete time" is a silent no-op (e.g.,
+        if a partial crash or manual cleanup already removed one of the two
+        files). We do NOT want a missing companion to abort the rotation.
+        """
+        import os as _os
+        # Remove the regular checkpoint (delegates to trainer.strategy for
+        # distributed-safe deletion).
+        try:
+            super()._remove_checkpoint(trainer, filepath)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            if _os.path.exists(filepath):
+                try:
+                    _os.remove(filepath)
+                except OSError:
+                    pass
+        # Remove the EMA companion if present.
+        ema_filepath = self._ema_format_filepath(filepath)
+        try:
+            trainer.strategy.remove_checkpoint(ema_filepath)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            if _os.path.exists(ema_filepath):
+                try:
+                    _os.remove(ema_filepath)
+                except OSError:
+                    pass
