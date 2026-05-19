@@ -27,15 +27,15 @@ cd /home/gridsan/cou/proteina
 # of proteins sorted by length for balanced workload.
 # OOM errors automatically halve max_nsamples and retry.
 python proteinfoundation/prediction_pipeline/run_prediction_pipeline.py \
-    --dataset_file /home/gridsan/cou/data/bad_afdb/pdb_70_cluster_reps_aligned_confidence_aggregate_monomer_length_50-640_tm-05_coverage-08_identity-07_cutoff-190828_in-train.csv \
+    --dataset_file ~/data/bad_afdb/pdb_70_cluster_reps_aligned_confidence_aggregate_monomer_tm-05_coverage-08_identity-07_length_50-512.csv \
     --id_col pdb \
     --tms_col tm_score \
-    --cif_dir /home/gridsan/cou/data/bad_afdb/pdb \
-    --output_dir /home/gridsan/cou/proteina/inference/inference_seq_cond_sampling_ca_dssp_extlig_no-sin-pos-emb_beta-2.5-2.0_finetune-all_v1.6_default-fold_21-seq-S25_128-eff-bs_pdb_last_045-noise/failed_afdb_cross_protein_analysis \
+    --cif_dir ~/data/bad_afdb/pdb \
+    --output_dir ~/proteina/inference/inference_seq_cond_sampling_ca_dssp_extlig_no-sin-pos-emb_beta-2.5-2.0_finetune-all_v1.6_default-fold_21-seq-S25_128-eff-bs_pdb_last_045-noise/failed_afdb_cross_protein_analysis \
     --inference_config inference_seq_cond_sampling_ca_dssp_extlig_no-sin-pos-emb_beta-2.5-2.0_finetune-all_v1.6_default-fold_21-seq-S25_128-eff-bs_pdb_last_045-noise \
     --scorer proteinebm \
-    --proteinebm_checkpoint /home/gridsan/cou/ProteinEBM/weights/pae.ckpt \
-    --proteinebm_config /home/gridsan/cou/ProteinEBM/protein_ebm/config/pae_config.yaml \
+    --proteinebm_checkpoint ~/ProteinEBM/weights/pae.ckpt \
+    --proteinebm_config ~/ProteinEBM/protein_ebm/config/pae_config.yaml \
     --proteinebm_t 0.05 \
     --skip_diversity \
     --af2rank_top_k 8 \
@@ -47,18 +47,19 @@ python proteinfoundation/prediction_pipeline/run_prediction_pipeline.py \
     --proteina_force_compile \
     --af2rank_backend openfold \
     --direct_python \
-    --num_gpus 2 
+    --num_gpus 2 \
+    --rerun_score
 
 python proteinfoundation/prediction_pipeline/run_prediction_pipeline.py \
-    --dataset_file /home/gridsan/cou/data/bad_afdb/pdb_70_cluster_reps_aligned_confidence_aggregate_monomer_length_50-640_tm-05_coverage-08_identity-07_cutoff-190828_in-train.csv \
+    --dataset_file ~/data/bad_afdb/pdb_70_cluster_reps_aligned_confidence_aggregate_monomer_tm-05_coverage-08_identity-07_length_50-512.csv \
     --id_col pdb \
     --tms_col tm_score \
-    --cif_dir /home/gridsan/cou/data/bad_afdb/pdb \
-    --output_dir /home/gridsan/cou/proteina/inference/inference_seq_cond_sampling_ca_dssp_extlig_no-sin-pos-emb_beta-2.5-2.0_finetune-all_v1.6_default-fold_4-seq-S25_128-eff-bs_pdb_last_045-noise/failed_afdb_cross_protein_analysis \
+    --cif_dir ~/data/bad_afdb/pdb \
+    --output_dir ~/proteina/inference/inference_seq_cond_sampling_ca_dssp_extlig_no-sin-pos-emb_beta-2.5-2.0_finetune-all_v1.6_default-fold_4-seq-S25_128-eff-bs_pdb_last_045-noise/failed_afdb_cross_protein_analysis \
     --inference_config inference_seq_cond_sampling_ca_dssp_extlig_no-sin-pos-emb_beta-2.5-2.0_finetune-all_v1.6_default-fold_4-seq-S25_128-eff-bs_pdb_last_045-noise \
     --scorer proteinebm \
-    --proteinebm_checkpoint /home/gridsan/cou/ProteinEBM/weights/pae.ckpt \
-    --proteinebm_config /home/gridsan/cou/ProteinEBM/protein_ebm/config/pae_config.yaml \
+    --proteinebm_checkpoint ~/ProteinEBM/weights/pae.ckpt \
+    --proteinebm_config ~/ProteinEBM/protein_ebm/config/pae_config.yaml \
     --proteinebm_t 0.05 \
     --skip_diversity \
     --af2rank_top_k 8 \
@@ -70,4 +71,5 @@ python proteinfoundation/prediction_pipeline/run_prediction_pipeline.py \
     --proteina_force_compile \
     --af2rank_backend openfold \
     --direct_python \
-    --num_gpus 2 
+    --num_gpus 2 \
+    --rerun_score

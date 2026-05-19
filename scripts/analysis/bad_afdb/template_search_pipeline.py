@@ -56,6 +56,7 @@ class Config:
     conda_env: str
     conda_hook: str
     top_k: int
+    tm_mode: int
 
 
 def ensure_dirs(cfg: Config) -> None:
@@ -296,7 +297,7 @@ def extract_chain_using_biopython(cif_file: Path, chain_id: str, output_pdb: Pat
     return None
 
 
-def run_usalign(cfg: Config, target_pdb: Path, template_pdbs, pdb_id: str, chain_id: str):
+def run_usalign(cfg: Config, target_pdb: Path, template_pdbs, pdb_id: str, chain_id: str, tm_mode: int):
     """Run USalign to compare target structure with template structures."""
     pdb_chain_id = f"{pdb_id}_{chain_id}"
     aln_file = cfg.template_aln_dir / f"{pdb_chain_id}.tsv"
@@ -314,7 +315,7 @@ def run_usalign(cfg: Config, target_pdb: Path, template_pdbs, pdb_id: str, chain
             f.write(f"{tpdb.name}\n")
 
     print(f"  Running USalign with {len(template_pdbs)} templates...")
-    cmd = f"USalign -outfmt 2 {target_pdb} -dir2 {cfg.template_pdb_dir}/ {temp_list_file}"
+    cmd = f"USalign -outfmt 2 {target_pdb} -dir2 {cfg.template_pdb_dir}/ {temp_list_file} -TMscore {tm_mode}"
     result = run_conda_command(cfg, cmd)
 
     temp_list_file.unlink()
@@ -401,7 +402,7 @@ def process_protein(cfg: Config, pdb_id: str, chain_id: str, uniprot_id: str):
         print("  WARNING: Failed to extract target chain")
         return None
 
-    aln_file = run_usalign(cfg, target_chain_pdb, template_pdbs, pdb_id, chain_id)
+    aln_file = run_usalign(cfg, target_chain_pdb, template_pdbs, pdb_id, chain_id, cfg.tm_mode)
     if not aln_file:
         return None
 
@@ -501,6 +502,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("-k", "--top_k", type=int, default=4,
                    help="Number of top templates to use.")
+    p.add_argument("--tm_mode", type=int, default=5, help="TM-score mode to use.")
     return p
 
 
@@ -518,6 +520,7 @@ def main():
         conda_env=args.conda_env,
         conda_hook=args.conda_hook,
         top_k=args.top_k,
+        tm_mode=args.tm_mode,
     )
     ensure_dirs(cfg)
 

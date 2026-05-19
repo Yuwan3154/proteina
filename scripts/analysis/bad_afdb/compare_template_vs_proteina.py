@@ -254,11 +254,11 @@ def create_scatter_plot(x, y, xlabel, ylabel, title, output_file, add_stats=True
         pearson_r, pearson_p = stats.pearsonr(x_plot, y_plot)
         spearman_r, spearman_p = stats.spearmanr(x_plot, y_plot)
 
-        # Paired t-test (two-sided)
-        t_stat, t_p = stats.ttest_rel(y_plot, x_plot)
+        # # Paired t-test (two-sided)
+        # t_stat, t_p = stats.ttest_rel(y_plot, x_plot)
 
-        # Wilcoxon signed-rank test (two-sided)
-        wilcoxon_stat, wilcoxon_p = stats.wilcoxon(y_plot, x_plot, alternative='two-sided')
+        # # Wilcoxon signed-rank test (two-sided)
+        # wilcoxon_stat, wilcoxon_p = stats.wilcoxon(y_plot, x_plot, alternative='two-sided')
 
         # Add correlation statistics text
         stats_text = f'Pearson r = {pearson_r:.3f} (p={pearson_p:.2e})\n'
@@ -267,15 +267,15 @@ def create_scatter_plot(x, y, xlabel, ylabel, title, output_file, add_stats=True
                 verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
                 fontsize=10)
 
-        # Add difference statistics
-        mean_diff = (y_plot - x_plot).mean()
-        diff_text = f'Mean Δ = {mean_diff:.4f}\n'
-        diff_text += f'Paired t-test: p={t_p:.2e}\n'
-        diff_text += f'Wilcoxon: p={wilcoxon_p:.2e}\n'
-        diff_text += f'N = {len(x_plot)}'
-        ax.text(0.05, 0.05, diff_text,
-                transform=ax.transAxes, verticalalignment='bottom',
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8), fontsize=10)
+        # # Add difference statistics
+        # mean_diff = (y_plot - x_plot).mean()
+        # diff_text = f'Mean Δ = {mean_diff:.4f}\n'
+        # diff_text += f'Paired t-test: p={t_p:.2e}\n'
+        # diff_text += f'Wilcoxon: p={wilcoxon_p:.2e}\n'
+        # diff_text += f'N = {len(x_plot)}'
+        # ax.text(0.05, 0.05, diff_text,
+        #         transform=ax.transAxes, verticalalignment='bottom',
+        #         bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8), fontsize=10)
 
     ax.set_xlabel(xlabel, fontsize=12)
     ax.set_ylabel(ylabel, fontsize=12)
@@ -297,11 +297,11 @@ def create_scatter_plot(x, y, xlabel, ylabel, title, output_file, add_stats=True
         return {
             'pearson_r': pearson_r,
             'spearman_r': spearman_r,
-            't_stat': t_stat,
-            't_p': t_p,
-            'wilcoxon_stat': wilcoxon_stat,
-            'wilcoxon_p': wilcoxon_p,
-            'mean_diff': mean_diff,
+            # 't_stat': t_stat,
+            # 't_p': t_p,
+            # 'wilcoxon_stat': wilcoxon_stat,
+            # 'wilcoxon_p': wilcoxon_p,
+            # 'mean_diff': mean_diff,
             'n_samples': len(x_plot)
         }
     return None
@@ -312,26 +312,26 @@ def print_significance_results(comparison_name, results, alpha=0.05):
     print(f"\n{comparison_name} (N={results['n_samples']}):")
     print(f"  Pearson correlation:  r={results['pearson_r']:.4f}")
     print(f"  Spearman correlation: ρ={results['spearman_r']:.4f}")
-    print(f"  Mean difference (Proteina - Template): {results['mean_diff']:.4f}")
-    print(f"  Paired t-test: t={results['t_stat']:.4f}, p={results['t_p']:.2e}", end='')
-    if results['t_p'] < alpha:
-        print(f" ***SIGNIFICANT*** (α={alpha})")
-    else:
-        print(f" (not significant at α={alpha})")
-    print(f"  Wilcoxon signed-rank: stat={results['wilcoxon_stat']:.1f}, p={results['wilcoxon_p']:.2e}", end='')
-    if results['wilcoxon_p'] < alpha:
-        print(f" ***SIGNIFICANT*** (α={alpha})")
-    else:
-        print(f" (not significant at α={alpha})")
+    # print(f"  Mean difference (Proteina - Template): {results['mean_diff']:.4f}")
+    # print(f"  Paired t-test: t={results['t_stat']:.4f}, p={results['t_p']:.2e}", end='')
+    # if results['t_p'] < alpha:
+    #     print(f" ***SIGNIFICANT*** (α={alpha})")
+    # else:
+    #     print(f" (not significant at α={alpha})")
+    # print(f"  Wilcoxon signed-rank: stat={results['wilcoxon_stat']:.1f}, p={results['wilcoxon_p']:.2e}", end='')
+    # if results['wilcoxon_p'] < alpha:
+    #     print(f" ***SIGNIFICANT*** (α={alpha})")
+    # else:
+    #     print(f" (not significant at α={alpha})")
 
-    # Interpretation
-    if results['t_p'] < alpha or results['wilcoxon_p'] < alpha:
-        if results['mean_diff'] > 0:
-            print(f"  → Proteina is SIGNIFICANTLY BETTER than template search")
-        else:
-            print(f"  → Template search is SIGNIFICANTLY BETTER than Proteina")
-    else:
-        print(f"  → No significant difference between methods")
+    # # Interpretation
+    # if results['t_p'] < alpha or results['wilcoxon_p'] < alpha:
+    #     if results['mean_diff'] > 0:
+    #         print(f"  → Proteina is SIGNIFICANTLY BETTER than template search")
+    #     else:
+    #         print(f"  → Template search is SIGNIFICANTLY BETTER than Proteina")
+    # else:
+    #     print(f"  → No significant difference between methods")
 
 
 # Base comparison spec (label suffix is applied at run time)
