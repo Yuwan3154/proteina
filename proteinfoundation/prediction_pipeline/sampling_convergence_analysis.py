@@ -467,12 +467,41 @@ def _run_fallback_scoring(
 
     results: Dict[str, Dict[str, Dict[str, Any]]] = {pid: {} for pid in per_protein_templates}
 
+    def _existing_scored_files(out_subdir: str) -> Dict[str, set]:
+        """Return {pid: set of structure_file values already in the AF2Rank CSV}."""
+        out: Dict[str, set] = {}
+        for cfg in protein_configs:
+            pid = cfg["protein_id"]
+            scores_csv = inference_dir / pid / AF2RANK_TOPK_SUBDIR / out_subdir / f"af2rank_scores_{pid}.csv"
+            if scores_csv.exists():
+                try:
+                    df = pd.read_csv(scores_csv)
+                    out[pid] = set(df["structure_file"].astype(str)) if "structure_file" in df.columns else set()
+                except Exception:
+                    out[pid] = set()
+            else:
+                out[pid] = set()
+        return out
+
     def _run_pass(model_name: str, out_subdir: str) -> None:
-        logger.info("Loading AF2Rank %s for fallback scoring...", model_name)
-        first = protein_configs[0]
+        # Skip the entire pass if nothing needs scoring (cache hit on rerun).
+        already = _existing_scored_files(out_subdir)
+        todo = [
+            (cfg, [t for t in cfg["templates"] if t["structure_file"] not in already.get(cfg["protein_id"], set())])
+            for cfg in protein_configs
+        ]
+        todo = [(cfg, tpls) for cfg, tpls in todo if tpls]
+        if not todo:
+            logger.info("AF2Rank %s: all fallback templates already cached, skipping model load",
+                        model_name)
+            return
+
+        logger.info("Loading AF2Rank %s for fallback scoring (%d proteins, %d templates)...",
+                    model_name, len(todo), sum(len(tpls) for _, tpls in todo))
+        first_cfg = todo[0][0]
         scorer = OpenFoldAF2Rank(
-            reference_pdb=first["reference_path"],
-            chain=first["chain"],
+            reference_pdb=first_cfg["reference_path"],
+            chain=first_cfg["chain"],
             model_name=model_name,
             recycles=recycles,
             use_deepspeed_evoformer_attention=use_deepspeed_evoformer_attention,
@@ -481,7 +510,7 @@ def _run_fallback_scoring(
             skip_ref_metrics=not has_ground_truth,
         )
         try:
-            for i, cfg in enumerate(protein_configs):
+            for i, (cfg, tpls) in enumerate(todo):
                 pid = cfg["protein_id"]
                 if i > 0:
                     try:
@@ -493,7 +522,7 @@ def _run_fallback_scoring(
                 predicted_dir = out_dir / PREDICTED_SUBDIR
                 predicted_dir.mkdir(parents=True, exist_ok=True)
                 scores_csv = out_dir / f"af2rank_scores_{pid}.csv"
-                for tpl in cfg["templates"]:
+                for tpl in tpls:
                     ca_pdb = tpl["structure_path"]
                     prebuilt = allatom_map.get(ca_pdb)
                     scored_pdb = prebuilt if prebuilt and Path(prebuilt).exists() else ca_pdb
@@ -523,8 +552,7 @@ def _run_fallback_scoring(
                     _append_score_row(scores_csv, row)
                     results[pid].setdefault(pdb_filename, {})[model_name] = row
                 logger.info("  fallback %s [%d/%d] %s: scored %d templates",
-                            model_name, i + 1, len(protein_configs), pid,
-                            len(cfg["templates"]))
+                            model_name, i + 1, len(todo), pid, len(tpls))
         finally:
             del scorer
             gc.collect()
@@ -536,6 +564,11 @@ def _run_fallback_scoring(
 
     _run_pass("model_1_ptm", M1_SUBDIR)
     _run_pass("model_2_ptm", M2_SUBDIR)
+    # Always populate `results` with the set of proteins that had queued
+    # fallbacks, so the post-fallback recomputation in main() runs even on a
+    # re-run where every score was already cached (skip-cache path above).
+    for pid in per_protein_templates.keys():
+        results.setdefault(pid, {})
     return results
 
 
@@ -1020,33 +1053,44 @@ def main(argv: Optional[List[str]] = None) -> int:
             use_cuequivariance_multiplicative_update=args.use_cuequivariance_multiplicative_update,
             tar_protein_dirs=args.tar_protein_dirs,
         )
-        # After scoring, re-read AF2Rank CSVs and recompute Case-A logic for
-        # the previously-fallback cutoffs.  We use the on-disk extracted files
-        # since _run_fallback_scoring restored the protein dirs.
-        for pid, by_file in fallback_results.items():
+        # After scoring, re-read AF2Rank CSVs and recompute the max metrics
+        # for EVERY cutoff (not just the fallback ones).  A fallback template
+        # scored for cutoff N also has sample_index < N′ for all larger N′ in
+        # the cutoff list, so it should contribute to those larger cutoffs too
+        # (otherwise monotonicity can be violated when the newly-scored
+        # fallback template outperforms the original top-k entries that lie
+        # within the larger window).
+        for pid in fallback_results.keys():
             cache = per_protein_caches.get(pid)
             if cache is None:
                 continue
+            energy_df = _read_energy_df(inference_dir, pid, args.proteinebm_analysis_subdir)
             af2_df = _read_af2rank_scores(inference_dir, pid)
-            if af2_df is None:
+            if energy_df is None or af2_df is None:
                 continue
             scored_files = set(af2_df["structure_file"].astype(str))
             for N_key, rec in cache["cutoffs"].items():
-                if not rec.get("fallback_used"):
+                N = int(N_key)
+                subset = energy_df[energy_df["sample_index"] < N]
+                if subset.empty:
                     continue
-                # Find the (single) fallback structure_file for this cutoff
-                # from the original fallback_by_protein entries.
-                queued = [it for it in fallback_by_protein.get(pid, []) if it["cutoff"] == int(N_key)]
-                if not queued:
+                scored_in_subset = set(subset["structure_file"].astype(str)) & scored_files
+                if not scored_in_subset:
+                    # Still no cached templates within this cutoff — fallback
+                    # for this cutoff must have failed; leave the record as-is.
                     continue
-                sf = queued[0]["structure_file"]
-                if sf not in scored_files:
-                    logger.warning("%s: fallback for cutoff %s (%s) not found in CSVs after scoring",
-                                   pid, N_key, sf)
-                    continue
-                sub = af2_df[af2_df["structure_file"].astype(str) == sf]
-                _fill_max_metrics(rec, sub)
-                rec["n_scored_in_cutoff"] = 1
+                sub_scores = af2_df[af2_df["structure_file"].astype(str).isin(scored_in_subset)]
+                # Reset max fields so _fill_max_metrics starts from a clean slate
+                for key in ("max_min_ptm", "max_ptm_m1", "max_ptm_m2",
+                            "max_min_composite", "max_min_tm_ref_pred"):
+                    rec[key] = float("nan")
+                rec["best_structure_file_min_ptm"] = ""
+                rec["best_structure_file_min_tm_ref_pred"] = ""
+                _fill_max_metrics(rec, sub_scores)
+                rec["n_scored_in_cutoff"] = len(scored_in_subset)
+                # fallback_used remains True for cutoffs that originally
+                # needed a fallback; the (now-cached) template is what the
+                # max metric was derived from.
             # has_gt may have changed: re-evaluate
             cache["has_gt"] = bool(
                 "min_tm_ref_pred" in af2_df.columns
