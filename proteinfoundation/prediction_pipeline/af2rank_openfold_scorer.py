@@ -155,7 +155,7 @@ class CG2AllReconstructor:
         import dgl
         import cg2all.lib.libcg
         import cg2all.lib.libmodel
-        from cg2all.lib.libconfig import MODEL_HOME
+        from proteinfoundation.prediction_pipeline.cg2all_reconstruct import ensure_ckpt
         from cg2all.lib.libdata import PredictionData, create_trajectory_from_batch
         from cg2all.lib.libter import patch_termini
 
@@ -165,7 +165,7 @@ class CG2AllReconstructor:
         self.patch_termini = patch_termini
 
         self.device = torch.device(device)
-        ckpt_path = MODEL_HOME / "CalphaBasedModel.ckpt"
+        ckpt_path = ensure_ckpt("CalphaBasedModel")
         ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
         config = ckpt["hyper_parameters"]
         self.cg_model = cg2all.lib.libcg.CalphaBasedModel

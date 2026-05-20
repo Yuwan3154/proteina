@@ -88,6 +88,33 @@ PRED_PIPELINE_DIR = os.path.dirname(_pf_pp.__file__)
 PROTEINA_BASE_DIR = os.getcwd()
 
 
+def _split_shard_args(shard_args: list | None) -> tuple[int | None, int | None, list]:
+    """Inverse of sharding_utils.build_shard_cli_args. Returns
+    (external_shard_index, external_num_shards, passthrough) where passthrough
+    preserves --len_col and any other unrecognized flags."""
+    if not shard_args:
+        return None, None, []
+    ext_idx, ext_n, passthrough = None, None, []
+    it = iter(shard_args)
+    for tok in it:
+        if tok == "--shard_index":
+            ext_idx = int(next(it))
+        elif tok == "--num_shards":
+            ext_n = int(next(it))
+        else:
+            passthrough.append(tok)
+    return ext_idx, ext_n, passthrough
+
+
+def _available_gpu_count(default: int = 1) -> int:
+    """Return number of visible GPUs via nvidia-smi, or `default` if detection fails."""
+    try:
+        out = subprocess.check_output(["nvidia-smi", "--list-gpus"]).decode()
+        return out.count("\n")
+    except Exception:
+        return default
+
+
 def _tar_cli_args(enabled: bool) -> list[str]:
     return ["--tar_protein_dirs"] if enabled else ["--no-tar_protein_dirs"]
 
@@ -368,11 +395,70 @@ def step_af2rank_topk(
         cmd.append("--no-use_cuequivariance_attention")
     if not use_cuequivariance_multiplicative_update:
         cmd.append("--no-use_cuequivariance_multiplicative_update")
-    if shard_args:
-        cmd.extend(shard_args)
     cmd.extend(_tar_cli_args(tar_protein_dirs))
     cmd.extend(_dynamic_cli_args(dynamic_resharding, progress_check_workers))
-    return run_with_conda_env("proteina", cmd, direct_python=direct_python)
+
+    requested_gpus = num_gpus if num_gpus and num_gpus > 0 else 1
+    detected_gpus = _available_gpu_count(default=requested_gpus)
+    if detected_gpus < requested_gpus:
+        logger.warning(
+            f"Requested {requested_gpus} GPUs but only {detected_gpus} available; using {detected_gpus}."
+        )
+    effective_num_gpus = min(requested_gpus, detected_gpus)
+
+    if direct_python:
+        python_cmd = [sys.executable]
+    else:
+        python_cmd = [os.path.join(PRED_PIPELINE_DIR, "run_with_proteina_env.sh"), "python"]
+    base_cmd = python_cmd + cmd[1:]
+
+    ext_idx, ext_n, passthrough = _split_shard_args(shard_args)
+    base_ext_idx = ext_idx if ext_idx is not None else 0
+    base_ext_n = ext_n if ext_n is not None else 1
+
+    if effective_num_gpus == 1 and ext_idx is None and ext_n is None:
+        sub_cmds = [(0, list(base_cmd) + passthrough)]
+    else:
+        sub_cmds = []
+        for gpu_id in range(effective_num_gpus):
+            eff_index = base_ext_idx * effective_num_gpus + gpu_id
+            eff_shards = base_ext_n * effective_num_gpus
+            sub_cmd = list(base_cmd) + passthrough + [
+                "--shard_index", str(eff_index),
+                "--num_shards", str(eff_shards),
+            ]
+            sub_cmds.append((gpu_id, sub_cmd))
+
+    procs: list[tuple[int, subprocess.Popen]] = []
+    for gpu_id, sub_cmd in sub_cmds:
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        if effective_num_gpus > 1 or ext_idx is not None:
+            logger.info(
+                f"GPU {gpu_id}: launching AF2Rank top-k worker "
+                f"(shard {base_ext_idx * effective_num_gpus + gpu_id}/{base_ext_n * effective_num_gpus})"
+            )
+        else:
+            logger.info(f"GPU {gpu_id}: launching AF2Rank top-k worker (single-GPU)")
+        proc = subprocess.Popen(sub_cmd, env=env)
+        procs.append((gpu_id, proc))
+
+    failed: list[int] = []
+    try:
+        for gpu_id, proc in procs:
+            rc = proc.wait()
+            if rc != 0:
+                logger.error(f"GPU {gpu_id} AF2Rank top-k worker exited with code {rc}")
+                failed.append(gpu_id)
+            else:
+                logger.info(f"GPU {gpu_id} AF2Rank top-k worker finished successfully")
+    except KeyboardInterrupt:
+        for _, proc in procs:
+            if proc.poll() is None:
+                proc.terminate()
+        raise
+
+    return not failed
 
 
 def step_central_analysis(
