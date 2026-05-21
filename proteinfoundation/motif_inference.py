@@ -291,6 +291,21 @@ if __name__ == "__main__":
         else:
             config_name = args.config_name
         cfg = hydra.compose(config_name=config_name)
+
+        # Resolve unified config (training and inference configs in the same file)
+        original_run_name = cfg.get("run_name_", None)
+        if "inference" in cfg and cfg.inference is not None:
+            inference_cfg = cfg.inference
+            from omegaconf import open_dict
+            import copy
+            cfg_copy = copy.deepcopy(cfg)
+            with open_dict(cfg_copy):
+                inf_block = cfg_copy.pop("inference")
+                cfg = OmegaConf.merge(cfg_copy, inf_block)
+        
+        if not original_run_name and "run_name_" in cfg:
+            original_run_name = cfg.run_name_
+
         logger.info(f"Inference config {cfg}")
         run_name = cfg.run_name_
 
@@ -304,11 +319,44 @@ if __name__ == "__main__":
         shutil.rmtree(root_path)
     os.makedirs(root_path, exist_ok=True)
 
-    # Load model from checkpoint
-    ckpt_path = cfg.ckpt_path
-    ckpt_file = os.path.join(ckpt_path, cfg.ckpt_name)
-    logger.info(f"Using checkpoint {ckpt_file}")
-    assert os.path.exists(ckpt_file), f"Not a valid checkpoint {ckpt_file}"
+    # Locate checkpoint
+    ckpt_name = cfg.get("ckpt_name", None)
+    checkpoint_mode = cfg.get("checkpoint_mode", "best") # default to 'best'
+    
+    if ckpt_name is not None and ckpt_name != "":
+        # Explicit Checkpoint Mode (if ckpt_name is provided)
+        ckpt_path = cfg.get("ckpt_path", None)
+        if ckpt_path is None:
+            ckpt_path = os.path.join(os.getenv("DATA_PATH"), "weights")
+        ckpt_file = os.path.expanduser(os.path.join(ckpt_path, ckpt_name))
+        logger.info(f"Using explicit checkpoint {ckpt_file}")
+        assert os.path.exists(ckpt_file), f"Not a valid checkpoint {ckpt_file}"
+    else:
+        # Automatic Checkpoint Resolution Mode (if ckpt_name is null/empty)
+        if not original_run_name or original_run_name == "":
+            raise ValueError("No run_name_ found in config. Cannot automatically resolve checkpoint without run_name_.")
+        ckpt_dir = os.path.join(".", "store", original_run_name, "checkpoints")
+        if checkpoint_mode == "last":
+            from proteinfoundation.utils.fetch_last_ckpt import fetch_last_ckpt
+            last_ckpt_name = fetch_last_ckpt(ckpt_dir)
+            if last_ckpt_name is None:
+                raise FileNotFoundError(f"No last checkpoint found in {ckpt_dir}")
+            ckpt_file = os.path.join(ckpt_dir, last_ckpt_name)
+        else: # "best"
+            from proteinfoundation.utils.fetch_last_ckpt import fetch_best_ckpt
+            best_ckpt_name = fetch_best_ckpt(ckpt_dir)
+            if best_ckpt_name is None:
+                # Fallback to last checkpoint
+                logger.warning(f"No best checkpoint found in {ckpt_dir}, falling back to last checkpoint")
+                from proteinfoundation.utils.fetch_last_ckpt import fetch_last_ckpt
+                last_ckpt_name = fetch_last_ckpt(ckpt_dir)
+                if last_ckpt_name is None:
+                    raise FileNotFoundError(f"No checkpoint found in {ckpt_dir}")
+                ckpt_file = os.path.join(ckpt_dir, last_ckpt_name)
+            else:
+                ckpt_file = os.path.join(ckpt_dir, best_ckpt_name)
+        ckpt_file = os.path.expanduser(ckpt_file)
+        logger.info(f"Using auto-resolved checkpoint {ckpt_file} (mode: {checkpoint_mode})")
     model = Proteina.load_from_checkpoint(ckpt_file)
 
     # Set seed

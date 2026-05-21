@@ -1,0 +1,191 @@
+run_name_: ca_dssp_extlig_no-sin-pos-emb_beta-1p3-2_finetune-all_v1p6_default-fold-sum_2-seq-S25_16-eff-bs_200-epoch_pdb_purge-test_warmup_maxlen-256_cutoff-190828
+pretrain_ckpt_path: ~/proteina/data/weights/proteina_v1.6_DFS_200M_notri_long_chain_generation.ckpt
+
+hardware:
+  ncpus_per_task_train_: 16
+  ncpus_per_task_prepro_: 16
+  accelerator: gpu
+  ngpus_per_node_: 1
+  nnodes_: 1
+
+loss:
+  t_distribution:
+    name: mix_up02_beta
+    p1: 1.3
+    p2: 2.0
+  loss_t_clamp: 0.9
+  use_aux_loss: True
+  aux_loss_t_lim: 0.3
+  thres_aux_2d_loss: 0.6
+  aux_loss_weight: 1.0
+  dssp_aux_loss_weight: 1.0
+  num_dist_buckets: 64
+  max_dist_boundary: 1.0
+
+defaults:
+  - model: caflow
+  - override model/nn: ca_af3_200M_no_tri
+  - _self_
+
+model:
+  nn:
+    multilabel_mode: "sum"
+    cath_dedupe_codes: True
+    residue_type_emb_init_seq: True
+    residue_type_emb_cond_seq: True
+    residue_type_emb_init_pair: True
+    residue_type_emb_cond_pair: True
+    seq_emb_dim: 2
+    predict_dssp: true
+    ext_lig_emb_init_seq: True
+    ext_lig_emb_cond_seq: True
+    ext_lig_emb_dim: 3
+
+# Dataset: PDB only (purge-test, no mixed d_FS)
+dataset: pdb_train_S25_max256_purge-test_cutoff-190828
+dataset_config_subdir: pdb
+
+force_precision_f32: False
+
+training:
+  self_cond: True
+  seq_cond: True
+  fold_cond: True
+  mask_T_prob: 0.5
+  mask_A_prob: 0.5
+  mask_C_prob: 0.5
+  fold_label_sample_ratio: [0.67, 0.13, 0.2, 0.0] # Pretain: [0.5, 0.1, 0.15, 0.25], Finetune (no H, scale up by 4/3): [0.67, 0.13, 0.2, 0.0]
+  mask_seq_proportion: 0.15
+  mask_extlig_proportion: 0.3
+  finetune_seq_cond_lora_only: False
+  self_cond_use_copy: True
+  self_cond_copy_update_every: 10
+  zero_sin_pos_emb: True
+
+lora:
+  use: False
+  lora_alpha: 32.0
+  lora_dropout: 0.0
+  r: 0
+  train_bias: "none"
+
+opt:
+  lr: 0.0001
+  max_epochs: 200
+  batch_size: 8
+  accumulate_grad_batches: 2
+  optimizer: muon
+  val_check_interval_optim_steps: 1000  # counted in optim steps
+  skip_nan_grad: False
+  grad_and_weight_analysis: False
+  dist_strategy: ddp
+  dist_backend: gloo
+  use_lr_warmup: True
+  warmup_steps: 3000
+  warmup_start_lr_ratio: 0.0
+  lr_scheduler_type: "cosine"
+  use_cueq: False
+
+log:
+  wandb_project: protein_transformer_big_runs
+  log_wandb: True
+  log_every_n_steps: 1
+  log_structure_every_n_steps: 50
+  checkpoint: True
+  last_ckpt_every_n_steps: 200
+
+validation_sampling:
+  dt: 0.005
+  sampling_mode: sc
+  sc_scale_noise: 0.45
+  tmscore_n_samples: 8
+  tmscore_every_n_val_epochs: 1
+  tmscore_mode: 5
+  tmscore_traj_chunk_size: 8
+  variable_length_sampling: False
+
+seed: 42
+
+ema:
+  decay: 0.999
+  validate_original_weights: False
+  every_n_steps: 1
+  cpu_offload: False
+
+# ==============================================================================
+# Inference Configuration Section
+# Used when calling inference scripts (inference.py / motif_inference.py) directly
+# with this unified config file.
+# ==============================================================================
+inference:
+  # Mode for automatic checkpoint resolution.
+  # Options:
+  #   - 'best': Automatically resolve the best checkpoint (prioritizing TM-score)
+  #             from `./store/<run_name_>/checkpoints/`
+  #   - 'last': Automatically resolve the last checkpoint from the run checkpoints dir
+  # This uses the top-level run_name_ automatically when 'ckpt_name' is omitted or set to null.
+  checkpoint_mode: "best"
+
+  # Or, backward compatibility mode (specify exact checkpoint path/name):
+  ckpt_path: null
+  ckpt_name: ca_dssp_extlig_no-sin-pos-emb_beta-1p3-2_finetune-all_v1p6_default-fold-sum_2-seq-S25_16-eff-bs_200-epoch_pdb_purge-test_warmup_maxlen-256_cutoff-190828_e112.ckpt
+
+  run_name_: seq_cond_pdb_no-sin-pos-emb
+  ncpus_: 24
+  seed: 5
+
+  # Lengths to sample. Uses `nres_lens` if specified, otherwise arange(min_len, max_len+1, step)
+  nres_lens: [50, 100, 150, 200, 250]
+  min_len: null
+  max_len: null
+  step_len: null
+
+  # Number of samples per protein length
+  nsamples_per_len: 512
+
+  # Maximum number of samples in each batch
+  max_nsamples: 32
+
+  # Sampling
+  dt: 0.005
+  self_cond: True
+  fold_cond: False
+  cath_code_level: "T"
+  seq_cond: True
+  zero_sin_pos_emb: True
+
+  data_dir: ${oc.env:DATA_PATH}/pdb_train/
+  cath_code_file: cath_codes_train_df_pdb_f1_minl50_maxl256_mtprotein_etdiffractionEM_minoNone_maxoNone_minr0.0_maxr5.0_hl_rl_rnsrTrue_rpuTrue_l_rcuFalse.csv
+
+  # ext_lig inference default: fill value when ext_lig is not provided in the inference batch.
+  # "unknown" (2) is appropriate for unconditional / AFDB-style generation.
+  # "absent" (0) is appropriate when generating apo / ligand-free structures explicitly.
+  ext_lig_default: "unknown"
+
+  # Sampling params only for CAFlow
+  sampling_caflow:
+    sampling_mode: sc  # Options are: vf (plain flow matching) or sc (using score)
+    sc_scale_noise: 0.45  # scale used to multiply noise if mode == sc
+    sc_scale_score: 1.0  # scale used to multiply score if mode == sc
+    gt_mode: "1/t"
+    gt_p: 1.0
+    gt_clamp_val: null
+
+  schedule:
+    schedule_mode: log
+    schedule_p: 2.0
+
+  # LoRA -- if you use lora, set the same parameters as for training
+  lora:
+    use: False
+    lora_alpha: 32.0
+    lora_dropout: 0.0
+    r: 0
+    train_bias: "none"
+
+  # Designability
+  designability_seqs_per_struct: 8
+  compute_designability: False
+
+  # FID-related metrics
+  compute_fid: False
