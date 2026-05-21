@@ -259,7 +259,8 @@ def main():
             sys.exit(f"--file not found: {src}")
         ext = src.suffix.lower() or ".pdb"
         query_path = out_dir / f"query{ext}"
-        shutil.copyfile(src, query_path)
+        if src.resolve() != query_path.resolve():
+            shutil.copyfile(src, query_path)
         query_source = f"file:{src}"
 
     head = query_path.read_bytes()[:200].decode("utf-8", errors="ignore")

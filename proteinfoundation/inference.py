@@ -215,6 +215,20 @@ def parse_nlens_cfg(cfg):
     return nlens_dict
 
 
+def _normalize_cath_code(code):
+    """Normalize a CATH code string to 4 dot-separated levels (pad H with 'x').
+
+    Accepts 'C.A.T' or 'C.A.T.H' (or 'x.x.x.x' as a null sentinel).
+    Raises SystemExit on malformed input.
+    """
+    parts = code.strip().split(".")
+    if len(parts) == 3:
+        parts.append("x")
+    elif len(parts) != 4:
+        raise SystemExit(f"--cath_code must have 3 or 4 dot-separated parts; got {code!r}")
+    return ".".join(parts)
+
+
 def parse_len_cath_code(cfg):
     """Load (len, cath_codes) joint distribution. Apply mask according to the guidance cath code level"""
     if cfg.get("len_cath_code_path") is not None:
@@ -295,6 +309,29 @@ if __name__ == "__main__":
         default=None,
         help="Override max_nsamples (GPU batch size) from config.",
     )
+    parser.add_argument(
+        "--nsamples_per_protein",
+        type=int,
+        default=None,
+        help="Override nsamples_per_len (total samples per protein) from config.",
+    )
+    parser.add_argument(
+        "--cath_code",
+        type=str,
+        default=None,
+        help="CATH code for this protein, e.g. '3.30.70' or '3.30.70.x' or 'x.x.x.x'. "
+             "Overrides cfg.cath_code_file when provided. 3-level codes get padded with '.x' for H.",
+    )
+    parser.add_argument(
+        "--conditioning_mode",
+        type=str,
+        default=None,
+        choices=["seq", "seq_cath"],
+        help="Which conditioning to apply this run. "
+             "'seq' = sequence only (forces cath='x.x.x.x', fold_cond=False). "
+             "'seq_cath' = sequence + top-1 CATH (requires --cath_code, sets fold_cond=True). "
+             "If omitted, behavior is unchanged from baseline (uses cfg.fold_cond + cfg.cath_code_file).",
+    )
 
     args = parser.parse_args()
     logger.info(" ".join(sys.argv))
@@ -322,33 +359,68 @@ if __name__ == "__main__":
         else:
             config_name = args.config_name
         cfg = hydra.compose(config_name=config_name)
-        if args.max_nsamples is not None:
-            cfg = OmegaConf.merge(cfg, {"max_nsamples": args.max_nsamples})
-            logger.info(f"Overriding max_nsamples to {args.max_nsamples}")
 
-        # Resolve unified config (training and inference configs in the same file)
-        original_run_name = cfg.get("run_name_", None)
+        # Resolve unified config (training and inference configs in the same file).
+        # DESIGN INVARIANT: there is exactly ONE `run_name_` identifier per config, at the
+        # top level. It is the SHARED identifier between training (where it determines the
+        # `./store/{run_name_}/checkpoints/` output dir) and inference (where it's used to
+        # auto-resolve the best/last checkpoint from that same dir). The `inference:` block
+        # must NOT define its own `run_name_` — that would shadow the training name after
+        # the merge below and silently point inference at the wrong checkpoint dir.
         if "inference" in cfg and cfg.inference is not None:
-            inference_cfg = cfg.inference
+            if "run_name_" in cfg.inference:
+                raise ValueError(
+                    "Inference config block must NOT define its own 'run_name_'. "
+                    "There is exactly one 'run_name_' per config, at the top level, "
+                    "shared between training and inference."
+                )
             from omegaconf import open_dict
             import copy
             cfg_copy = copy.deepcopy(cfg)
             with open_dict(cfg_copy):
                 inf_block = cfg_copy.pop("inference")
                 cfg = OmegaConf.merge(cfg_copy, inf_block)
-        
-        if not original_run_name and "run_name_" in cfg:
-            original_run_name = cfg.run_name_
+
+        # CLI overrides — applied AFTER the unified-config merge so they actually win.
+        if args.max_nsamples is not None:
+            cfg = OmegaConf.merge(cfg, {"max_nsamples": args.max_nsamples})
+            logger.info(f"Overriding max_nsamples to {args.max_nsamples}")
+        if args.nsamples_per_protein is not None:
+            cfg = OmegaConf.merge(cfg, {"nsamples_per_len": args.nsamples_per_protein})
+            logger.info(f"Overriding nsamples_per_len to {args.nsamples_per_protein}")
+
+        # Conditioning-mode override: drives both cfg.fold_cond and the per-protein cath_codes.
+        cath_codes_override = None
+        if args.conditioning_mode == "seq":
+            cfg = OmegaConf.merge(cfg, {"fold_cond": False})
+            cath_codes_override = ["x.x.x.x"]
+            logger.info("Conditioning mode 'seq': fold_cond=False, cath_codes=['x.x.x.x']")
+        elif args.conditioning_mode == "seq_cath":
+            cfg = OmegaConf.merge(cfg, {"fold_cond": True})
+            if args.cath_code is None:
+                raise SystemExit("--conditioning_mode seq_cath requires --cath_code")
+            cath_codes_override = [_normalize_cath_code(args.cath_code)]
+            logger.info(f"Conditioning mode 'seq_cath': fold_cond=True, cath_codes={cath_codes_override}")
+        elif args.cath_code is not None:
+            cath_codes_override = [_normalize_cath_code(args.cath_code)]
+            logger.info(f"Using --cath_code override (no explicit mode): cath_codes={cath_codes_override}")
 
         logger.info(f"Inference config {cfg}")
-        run_name = cfg.run_name_
 
     assert (
         not cfg.compute_designability or not cfg.compute_fid
     ), "Designability cannot be computed together with FID"
 
-    # Set root path for this inference run
+    # Set root path for this inference run.
+    # Conditioning_mode segment lets multiple runs of the same config coexist:
+    #   inference/{config_name}/{seq_cond|seq_cath_cond|legacy}/{protein}/
     root_path = f"./inference/{config_name}"
+    if args.conditioning_mode == "seq":
+        root_path = os.path.join(root_path, "seq_cond")
+    elif args.conditioning_mode == "seq_cath":
+        root_path = os.path.join(root_path, "seq_cath_cond")
+    else:
+        root_path = os.path.join(root_path, "legacy")
     if cfg.seq_cond:
         root_path = os.path.join(root_path, args.pt)
 
@@ -384,10 +456,13 @@ if __name__ == "__main__":
         logger.info(f"Using explicit checkpoint {ckpt_file}")
         assert os.path.exists(ckpt_file), f"Not a valid checkpoint {ckpt_file}"
     else:
-        # Automatic Checkpoint Resolution Mode (if ckpt_name is null/empty)
-        if not original_run_name or original_run_name == "":
+        # Automatic Checkpoint Resolution Mode (if ckpt_name is null/empty).
+        # The single top-level `run_name_` from the unified config doubles as the
+        # checkpoint directory name (training and inference share this identifier).
+        run_name_ = cfg.get("run_name_", None)
+        if not run_name_:
             raise ValueError("No run_name_ found in config. Cannot automatically resolve checkpoint without run_name_.")
-        ckpt_dir = os.path.join(".", "store", original_run_name, "checkpoints")
+        ckpt_dir = os.path.join(".", "store", run_name_, "checkpoints")
         if checkpoint_mode == "last":
             from proteinfoundation.utils.fetch_last_ckpt import fetch_last_ckpt
             last_ckpt_name = fetch_last_ckpt(ckpt_dir)
@@ -471,7 +546,10 @@ if __name__ == "__main__":
 
     # Create inference dataset
     pt = torch.load(os.path.join(cfg.data_dir, "processed", f"{args.pt}.pt"), weights_only=False)
-    cath_codes = pd.read_csv(os.path.join(cfg.data_dir, cfg.cath_code_file))["cath_code"].tolist()
+    if cath_codes_override is not None:
+        cath_codes = cath_codes_override
+    else:
+        cath_codes = pd.read_csv(os.path.join(cfg.data_dir, cfg.cath_code_file))["cath_code"].tolist()
     assert args.pt is not None, "pt must be provided if seq_cond is True"
     
     residue_type_tensor = None

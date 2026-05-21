@@ -100,9 +100,27 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def generate_protein_output_dir(inference_config, protein_name):
-    """Generate consistent output directory path for a protein."""
-    return os.path.join(PROTEINA_BASE_DIR, 'inference', inference_config, protein_name)
+def _conditioning_label(conditioning_mode):
+    """Map a conditioning_mode CLI value to the output-dir segment.
+
+    'seq'        -> 'seq_cond'
+    'seq_cath'   -> 'seq_cath_cond'
+    None         -> 'legacy'           # backward-compat: keeps the old un-namespaced layout in a labeled subdir
+    """
+    if conditioning_mode == "seq":
+        return "seq_cond"
+    if conditioning_mode == "seq_cath":
+        return "seq_cath_cond"
+    return "legacy"
+
+
+def generate_protein_output_dir(inference_config, protein_name, conditioning_mode=None):
+    """Generate consistent output directory path for a protein.
+
+    Layout: inference/{inference_config}/{conditioning_label}/{protein_name}/
+    """
+    label = _conditioning_label(conditioning_mode)
+    return os.path.join(PROTEINA_BASE_DIR, 'inference', inference_config, label, protein_name)
 
 def create_single_protein_csv(csv_file, csv_col, protein_name, output_dir):
     """Create a single-protein CSV file for individual processing."""
@@ -153,7 +171,10 @@ def run_cif_to_pt_conversion(csv_file, csv_col, cif_dir):
         return MockResult()
 
 def run_proteina_inference(protein_name, inference_config, force_compile: bool = False,
-                           max_nsamples: int = None):
+                           max_nsamples: int = None,
+                           conditioning_mode: str = None,
+                           cath_code: str = None,
+                           nsamples_per_protein: int = None):
     """
     Run Proteina inference directly.
     Only uses subprocess for calling proteinfoundation/inference.py.
@@ -170,6 +191,13 @@ def run_proteina_inference(protein_name, inference_config, force_compile: bool =
         cmd.append('--force_compile')
     if max_nsamples is not None:
         cmd.extend(['--max_nsamples', str(max_nsamples)])
+    if conditioning_mode is not None:
+        cmd.extend(['--conditioning_mode', conditioning_mode])
+    if cath_code is not None:
+        cmd.extend(['--cath_code', cath_code])
+    if nsamples_per_protein is not None:
+        cmd.extend(['--nsamples_per_protein', str(nsamples_per_protein)])
+    logger.info(f"subprocess argv: {' '.join(cmd)}")
 
     result = subprocess.run(
         cmd,
@@ -184,16 +212,18 @@ def process_single_protein(args):
     Process a single protein through the entire Proteina pipeline.
     Includes proper error handling and GPU memory cleanup.
     """
-    protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path, gpu_id, force_compile, skip_pt_conversion = args
-    
+    (protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path,
+     gpu_id, force_compile, skip_pt_conversion,
+     conditioning_mode, cath_code, nsamples_per_protein) = args
+
     try:
         # Set GPU for this process
         os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
-        
+
         logger.info(f"[GPU {gpu_id}] Starting processing for {protein_name}")
-        
-        # Generate output directory for this protein
-        protein_output_dir = generate_protein_output_dir(inference_config, protein_name)
+
+        # Generate output directory for this protein (includes conditioning_mode segment)
+        protein_output_dir = generate_protein_output_dir(inference_config, protein_name, conditioning_mode)
         
         logger.info(f"[GPU {gpu_id}] {protein_name} -> {protein_output_dir}")
         
@@ -230,7 +260,10 @@ def process_single_protein(args):
             logger.info(f"[GPU {gpu_id}] Step 2: Running Proteina inference for {protein_name}{bs_info}")
             result = run_proteina_inference(protein_name, inference_config,
                                             force_compile=force_compile,
-                                            max_nsamples=current_max_nsamples)
+                                            max_nsamples=current_max_nsamples,
+                                            conditioning_mode=conditioning_mode,
+                                            cath_code=cath_code,
+                                            nsamples_per_protein=nsamples_per_protein)
 
             if result.returncode == 0:
                 break  # success
@@ -314,13 +347,17 @@ def worker_init_proteina(counter, lock, num_gpus):
 # Wrapper function (must be at module level for pickling)
 def process_single_protein_wrapper(args_tuple):
     """Wrapper that uses the GPU assigned during worker init."""
-    protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path, force_compile, skip_pt_conversion = args_tuple
+    (protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path,
+     force_compile, skip_pt_conversion,
+     conditioning_mode, cath_code, nsamples_per_protein) = args_tuple
 
     # Get GPU ID from process-local variable set by worker_init
     gpu_id = getattr(builtins, '_worker_gpu_id', 0)
 
     # Call the actual processing function
-    full_args = (protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path, gpu_id, force_compile, skip_pt_conversion)
+    full_args = (protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path,
+                 gpu_id, force_compile, skip_pt_conversion,
+                 conditioning_mode, cath_code, nsamples_per_protein)
     return process_single_protein(full_args)
 
 def has_multi_char_chain_id(protein_name):
@@ -350,9 +387,11 @@ def get_protein_names(csv_file, csv_col):
 def _get_expected_nsamples(inference_config):
     """Read the expected nsamples_per_len from the inference config YAML.
 
-    Tries to load the Hydra config (with its defaults chain) so that values
-    defined in inference_base.yaml are inherited.  Falls back to a direct
-    YAML read and finally to a safe default.
+    Tries the locations in priority order:
+      1. Unified config: cfg.inference.nsamples_per_len  (nested under inference:)
+      2. Legacy / inference-only config: cfg.nsamples_per_len  (top-level)
+      3. Hydra defaults chain: any base in cfg.defaults that has nsamples_per_len top-level
+    Returns None when nothing matches.
     """
     try:
         from omegaconf import OmegaConf
@@ -360,9 +399,14 @@ def _get_expected_nsamples(inference_config):
         yaml_path = os.path.join(config_dir, f"{inference_config}.yaml")
         if os.path.exists(yaml_path):
             cfg = OmegaConf.load(yaml_path)
+            # 1. Unified config: nested under `inference:`
+            inf = cfg.get("inference")
+            if inf is not None and "nsamples_per_len" in inf:
+                return int(inf.nsamples_per_len)
+            # 2. Legacy / inference-only config: top-level
             if "nsamples_per_len" in cfg:
                 return int(cfg.nsamples_per_len)
-            # Fall through to base config
+            # 3. Defaults chain
             defaults = cfg.get("defaults", [])
             for d in defaults:
                 if isinstance(d, str):
@@ -383,6 +427,7 @@ def find_proteins_needing_inference(
     candidate_proteins=None,
     tar_protein_dirs: bool = False,
     max_workers=None,
+    conditioning_mode=None,
 ):
     """Find proteins from CSV that need inference (incomplete or missing).
 
@@ -393,7 +438,9 @@ def find_proteins_needing_inference(
     # Get proteins from CSV file
     csv_proteins = list(candidate_proteins) if candidate_proteins is not None else get_protein_names(csv_file, csv_col)
 
-    inference_base_dir = os.path.join(PROTEINA_BASE_DIR, 'inference', inference_config)
+    inference_base_dir = os.path.join(
+        PROTEINA_BASE_DIR, 'inference', inference_config, _conditioning_label(conditioning_mode)
+    )
 
     expected_nsamples = _get_expected_nsamples(inference_config)
     if expected_nsamples is not None:
@@ -454,6 +501,13 @@ def main():
                         help="Thread workers for progress checks (default: min(32, cpu_count * 4)).")
     parser.add_argument("--dynamic_resharding", action=argparse.BooleanOptionalAction, default=True,
                         help="Filter global progress before sharding each step to reduce idle shards (default: True).")
+    parser.add_argument("--conditioning_mode", choices=["seq", "seq_cath"], default=None,
+                        help="Which conditioning to apply this run. "
+                             "'seq' = sequence only (forces cath='x.x.x.x', fold_cond=False). "
+                             "'seq_cath' = sequence + top-1 CATH (requires a 'cath_code' column in --csv_file). "
+                             "Omitted -> legacy layout (un-namespaced subdir), reads cath_code_file from config.")
+    parser.add_argument("--nsamples_per_protein", type=int, default=None,
+                        help="Override nsamples_per_len (total samples per protein) per inference subprocess.")
     add_shard_args(parser)
 
     args = parser.parse_args()
@@ -501,7 +555,20 @@ def main():
             logger.info("Sorted proteins short-to-long for OOM-conservative batch-size adaptation.")
         shard_protein_names_for_tar = list(protein_names)
 
-    inference_base_dir = os.path.join(PROTEINA_BASE_DIR, "inference", args.inference_config)
+    inference_base_dir = os.path.join(
+        PROTEINA_BASE_DIR, "inference", args.inference_config, _conditioning_label(args.conditioning_mode)
+    )
+
+    # Resolve per-protein cath_codes when conditioning_mode is seq_cath.
+    cath_by_name = {}
+    if args.conditioning_mode == "seq_cath":
+        cath_df = pd.read_csv(args.csv_file)
+        if "cath_code" not in cath_df.columns:
+            logger.error(f"--conditioning_mode seq_cath requires a 'cath_code' column in {args.csv_file}")
+            sys.exit(1)
+        cath_by_name = dict(zip(cath_df[args.csv_col].astype(str), cath_df["cath_code"].astype(str)))
+        n_null = sum(1 for v in cath_by_name.values() if v.strip().lower() in ("", "nan", "x.x.x.x"))
+        logger.info(f"Loaded {len(cath_by_name)} cath_codes from {args.csv_file} (null/x.x.x.x count: {n_null})")
 
     check_candidates = global_protein_names if args.dynamic_resharding and shard_index is not None else protein_names
     if args.skip_existing:
@@ -513,6 +580,7 @@ def main():
             candidate_proteins=check_candidates,
             tar_protein_dirs=args.tar_protein_dirs,
             max_workers=args.progress_check_workers,
+            conditioning_mode=args.conditioning_mode,
         )
         if args.dynamic_resharding and shard_index is not None:
             protein_names = shard_proteins(
@@ -570,7 +638,9 @@ def main():
     
     try:
         # Submit all jobs (GPU assignment happens via worker init)
-        work_items = [(protein_name, args.csv_file, args.csv_col, args.cif_dir, args.inference_config, args.usalign_path, args.force_compile, args.skip_pt_conversion)
+        work_items = [(protein_name, args.csv_file, args.csv_col, args.cif_dir, args.inference_config, args.usalign_path,
+                       args.force_compile, args.skip_pt_conversion,
+                       args.conditioning_mode, cath_by_name.get(protein_name), args.nsamples_per_protein)
                       for protein_name in protein_names]
         future_to_protein = {executor.submit(process_single_protein_wrapper, item): work_items[i][0] 
                             for i, item in enumerate(work_items)}

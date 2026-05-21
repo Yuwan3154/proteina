@@ -1,3 +1,7 @@
+# `run_name_` is the SINGLE identifier shared between training and inference.
+# Training writes checkpoints to ./store/{run_name_}/checkpoints/, and inference
+# auto-resolves the best/last checkpoint from that same path. Do NOT add another
+# `run_name_` inside the `inference:` block — there must be exactly one per config.
 run_name_: ca_dssp_extlig_no-sin-pos-emb_beta-1p3-2_finetune-all_v1p6_default-fold-sum_2-seq-S25_16-eff-bs_200-epoch_pdb_purge-test_warmup_maxlen-256_cutoff-190828
 pretrain_ckpt_path: ~/proteina/data/weights/proteina_v1.6_DFS_200M_notri_long_chain_generation.ckpt
 
@@ -128,11 +132,10 @@ inference:
 
   # Or, backward compatibility mode (specify exact checkpoint path/name):
   ckpt_path: null
-  ckpt_name: ca_dssp_extlig_no-sin-pos-emb_beta-1p3-2_finetune-all_v1p6_default-fold-sum_2-seq-S25_16-eff-bs_200-epoch_pdb_purge-test_warmup_maxlen-256_cutoff-190828_e112.ckpt
+  ckpt_name: null
 
-  run_name_: seq_cond_pdb_no-sin-pos-emb
   ncpus_: 24
-  seed: 5
+  seed: 42
 
   # Lengths to sample. Uses `nres_lens` if specified, otherwise arange(min_len, max_len+1, step)
   nres_lens: [50, 100, 150, 200, 250]

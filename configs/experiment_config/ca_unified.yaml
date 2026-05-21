@@ -1,3 +1,7 @@
+# `run_name_` is the SINGLE identifier shared between training and inference.
+# Training writes checkpoints to ./store/{run_name_}/checkpoints/, and inference
+# auto-resolves the best/last checkpoint from that same path. Do NOT add another
+# `run_name_` inside the `inference:` block — there must be exactly one per config.
 run_name_: train_run_1gpu
 
 hardware:
