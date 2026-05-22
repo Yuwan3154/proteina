@@ -100,6 +100,65 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Worker-process model cache (in-process single-load).
+#
+# ProcessPoolExecutor reuses the same worker process across many submitted
+# tasks. By caching the loaded model + compiled graph as MODULE-LEVEL state
+# we get true single-load: the first protein on a worker pays the checkpoint
+# load + first-compile cost, every subsequent protein on the SAME worker
+# reuses the cached objects.
+# ---------------------------------------------------------------------------
+_WORKER_MODEL = None        # (model, nn_ag, trainer, cfg, config_name) or None
+_WORKER_MODEL_KEY = None    # (inference_config, conditioning_mode, force_compile, dynamic_shapes)
+
+
+def _get_or_load_worker_model(inference_config, conditioning_mode, force_compile,
+                              dynamic_shapes, verbose=False, use_cueq=True):
+    """Cached per-worker model loader. Returns (model, nn_ag, trainer, cfg, config_name).
+
+    The first call on a worker process loads the checkpoint and (when
+    force_compile=True) sets up torch.compile with the chosen dynamic-shapes
+    flag. Subsequent calls with the same key return the cached objects so
+    every protein on that worker reuses the model + compiled graphs.
+    """
+    global _WORKER_MODEL, _WORKER_MODEL_KEY
+    key = (inference_config, conditioning_mode, bool(force_compile), bool(dynamic_shapes))
+    if _WORKER_MODEL is not None and _WORKER_MODEL_KEY == key:
+        return _WORKER_MODEL
+
+    # First call (or key change): build a synthetic args namespace to drive
+    # the shared compose_inference_cfg from inference.py. cath_code is
+    # per-protein, not per-worker — for seq_cath mode we feed a placeholder
+    # here so the initial cfg merge succeeds; the real cath_code is supplied
+    # to run_one_protein_in_process below.
+    from proteinfoundation.inference import compose_inference_cfg, load_model_for_worker
+    import types
+    a = types.SimpleNamespace(
+        config_subdir=None,
+        config_number=-1,
+        config_name=inference_config,
+        max_nsamples=None,
+        nsamples_per_protein=None,
+        conditioning_mode=conditioning_mode,
+        cath_code=("x.x.x.x" if conditioning_mode == "seq_cath" else None),
+    )
+    cfg, config_name, _ = compose_inference_cfg(a)
+    model, nn_ag, trainer = load_model_for_worker(
+        cfg,
+        force_compile=force_compile,
+        dynamic_shapes=dynamic_shapes,
+        verbose=verbose,
+        use_cueq=use_cueq,
+    )
+    _WORKER_MODEL = (model, nn_ag, trainer, cfg, config_name)
+    _WORKER_MODEL_KEY = key
+    logger.info(f"[worker pid={os.getpid()}] Cached model "
+                f"(inference_config={inference_config}, conditioning_mode={conditioning_mode}, "
+                f"force_compile={force_compile}, dynamic_shapes={dynamic_shapes})")
+    return _WORKER_MODEL
+
+
 def _conditioning_label(conditioning_mode):
     """Map a conditioning_mode CLI value to the output-dir segment.
 
@@ -207,14 +266,93 @@ def run_proteina_inference(protein_name, inference_config, force_compile: bool =
     )
     return result
 
+def _step2_inference_in_process(protein_name, gpu_id, inference_config, conditioning_mode,
+                                 cath_code, nsamples_per_protein, force_compile, dynamic_shapes,
+                                 protein_output_dir):
+    """Step 2 (in-process path): use the cached worker-process model to generate samples
+    for one protein, reusing the loaded checkpoint and any compiled graphs.
+
+    Persists OOM-reduced max_nsamples to `builtins._worker_max_nsamples` so it
+    sticks across proteins on the same worker — matches the subprocess-path
+    behavior.
+    """
+    from proteinfoundation.inference import run_one_protein_in_process
+
+    model, nn_ag, trainer, cfg, config_name = _get_or_load_worker_model(
+        inference_config, conditioning_mode, force_compile, dynamic_shapes
+    )
+
+    # Apply per-protein cath_codes_override
+    if conditioning_mode == "seq":
+        cath_codes_override = ["x.x.x.x"]
+    elif conditioning_mode == "seq_cath":
+        if cath_code is None:
+            return {'protein': protein_name, 'gpu': gpu_id, 'status': 'failed',
+                    'error_type': 'BAD_INPUT',
+                    'error': "--conditioning_mode seq_cath but no cath_code for this protein",
+                    'output_dir': protein_output_dir}
+        from proteinfoundation.inference import _normalize_cath_code
+        cath_codes_override = [_normalize_cath_code(cath_code)]
+    else:
+        cath_codes_override = None
+
+    # Apply per-protein nsamples_per_protein override (and OOM-persisted max_nsamples)
+    if nsamples_per_protein is not None:
+        cfg.nsamples_per_len = int(nsamples_per_protein)
+    worker_max = getattr(builtins, '_worker_max_nsamples', None)
+    if worker_max is not None:
+        cfg.max_nsamples = int(worker_max)
+
+    logger.info(f"[GPU {gpu_id}] Step 2 (in-process): {protein_name} "
+                f"cath_code={cath_codes_override} max_nsamples={cfg.max_nsamples} "
+                f"nsamples_per_len={cfg.nsamples_per_len}")
+
+    result = run_one_protein_in_process(
+        model, nn_ag, trainer, cfg,
+        pt_name=protein_name,
+        config_name=config_name,
+        conditioning_mode=conditioning_mode,
+        cath_codes_override=cath_codes_override,
+    )
+
+    # Persist any OOM-reduced max_nsamples for subsequent proteins on this worker
+    if result.get("final_max_nsamples") is not None:
+        if worker_max is None or result["final_max_nsamples"] < worker_max:
+            builtins._worker_max_nsamples = int(result["final_max_nsamples"])
+
+    if result.get("status") == "FAILED":
+        return {'protein': protein_name, 'gpu': gpu_id, 'status': 'failed',
+                'error_type': result.get("error_type", "INFERENCE_ERROR"),
+                'error': result.get("error", "unknown"),
+                'output_dir': protein_output_dir}
+
+    logger.info(f"[GPU {gpu_id}] ✅ In-process inference completed for {protein_name} "
+                f"(samples_written={result.get('n_samples_written', 0)})")
+    return {'protein': protein_name, 'gpu': gpu_id, 'status': 'success',
+            'output_dir': protein_output_dir}
+
+
 def process_single_protein(args):
     """
     Process a single protein through the entire Proteina pipeline.
     Includes proper error handling and GPU memory cleanup.
+
+    Dispatches to the in-process or subprocess-per-protein path based on the
+    last tuple element (in_process_mode + dynamic_shapes). When tuple length
+    is 12 (legacy), uses subprocess; when length is 14, uses in-process if
+    requested.
     """
-    (protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path,
-     gpu_id, force_compile, skip_pt_conversion,
-     conditioning_mode, cath_code, nsamples_per_protein) = args
+    if len(args) >= 14:
+        (protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path,
+         gpu_id, force_compile, skip_pt_conversion,
+         conditioning_mode, cath_code, nsamples_per_protein,
+         in_process_mode, dynamic_shapes) = args
+    else:
+        (protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path,
+         gpu_id, force_compile, skip_pt_conversion,
+         conditioning_mode, cath_code, nsamples_per_protein) = args
+        in_process_mode = False
+        dynamic_shapes = True
 
     try:
         # Set GPU for this process
@@ -224,13 +362,13 @@ def process_single_protein(args):
 
         # Generate output directory for this protein (includes conditioning_mode segment)
         protein_output_dir = generate_protein_output_dir(inference_config, protein_name, conditioning_mode)
-        
+
         logger.info(f"[GPU {gpu_id}] {protein_name} -> {protein_output_dir}")
-        
+
         # Create single-protein CSV file
         logger.info(f"[GPU {gpu_id}] Creating single_protein.csv for {protein_name}")
         single_csv_path = create_single_protein_csv(csv_file, csv_col, protein_name, protein_output_dir)
-        
+
         # Step 1: CIF to PT conversion (skip if PT files already exist)
         if skip_pt_conversion:
             logger.info(f"[GPU {gpu_id}] Skipping CIF to PT conversion for {protein_name} (--skip_pt_conversion)")
@@ -250,7 +388,15 @@ def process_single_protein(args):
                 }
 
             logger.info(f"[GPU {gpu_id}] ✅ CIF to PT conversion completed for {protein_name}")
-        
+
+        # Step 2: Proteina inference — branch on in_process_mode.
+        if in_process_mode:
+            return _step2_inference_in_process(
+                protein_name, gpu_id, inference_config, conditioning_mode,
+                cath_code, nsamples_per_protein, force_compile, dynamic_shapes,
+                protein_output_dir,
+            )
+        # Legacy: subprocess-per-protein
         # Step 2: Proteina inference with adaptive batch size on OOM
         # Read persisted max_nsamples from prior OOM in this worker (if any)
         current_max_nsamples = getattr(builtins, '_worker_max_nsamples', None)
@@ -346,18 +492,30 @@ def worker_init_proteina(counter, lock, num_gpus):
 
 # Wrapper function (must be at module level for pickling)
 def process_single_protein_wrapper(args_tuple):
-    """Wrapper that uses the GPU assigned during worker init."""
-    (protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path,
-     force_compile, skip_pt_conversion,
-     conditioning_mode, cath_code, nsamples_per_protein) = args_tuple
+    """Wrapper that uses the GPU assigned during worker init.
+
+    Supports both legacy 11-tuple (subprocess mode) and 13-tuple (in-process mode).
+    """
+    if len(args_tuple) >= 13:
+        (protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path,
+         force_compile, skip_pt_conversion,
+         conditioning_mode, cath_code, nsamples_per_protein,
+         in_process_mode, dynamic_shapes) = args_tuple
+    else:
+        (protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path,
+         force_compile, skip_pt_conversion,
+         conditioning_mode, cath_code, nsamples_per_protein) = args_tuple
+        in_process_mode = False
+        dynamic_shapes = True
 
     # Get GPU ID from process-local variable set by worker_init
     gpu_id = getattr(builtins, '_worker_gpu_id', 0)
 
-    # Call the actual processing function
+    # Call the actual processing function (14-tuple for in-process dispatch)
     full_args = (protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path,
                  gpu_id, force_compile, skip_pt_conversion,
-                 conditioning_mode, cath_code, nsamples_per_protein)
+                 conditioning_mode, cath_code, nsamples_per_protein,
+                 in_process_mode, dynamic_shapes)
     return process_single_protein(full_args)
 
 def has_multi_char_chain_id(protein_name):
@@ -508,6 +666,15 @@ def main():
                              "Omitted -> legacy layout (un-namespaced subdir), reads cath_code_file from config.")
     parser.add_argument("--nsamples_per_protein", type=int, default=None,
                         help="Override nsamples_per_len (total samples per protein) per inference subprocess.")
+    parser.add_argument("--in_process", action=argparse.BooleanOptionalAction, default=True,
+                        help="Default: each worker process loads the model ONCE and reuses it across "
+                             "every assigned protein (single-load). --no-in_process falls back to "
+                             "the legacy subprocess-per-protein path (one Python startup + ckpt load "
+                             "per chain).")
+    parser.add_argument("--dynamic_shapes", action=argparse.BooleanOptionalAction, default=True,
+                        help="When --force_compile is set: torch.compile with dynamic=True so a single "
+                             "compiled graph handles all protein lengths. --no-dynamic_shapes restores "
+                             "static-shape compilation (one specialized graph per (length, batch).")
     add_shard_args(parser)
 
     args = parser.parse_args()
@@ -625,22 +792,31 @@ def main():
     start_time = time.time()
     results = []
     
-    # Create shared counter for worker initialization
-    manager = mp.Manager()
+    # In-process mode loads CUDA-touching modules (deepspeed, torch) in the
+    # parent before the worker starts. Default fork-based ProcessPoolExecutor
+    # would inherit a partially-initialized CUDA context and the worker's
+    # `torch.cuda.is_available()` call fails with
+    # "CUDA error: initialization error". Use spawn for a clean child interpreter.
+    # Use the SAME context for the Manager so its proxies work with the executor.
+    mp_ctx = mp.get_context('spawn') if args.in_process else mp.get_context()
+    manager = mp_ctx.Manager()
     worker_counter = manager.Value('i', 0)
     worker_lock = manager.Lock()
-    
+
     executor = ProcessPoolExecutor(
         max_workers=args.num_gpus,
         initializer=worker_init_proteina,
-        initargs=(worker_counter, worker_lock, args.num_gpus)
+        initargs=(worker_counter, worker_lock, args.num_gpus),
+        mp_context=mp_ctx,
     )
     
     try:
         # Submit all jobs (GPU assignment happens via worker init)
+        # 13-tuple: legacy 11 fields + (in_process_mode, dynamic_shapes)
         work_items = [(protein_name, args.csv_file, args.csv_col, args.cif_dir, args.inference_config, args.usalign_path,
                        args.force_compile, args.skip_pt_conversion,
-                       args.conditioning_mode, cath_by_name.get(protein_name), args.nsamples_per_protein)
+                       args.conditioning_mode, cath_by_name.get(protein_name), args.nsamples_per_protein,
+                       args.in_process, args.dynamic_shapes)
                       for protein_name in protein_names]
         future_to_protein = {executor.submit(process_single_protein_wrapper, item): work_items[i][0] 
                             for i, item in enumerate(work_items)}

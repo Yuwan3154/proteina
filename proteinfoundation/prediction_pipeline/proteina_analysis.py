@@ -1301,6 +1301,11 @@ def analysis_complete_in_tar_or_dir(
     if summary_text is None:
         return False
     summary = json.loads(summary_text)
+    # A stub summary written before enrichment ran (e.g. an early broken pipeline
+    # invocation) will have proteinebm_summary=null + empty af2rank_summaries. Treat
+    # it as INCOMPLETE so the next run re-enriches instead of silently skipping.
+    if summary.get("proteinebm_summary") is None and not summary.get("af2rank_summaries"):
+        return False
     current_templates = protein_glob_members(inference_dir, protein_id, f"{protein_id}_*.pdb")
     return len(current_templates) <= int(summary.get("n_samples", 0) or 0)
 

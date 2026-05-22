@@ -87,8 +87,25 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _inference_base(inference_config: str) -> str:
+    """Build the inference base dir, optionally appending a conditioning-mode
+    subdir from the PROTEINA_CONDITIONING_MODE env var. Mirrors the layout
+    written by parallel_proteina_inference.py's --conditioning_mode flag:
+        PROTEINA_CONDITIONING_MODE=seq      -> inference/{config}/seq_cond/
+        PROTEINA_CONDITIONING_MODE=seq_cath -> inference/{config}/seq_cath_cond/
+        (unset / other)                     -> inference/{config}/
+    """
+    parts = [PROTEINA_BASE_DIR, "inference", inference_config]
+    label = {"seq": "seq_cond", "seq_cath": "seq_cath_cond"}.get(
+        os.environ.get("PROTEINA_CONDITIONING_MODE", ""), ""
+    )
+    if label:
+        parts.append(label)
+    return os.path.join(*parts)
+
+
 def generate_protein_output_dir(inference_config: str, protein_name: str) -> str:
-    return os.path.join(PROTEINA_BASE_DIR, "inference", inference_config, protein_name)
+    return os.path.join(_inference_base(inference_config), protein_name)
 
 
 def find_reference_cif(protein_name: str, cif_dir: str) -> str:
@@ -173,7 +190,7 @@ def find_proteins_needing_proteinebm(
     max_workers: int | None = None,
 ):
     csv_proteins = list(candidate_proteins) if candidate_proteins is not None else get_protein_names(csv_file, csv_col)
-    inference_base_dir = os.path.join(PROTEINA_BASE_DIR, "inference", inference_config)
+    inference_base_dir = _inference_base(inference_config)
     if not os.path.exists(inference_base_dir):
         return []
 
@@ -382,7 +399,7 @@ def main():
     else:
         shard_protein_names_for_tar = list(protein_names)
 
-    inference_base_dir = os.path.join(PROTEINA_BASE_DIR, "inference", args.inference_config)
+    inference_base_dir = _inference_base(args.inference_config)
 
     check_candidates = global_protein_names if args.dynamic_resharding and shard_index is not None else protein_names
     if args.filter_existing:

@@ -55,6 +55,10 @@ class OpenFoldTemplateInference(nn.Module):
         use_cuequivariance_attention: bool = False,
         use_cuequivariance_triangle_attention: bool = False,
         use_cuequivariance_multiplicative_update: bool = False,
+        compile_inference_path: bool = False,
+        inference_attn_kernel: str = "sdpa",
+        compile_strategy: str = "per_block",
+        use_cueq_triangle_mul: bool = False,
     ):
         super().__init__()
 
@@ -122,7 +126,17 @@ class OpenFoldTemplateInference(nn.Module):
         self._original_forwards = {}
         self._compile_interval = compile_interval
 
-        if compile_model:
+        # New full-graph inference path (torch.compile-compatible).
+        self._compile_inference_path = False
+        self._inference_attn_kernel = inference_attn_kernel
+
+        if compile_inference_path:
+            self.enable_compile_inference_path(
+                attn_kernel=inference_attn_kernel,
+                compile_strategy=compile_strategy,
+                use_cueq_triangle_mul=use_cueq_triangle_mul,
+            )
+        elif compile_model:
             if use_deepspeed_evoformer_attention:
                 # deepspeed attention uses a custom CUDA kernel whose fake/meta
                 # kernel is incompatible with torch.compile (stride mismatch).
@@ -154,6 +168,305 @@ class OpenFoldTemplateInference(nn.Module):
     @property
     def compiled(self) -> bool:
         return self._compiled
+
+    def enable_compile_inference_path(
+        self,
+        attn_kernel: str = "sdpa",
+        compile_strategy: str = "per_block",
+        use_cueq_triangle_mul: bool = False,
+    ) -> None:
+        """Enable the compile-friendly inference path.
+
+        Routes attention through the SDPA, vanilla matmul, or cuEquivariance
+        branch added to openfold's Attention/IPA modules so the model can be
+        compiled by torch.compile.
+
+        Two compile strategies:
+          * ``per_block`` (default) — compile each EvoformerBlock /
+            ExtraMSABlock / TemplatePairStackBlock / structure-module piece
+            separately. Bounded per-compile latency (~30-60 s per block
+            type, one-shot); the Inductor cache shares across instances
+            with the same shape.
+          * ``whole_graph`` — compile the whole ``AlphaFold.iteration_inference``
+            as one graph. Larger trace time (5-10 min) but slightly more
+            fusion across block boundaries. Only worthwhile for very large
+            decoy batches per protein.
+
+        Three attention kernels:
+          * ``sdpa`` — ``F.scaled_dot_product_attention``; broad support, no
+            extra deps.
+          * ``vanilla`` — explicit matmul + softmax via the existing
+            ``_attention`` helper. Compile-friendly numerics-fidelity
+            fallback if SDPA drifts.
+          * ``cuequivariance`` — cuEquivariance triangle_attention kernel.
+            Compile-traceable (registered as torch.library custom op with
+            register_fake). Faster on triangle attention; AF2Rank model
+            (c_hidden=32, no_heads=4 → 8/head) fits the kernel's
+            hidden-dim constraints (fp32 ≤32 ÷4 = 0; fp16/bf16 ≤128 ÷8 = 0).
+
+        Always-on in this mode:
+          * cuEquivariance triangle multiplicative update — the kernel has
+            ``torch.compiler.is_compiling()`` branches that explicitly
+            disable its eager fallback during compile, so it traces cleanly
+            via its registered fake meta implementation.
+          * ChunkSizeTuner is removed from evoformer / extra_msa_stack /
+            template_pair_stack so chunk sizes never depend on input
+            shape (which would otherwise trigger per-L recompiles).
+
+        Incompatible with ``use_deepspeed_evoformer_attention`` (skipped
+        automatically by the inference path).
+        """
+        if self._compile_inference_path:
+            return
+        if attn_kernel not in ("sdpa", "vanilla", "cuequivariance"):
+            raise ValueError(
+                f"attn_kernel must be 'sdpa', 'vanilla', or 'cuequivariance'; "
+                f"got {attn_kernel!r}"
+            )
+        if compile_strategy not in ("per_block", "whole_graph"):
+            raise ValueError(
+                f"compile_strategy must be 'per_block' or 'whole_graph'; "
+                f"got {compile_strategy!r}"
+            )
+
+        # Defensive: the full-graph path skips chunking by construction, but
+        # if a caller has set chunk_size on the config we make that explicit.
+        if getattr(self.cfg.globals, "chunk_size", None) is not None:
+            logger.info(
+                "compile_inference_path overrides cfg.globals.chunk_size=%s "
+                "(only the main evoformer trunk uses chunk_size=None; "
+                "auxiliary chunked stacks still chunk via _aux_chunk).",
+                self.cfg.globals.chunk_size,
+            )
+            self.cfg.globals.chunk_size = None
+
+        # Step A — drop ChunkSizeTuner. The tuner runs OOM-binary-search
+        # forward passes per input shape and caches by shape, so a different
+        # L produces a different chunk_size and a fresh traced graph. Killing
+        # it here is the simplest way to keep the compiled graph stable.
+        for stack_attr, sub_attr in (
+            ("evoformer", None),
+            ("extra_msa_stack", None),
+            ("template_embedder", "template_pair_stack"),
+        ):
+            stack = getattr(self.model, stack_attr, None)
+            if stack is None:
+                continue
+            target = stack if sub_attr is None else getattr(stack, sub_attr, None)
+            if target is None:
+                continue
+            if getattr(target, "chunk_size_tuner", None) is not None:
+                logger.info(
+                    "compile_inference_path: disabling chunk_size_tuner on %s%s",
+                    stack_attr, f".{sub_attr}" if sub_attr else "",
+                )
+                target.chunk_size_tuner = None
+                target.tune_chunk_size = False
+
+        # Step F — warm the triton cache used by the cuEquivariance triangle
+        # multiplicative update before installing torch.compile. The kernel
+        # has compile-aware branches but its first-call autotuning is slow
+        # if the cache isn't initialized.
+        try:
+            from cuequivariance_ops_torch import init_triton_cache  # type: ignore
+            init_triton_cache()
+            logger.info("compile_inference_path: cuEquivariance triton cache initialized")
+        except Exception as exc:
+            logger.info(
+                "compile_inference_path: skipping init_triton_cache (%s); "
+                "cueq triangle-mul autotuning will happen lazily on first call.",
+                exc,
+            )
+
+        torch._dynamo.config.recompile_limit = max(
+            64, getattr(torch._dynamo.config, "recompile_limit", 8),
+        )
+
+        # Attach attention-kernel selection to the AlphaFold instance so that
+        # forward_inference() can read it without re-threading flags.
+        self.model._inference_use_torch_sdpa = (attn_kernel == "sdpa")
+        self.model._inference_use_torch_vanilla = (attn_kernel == "vanilla")
+        self.model._inference_use_torch_cueq = (attn_kernel == "cuequivariance")
+        # cuEq triangle multiplicative update — Triton-based, re-autotunes
+        # per shape. Default OFF to preserve true dynamic-shape behaviour;
+        # opt in with use_cueq_triangle_mul=True for the ~50% steady-state
+        # speedup at the cost of per-shape compile time.
+        self.model._inference_use_cueq_mul_update = use_cueq_triangle_mul
+
+        if compile_strategy == "whole_graph":
+            self._enable_whole_graph_compile()
+        else:
+            self._enable_per_block_compile()
+
+        self._compile_inference_path = True
+        self._compile_strategy = compile_strategy
+        self._inference_attn_kernel = attn_kernel
+        logger.info(
+            "OpenFold inference-path compile enabled "
+            "(strategy=%s; attn_kernel=%s)",
+            compile_strategy, attn_kernel,
+        )
+
+    def _enable_per_block_compile(self) -> None:
+        """Per-block compile strategy: compile each transformer block.
+
+        Each block gets its own compile context. Without intervention,
+        Dynamo specialises on the L-axis of every tensor entering each
+        block, which means a new L triggers a recompile per block (~50
+        blocks × per-shape recompile = catastrophic).
+
+        Fix: wrap each compiled block.forward with a thin pre-call hook
+        that calls torch._dynamo.mark_dynamic on the per-residue axis of
+        each tensor argument. mark_dynamic on the FIRST call propagates
+        to Dynamo's symbolic-shape engine, so the compiled kernel is
+        produced with symbolic L. On subsequent calls (different L),
+        mark_dynamic is a no-op and the cached kernel is reused.
+
+        The hook is per-block-class because each block class has different
+        L-axis positions:
+          * EvoformerBlock / ExtraMSABlock: m at axis -2 (= L), z at -3, -2
+          * TemplatePairStackBlock: z at axis -2 (and -3)
+          * StructureModule transition/angle_resnet: single arg at axis -2
+        """
+        compile_kwargs = dict(dynamic=True, fullgraph=False, mode="default")
+
+        # Track originals so we can restore on disable.
+        self._original_forwards = {}
+
+        def _make_l_axis_marker(spec):
+            """Return a wrapper that marks per-residue axes dynamic on the
+            FIRST call before invoking the compiled callable.  `spec` is a
+            tuple of (arg_name_or_position, [negative-axis indices]) pairs.
+            Once Dynamo has produced a graph with symbolic shapes, the hint
+            on subsequent calls is a cheap no-op.
+
+            Uses `maybe_mark_dynamic` (soft hint), NOT `mark_dynamic`
+            (hard constraint).  The hard form raises ConstraintViolationError
+            when Dynamo's symbolic engine infers the marked dim must be
+            constant during tracing — which IS the case here: each per-block
+            compile boundary creates a fresh tracing context where the
+            block's body contains ops like `m + extra` and `m * pair_bias`
+            whose other operands derive their L from non-marked sources,
+            forcing specialisation.  The soft hint lets Dynamo specialise
+            silently when needed; the worst case is the same as without
+            the hint (recompile on a new L), but the compile no longer
+            CRASHES the way it does with the strict version.
+            """
+            mark_fn = getattr(
+                torch._dynamo, "maybe_mark_dynamic", torch._dynamo.mark_dynamic,
+            )
+
+            def wrap(compiled_fn):
+                marked = [False]
+
+                def wrapper(*args, **kwargs):
+                    if not marked[0]:
+                        for slot, axes in spec:
+                            if isinstance(slot, int):
+                                if slot < len(args) and isinstance(args[slot], torch.Tensor):
+                                    t = args[slot]
+                                    for ax in axes:
+                                        if t.dim() >= abs(ax):
+                                            try:
+                                                mark_fn(t, t.dim() + ax)
+                                            except Exception:
+                                                pass
+                            else:
+                                t = kwargs.get(slot)
+                                if isinstance(t, torch.Tensor):
+                                    for ax in axes:
+                                        if t.dim() >= abs(ax):
+                                            try:
+                                                mark_fn(t, t.dim() + ax)
+                                            except Exception:
+                                                pass
+                        marked[0] = True
+                    return compiled_fn(*args, **kwargs)
+                return wrapper
+            return wrap
+
+        # IMPORTANT: only mark ONE axis per tensor.  All L axes across a
+        # block's inputs derive from the SAME underlying L; Dynamo's
+        # symbolic engine will broadcast the symbolic dim across other
+        # axes via the ops that constructed them.  Marking multiple axes
+        # of the same tensor creates independent symbols (s0, s1, …),
+        # which the body code then asserts must be equal — triggering a
+        # ConstraintViolationError.
+        #
+        # We mark m's L axis explicitly.  z's two L dims share a symbol
+        # via the broadcasts that built it from m's pair embedding.
+        # Same for msa_mask and pair_mask.
+        evo_spec = [(0, [-2])]        # m's L
+        extra_spec = evo_spec
+        # TemplatePairStackBlock.forward(z, mask, ...): mark only z's
+        # second-to-last L axis; the first L is the same symbol via
+        # broadcasts.
+        tps_spec = [(0, [-2])]
+        # StructureModule transition / angle_resnet: shape (..., L, C).
+        sm_spec = [(0, [-2])]
+
+        # Evoformer blocks (the main bottleneck: 48 blocks).
+        wrap_evo = _make_l_axis_marker(evo_spec)
+        for i, block in enumerate(self.model.evoformer.blocks):
+            key = f"ip_evoformer_block_{i}"
+            self._original_forwards[key] = block.forward
+            block.forward = wrap_evo(torch.compile(block.forward, **compile_kwargs))
+
+        # Extra-MSA blocks.
+        if hasattr(self.model, "extra_msa_stack"):
+            wrap_extra = _make_l_axis_marker(extra_spec)
+            for i, block in enumerate(self.model.extra_msa_stack.blocks):
+                key = f"ip_extra_msa_block_{i}"
+                self._original_forwards[key] = block.forward
+                block.forward = wrap_extra(torch.compile(block.forward, **compile_kwargs))
+
+        # Template pair stack blocks.
+        if (
+            hasattr(self.model, "template_embedder")
+            and hasattr(self.model.template_embedder, "template_pair_stack")
+        ):
+            tps = self.model.template_embedder.template_pair_stack
+            wrap_tps = _make_l_axis_marker(tps_spec)
+            for i, block in enumerate(tps.blocks):
+                key = f"ip_tps_block_{i}"
+                self._original_forwards[key] = block.forward
+                block.forward = wrap_tps(torch.compile(block.forward, **compile_kwargs))
+
+        # Structure-module pieces that don't depend on the inplace CUDA
+        # extension (we leave IPA itself eager — its non-inplace branch is
+        # already small).
+        sm = self.model.structure_module
+        wrap_sm = _make_l_axis_marker(sm_spec)
+        for name in ("transition", "angle_resnet"):
+            submod = getattr(sm, name, None)
+            if submod is not None:
+                key = f"ip_sm_{name}"
+                self._original_forwards[key] = submod.forward
+                submod.forward = wrap_sm(torch.compile(submod.forward, **compile_kwargs))
+
+    def _enable_whole_graph_compile(self) -> None:
+        """Whole-graph compile strategy: compile iteration_inference as one graph.
+
+        Note: trace time is large (5-10 min on AlphaFold-2 scale). Only
+        worthwhile when amortised across many decoys at the same shape.
+        """
+        compile_kwargs = dict(dynamic=True, fullgraph=False, mode="default")
+        self._original_forwards = {
+            "iteration_inference": self.model.iteration_inference,
+        }
+        self.model.iteration_inference = torch.compile(
+            self.model.iteration_inference, **compile_kwargs,
+        )
+
+    def forward_inference(self, batch: dict) -> dict:
+        """Run the compile-friendly inference forward on a prepared batch.
+
+        This is what AF2Rank should call when compile_inference_path=True:
+            batch = wrapper.build_batch(...)
+            out   = wrapper.forward_inference(batch)
+        """
+        with torch.no_grad():
+            return self.model.forward_inference(batch)
 
     def enable_compilation(self, dynamic: bool = False) -> None:
         """Compile compute-intensive submodules with torch.compile.
