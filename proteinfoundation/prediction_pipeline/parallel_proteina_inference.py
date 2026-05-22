@@ -153,7 +153,8 @@ def run_cif_to_pt_conversion(csv_file, csv_col, cif_dir):
         return MockResult()
 
 def run_proteina_inference(protein_name, inference_config, force_compile: bool = False,
-                           max_nsamples: int = None):
+                           max_nsamples: int = None,
+                           nsamples_per_len: int = None):
     """
     Run Proteina inference directly.
     Only uses subprocess for calling proteinfoundation/inference.py.
@@ -170,6 +171,8 @@ def run_proteina_inference(protein_name, inference_config, force_compile: bool =
         cmd.append('--force_compile')
     if max_nsamples is not None:
         cmd.extend(['--max_nsamples', str(max_nsamples)])
+    if nsamples_per_len is not None:
+        cmd.extend(['--nsamples_per_len', str(nsamples_per_len)])
 
     result = subprocess.run(
         cmd,
@@ -184,7 +187,8 @@ def process_single_protein(args):
     Process a single protein through the entire Proteina pipeline.
     Includes proper error handling and GPU memory cleanup.
     """
-    protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path, gpu_id, force_compile, skip_pt_conversion = args
+    (protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path,
+     gpu_id, force_compile, skip_pt_conversion, nsamples_per_len) = args
     
     try:
         # Set GPU for this process
@@ -230,7 +234,8 @@ def process_single_protein(args):
             logger.info(f"[GPU {gpu_id}] Step 2: Running Proteina inference for {protein_name}{bs_info}")
             result = run_proteina_inference(protein_name, inference_config,
                                             force_compile=force_compile,
-                                            max_nsamples=current_max_nsamples)
+                                            max_nsamples=current_max_nsamples,
+                                            nsamples_per_len=nsamples_per_len)
 
             if result.returncode == 0:
                 break  # success
@@ -314,13 +319,15 @@ def worker_init_proteina(counter, lock, num_gpus):
 # Wrapper function (must be at module level for pickling)
 def process_single_protein_wrapper(args_tuple):
     """Wrapper that uses the GPU assigned during worker init."""
-    protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path, force_compile, skip_pt_conversion = args_tuple
+    (protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path,
+     force_compile, skip_pt_conversion, nsamples_per_len) = args_tuple
 
     # Get GPU ID from process-local variable set by worker_init
     gpu_id = getattr(builtins, '_worker_gpu_id', 0)
 
     # Call the actual processing function
-    full_args = (protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path, gpu_id, force_compile, skip_pt_conversion)
+    full_args = (protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path,
+                 gpu_id, force_compile, skip_pt_conversion, nsamples_per_len)
     return process_single_protein(full_args)
 
 def has_multi_char_chain_id(protein_name):
@@ -570,7 +577,10 @@ def main():
     
     try:
         # Submit all jobs (GPU assignment happens via worker init)
-        work_items = [(protein_name, args.csv_file, args.csv_col, args.cif_dir, args.inference_config, args.usalign_path, args.force_compile, args.skip_pt_conversion)
+        pinned_nsamples_per_len = _get_expected_nsamples(args.inference_config)
+        if pinned_nsamples_per_len is not None:
+            logger.info(f"Pinning nsamples_per_len={pinned_nsamples_per_len} for all worker subprocesses (immune to mid-run YAML edits).")
+        work_items = [(protein_name, args.csv_file, args.csv_col, args.cif_dir, args.inference_config, args.usalign_path, args.force_compile, args.skip_pt_conversion, pinned_nsamples_per_len)
                       for protein_name in protein_names]
         future_to_protein = {executor.submit(process_single_protein_wrapper, item): work_items[i][0] 
                             for i, item in enumerate(work_items)}

@@ -295,6 +295,13 @@ if __name__ == "__main__":
         default=None,
         help="Override max_nsamples (GPU batch size) from config.",
     )
+    parser.add_argument(
+        "--nsamples_per_len",
+        type=int,
+        default=None,
+        help="Override nsamples_per_len from config. When set by the parent runner, "
+             "protects against mid-run YAML edits affecting per-subprocess targets.",
+    )
 
     args = parser.parse_args()
     logger.info(" ".join(sys.argv))
@@ -325,6 +332,9 @@ if __name__ == "__main__":
         if args.max_nsamples is not None:
             cfg = OmegaConf.merge(cfg, {"max_nsamples": args.max_nsamples})
             logger.info(f"Overriding max_nsamples to {args.max_nsamples}")
+        if args.nsamples_per_len is not None:
+            cfg = OmegaConf.merge(cfg, {"nsamples_per_len": args.nsamples_per_len})
+            logger.info(f"Overriding nsamples_per_len to {args.nsamples_per_len}")
         logger.info(f"Inference config {cfg}")
         run_name = cfg.run_name_
 
