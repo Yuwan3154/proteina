@@ -987,6 +987,20 @@ class ProteinTransformerAF3(torch.nn.Module):
             if getattr(self, "_forward_compiled_train", None) is None:
                 self._forward_compiled_train = torch.compile(self._forward_impl)
             return self._forward_compiled_train(batch_nn)
+        # Pure-inference path: when force_compile=True and grad is off, compile
+        # the eval forward separately. Safe in this configuration because the
+        # process is doing ONLY inference (no grad-mode flipping), so the
+        # grad-mode cache-thrash described above can't happen. Honors
+        # `self._compile_dynamic` so one compiled graph handles all protein
+        # lengths (no per-length recompile). Set by inference's
+        # load_model_for_worker() before the first forward.
+        if force_compile and not torch.is_grad_enabled():
+            dynamic_shapes = getattr(self, "_compile_dynamic", True)
+            if getattr(self, "_forward_compiled_eval", None) is None:
+                self._forward_compiled_eval = torch.compile(
+                    self._forward_impl, dynamic=dynamic_shapes
+                )
+            return self._forward_compiled_eval(batch_nn)
         return self._forward_impl(batch_nn)
 
     def _forward_impl(self, batch_nn: Dict[str, torch.Tensor]):

@@ -106,6 +106,23 @@ def _split_shard_args(shard_args: list | None) -> tuple[int | None, int | None, 
     return ext_idx, ext_n, passthrough
 
 
+def _inference_base(inference_config):
+    """Build the inference base dir, optionally appending a conditioning-mode
+    subdir from the PROTEINA_CONDITIONING_MODE env var. Mirrors the layout
+    written by parallel_proteina_inference.py's --conditioning_mode flag:
+        PROTEINA_CONDITIONING_MODE=seq      -> inference/{config}/seq_cond/
+        PROTEINA_CONDITIONING_MODE=seq_cath -> inference/{config}/seq_cath_cond/
+        (unset / other)                     -> inference/{config}/
+    """
+    parts = [PROTEINA_BASE_DIR, "inference", inference_config]
+    label = {"seq": "seq_cond", "seq_cath": "seq_cath_cond"}.get(
+        os.environ.get("PROTEINA_CONDITIONING_MODE", ""), ""
+    )
+    if label:
+        parts.append(label)
+    return os.path.join(*parts)
+
+
 def _available_gpu_count(default: int = 1) -> int:
     """Return number of visible GPUs via nvidia-smi, or `default` if detection fails."""
     try:
@@ -371,7 +388,7 @@ def step_af2rank_topk(
     are added to the output CSVs.
     """
     logger.info(f"Starting AF2Rank on ProteinEBM top-{af2rank_top_k} ...")
-    inference_dir = os.path.join(PROTEINA_BASE_DIR, "inference", inference_config)
+    inference_dir = _inference_base(inference_config)
     cmd = [
         "python", os.path.join(PRED_PIPELINE_DIR, "run_af2rank_prediction.py"),
         "--inference_dir", inference_dir,
@@ -479,7 +496,7 @@ def step_central_analysis(
     """Run centralized TM analysis after scorer outputs and prediction PDBs exist.
     When cif_dir is provided, GT TM-score columns are added to the per-protein
     enriched CSVs."""
-    inference_dir = os.path.join(PROTEINA_BASE_DIR, "inference", inference_config)
+    inference_dir = _inference_base(inference_config)
     cmd = [
         "python",
         os.path.join(PRED_PIPELINE_DIR, "proteina_analysis.py"),
@@ -528,7 +545,7 @@ def step_cross_protein_plots(
     the primary scorer; if scorer=proteinebm and af2rank_top_k > 0, runs a
     second time for the af2rank_on_proteinebm_topk plots.
     """
-    inference_dir = os.path.join(PROTEINA_BASE_DIR, "inference", inference_config)
+    inference_dir = _inference_base(inference_config)
 
     def _one(scorer_name: str) -> bool:
         cmd = [
@@ -575,7 +592,7 @@ def step_collect_results(
     Returns list of per-protein result dicts.
     """
     logger.info("Collecting results...")
-    inference_base = os.path.join(PROTEINA_BASE_DIR, "inference", inference_config)
+    inference_base = _inference_base(inference_config)
     best_templates_dir = os.path.join(output_dir, "best_templates")
     best_predictions_dir = os.path.join(output_dir, "best_predictions")
     os.makedirs(best_templates_dir, exist_ok=True)
@@ -867,7 +884,7 @@ def step_collect_results(
 
     # Add analysis pairwise TM metrics if available
     from proteinfoundation.prediction_pipeline.proteina_analysis import load_analysis_data
-    inference_base = os.path.join(PROTEINA_BASE_DIR, "inference", inference_config)
+    inference_base = _inference_base(inference_config)
     analysis_data = load_analysis_data(inference_base)
     if analysis_data:
         div_medians = [v["median_tem_to_tem_tm"] for v in analysis_data.values() if v.get("median_tem_to_tem_tm") is not None]
@@ -1276,7 +1293,7 @@ def main(argv: list[str] | None = None):
         working_csv_id_col = args.id_col
     logger.info(f"Loaded {len(protein_ids)} proteins")
 
-    inference_base = os.path.join(PROTEINA_BASE_DIR, "inference", args.inference_config)
+    inference_base = _inference_base(args.inference_config)
     shard_protein_ids_for_tar = list(protein_ids)
     if shard_index is not None:
         lengths = lengths_from_csv(working_csv, working_csv_id_col, args.len_col)

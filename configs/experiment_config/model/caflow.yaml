@@ -2,7 +2,7 @@ name: caflow
 
 defaults:
   - _self_
-  - nn: ca_af3_60M_notri
+  - nn: ca_af3_60M_no_tri
 
 target_pred: v
 

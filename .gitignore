@@ -36,3 +36,4 @@ proteina_training_data_indices/
 analysis_out/
 dssp_precompute.csv
 foldseek_results/
+foldseek_cath_batch/

@@ -357,6 +357,38 @@ def main() -> None:
     parser.add_argument("--use_cuequivariance_multiplicative_update",
                         action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
+        "--compile_inference_path",
+        action=argparse.BooleanOptionalAction, default=False,
+        help="Use the full-graph compile-friendly inference path "
+             "(torch.compile + SDPA). Forces DeepSpeed/cueq kernels off.",
+    )
+    parser.add_argument(
+        "--inference_attn_kernel",
+        choices=["sdpa", "vanilla", "cuequivariance"], default="sdpa",
+        help="Attention kernel for --compile_inference_path. 'sdpa' = "
+             "F.scaled_dot_product_attention (broadest support); 'vanilla' "
+             "= explicit matmul+softmax (bit-equivalent fallback); "
+             "'cuequivariance' = cueq triangle_attention kernel (faster on "
+             "triangle ops; the cueq triangle multiplicative update is used "
+             "unconditionally in the compile path regardless of this flag).",
+    )
+    parser.add_argument(
+        "--compile_strategy",
+        choices=["per_block", "whole_graph"], default="per_block",
+        help="torch.compile boundary. 'per_block' compiles each transformer "
+             "block separately (bounded trace time, recommended). "
+             "'whole_graph' compiles iteration_inference as a single graph "
+             "(larger trace cost; only useful for very large decoy batches).",
+    )
+    parser.add_argument(
+        "--use_cueq_triangle_mul", action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable the cuEquivariance triangle multiplicative update "
+             "kernel in the compile path (~50%% steady-state speedup at the "
+             "cost of per-shape Triton autotuning — defeats dynamic shape). "
+             "Off by default; enable for many decoys at the same L.",
+    )
+    parser.add_argument(
         "--tar_protein_dirs",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -537,6 +569,10 @@ def main() -> None:
             OpenFoldAF2Rank=OpenFoldAF2Rank,
             allatom_map=allatom_map,
             has_ground_truth=has_ground_truth,
+            compile_inference_path=args.compile_inference_path,
+            inference_attn_kernel=args.inference_attn_kernel,
+            compile_strategy=args.compile_strategy,
+            use_cueq_triangle_mul=args.use_cueq_triangle_mul,
         )
 
         # ── Model 2: model_2_ptm ─────────────────────────────────────────────
@@ -552,6 +588,10 @@ def main() -> None:
             OpenFoldAF2Rank=OpenFoldAF2Rank,
             allatom_map=allatom_map,
             has_ground_truth=has_ground_truth,
+            compile_inference_path=args.compile_inference_path,
+            inference_attn_kernel=args.inference_attn_kernel,
+            compile_strategy=args.compile_strategy,
+            use_cueq_triangle_mul=args.use_cueq_triangle_mul,
         )
 
         # ── Generate per-protein summary CSVs (for the scored proteins) ─────
@@ -687,6 +727,10 @@ def _run_model_pass(
     OpenFoldAF2Rank,
     allatom_map: Dict[str, str],
     has_ground_truth: bool = True,
+    compile_inference_path: bool = False,
+    inference_attn_kernel: str = "sdpa",
+    compile_strategy: str = "per_block",
+    use_cueq_triangle_mul: bool = False,
 ) -> None:
     """Load model_name ONCE, then iterate over all proteins.
 
@@ -708,6 +752,10 @@ def _run_model_pass(
         use_cuequivariance_attention=use_cuequivariance_attention,
         use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
         skip_ref_metrics=not has_ground_truth,
+        compile_inference_path=compile_inference_path,
+        inference_attn_kernel=inference_attn_kernel,
+        compile_strategy=compile_strategy,
+        use_cueq_triangle_mul=use_cueq_triangle_mul,
     )
     logger.info(f"{model_name} loaded. Scoring {len(protein_configs)} proteins ...")
 

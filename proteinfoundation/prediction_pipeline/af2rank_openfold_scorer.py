@@ -271,13 +271,20 @@ def convert_pdb_to_cif(pdb_file, chain_id=None):
     with open(pdb_file) as f:
         pdb_str = f.read()
     prot = openfold_protein.from_pdb_string(pdb_str, chain_id=chain_id)
-    # to_modelcif expects 1-indexed residue_index (ihm convention),
-    # but from_pdb_string produces 0-indexed. Fix by adding 1.
+    # to_modelcif builds a modelcif.Entity of length n (= len(aatype)) and
+    # then references each residue by residue_index[i] as a 1..n seq_id.
+    # That fails whenever the source PDB doesn't use contiguous 1..n
+    # numbering (e.g. 6KWC_1_model_1_ptm_relaxed.pdb already uses 1..191,
+    # but the previous "+1" bumped it to 2..192 and overflowed the entity).
+    # Renumber to a contiguous 1..n range so the entity and the seq_ids
+    # always line up. AF2Rank passes skip_template_alignment=True so the
+    # original residue numbering is not used downstream.
+    n = len(prot.aatype)
     prot = openfold_protein.Protein(
         atom_positions=prot.atom_positions,
         atom_mask=prot.atom_mask,
         aatype=prot.aatype,
-        residue_index=prot.residue_index + 1,
+        residue_index=np.arange(1, n + 1, dtype=prot.residue_index.dtype),
         chain_index=prot.chain_index,
         b_factors=prot.b_factors,
     )
@@ -591,6 +598,10 @@ class OpenFoldAF2Rank:
         use_cuequivariance_attention: bool = False,
         use_cuequivariance_multiplicative_update: bool = False,
         skip_ref_metrics: bool = False,
+        compile_inference_path: bool = False,
+        inference_attn_kernel: str = "sdpa",
+        compile_strategy: str = "per_block",
+        use_cueq_triangle_mul: bool = False,
     ):
         if chain is None:
             chain = "A"
@@ -626,6 +637,20 @@ class OpenFoldAF2Rank:
         if not os.path.exists(jax_params_path):
             raise FileNotFoundError(f"Weight file not found: {jax_params_path}")
 
+        # The compile inference path is mutually exclusive with the
+        # DeepSpeed/cueq kernels (its whole point is to use SDPA inside a
+        # torch.compile-friendly forward).  Silently force those off when the
+        # caller enables it.
+        if compile_inference_path:
+            if use_deepspeed_evoformer_attention or use_cuequivariance_attention or use_cuequivariance_multiplicative_update:
+                logger.info(
+                    "compile_inference_path=True: disabling DeepSpeed/cuEquivariance "
+                    "kernels (they are bypassed by the SDPA inference path)."
+                )
+            use_deepspeed_evoformer_attention = False
+            use_cuequivariance_attention = False
+            use_cuequivariance_multiplicative_update = False
+
         logger.info(f"Loading OpenFold model {model_name} from {jax_params_path}...")
         self.model = OpenFoldTemplateInference(
             model_name=model_name,
@@ -635,10 +660,15 @@ class OpenFoldAF2Rank:
             use_deepspeed_evoformer_attention=use_deepspeed_evoformer_attention,
             use_cuequivariance_attention=use_cuequivariance_attention,
             use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
+            compile_inference_path=compile_inference_path,
+            inference_attn_kernel=inference_attn_kernel,
+            compile_strategy=compile_strategy,
+            use_cueq_triangle_mul=use_cueq_triangle_mul,
         )
+        self.compile_inference_path = compile_inference_path
 
         # Set chunk_size if specified (0 or 1 disables chunking)
-        if chunk_size is not None:
+        if chunk_size is not None and not compile_inference_path:
             self.model.cfg.globals.chunk_size = chunk_size if chunk_size > 0 else None
             logger.info(f"Set chunk_size to {chunk_size}")
 
@@ -760,7 +790,10 @@ class OpenFoldAF2Rank:
         )
 
         with torch.no_grad():
-            out = self.model.model(batch)
+            if getattr(self, "compile_inference_path", False):
+                out = self.model.model.forward_inference(batch)
+            else:
+                out = self.model.model(batch)
 
         scores = self._extract_scores(out)
         if output_pdb is not None:

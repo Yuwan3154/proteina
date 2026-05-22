@@ -56,3 +56,48 @@ def fetch_last_ckpt(ckpt_dir: str) -> Union[str, None]:
         last_ckpts, key=get_version_number, reverse=True
     )  # sort by version #, highest first
     return sorted_files[0]
+
+
+def fetch_best_ckpt(ckpt_dir: str) -> Union[str, None]:
+    """
+    Returns the name of the best checkpoint.
+    First tries to find the best TM-score checkpoint (chk_best_tmscore_median_*.ckpt).
+    If none found, falls back to regular best checkpoints (chk_*.ckpt).
+
+    Args:
+        ckpt_dir: directory where checkpoints are stored.
+
+    Returns:
+        Name of the best checkpoint, None if no such checkpoint present.
+    """
+    if not os.path.exists(ckpt_dir):
+        return None
+    # 1. Try best TM-score checkpoints
+    best_tm_files = [
+        f
+        for f in os.listdir(ckpt_dir)
+        if f.startswith("chk_best_tmscore_median_") and f.endswith(".ckpt")
+    ]
+    
+    # 2. Try regular best checkpoints (starts with chk_ but not chk_best_tmscore_median_)
+    regular_best_files = [
+        f
+        for f in os.listdir(ckpt_dir)
+        if f.startswith("chk_") and not f.startswith("chk_best_tmscore_median_") and f.endswith(".ckpt")
+    ]
+    
+    files = best_tm_files if best_tm_files else regular_best_files
+    if not files:
+        return None
+        
+    def extract_epoch_step(fname):
+        matches = re.findall(r"\d+", fname)
+        if len(matches) >= 2:
+            return int(matches[-2]), int(matches[-1])  # (epoch, step)
+        elif len(matches) == 1:
+            return 0, int(matches[0])
+        return 0, 0
+
+    sorted_files = sorted(files, key=extract_epoch_step, reverse=True)
+    return sorted_files[0]
+

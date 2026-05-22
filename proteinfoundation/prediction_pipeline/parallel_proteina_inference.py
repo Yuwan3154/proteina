@@ -100,9 +100,86 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def generate_protein_output_dir(inference_config, protein_name):
-    """Generate consistent output directory path for a protein."""
-    return os.path.join(PROTEINA_BASE_DIR, 'inference', inference_config, protein_name)
+# ---------------------------------------------------------------------------
+# Worker-process model cache (in-process single-load).
+#
+# ProcessPoolExecutor reuses the same worker process across many submitted
+# tasks. By caching the loaded model + compiled graph as MODULE-LEVEL state
+# we get true single-load: the first protein on a worker pays the checkpoint
+# load + first-compile cost, every subsequent protein on the SAME worker
+# reuses the cached objects.
+# ---------------------------------------------------------------------------
+_WORKER_MODEL = None        # (model, nn_ag, trainer, cfg, config_name) or None
+_WORKER_MODEL_KEY = None    # (inference_config, conditioning_mode, force_compile, dynamic_shapes)
+
+
+def _get_or_load_worker_model(inference_config, conditioning_mode, force_compile,
+                              dynamic_shapes, verbose=False, use_cueq=True):
+    """Cached per-worker model loader. Returns (model, nn_ag, trainer, cfg, config_name).
+
+    The first call on a worker process loads the checkpoint and (when
+    force_compile=True) sets up torch.compile with the chosen dynamic-shapes
+    flag. Subsequent calls with the same key return the cached objects so
+    every protein on that worker reuses the model + compiled graphs.
+    """
+    global _WORKER_MODEL, _WORKER_MODEL_KEY
+    key = (inference_config, conditioning_mode, bool(force_compile), bool(dynamic_shapes))
+    if _WORKER_MODEL is not None and _WORKER_MODEL_KEY == key:
+        return _WORKER_MODEL
+
+    # First call (or key change): build a synthetic args namespace to drive
+    # the shared compose_inference_cfg from inference.py. cath_code is
+    # per-protein, not per-worker — for seq_cath mode we feed a placeholder
+    # here so the initial cfg merge succeeds; the real cath_code is supplied
+    # to run_one_protein_in_process below.
+    from proteinfoundation.inference import compose_inference_cfg, load_model_for_worker
+    import types
+    a = types.SimpleNamespace(
+        config_subdir=None,
+        config_number=-1,
+        config_name=inference_config,
+        max_nsamples=None,
+        nsamples_per_protein=None,
+        conditioning_mode=conditioning_mode,
+        cath_code=("x.x.x.x" if conditioning_mode == "seq_cath" else None),
+    )
+    cfg, config_name, _ = compose_inference_cfg(a)
+    model, nn_ag, trainer = load_model_for_worker(
+        cfg,
+        force_compile=force_compile,
+        dynamic_shapes=dynamic_shapes,
+        verbose=verbose,
+        use_cueq=use_cueq,
+    )
+    _WORKER_MODEL = (model, nn_ag, trainer, cfg, config_name)
+    _WORKER_MODEL_KEY = key
+    logger.info(f"[worker pid={os.getpid()}] Cached model "
+                f"(inference_config={inference_config}, conditioning_mode={conditioning_mode}, "
+                f"force_compile={force_compile}, dynamic_shapes={dynamic_shapes})")
+    return _WORKER_MODEL
+
+
+def _conditioning_label(conditioning_mode):
+    """Map a conditioning_mode CLI value to the output-dir segment.
+
+    'seq'        -> 'seq_cond'
+    'seq_cath'   -> 'seq_cath_cond'
+    None         -> 'legacy'           # backward-compat: keeps the old un-namespaced layout in a labeled subdir
+    """
+    if conditioning_mode == "seq":
+        return "seq_cond"
+    if conditioning_mode == "seq_cath":
+        return "seq_cath_cond"
+    return "legacy"
+
+
+def generate_protein_output_dir(inference_config, protein_name, conditioning_mode=None):
+    """Generate consistent output directory path for a protein.
+
+    Layout: inference/{inference_config}/{conditioning_label}/{protein_name}/
+    """
+    label = _conditioning_label(conditioning_mode)
+    return os.path.join(PROTEINA_BASE_DIR, 'inference', inference_config, label, protein_name)
 
 def create_single_protein_csv(csv_file, csv_col, protein_name, output_dir):
     """Create a single-protein CSV file for individual processing."""
@@ -154,7 +231,13 @@ def run_cif_to_pt_conversion(csv_file, csv_col, cif_dir):
 
 def run_proteina_inference(protein_name, inference_config, force_compile: bool = False,
                            max_nsamples: int = None,
+<<<<<<< HEAD
                            nsamples_per_len: int = None):
+=======
+                           conditioning_mode: str = None,
+                           cath_code: str = None,
+                           nsamples_per_protein: int = None):
+>>>>>>> 183ee6e02994d83889f7df42f4a9cbd12ef27650
     """
     Run Proteina inference directly.
     Only uses subprocess for calling proteinfoundation/inference.py.
@@ -171,8 +254,18 @@ def run_proteina_inference(protein_name, inference_config, force_compile: bool =
         cmd.append('--force_compile')
     if max_nsamples is not None:
         cmd.extend(['--max_nsamples', str(max_nsamples)])
+<<<<<<< HEAD
     if nsamples_per_len is not None:
         cmd.extend(['--nsamples_per_len', str(nsamples_per_len)])
+=======
+    if conditioning_mode is not None:
+        cmd.extend(['--conditioning_mode', conditioning_mode])
+    if cath_code is not None:
+        cmd.extend(['--cath_code', cath_code])
+    if nsamples_per_protein is not None:
+        cmd.extend(['--nsamples_per_protein', str(nsamples_per_protein)])
+    logger.info(f"subprocess argv: {' '.join(cmd)}")
+>>>>>>> 183ee6e02994d83889f7df42f4a9cbd12ef27650
 
     result = subprocess.run(
         cmd,
@@ -182,29 +275,115 @@ def run_proteina_inference(protein_name, inference_config, force_compile: bool =
     )
     return result
 
+def _step2_inference_in_process(protein_name, gpu_id, inference_config, conditioning_mode,
+                                 cath_code, nsamples_per_protein, force_compile, dynamic_shapes,
+                                 protein_output_dir):
+    """Step 2 (in-process path): use the cached worker-process model to generate samples
+    for one protein, reusing the loaded checkpoint and any compiled graphs.
+
+    Persists OOM-reduced max_nsamples to `builtins._worker_max_nsamples` so it
+    sticks across proteins on the same worker — matches the subprocess-path
+    behavior.
+    """
+    from proteinfoundation.inference import run_one_protein_in_process
+
+    model, nn_ag, trainer, cfg, config_name = _get_or_load_worker_model(
+        inference_config, conditioning_mode, force_compile, dynamic_shapes
+    )
+
+    # Apply per-protein cath_codes_override
+    if conditioning_mode == "seq":
+        cath_codes_override = ["x.x.x.x"]
+    elif conditioning_mode == "seq_cath":
+        if cath_code is None:
+            return {'protein': protein_name, 'gpu': gpu_id, 'status': 'failed',
+                    'error_type': 'BAD_INPUT',
+                    'error': "--conditioning_mode seq_cath but no cath_code for this protein",
+                    'output_dir': protein_output_dir}
+        from proteinfoundation.inference import _normalize_cath_code
+        cath_codes_override = [_normalize_cath_code(cath_code)]
+    else:
+        cath_codes_override = None
+
+    # Apply per-protein nsamples_per_protein override (and OOM-persisted max_nsamples)
+    if nsamples_per_protein is not None:
+        cfg.nsamples_per_len = int(nsamples_per_protein)
+    worker_max = getattr(builtins, '_worker_max_nsamples', None)
+    if worker_max is not None:
+        cfg.max_nsamples = int(worker_max)
+
+    logger.info(f"[GPU {gpu_id}] Step 2 (in-process): {protein_name} "
+                f"cath_code={cath_codes_override} max_nsamples={cfg.max_nsamples} "
+                f"nsamples_per_len={cfg.nsamples_per_len}")
+
+    result = run_one_protein_in_process(
+        model, nn_ag, trainer, cfg,
+        pt_name=protein_name,
+        config_name=config_name,
+        conditioning_mode=conditioning_mode,
+        cath_codes_override=cath_codes_override,
+    )
+
+    # Persist any OOM-reduced max_nsamples for subsequent proteins on this worker
+    if result.get("final_max_nsamples") is not None:
+        if worker_max is None or result["final_max_nsamples"] < worker_max:
+            builtins._worker_max_nsamples = int(result["final_max_nsamples"])
+
+    if result.get("status") == "FAILED":
+        return {'protein': protein_name, 'gpu': gpu_id, 'status': 'failed',
+                'error_type': result.get("error_type", "INFERENCE_ERROR"),
+                'error': result.get("error", "unknown"),
+                'output_dir': protein_output_dir}
+
+    logger.info(f"[GPU {gpu_id}] ✅ In-process inference completed for {protein_name} "
+                f"(samples_written={result.get('n_samples_written', 0)})")
+    return {'protein': protein_name, 'gpu': gpu_id, 'status': 'success',
+            'output_dir': protein_output_dir}
+
+
 def process_single_protein(args):
     """
     Process a single protein through the entire Proteina pipeline.
     Includes proper error handling and GPU memory cleanup.
+
+    Dispatches to the in-process or subprocess-per-protein path based on the
+    last tuple element (in_process_mode + dynamic_shapes). When tuple length
+    is 12 (legacy), uses subprocess; when length is 14, uses in-process if
+    requested.
     """
+<<<<<<< HEAD
     (protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path,
      gpu_id, force_compile, skip_pt_conversion, nsamples_per_len) = args
     
+=======
+    if len(args) >= 14:
+        (protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path,
+         gpu_id, force_compile, skip_pt_conversion,
+         conditioning_mode, cath_code, nsamples_per_protein,
+         in_process_mode, dynamic_shapes) = args
+    else:
+        (protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path,
+         gpu_id, force_compile, skip_pt_conversion,
+         conditioning_mode, cath_code, nsamples_per_protein) = args
+        in_process_mode = False
+        dynamic_shapes = True
+
+>>>>>>> 183ee6e02994d83889f7df42f4a9cbd12ef27650
     try:
         # Set GPU for this process
         os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
-        
+
         logger.info(f"[GPU {gpu_id}] Starting processing for {protein_name}")
-        
-        # Generate output directory for this protein
-        protein_output_dir = generate_protein_output_dir(inference_config, protein_name)
-        
+
+        # Generate output directory for this protein (includes conditioning_mode segment)
+        protein_output_dir = generate_protein_output_dir(inference_config, protein_name, conditioning_mode)
+
         logger.info(f"[GPU {gpu_id}] {protein_name} -> {protein_output_dir}")
-        
+
         # Create single-protein CSV file
         logger.info(f"[GPU {gpu_id}] Creating single_protein.csv for {protein_name}")
         single_csv_path = create_single_protein_csv(csv_file, csv_col, protein_name, protein_output_dir)
-        
+
         # Step 1: CIF to PT conversion (skip if PT files already exist)
         if skip_pt_conversion:
             logger.info(f"[GPU {gpu_id}] Skipping CIF to PT conversion for {protein_name} (--skip_pt_conversion)")
@@ -224,7 +403,15 @@ def process_single_protein(args):
                 }
 
             logger.info(f"[GPU {gpu_id}] ✅ CIF to PT conversion completed for {protein_name}")
-        
+
+        # Step 2: Proteina inference — branch on in_process_mode.
+        if in_process_mode:
+            return _step2_inference_in_process(
+                protein_name, gpu_id, inference_config, conditioning_mode,
+                cath_code, nsamples_per_protein, force_compile, dynamic_shapes,
+                protein_output_dir,
+            )
+        # Legacy: subprocess-per-protein
         # Step 2: Proteina inference with adaptive batch size on OOM
         # Read persisted max_nsamples from prior OOM in this worker (if any)
         current_max_nsamples = getattr(builtins, '_worker_max_nsamples', None)
@@ -235,7 +422,13 @@ def process_single_protein(args):
             result = run_proteina_inference(protein_name, inference_config,
                                             force_compile=force_compile,
                                             max_nsamples=current_max_nsamples,
+<<<<<<< HEAD
                                             nsamples_per_len=nsamples_per_len)
+=======
+                                            conditioning_mode=conditioning_mode,
+                                            cath_code=cath_code,
+                                            nsamples_per_protein=nsamples_per_protein)
+>>>>>>> 183ee6e02994d83889f7df42f4a9cbd12ef27650
 
             if result.returncode == 0:
                 break  # success
@@ -318,16 +511,42 @@ def worker_init_proteina(counter, lock, num_gpus):
 
 # Wrapper function (must be at module level for pickling)
 def process_single_protein_wrapper(args_tuple):
+<<<<<<< HEAD
     """Wrapper that uses the GPU assigned during worker init."""
     (protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path,
      force_compile, skip_pt_conversion, nsamples_per_len) = args_tuple
+=======
+    """Wrapper that uses the GPU assigned during worker init.
+
+    Supports both legacy 11-tuple (subprocess mode) and 13-tuple (in-process mode).
+    """
+    if len(args_tuple) >= 13:
+        (protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path,
+         force_compile, skip_pt_conversion,
+         conditioning_mode, cath_code, nsamples_per_protein,
+         in_process_mode, dynamic_shapes) = args_tuple
+    else:
+        (protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path,
+         force_compile, skip_pt_conversion,
+         conditioning_mode, cath_code, nsamples_per_protein) = args_tuple
+        in_process_mode = False
+        dynamic_shapes = True
+>>>>>>> 183ee6e02994d83889f7df42f4a9cbd12ef27650
 
     # Get GPU ID from process-local variable set by worker_init
     gpu_id = getattr(builtins, '_worker_gpu_id', 0)
 
+<<<<<<< HEAD
     # Call the actual processing function
     full_args = (protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path,
                  gpu_id, force_compile, skip_pt_conversion, nsamples_per_len)
+=======
+    # Call the actual processing function (14-tuple for in-process dispatch)
+    full_args = (protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path,
+                 gpu_id, force_compile, skip_pt_conversion,
+                 conditioning_mode, cath_code, nsamples_per_protein,
+                 in_process_mode, dynamic_shapes)
+>>>>>>> 183ee6e02994d83889f7df42f4a9cbd12ef27650
     return process_single_protein(full_args)
 
 def has_multi_char_chain_id(protein_name):
@@ -357,9 +576,11 @@ def get_protein_names(csv_file, csv_col):
 def _get_expected_nsamples(inference_config):
     """Read the expected nsamples_per_len from the inference config YAML.
 
-    Tries to load the Hydra config (with its defaults chain) so that values
-    defined in inference_base.yaml are inherited.  Falls back to a direct
-    YAML read and finally to a safe default.
+    Tries the locations in priority order:
+      1. Unified config: cfg.inference.nsamples_per_len  (nested under inference:)
+      2. Legacy / inference-only config: cfg.nsamples_per_len  (top-level)
+      3. Hydra defaults chain: any base in cfg.defaults that has nsamples_per_len top-level
+    Returns None when nothing matches.
     """
     try:
         from omegaconf import OmegaConf
@@ -367,9 +588,14 @@ def _get_expected_nsamples(inference_config):
         yaml_path = os.path.join(config_dir, f"{inference_config}.yaml")
         if os.path.exists(yaml_path):
             cfg = OmegaConf.load(yaml_path)
+            # 1. Unified config: nested under `inference:`
+            inf = cfg.get("inference")
+            if inf is not None and "nsamples_per_len" in inf:
+                return int(inf.nsamples_per_len)
+            # 2. Legacy / inference-only config: top-level
             if "nsamples_per_len" in cfg:
                 return int(cfg.nsamples_per_len)
-            # Fall through to base config
+            # 3. Defaults chain
             defaults = cfg.get("defaults", [])
             for d in defaults:
                 if isinstance(d, str):
@@ -390,6 +616,7 @@ def find_proteins_needing_inference(
     candidate_proteins=None,
     tar_protein_dirs: bool = False,
     max_workers=None,
+    conditioning_mode=None,
 ):
     """Find proteins from CSV that need inference (incomplete or missing).
 
@@ -400,7 +627,9 @@ def find_proteins_needing_inference(
     # Get proteins from CSV file
     csv_proteins = list(candidate_proteins) if candidate_proteins is not None else get_protein_names(csv_file, csv_col)
 
-    inference_base_dir = os.path.join(PROTEINA_BASE_DIR, 'inference', inference_config)
+    inference_base_dir = os.path.join(
+        PROTEINA_BASE_DIR, 'inference', inference_config, _conditioning_label(conditioning_mode)
+    )
 
     expected_nsamples = _get_expected_nsamples(inference_config)
     if expected_nsamples is not None:
@@ -461,6 +690,22 @@ def main():
                         help="Thread workers for progress checks (default: min(32, cpu_count * 4)).")
     parser.add_argument("--dynamic_resharding", action=argparse.BooleanOptionalAction, default=True,
                         help="Filter global progress before sharding each step to reduce idle shards (default: True).")
+    parser.add_argument("--conditioning_mode", choices=["seq", "seq_cath"], default=None,
+                        help="Which conditioning to apply this run. "
+                             "'seq' = sequence only (forces cath='x.x.x.x', fold_cond=False). "
+                             "'seq_cath' = sequence + top-1 CATH (requires a 'cath_code' column in --csv_file). "
+                             "Omitted -> legacy layout (un-namespaced subdir), reads cath_code_file from config.")
+    parser.add_argument("--nsamples_per_protein", type=int, default=None,
+                        help="Override nsamples_per_len (total samples per protein) per inference subprocess.")
+    parser.add_argument("--in_process", action=argparse.BooleanOptionalAction, default=True,
+                        help="Default: each worker process loads the model ONCE and reuses it across "
+                             "every assigned protein (single-load). --no-in_process falls back to "
+                             "the legacy subprocess-per-protein path (one Python startup + ckpt load "
+                             "per chain).")
+    parser.add_argument("--dynamic_shapes", action=argparse.BooleanOptionalAction, default=True,
+                        help="When --force_compile is set: torch.compile with dynamic=True so a single "
+                             "compiled graph handles all protein lengths. --no-dynamic_shapes restores "
+                             "static-shape compilation (one specialized graph per (length, batch).")
     add_shard_args(parser)
 
     args = parser.parse_args()
@@ -508,7 +753,20 @@ def main():
             logger.info("Sorted proteins short-to-long for OOM-conservative batch-size adaptation.")
         shard_protein_names_for_tar = list(protein_names)
 
-    inference_base_dir = os.path.join(PROTEINA_BASE_DIR, "inference", args.inference_config)
+    inference_base_dir = os.path.join(
+        PROTEINA_BASE_DIR, "inference", args.inference_config, _conditioning_label(args.conditioning_mode)
+    )
+
+    # Resolve per-protein cath_codes when conditioning_mode is seq_cath.
+    cath_by_name = {}
+    if args.conditioning_mode == "seq_cath":
+        cath_df = pd.read_csv(args.csv_file)
+        if "cath_code" not in cath_df.columns:
+            logger.error(f"--conditioning_mode seq_cath requires a 'cath_code' column in {args.csv_file}")
+            sys.exit(1)
+        cath_by_name = dict(zip(cath_df[args.csv_col].astype(str), cath_df["cath_code"].astype(str)))
+        n_null = sum(1 for v in cath_by_name.values() if v.strip().lower() in ("", "nan", "x.x.x.x"))
+        logger.info(f"Loaded {len(cath_by_name)} cath_codes from {args.csv_file} (null/x.x.x.x count: {n_null})")
 
     check_candidates = global_protein_names if args.dynamic_resharding and shard_index is not None else protein_names
     if args.skip_existing:
@@ -520,6 +778,7 @@ def main():
             candidate_proteins=check_candidates,
             tar_protein_dirs=args.tar_protein_dirs,
             max_workers=args.progress_check_workers,
+            conditioning_mode=args.conditioning_mode,
         )
         if args.dynamic_resharding and shard_index is not None:
             protein_names = shard_proteins(
@@ -564,23 +823,38 @@ def main():
     start_time = time.time()
     results = []
     
-    # Create shared counter for worker initialization
-    manager = mp.Manager()
+    # In-process mode loads CUDA-touching modules (deepspeed, torch) in the
+    # parent before the worker starts. Default fork-based ProcessPoolExecutor
+    # would inherit a partially-initialized CUDA context and the worker's
+    # `torch.cuda.is_available()` call fails with
+    # "CUDA error: initialization error". Use spawn for a clean child interpreter.
+    # Use the SAME context for the Manager so its proxies work with the executor.
+    mp_ctx = mp.get_context('spawn') if args.in_process else mp.get_context()
+    manager = mp_ctx.Manager()
     worker_counter = manager.Value('i', 0)
     worker_lock = manager.Lock()
-    
+
     executor = ProcessPoolExecutor(
         max_workers=args.num_gpus,
         initializer=worker_init_proteina,
-        initargs=(worker_counter, worker_lock, args.num_gpus)
+        initargs=(worker_counter, worker_lock, args.num_gpus),
+        mp_context=mp_ctx,
     )
     
     try:
         # Submit all jobs (GPU assignment happens via worker init)
+<<<<<<< HEAD
         pinned_nsamples_per_len = _get_expected_nsamples(args.inference_config)
         if pinned_nsamples_per_len is not None:
             logger.info(f"Pinning nsamples_per_len={pinned_nsamples_per_len} for all worker subprocesses (immune to mid-run YAML edits).")
         work_items = [(protein_name, args.csv_file, args.csv_col, args.cif_dir, args.inference_config, args.usalign_path, args.force_compile, args.skip_pt_conversion, pinned_nsamples_per_len)
+=======
+        # 13-tuple: legacy 11 fields + (in_process_mode, dynamic_shapes)
+        work_items = [(protein_name, args.csv_file, args.csv_col, args.cif_dir, args.inference_config, args.usalign_path,
+                       args.force_compile, args.skip_pt_conversion,
+                       args.conditioning_mode, cath_by_name.get(protein_name), args.nsamples_per_protein,
+                       args.in_process, args.dynamic_shapes)
+>>>>>>> 183ee6e02994d83889f7df42f4a9cbd12ef27650
                       for protein_name in protein_names]
         future_to_protein = {executor.submit(process_single_protein_wrapper, item): work_items[i][0] 
                             for i, item in enumerate(work_items)}
