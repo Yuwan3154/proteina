@@ -245,6 +245,20 @@ def step_proteina_inference(
         cmd.append("--skip_existing")
     if proteina_force_compile:
         cmd.append("--force_compile")
+    # Propagate PROTEINA_CONDITIONING_MODE env var to --conditioning_mode flag.
+    # parallel_proteina_inference.py uses this to load per-protein cath_codes
+    # from the CSV and route them into inference.py's cath conditioning path.
+    _cm = os.environ.get("PROTEINA_CONDITIONING_MODE", "").strip()
+    if _cm in ("seq", "seq_cath"):
+        cmd.extend(["--conditioning_mode", _cm])
+    # Force subprocess-per-protein mode. The in_process ProcessPoolExecutor
+    # path sets CUDA_VISIBLE_DEVICES via worker_init, but by then torch +
+    # deepspeed have already initialized CUDA seeing all GPUs in the child
+    # process (because module-level imports run before the initializer), so
+    # all workers default to cuda:0. Subprocess mode gives each protein a
+    # fresh child with CUDA_VISIBLE_DEVICES set in env at exec time -- proper
+    # per-GPU isolation.
+    cmd.append("--no-in_process")
     if shard_args:
         cmd.extend(shard_args)
     cmd.extend(_tar_cli_args(tar_protein_dirs))

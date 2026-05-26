@@ -231,13 +231,9 @@ def run_cif_to_pt_conversion(csv_file, csv_col, cif_dir):
 
 def run_proteina_inference(protein_name, inference_config, force_compile: bool = False,
                            max_nsamples: int = None,
-<<<<<<< HEAD
-                           nsamples_per_len: int = None):
-=======
                            conditioning_mode: str = None,
                            cath_code: str = None,
                            nsamples_per_protein: int = None):
->>>>>>> 183ee6e02994d83889f7df42f4a9cbd12ef27650
     """
     Run Proteina inference directly.
     Only uses subprocess for calling proteinfoundation/inference.py.
@@ -254,10 +250,6 @@ def run_proteina_inference(protein_name, inference_config, force_compile: bool =
         cmd.append('--force_compile')
     if max_nsamples is not None:
         cmd.extend(['--max_nsamples', str(max_nsamples)])
-<<<<<<< HEAD
-    if nsamples_per_len is not None:
-        cmd.extend(['--nsamples_per_len', str(nsamples_per_len)])
-=======
     if conditioning_mode is not None:
         cmd.extend(['--conditioning_mode', conditioning_mode])
     if cath_code is not None:
@@ -265,7 +257,6 @@ def run_proteina_inference(protein_name, inference_config, force_compile: bool =
     if nsamples_per_protein is not None:
         cmd.extend(['--nsamples_per_protein', str(nsamples_per_protein)])
     logger.info(f"subprocess argv: {' '.join(cmd)}")
->>>>>>> 183ee6e02994d83889f7df42f4a9cbd12ef27650
 
     result = subprocess.run(
         cmd,
@@ -351,11 +342,6 @@ def process_single_protein(args):
     is 12 (legacy), uses subprocess; when length is 14, uses in-process if
     requested.
     """
-<<<<<<< HEAD
-    (protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path,
-     gpu_id, force_compile, skip_pt_conversion, nsamples_per_len) = args
-    
-=======
     if len(args) >= 14:
         (protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path,
          gpu_id, force_compile, skip_pt_conversion,
@@ -368,7 +354,6 @@ def process_single_protein(args):
         in_process_mode = False
         dynamic_shapes = True
 
->>>>>>> 183ee6e02994d83889f7df42f4a9cbd12ef27650
     try:
         # Set GPU for this process
         os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
@@ -422,13 +407,9 @@ def process_single_protein(args):
             result = run_proteina_inference(protein_name, inference_config,
                                             force_compile=force_compile,
                                             max_nsamples=current_max_nsamples,
-<<<<<<< HEAD
-                                            nsamples_per_len=nsamples_per_len)
-=======
                                             conditioning_mode=conditioning_mode,
                                             cath_code=cath_code,
                                             nsamples_per_protein=nsamples_per_protein)
->>>>>>> 183ee6e02994d83889f7df42f4a9cbd12ef27650
 
             if result.returncode == 0:
                 break  # success
@@ -511,11 +492,6 @@ def worker_init_proteina(counter, lock, num_gpus):
 
 # Wrapper function (must be at module level for pickling)
 def process_single_protein_wrapper(args_tuple):
-<<<<<<< HEAD
-    """Wrapper that uses the GPU assigned during worker init."""
-    (protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path,
-     force_compile, skip_pt_conversion, nsamples_per_len) = args_tuple
-=======
     """Wrapper that uses the GPU assigned during worker init.
 
     Supports both legacy 11-tuple (subprocess mode) and 13-tuple (in-process mode).
@@ -531,22 +507,15 @@ def process_single_protein_wrapper(args_tuple):
          conditioning_mode, cath_code, nsamples_per_protein) = args_tuple
         in_process_mode = False
         dynamic_shapes = True
->>>>>>> 183ee6e02994d83889f7df42f4a9cbd12ef27650
 
     # Get GPU ID from process-local variable set by worker_init
     gpu_id = getattr(builtins, '_worker_gpu_id', 0)
 
-<<<<<<< HEAD
-    # Call the actual processing function
-    full_args = (protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path,
-                 gpu_id, force_compile, skip_pt_conversion, nsamples_per_len)
-=======
     # Call the actual processing function (14-tuple for in-process dispatch)
     full_args = (protein_name, csv_file, csv_col, cif_dir, inference_config, usalign_path,
                  gpu_id, force_compile, skip_pt_conversion,
                  conditioning_mode, cath_code, nsamples_per_protein,
                  in_process_mode, dynamic_shapes)
->>>>>>> 183ee6e02994d83889f7df42f4a9cbd12ef27650
     return process_single_protein(full_args)
 
 def has_multi_char_chain_id(protein_name):
@@ -843,18 +812,11 @@ def main():
     
     try:
         # Submit all jobs (GPU assignment happens via worker init)
-<<<<<<< HEAD
-        pinned_nsamples_per_len = _get_expected_nsamples(args.inference_config)
-        if pinned_nsamples_per_len is not None:
-            logger.info(f"Pinning nsamples_per_len={pinned_nsamples_per_len} for all worker subprocesses (immune to mid-run YAML edits).")
-        work_items = [(protein_name, args.csv_file, args.csv_col, args.cif_dir, args.inference_config, args.usalign_path, args.force_compile, args.skip_pt_conversion, pinned_nsamples_per_len)
-=======
         # 13-tuple: legacy 11 fields + (in_process_mode, dynamic_shapes)
         work_items = [(protein_name, args.csv_file, args.csv_col, args.cif_dir, args.inference_config, args.usalign_path,
                        args.force_compile, args.skip_pt_conversion,
                        args.conditioning_mode, cath_by_name.get(protein_name), args.nsamples_per_protein,
                        args.in_process, args.dynamic_shapes)
->>>>>>> 183ee6e02994d83889f7df42f4a9cbd12ef27650
                       for protein_name in protein_names]
         future_to_protein = {executor.submit(process_single_protein_wrapper, item): work_items[i][0] 
                             for i, item in enumerate(work_items)}

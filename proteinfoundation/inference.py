@@ -832,29 +832,14 @@ def main():
         format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {file}:{line} | {message}",
     )
 
-    # Inference config
-    # If config_subdir is None then use base inference config
-    # Otherwise use config_subdir/some_config
-    if args.config_subdir is None:
-        config_path = "../configs/experiment_config"
-    else:
-        config_path = f"../configs/experiment_config/{args.config_subdir}"
-
-    with hydra.initialize(config_path, version_base=hydra.__version__):
-        # If number provided use it, otherwise name
-        if args.config_number != -1:
-            config_name = f"inf_{args.config_number}"
-        else:
-            config_name = args.config_name
-        cfg = hydra.compose(config_name=config_name)
-        if args.max_nsamples is not None:
-            cfg = OmegaConf.merge(cfg, {"max_nsamples": args.max_nsamples})
-            logger.info(f"Overriding max_nsamples to {args.max_nsamples}")
-        if args.nsamples_per_len is not None:
-            cfg = OmegaConf.merge(cfg, {"nsamples_per_len": args.nsamples_per_len})
-            logger.info(f"Overriding nsamples_per_len to {args.nsamples_per_len}")
-        logger.info(f"Inference config {cfg}")
-        run_name = cfg.run_name_
+    # Inference config: use compose_inference_cfg() to flatten the unified
+    # `inference:` block into the top-level cfg (so cfg.compute_designability,
+    # cfg.nsamples_per_len, cfg.fold_cond, etc. all resolve at top level) and
+    # to apply CLI overrides (--max_nsamples, --nsamples_per_protein,
+    # --conditioning_mode, --cath_code). Returns cath_codes_override which is
+    # plumbed to run_one_protein_in_process below.
+    cfg, config_name, cath_codes_override = compose_inference_cfg(args)
+    run_name = cfg.run_name_
 
     assert (
         not cfg.compute_designability or not cfg.compute_fid
