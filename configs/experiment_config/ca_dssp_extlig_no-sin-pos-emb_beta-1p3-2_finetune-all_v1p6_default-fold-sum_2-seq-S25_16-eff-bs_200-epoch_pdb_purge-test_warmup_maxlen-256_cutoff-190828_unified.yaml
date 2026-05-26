@@ -144,7 +144,7 @@ inference:
   step_len: null
 
   # Number of samples per protein length
-  nsamples_per_len: 512
+  nsamples_per_len: 1024
 
   # Maximum number of samples in each batch
   max_nsamples: 32
