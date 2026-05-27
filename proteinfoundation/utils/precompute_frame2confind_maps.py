@@ -21,9 +21,11 @@ Example
 
 import argparse
 import csv
+import json
 import os
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -104,28 +106,72 @@ def _collate_items(items: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tens
     return {"x_f2s": x_f2s, "mask": mask, "lengths": lengths}
 
 
-def _iter_processed(processed_dir: Path, max_len: int) -> List[Tuple[Path, int]]:
-    """Enumerate processed .pt files with lengths, filtering by max_len.
+def _scan_one(path_str: str):
+    """Worker: load one .pt, return (path_str, length, has_contact_map).
 
-    Uses ``rglob`` so the sharded layout (d_FS processed/<bucket>/*.pt) is
-    walked transparently. Flat dirs incur no extra cost.
+    Returns (path_str, -1, False) if the file is unreadable / missing coords
+    so the caller can drop it.
     """
-    items = []
-    for path in sorted(Path(processed_dir).rglob("*.pt")):
-        if not path.is_file():
-            continue
+    try:
+        g = torch.load(path_str, map_location="cpu", weights_only=False)
+    except Exception:
+        return (path_str, -1, False)
+    coords = getattr(g, "coords", None)
+    if coords is None:
+        return (path_str, -1, False)
+    has_cm = bool(getattr(g, "contact_map_confind", None) is not None)
+    return (path_str, int(coords.shape[0]), has_cm)
+
+
+def _iter_processed(
+    processed_dir: Path,
+    max_len: int,
+    workers: int = 1,
+    cache_path: Optional[Path] = None,
+) -> List[Tuple[Path, int, bool]]:
+    """Enumerate processed .pt files with (length, has_contact_map).
+
+    Walks the sharded layout via rglob, then loads each file in parallel
+    (ProcessPoolExecutor) to extract coords.shape[0] and whether
+    contact_map_confind is already populated. The result is cached to
+    ``cache_path`` (JSON: list of [path, length, has_cm]) so re-invocations
+    skip the multi-hour scan.
+
+    Returns the unfiltered list (length, has_cm included for all readable
+    files); callers apply max_len + has_cm filters downstream.
+    """
+    cache_path = Path(cache_path) if cache_path else None
+    if cache_path and cache_path.exists():
         try:
-            graph = _load_graph(path)
+            data = json.loads(cache_path.read_text())
+            return [(Path(p), int(L), bool(cm)) for (p, L, cm) in data]
         except Exception:
-            continue
-        coords = getattr(graph, "coords", None)
-        if coords is None:
-            continue
-        L = coords.shape[0]
-        if L > max_len:
-            continue
-        items.append((path, L))
-    return items
+            pass  # rebuild
+
+    all_paths = sorted(str(p) for p in Path(processed_dir).rglob("*.pt"))
+    results: List[Tuple[Path, int, bool]] = []
+    if workers <= 1:
+        for p in all_paths:
+            ps, L, cm = _scan_one(p)
+            if L > 0:
+                results.append((Path(ps), L, cm))
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            futs = [ex.submit(_scan_one, p) for p in all_paths]
+            done = 0
+            for fut in as_completed(futs):
+                ps, L, cm = fut.result()
+                if L > 0:
+                    results.append((Path(ps), L, cm))
+                done += 1
+                if done % 50000 == 0:
+                    print(f"  scan {done}/{len(all_paths)}", flush=True)
+    if cache_path:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps([[str(p), L, cm] for (p, L, cm) in results]))
+    # Note: caller is responsible for applying max_len + has_cm filters so
+    # we keep the cache reusable across runs with different filter settings.
+    return results
 
 
 def run_precompute(
@@ -139,6 +185,8 @@ def run_precompute(
     limit: int = 0,
     status_csv: Optional[str] = None,
     log_path: Optional[str] = None,
+    scan_workers: int = 1,
+    length_cache: Optional[str] = None,
 ) -> Dict[str, float]:
     """Run GPU-accelerated ConFind precompute.
 
@@ -173,30 +221,38 @@ def run_precompute(
     )
     _log(f"Model loaded on {predictor.device}", log_file)
 
-    # Enumerate and filter files
-    _log(f"Scanning {processed_dir} for .pt files (max_len={max_len})", log_file)
-    all_items = _iter_processed(processed_dir, max_len)
-    _log(f"Found {len(all_items)} files within max_len={max_len}", log_file)
-
-    # Filter already-processed files
-    if not overwrite:
-        pending = []
-        skipped = 0
-        for path, length in all_items:
-            try:
-                graph = _load_graph(path)
-                if (
-                    hasattr(graph, "contact_map_confind")
-                    and graph.contact_map_confind is not None
-                ):
-                    skipped += 1
-                    continue
-            except Exception:
-                pass
-            pending.append((path, length))
-        _log(f"Skipping {skipped} files with existing contact_map_confind", log_file)
+    # Enumerate and filter files. Parallel scan via scan_workers; cache to
+    # length_cache JSON so subsequent invocations skip the multi-hour load.
+    cache = Path(length_cache) if length_cache else None
+    if cache and cache.exists():
+        _log(f"Loading length+contact-map cache from {cache}", log_file)
     else:
-        pending = all_items
+        _log(f"Scanning {processed_dir} with {scan_workers} workers (cache={cache})",
+             log_file)
+    scan_start = time.perf_counter()
+    scanned = _iter_processed(processed_dir, max_len, workers=scan_workers,
+                              cache_path=cache)
+    _log(f"Scanned {len(scanned)} files in {time.perf_counter()-scan_start:.1f}s",
+         log_file)
+
+    # Apply max_len + (optionally) skip-existing filters in one pass.
+    all_items: List[Tuple[Path, int]] = []
+    skipped_long = 0
+    skipped_existing = 0
+    for path, length, has_cm in scanned:
+        if length > max_len:
+            skipped_long += 1
+            continue
+        if (not overwrite) and has_cm:
+            skipped_existing += 1
+            continue
+        all_items.append((path, length))
+    _log(
+        f"Filter: {len(all_items)} pending "
+        f"(skipped {skipped_long} long, {skipped_existing} already-done)",
+        log_file,
+    )
+    pending = all_items
 
     # Sort by length descending (longest first for efficient batching)
     pending.sort(key=lambda x: x[1], reverse=True)
@@ -403,6 +459,18 @@ def main() -> None:
     )
     parser.add_argument("--status-csv", default=None)
     parser.add_argument("--log", default=None, dest="log_path")
+    parser.add_argument(
+        "--scan-workers", type=int, default=1,
+        help="Number of worker processes for the initial .pt length scan. "
+             "For sharded trees with millions of files set to nproc to cut "
+             "the scan from hours to minutes.",
+    )
+    parser.add_argument(
+        "--length-cache", default=None,
+        help="Path to JSON cache of (path, length, has_contact_map) tuples. "
+             "If present, the scan is skipped. If absent, the scan result "
+             "is written here for reuse.",
+    )
     args = parser.parse_args()
 
     run_precompute(
@@ -416,6 +484,8 @@ def main() -> None:
         limit=args.limit,
         status_csv=args.status_csv,
         log_path=args.log_path,
+        scan_workers=args.scan_workers,
+        length_cache=args.length_cache,
     )
 
 
