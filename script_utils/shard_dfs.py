@@ -158,7 +158,7 @@ def move_raw(manifest_path: Path, src: Path, dst: Path, suffix: str, execute: bo
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    sub = p.add_subparsers(dest="cmd", required=True)
+    sub = p.add_subparsers(dest="cmd")
 
     pb = sub.add_parser("build", help="Build shard manifest from effective_ids.txt")
     pb.add_argument("--ids", type=Path, required=True)
@@ -174,6 +174,9 @@ def main() -> int:
                     help="Actually mv files. Without this, dry-run only.")
 
     args = p.parse_args()
+    if args.cmd is None:
+        p.print_help()
+        return 2
     if args.cmd == "build":
         build_manifest(args.ids, args.manifest, args.max_per_bucket)
     elif args.cmd == "move-raw":
