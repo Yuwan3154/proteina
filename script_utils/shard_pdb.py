@@ -62,36 +62,48 @@ def _bucket_for(pdb_id, depth_table, hash_subbucket_for):
     return f"{mid3}/{h}"
 
 
-def _build_depth_table(pdb_ids, max_per_bucket):
-    """Pick depth (2 or 3) per top-level mid-two bucket. For 3-depth buckets that
-    still exceed cap, register them in hash_subbucket_for with N-hex-char depth.
+def _build_depth_table(stems, max_per_bucket):
+    """Pick depth (2 or 3) per top-level mid-two bucket so STEM count (not PDB-ID
+    count) per leaf bucket is <= max_per_bucket. A single PDB ID can map to many
+    chain stems, so the count that matters for filesystem-level distribution is
+    stems, not PDB IDs.
     """
-    by_2 = defaultdict(list)
-    for p in pdb_ids:
-        by_2[p[1:3]].append(p)
+    by_2 = defaultdict(int)
+    by_2_pdb = defaultdict(set)
+    for s in stems:
+        p = pdb_id_from_stem(s)
+        by_2[p[1:3]] += 1
+        by_2_pdb[p[1:3]].add(p)
 
     depth_table = {}
     hash_subbucket_for = {}
-    for mid2, members in by_2.items():
-        if len(members) <= max_per_bucket:
+    for mid2, stem_count in by_2.items():
+        if stem_count <= max_per_bucket:
             depth_table[mid2] = 2
             continue
         # Try depth 3
-        by_3 = defaultdict(list)
-        for p in members:
-            by_3[p[1:4]].append(p)
-        if max(len(v) for v in by_3.values()) <= max_per_bucket:
+        by_3 = defaultdict(int)
+        for s in stems:
+            p = pdb_id_from_stem(s)
+            if p[1:3] == mid2:
+                by_3[p[1:4]] += 1
+        if max(by_3.values()) <= max_per_bucket:
             depth_table[mid2] = 3
             continue
         # Some 3-bucket still over cap -> use hash sub-bucket
         depth_table[mid2] = 3
-        for mid3, sub_members in by_3.items():
-            if len(sub_members) <= max_per_bucket:
+        for mid3, sub_stem_count in by_3.items():
+            if sub_stem_count <= max_per_bucket:
                 continue
-            # Pick smallest hex-prefix that puts each sub-bucket under cap
+            # Pick smallest hex-prefix that puts each sub-bucket under cap.
+            # Count stems landing in each hash sub-bucket.
+            sub_pdb_ids = [p for p in by_2_pdb[mid2] if p[1:4] == mid3]
+            stems_in_mid3 = [s for s in stems
+                             if pdb_id_from_stem(s) in set(sub_pdb_ids)]
             for nhex in (1, 2, 3):
                 by_h = defaultdict(int)
-                for p in sub_members:
+                for s in stems_in_mid3:
+                    p = pdb_id_from_stem(s)
                     h = hashlib.md5(p.encode()).hexdigest()[:nhex]
                     by_h[h] += 1
                 if max(by_h.values()) <= max_per_bucket:
@@ -111,7 +123,7 @@ def id_to_bucket(stem, manifest):
 def build_manifest(stems_path, manifest_path, max_per_bucket):
     stems = [s.strip() for s in Path(stems_path).read_text().splitlines() if s.strip()]
     pdb_ids = sorted({pdb_id_from_stem(s) for s in stems})
-    depth_table, hash_subbucket_for = _build_depth_table(pdb_ids, max_per_bucket)
+    depth_table, hash_subbucket_for = _build_depth_table(stems, max_per_bucket)
     manifest = {
         "max_per_bucket": max_per_bucket,
         "n_pdb_ids": len(pdb_ids),
