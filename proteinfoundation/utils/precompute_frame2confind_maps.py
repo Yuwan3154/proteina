@@ -25,7 +25,7 @@ import json
 import os
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -174,6 +174,15 @@ def _iter_processed(
     return results
 
 
+def _save_one(path, graph):
+    """Atomic-style save: write to tmp, rename. Used by ThreadPoolExecutor so a
+    batch's saves run concurrently — Lustre/GPFS per-file latency (~20-30ms) is
+    I/O-bound, threads share the GIL only briefly."""
+    tmp_path = path.with_suffix(".pt.tmp")
+    torch.save(graph, tmp_path)
+    tmp_path.rename(path)
+
+
 def run_precompute(
     checkpoint: str,
     processed_dir: str,
@@ -187,6 +196,7 @@ def run_precompute(
     log_path: Optional[str] = None,
     scan_workers: int = 1,
     length_cache: Optional[str] = None,
+    save_workers: int = 8,
 ) -> Dict[str, float]:
     """Run GPU-accelerated ConFind precompute.
 
@@ -338,43 +348,57 @@ def run_precompute(
         )  # [B, Lmax, Lmax]
         infer_sec = time.perf_counter() - infer_start
 
-        # Save results back to .pt files
+        # Save results back to .pt files. Each save is an independent
+        # tmp-then-rename on shared storage (Lustre/GPFS); per-file latency is
+        # ~20-30ms serial, so we dispatch the batch in parallel threads to
+        # overlap that latency.
         save_start = time.perf_counter()
+        # Stage contact maps onto each graph before dispatching saves.
+        save_payloads = []  # (path, graph, L)
         for i, (path, graph) in enumerate(zip(batch_paths, batch_graphs)):
             L = int(collated["lengths"][i].item())
-            # Extract [L, L] and store as float16 (matching CPU precompute format)
             contact_probs = probs[i, :L, :L].contiguous().to(dtype=torch.float16)
             graph.contact_map_confind = contact_probs
-            try:
-                tmp_path = path.with_suffix(".pt.tmp")
-                torch.save(graph, tmp_path)
-                tmp_path.rename(path)
-                if csv_writer:
-                    csv_writer.writerow(
-                        {
-                            "file": path.name,
-                            "length": L,
-                            "status": "processed",
-                            "infer_sec": infer_sec / len(batch_items),
-                            "save_sec": 0.0,  # filled below
-                            "error": "",
-                        }
-                    )
-                processed_count += 1
-                total_residues += L
-            except Exception as e:
-                if csv_writer:
-                    csv_writer.writerow(
-                        {
-                            "file": path.name,
-                            "length": L,
-                            "status": "failed",
-                            "infer_sec": infer_sec / len(batch_items),
-                            "save_sec": 0.0,
-                            "error": str(e),
-                        }
-                    )
-                failed_count += 1
+            save_payloads.append((path, graph, L))
+
+        save_pool = ThreadPoolExecutor(max_workers=save_workers)
+        try:
+            fut_to_meta = {
+                save_pool.submit(_save_one, path, graph): (path, L)
+                for (path, graph, L) in save_payloads
+            }
+            for fut in as_completed(fut_to_meta):
+                path, L = fut_to_meta[fut]
+                err = fut.exception()
+                if err is None:
+                    if csv_writer:
+                        csv_writer.writerow(
+                            {
+                                "file": path.name,
+                                "length": L,
+                                "status": "processed",
+                                "infer_sec": infer_sec / len(batch_items),
+                                "save_sec": 0.0,
+                                "error": "",
+                            }
+                        )
+                    processed_count += 1
+                    total_residues += L
+                else:
+                    if csv_writer:
+                        csv_writer.writerow(
+                            {
+                                "file": path.name,
+                                "length": L,
+                                "status": "failed",
+                                "infer_sec": infer_sec / len(batch_items),
+                                "save_sec": 0.0,
+                                "error": str(err),
+                            }
+                        )
+                    failed_count += 1
+        finally:
+            save_pool.shutdown(wait=True)
 
         save_sec = time.perf_counter() - save_start
         total_infer_sec += infer_sec
@@ -471,6 +495,11 @@ def main() -> None:
              "If present, the scan is skipped. If absent, the scan result "
              "is written here for reuse.",
     )
+    parser.add_argument(
+        "--save-workers", type=int, default=8,
+        help="ThreadPoolExecutor workers for concurrent torch.save (saves are "
+             "shared-storage latency bound; 8-16 typically overlaps well).",
+    )
     args = parser.parse_args()
 
     run_precompute(
@@ -486,6 +515,7 @@ def main() -> None:
         log_path=args.log_path,
         scan_workers=args.scan_workers,
         length_cache=args.length_cache,
+        save_workers=args.save_workers,
     )
 
 
