@@ -81,6 +81,11 @@ model:
 dataset: pdb_train_contact-confind_S25_max256_purge-test_cutoff-190828
 dataset_config_subdir: pdb
 
+# Load processed .pt files into RAM at training start (policy switch 2026-05-26).
+# Overrides datamodule.in_memory in the dataset YAML.
+datamodule:
+  in_memory: True
+
 force_precision_f32: False
 
 training:
@@ -185,3 +190,70 @@ ema:
   validate_original_weights: False
   every_n_steps: 1
   cpu_offload: False
+
+# ==============================================================================
+# Inference Configuration Section
+# Used when calling inference scripts (inference.py / motif_inference.py)
+# directly with this unified config file.
+# Stage-1 inference mirrors training: seq_cond=False, zero_sin_pos_emb=False
+# (matching the residue_type embeddings disabled + sinusoidal-pos-emb-on regime).
+# ==============================================================================
+inference:
+  # 'best' resolves the run's best TM-score ckpt from
+  # ./store/{run_name_}/checkpoints/ (writer is log.checkpoint_best_tmscore_median).
+  # 'last' resolves the most-recent checkpoint instead.
+  checkpoint_mode: "best"
+  # Backward-compatibility explicit path (overrides checkpoint_mode if set).
+  ckpt_path: null
+  ckpt_name: null
+
+  ncpus_: 24
+  seed: 42
+
+  # Lengths to sample (uses nres_lens if set, else arange(min_len, max_len+1, step))
+  nres_lens: [50, 100, 150, 200, 250]
+  min_len: null
+  max_len: null
+  step_len: null
+
+  nsamples_per_len: 1024
+  max_nsamples: 32
+
+  # Sampling
+  dt: 0.005
+  self_cond: True
+  fold_cond: False
+  cath_code_level: "T"
+  seq_cond: False
+  zero_sin_pos_emb: False
+
+  data_dir: ${oc.env:DATA_PATH}/pdb_train/
+  cath_code_file: cath_codes_train_df_pdb_f1_minl50_maxl256_mtprotein_etdiffractionEM_minoNone_maxoNone_minr0.0_maxr5.0_hl_rl_rnsrTrue_rpuTrue_l_rcuFalse.csv
+
+  # ext_lig default for inference: "unknown" (2, AFDB-style) or "absent" (0, apo).
+  ext_lig_default: "unknown"
+
+  # Sampling params for the caflow/contactflow sampler used by this model class
+  sampling_caflow:
+    sampling_mode: sc
+    sc_scale_noise: 0.45
+    sc_scale_score: 1.0
+    gt_mode: "1/t"
+    gt_p: 1.0
+    gt_clamp_val: null
+
+  schedule:
+    schedule_mode: log
+    schedule_p: 2.0
+
+  # LoRA — mirror training if you use lora
+  lora:
+    use: False
+    lora_alpha: 32.0
+    lora_dropout: 0.0
+    r: 0
+    train_bias: "none"
+
+  designability_seqs_per_struct: 8
+  compute_designability: False
+  compute_fid: False
