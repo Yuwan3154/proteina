@@ -567,7 +567,14 @@ class PDBDataset(Dataset):
 
         if self.in_memory:
             rank_zero_info("Reading data into memory")
-            self.data = [torch.load(self.processed_dir / f) for f in tqdm(file_names)]
+            # map_location="cpu" defends against .pt files whose tensors were
+            # saved with a CUDA device (e.g. d_FS files written by
+            # precompute_frame2confind_maps before the to("cpu") fix); without
+            # this the load fails on CPU-only DataLoader workers and OOMs the
+            # GPU when forked workers inherit a CUDA context.
+            self.data = [torch.load(self.processed_dir / f, map_location="cpu",
+                                    weights_only=False)
+                         for f in tqdm(file_names)]
 
     def __len__(self):
         return len(self.file_names)
@@ -626,7 +633,7 @@ class PDBDataset(Dataset):
                 if debug:
                     logger.info(f"{self._data_load_log_prefix()} loading fname={fname} ...")
                 try:
-                    graph = torch.load(path, weights_only=False)
+                    graph = torch.load(path, map_location="cpu", weights_only=False)
                 except Exception as e:
                     elapsed = time.perf_counter() - t0
                     err_msg = str(e).lower()

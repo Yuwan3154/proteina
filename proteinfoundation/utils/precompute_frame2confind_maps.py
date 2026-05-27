@@ -362,10 +362,15 @@ def run_precompute(
         # overlap that latency.
         save_start = time.perf_counter()
         # Stage contact maps onto each graph before dispatching saves.
+        # Move to CPU before assigning so the saved .pt file does NOT pickle a
+        # CUDA device reference (would break loading on CPU-only DataLoader
+        # workers and waste GPU memory at training time).
         save_payloads = []  # (path, graph, L)
         for i, (path, graph) in enumerate(zip(batch_paths, batch_graphs)):
             L = int(collated["lengths"][i].item())
-            contact_probs = probs[i, :L, :L].contiguous().to(dtype=torch.float16)
+            contact_probs = (
+                probs[i, :L, :L].contiguous().to(dtype=torch.float16).cpu()
+            )
             graph.contact_map_confind = contact_probs
             save_payloads.append((path, graph, L))
 
