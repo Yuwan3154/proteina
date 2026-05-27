@@ -1,7 +1,7 @@
 datamodule:
   _target_: "proteinfoundation.datasets.pdb_data.PDBLightningDataModule"
   data_dir: ${oc.env:DATA_PATH}/d_FS/
-  in_memory: False
+  in_memory: True  # policy switch 2026-05-26: load processed .pt into RAM at training start
   format: "pdb"
   overwrite: False
   regenerate_missing: True
@@ -33,3 +33,8 @@ datamodule:
     split_type: "random"
     split_sequence_similarity: 0.5
     overwrite_sequence_clusters: False
+    # Bad-AFDB exclusion (per ~/data/bad_afdb/ pdb_70_cluster_reps...with_cath.csv).
+    # PDBDataSplitter.split_data filters by the `id` column at line ~325-411 of
+    # pdb_data.py; the folder loader sets id = pdb_file.stem so stems must
+    # match (format: AF-<UniProt>-F1-model_v6).
+    exclude_ids_from_file: ${oc.env:DATA_PATH}/d_FS/exclude_bad_afdb.txt
