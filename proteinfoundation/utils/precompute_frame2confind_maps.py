@@ -197,6 +197,8 @@ def run_precompute(
     scan_workers: int = 1,
     length_cache: Optional[str] = None,
     save_workers: int = 8,
+    shard_id: int = 0,
+    num_shards: int = 1,
 ) -> Dict[str, float]:
     """Run GPU-accelerated ConFind precompute.
 
@@ -266,6 +268,12 @@ def run_precompute(
 
     # Sort by length descending (longest first for efficient batching)
     pending.sort(key=lambda x: x[1], reverse=True)
+
+    # Optional shard split (run N concurrent GPU jobs over disjoint slices).
+    # We deal cards round-robin so each shard sees similar length distribution.
+    if num_shards > 1:
+        pending = [item for i, item in enumerate(pending) if (i % num_shards) == shard_id]
+        _log(f"Shard {shard_id}/{num_shards}: {len(pending)} files in this shard", log_file)
 
     if limit > 0:
         pending = pending[:limit]
@@ -500,6 +508,10 @@ def main() -> None:
         help="ThreadPoolExecutor workers for concurrent torch.save (saves are "
              "shared-storage latency bound; 8-16 typically overlaps well).",
     )
+    parser.add_argument("--shard-id", type=int, default=0,
+                        help="Index of this shard (0..num_shards-1) for splitting work across GPUs.")
+    parser.add_argument("--num-shards", type=int, default=1,
+                        help="Total number of shards; round-robin split across GPUs.")
     args = parser.parse_args()
 
     run_precompute(
@@ -516,6 +528,8 @@ def main() -> None:
         scan_workers=args.scan_workers,
         length_cache=args.length_cache,
         save_workers=args.save_workers,
+        shard_id=args.shard_id,
+        num_shards=args.num_shards,
     )
 
 
