@@ -49,9 +49,16 @@ from omegaconf import OmegaConf
 # ---------------------------------------------------------------------------
 
 def _iter_processed_files(processed_dir: Path) -> Iterable[Path]:
-    for name in os.listdir(processed_dir):
-        if name.endswith(".pt"):
-            yield processed_dir / name
+    """Yield all .pt files under ``processed_dir``, walking sub-dirs.
+
+    Originally a flat-dir listing; switched to ``rglob`` so the sharded
+    layout (e.g. d_FS processed/<bucket>/*.pt) is handled transparently.
+    Flat directories incur no real cost since rglob just enumerates the
+    single level.
+    """
+    for p in Path(processed_dir).rglob("*.pt"):
+        if p.is_file():
+            yield p
 
 
 def _read_skip_csv(path: Path) -> Tuple[Set[str], List[Dict[str, str]]]:

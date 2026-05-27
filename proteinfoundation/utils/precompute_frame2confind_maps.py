@@ -105,12 +105,15 @@ def _collate_items(items: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tens
 
 
 def _iter_processed(processed_dir: Path, max_len: int) -> List[Tuple[Path, int]]:
-    """Enumerate processed .pt files with lengths, filtering by max_len."""
+    """Enumerate processed .pt files with lengths, filtering by max_len.
+
+    Uses ``rglob`` so the sharded layout (d_FS processed/<bucket>/*.pt) is
+    walked transparently. Flat dirs incur no extra cost.
+    """
     items = []
-    for name in sorted(os.listdir(processed_dir)):
-        if not name.endswith(".pt"):
+    for path in sorted(Path(processed_dir).rglob("*.pt")):
+        if not path.is_file():
             continue
-        path = processed_dir / name
         try:
             graph = _load_graph(path)
         except Exception:
