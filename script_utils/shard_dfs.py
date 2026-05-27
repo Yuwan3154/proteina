@@ -27,8 +27,6 @@ Usage:
         --dst ~/proteina/data/d_FS/raw \
         --execute
 """
-from __future__ import annotations
-
 import argparse
 import json
 import os
