@@ -643,12 +643,17 @@ class PDBDataset(Dataset):
                          for f in tqdm(file_names)]
 
     def _processed_path_for(self, fname: str) -> pathlib.Path:
-        """Return the processed .pt path for `fname` (e.g. ``1abc_A.pt``).
-        Uses the shard manifest if present, else the flat processed/ layout.
+        """Return the processed .pt path for ``fname`` (stem OR ``stem.pt``).
+
+        Callers in proteina pass either a stem (``1abc_A``) or filename
+        (``1abc_A.pt``) interchangeably — normalize to ``stem.pt`` before
+        joining so the bucket subdir gets the correct filename either way.
         """
+        # Normalize: always end with ".pt"
+        fname_with_pt = fname if fname.endswith(".pt") else f"{fname}.pt"
+        stem = fname_with_pt[:-3]
         if not self.is_sharded or self.shard_manifest is None:
-            return self.processed_dir / fname
-        stem = fname[:-3] if fname.endswith(".pt") else fname
+            return self.processed_dir / fname_with_pt
         pid = stem.split("_", 1)[0]
         depth_table = self.shard_manifest.get("depth_table", {})
         # PDB
@@ -656,23 +661,23 @@ class PDBDataset(Dataset):
             mid2 = pid[1:3]
             depth = depth_table.get(mid2, 2)
             if depth == 2:
-                return self.processed_dir / mid2 / fname
+                return self.processed_dir / mid2 / fname_with_pt
             mid3 = pid[1:4]
             hash_sub = self.shard_manifest.get("hash_subbucket_for", {})
             nhex = hash_sub.get(mid3)
             if nhex is None:
-                return self.processed_dir / mid3 / fname
+                return self.processed_dir / mid3 / fname_with_pt
             import hashlib
             h = hashlib.md5(pid.encode()).hexdigest()[:nhex]
-            return self.processed_dir / mid3 / h / fname
+            return self.processed_dir / mid3 / h / fname_with_pt
         # AFDB
         if stem.startswith("AF-"):
             uniprot = stem[len("AF-"):].split("-", 1)[0]
             if len(uniprot) >= 2:
                 depth = depth_table.get(uniprot[:2], 2)
                 bucket = uniprot[: min(len(uniprot), depth)]
-                return self.processed_dir / bucket / fname
-        return self.processed_dir / fname
+                return self.processed_dir / bucket / fname_with_pt
+        return self.processed_dir / fname_with_pt
 
     def __len__(self):
         return len(self.file_names)
