@@ -55,6 +55,62 @@ from proteinfoundation.datasets.ext_lig_utils import (
 )
 
 
+# ---------- module-level sharded path helpers ----------
+# These are pure functions so they're safe inside @staticmethod multiprocessing
+# workers (don't capture self). They mirror the instance method
+# PDBLightningDataModule._bucket_for_id but operate on a passed manifest dict.
+
+def _bucket_from_manifest(identifier: str, manifest: Optional[dict]) -> Optional[str]:
+    if not manifest:
+        return None
+    pid = identifier.split("_", 1)[0]
+    depth_table = manifest.get("depth_table", {})
+    if len(pid) == 4 and pid[1:3] in depth_table:
+        mid2 = pid[1:3]
+        depth = depth_table.get(mid2, 2)
+        if depth == 2:
+            return mid2
+        mid3 = pid[1:4]
+        nhex = manifest.get("hash_subbucket_for", {}).get(mid3)
+        if nhex is None:
+            return mid3
+        import hashlib
+        h = hashlib.md5(pid.encode()).hexdigest()[:nhex]
+        return f"{mid3}/{h}"
+    if identifier.startswith("AF-"):
+        uniprot = identifier[len("AF-"):].split("-", 1)[0]
+        if len(uniprot) >= 2:
+            depth = depth_table.get(uniprot[:2], 2)
+            return uniprot[: min(len(uniprot), depth)]
+    return None
+
+
+def _processed_path_sharded(processed_dir: pathlib.Path, stem: str,
+                            manifest: Optional[dict]) -> pathlib.Path:
+    bucket = _bucket_from_manifest(stem, manifest)
+    if bucket:
+        return processed_dir / bucket / f"{stem}.pt"
+    return processed_dir / f"{stem}.pt"
+
+
+def _resolve_raw_sharded(raw_dir: pathlib.Path, pdb_or_stem: str,
+                         format_type: str, manifest: Optional[dict]) -> Optional[pathlib.Path]:
+    """Search flat + bucketed for raw .<format>[.gz]. Returns Path or None."""
+    names = [f"{pdb_or_stem}.{format_type}", f"{pdb_or_stem}.{format_type}.gz"]
+    for n in names:
+        p = raw_dir / n
+        if p.exists():
+            return p
+    bucket = _bucket_from_manifest(pdb_or_stem, manifest)
+    if bucket:
+        for n in names:
+            p = raw_dir / bucket / n
+            if p.exists():
+                return p
+    return None
+# ---------- end module-level helpers ----------
+
+
 class PDBDataSelector:
     def __init__(
         self,
@@ -555,6 +611,16 @@ class PDBDataset(Dataset):
         self.format = format
         self.data_dir = pathlib.Path(data_dir)
         self.processed_dir = self.data_dir / "processed"
+        # Auto-load shard manifest for sharded processed/ tree (PDB or AFDB).
+        manifest_path = self.data_dir / "shard_manifest.json"
+        if manifest_path.exists():
+            import json as _json
+            with open(manifest_path) as _fh:
+                self.shard_manifest = _json.load(_fh)
+            self.is_sharded = True
+        else:
+            self.shard_manifest = None
+            self.is_sharded = False
         self.in_memory = in_memory
         self.file_names = file_names
         self.num_workers = num_workers
@@ -572,9 +638,41 @@ class PDBDataset(Dataset):
             # precompute_frame2confind_maps before the to("cpu") fix); without
             # this the load fails on CPU-only DataLoader workers and OOMs the
             # GPU when forked workers inherit a CUDA context.
-            self.data = [torch.load(self.processed_dir / f, map_location="cpu",
-                                    weights_only=False)
+            self.data = [torch.load(self._processed_path_for(f),
+                                    map_location="cpu", weights_only=False)
                          for f in tqdm(file_names)]
+
+    def _processed_path_for(self, fname: str) -> pathlib.Path:
+        """Return the processed .pt path for `fname` (e.g. ``1abc_A.pt``).
+        Uses the shard manifest if present, else the flat processed/ layout.
+        """
+        if not self.is_sharded or self.shard_manifest is None:
+            return self.processed_dir / fname
+        stem = fname[:-3] if fname.endswith(".pt") else fname
+        pid = stem.split("_", 1)[0]
+        depth_table = self.shard_manifest.get("depth_table", {})
+        # PDB
+        if len(pid) == 4 and pid[1:3] in depth_table:
+            mid2 = pid[1:3]
+            depth = depth_table.get(mid2, 2)
+            if depth == 2:
+                return self.processed_dir / mid2 / fname
+            mid3 = pid[1:4]
+            hash_sub = self.shard_manifest.get("hash_subbucket_for", {})
+            nhex = hash_sub.get(mid3)
+            if nhex is None:
+                return self.processed_dir / mid3 / fname
+            import hashlib
+            h = hashlib.md5(pid.encode()).hexdigest()[:nhex]
+            return self.processed_dir / mid3 / h / fname
+        # AFDB
+        if stem.startswith("AF-"):
+            uniprot = stem[len("AF-"):].split("-", 1)[0]
+            if len(uniprot) >= 2:
+                depth = depth_table.get(uniprot[:2], 2)
+                bucket = uniprot[: min(len(uniprot), depth)]
+                return self.processed_dir / bucket / fname
+        return self.processed_dir / fname
 
     def __len__(self):
         return len(self.file_names)
@@ -612,7 +710,8 @@ class PDBDataset(Dataset):
                 else:
                     fname = f"{self.pdb_codes[cur]}.pt"
 
-                path = self.data_dir / "processed" / fname
+                # Sharded-aware path: works for flat (degenerates) and bucketed layouts.
+                path = self._processed_path_for(fname)
 
                 if debug:
                     logger.info(
@@ -816,6 +915,21 @@ class PDBLightningDataModule(BaseLightningDataModule):
         self.processed_dir = self.data_dir / "processed"
         self.raw_dir.mkdir(parents=True, exist_ok=True)
         self.processed_dir.mkdir(parents=True, exist_ok=True)
+        # Optional shard manifest: presence enables sharded raw + processed
+        # layouts. Manifest schema (per script_utils/shard_pdb.py and
+        # script_utils/shard_dfs.py): depth_table (mid2 -> 2|3),
+        # hash_subbucket_for (mid3 -> nhex). If absent, paths stay flat.
+        manifest_path = self.data_dir / "shard_manifest.json"
+        if manifest_path.exists():
+            import json as _json
+            with open(manifest_path) as _fh:
+                self.shard_manifest = _json.load(_fh)
+            self.is_sharded = True
+            rank_zero_info(f"Loaded shard manifest: {manifest_path} "
+                           f"(buckets={self.shard_manifest.get('n_buckets', '?')})")
+        else:
+            self.shard_manifest = None
+            self.is_sharded = False
         self.dataselector = dataselector
         self.datasplitter = datasplitter
         self.sampling_mode = sampling_mode
@@ -834,6 +948,78 @@ class PDBLightningDataModule(BaseLightningDataModule):
         self.file_names = None
         self.min_length = dataselector.min_length if dataselector else None
         self.max_length = dataselector.max_length if dataselector else None
+
+    # ---------- sharded path helpers ----------
+    # Used by ALL raw/processed file lookups so the flat-or-bucketed layout is
+    # transparent. If self.shard_manifest is None the helpers degrade to flat.
+    def _bucket_for_id(self, identifier: str) -> Optional[str]:
+        """Return bucket dir name for a PDB ID or AFDB stem given the manifest.
+
+        - PDB IDs: 4 chars, bucket = mid-two via shard_pdb.py rules.
+        - AFDB stems (``AF-<UniProt>-F1-model_v6``): UniProt prefix via shard_dfs.py rules.
+        Returns None if no manifest is loaded.
+        """
+        if self.shard_manifest is None:
+            return None
+        # Try PDB-style first: identifier is the 4-char pdb_id (or starts with it like
+        # "1abc_A" -> split on underscore).
+        pid = identifier.split("_", 1)[0]
+        depth_table = self.shard_manifest.get("depth_table", {})
+        if len(pid) == 4 and pid[1:3] in depth_table:
+            # PDB middle-two-char (atomworks/PDB-mirror convention)
+            mid2 = pid[1:3]
+            depth = depth_table.get(mid2, 2)
+            if depth == 2:
+                return mid2
+            # depth == 3
+            mid3 = pid[1:4]
+            hash_sub = self.shard_manifest.get("hash_subbucket_for", {})
+            nhex = hash_sub.get(mid3)
+            if nhex is None:
+                return mid3
+            import hashlib
+            h = hashlib.md5(pid.encode()).hexdigest()[:nhex]
+            return f"{mid3}/{h}"
+        # AFDB-style: AF-<uniprot>-F1-model_v6
+        if identifier.startswith("AF-"):
+            uniprot = identifier[len("AF-"):].split("-", 1)[0]
+            if len(uniprot) >= 2:
+                depth = depth_table.get(uniprot[:2], 2)
+                return uniprot[: min(len(uniprot), depth)]
+        return None
+
+    def _raw_candidates(self, stem: str) -> List[pathlib.Path]:
+        """All plausible raw-file paths for a given stem, sharded or flat."""
+        names = [f"{stem}.{self.format}", f"{stem}.{self.format}.gz"]
+        cands = []
+        for n in names:
+            cands.append(self.raw_dir / n)
+        if self.is_sharded:
+            bucket = self._bucket_for_id(stem)
+            if bucket:
+                for n in names:
+                    cands.append(self.raw_dir / bucket / n)
+        return cands
+
+    def _resolve_raw(self, stem: str) -> Optional[pathlib.Path]:
+        for c in self._raw_candidates(stem):
+            if c.exists():
+                return c
+        return None
+
+    def _processed_path(self, stem: str) -> pathlib.Path:
+        """Where to write/find a processed .pt for this stem. Always returns the
+        intended target path (creates parent dir as side effect on write callers).
+        """
+        if self.is_sharded:
+            bucket = self._bucket_for_id(stem)
+            if bucket:
+                return self.processed_dir / bucket / f"{stem}.pt"
+        return self.processed_dir / f"{stem}.pt"
+
+    def _processed_exists(self, stem: str) -> bool:
+        return self._processed_path(stem).exists()
+    # ---------- end sharded path helpers ----------
 
     def prepare_data(self):
         if self.dataselector:
@@ -877,7 +1063,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
                     f"Dataset created with {len(df_data)} entries. Now downloading structure data..."
                 )
                 self._download_structure_data(df_data["pdb"].tolist())
-                has_processed = any(self.processed_dir.glob("*.pt"))
+                has_processed = any(self.processed_dir.rglob("*.pt"))
                 newly_processed = []
                 if self.overwrite or not has_processed or self.regenerate_missing:
                     newly_processed = self._process_structure_data(
@@ -937,7 +1123,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
                 if self.max_samples is not None:
                     df_data = df_data.head(self.max_samples)
                     rank_zero_info(f"Limiting to {len(df_data)} samples (max_samples={self.max_samples})")
-                has_processed = any(self.processed_dir.glob("*.pt"))
+                has_processed = any(self.processed_dir.rglob("*.pt"))
                 newly_processed = []
                 if self.overwrite or not has_processed or self.regenerate_missing:
                     newly_processed = self._process_structure_data(
@@ -962,9 +1148,9 @@ class PDBLightningDataModule(BaseLightningDataModule):
         Returns:
             pd.DataFrame: DataFrame with 'pdb' column containing filenames
         """
-        # Get all files with the specified format extension
-        pdb_files = list(data_dir.glob(f"*.{self.format}"))
-        
+        # Walk flat AND any bucket subdirs (sharded raw layouts).
+        pdb_files = list(data_dir.rglob(f"*.{self.format}"))
+
         # Create DataFrame with filenames
         df_data = pd.DataFrame({
             'pdb': [pdb_file.stem for pdb_file in pdb_files],
@@ -1025,7 +1211,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
         drop_stems = set(stems) - set(df_filtered[id_col].astype(str))
 
         for stem in drop_stems:
-            path = self.processed_dir / f"{stem}.pt"
+            path = self._processed_path(stem)
             if path.exists():
                 nres = length_map.get(stem)
                 drop = nres is None
@@ -1054,7 +1240,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
         add_safe_globals([tgd.Data])
         sequences = []
         for sid in df_data[id_col].astype(str):
-            path = self.processed_dir / f"{sid}.pt"
+            path = self._processed_path(sid)
             if not path.exists():
                 sequences.append("")
                 continue
@@ -1077,9 +1263,10 @@ class PDBLightningDataModule(BaseLightningDataModule):
         return df_data
 
     @staticmethod
-    def _get_length_from_pt(stem: str, processed_dir: pathlib.Path) -> Tuple[str, Optional[int]]:
+    def _get_length_from_pt(stem: str, processed_dir: pathlib.Path,
+                            shard_manifest: Optional[dict] = None) -> Tuple[str, Optional[int]]:
         add_safe_globals([tgd.Data])
-        path = processed_dir / f"{stem}.pt"
+        path = _processed_path_sharded(processed_dir, stem, shard_manifest)
         if not path.exists():
             return stem, None
         try:
@@ -1109,6 +1296,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
             process_func = functools.partial(
                 self._get_length_from_pt,
                 processed_dir=self.processed_dir,
+                shard_manifest=self.shard_manifest,
             )
             # Use map with chunksize to reduce overhead of submitting many small tasks
             chunksize = max(1, len(stems) // (self.num_workers * 4))
@@ -1125,7 +1313,9 @@ class PDBLightningDataModule(BaseLightningDataModule):
             # Sequential fallback
             add_safe_globals([tgd.Data])
             for stem in tqdm(stems, desc="Checking file lengths", unit="file"):
-                stem_ret, length = self._get_length_from_pt(stem, self.processed_dir)
+                stem_ret, length = self._get_length_from_pt(
+                    stem, self.processed_dir, self.shard_manifest
+                )
                 length_map[stem_ret] = length
                 
         return length_map
@@ -1280,13 +1470,13 @@ class PDBLightningDataModule(BaseLightningDataModule):
             index_pdb_tuples = [
                 (i, pdb, chains[i])
                 for i, pdb in enumerate(pdb_codes)
-                if not (self.processed_dir / f"{pdb}_{chains[i]}.pt").exists()
+                if not self._processed_exists(f"{pdb}_{chains[i]}")
             ]
         else:
             index_pdb_tuples = [
                 (i, pdb)
                 for i, pdb in enumerate(pdb_codes)
-                if not (self.processed_dir / f"{pdb}.pt").exists()
+                if not self._processed_exists(pdb)
             ]
 
         if not index_pdb_tuples:
@@ -1313,6 +1503,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
                 pre_transform=self.pre_transform,
                 pre_filter=self.pre_filter,
                 database_tag=database_tag,
+                shard_manifest=self.shard_manifest,
             )
             
             chunksize = max(1, len(index_pdb_tuples) // (self.num_workers * 4))
@@ -1351,6 +1542,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
         pre_transform: Optional[Callable] = None,
         pre_filter: Optional[Callable] = None,
         database_tag: str = "pdb",
+        shard_manifest: Optional[dict] = None,
     ) -> Optional[str]:
         """
         Static method for processing a single PDB file - suitable for multiprocessing.
@@ -1380,19 +1572,14 @@ class PDBLightningDataModule(BaseLightningDataModule):
                 raise ValueError("index_pdb_tuple must have 2 or 3 elements")
 
             pdb_code = pdb.lower()
-            path = raw_dir / f"{pdb_code}.{format_type}"
-            if path.exists():
-                path = str(path)
-            elif (raw_dir / f"{pdb}.{format_type}").exists():
-                path = str(raw_dir / f"{pdb}.{format_type}")
-            elif path.with_suffix("." + format_type + ".gz").exists():
-                path = str(path.with_suffix("." + format_type + ".gz"))
-            elif (raw_dir / f"{pdb}.{format_type}.gz").exists():
-                path = str(raw_dir / f"{pdb}.{format_type}.gz")
-            else:
+            resolved = (_resolve_raw_sharded(raw_dir, pdb_code, format_type, shard_manifest)
+                        or _resolve_raw_sharded(raw_dir, pdb, format_type, shard_manifest))
+            if resolved is None:
                 raise FileNotFoundError(
-                    f"{pdb} not found in raw directory. Are you sure it's downloaded and has the format {format_type}?"
+                    f"{pdb} not found in raw directory (flat or sharded). "
+                    f"Format: {format_type}"
                 )
+            path = str(resolved)
 
             def _to_float_tensor(arr):
                 if isinstance(arr, torch.Tensor):
@@ -1452,7 +1639,10 @@ class PDBLightningDataModule(BaseLightningDataModule):
                 if pre_filter(graph) is not True:
                     return None
 
-            torch.save(graph, processed_dir / fname)
+            stem = fname[:-3] if fname.endswith(".pt") else fname
+            target = _processed_path_sharded(processed_dir, stem, shard_manifest)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(graph, target)
             return fname
 
         except Exception as e:
@@ -1497,19 +1687,13 @@ class PDBLightningDataModule(BaseLightningDataModule):
                 raise ValueError("index_pdb_tuple must have 2 or 3 elements")
 
             pdb_code = pdb.lower()
-            path = self.raw_dir / f"{pdb_code}.{self.format}"
-            if path.exists():
-                path = str(path)
-            elif (self.raw_dir / f"{pdb}.{self.format}").exists():
-                path = str(self.raw_dir / f"{pdb}.{self.format}")
-            elif path.with_suffix("." + self.format + ".gz").exists():
-                path = str(path.with_suffix("." + self.format + ".gz"))
-            elif (self.raw_dir / f"{pdb}.{self.format}.gz").exists():
-                path = str(self.raw_dir / f"{pdb}.{self.format}.gz")
-            else:
+            resolved = self._resolve_raw(pdb_code) or self._resolve_raw(pdb)
+            if resolved is None:
                 raise FileNotFoundError(
-                    f"{pdb} not found in raw directory. Are you sure it's downloaded and has the format {self.format}?"
+                    f"{pdb} not found in raw directory (flat or sharded). "
+                    f"Format: {self.format}"
                 )
+            path = str(resolved)
 
             def _to_float_tensor(arr):
                 if isinstance(arr, torch.Tensor):
@@ -1583,7 +1767,10 @@ class PDBLightningDataModule(BaseLightningDataModule):
             if self.pre_filter(graph) is not True:
                 return None
 
-        torch.save(graph, self.processed_dir / fname)
+        stem = fname[:-3] if fname.endswith(".pt") else fname
+        target = self._processed_path(stem)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(graph, target)
         return fname
 
     def _download_structure_data(self, pdb_codes) -> None:
@@ -1594,10 +1781,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
                 else [
                     pdb
                     for pdb in pdb_codes
-                    if not (
-                        (self.raw_dir / f"{pdb}.{self.format}").exists()
-                        or (self.raw_dir / f"{pdb}.{self.format}.gz").exists()
-                    )
+                    if self._resolve_raw(pdb) is None
                 ]
             )
             to_download = list(set(to_download))
