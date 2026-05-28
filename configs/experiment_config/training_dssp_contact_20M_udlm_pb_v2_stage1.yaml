@@ -142,7 +142,12 @@ opt:
   debug_log_grads: False
   grad_and_weight_analysis: False
   dist_strategy: ddp
-  dist_backend: gloo
+  # NCCL: gloo's 30-min recv timeout was firing during stage-1 val (validation
+  # trajectory on rank-0 takes longer than ranks-1-3's sync_dist wait). NCCL is
+  # the right GPU collective anyway; gloo was a leftover from before stage-1
+  # had heavy val sampling. Callback `cluster_sampler_audit_callback.py`
+  # all_gather'd CPU tensors which NCCL refuses — fixed alongside this switch.
+  dist_backend: nccl
   use_lr_warmup: True
   warmup_steps: 3000
   warmup_start_lr_ratio: 0.0
@@ -156,26 +161,29 @@ log:
   log_structure_every_n_steps: 100
   checkpoint: True
   last_ckpt_every_n_steps: 2000
-  # Save an additional best-of-run checkpoint based on validation_sampling/tmscore_median
-  # (higher = better). save_top_k=1 keeps just the best one and removes worse ones.
-  # Set False to disable.
-  checkpoint_best_tmscore_median: True
+  # Disabled in stage-1: training has no sequence conditioning (seq_cond=False),
+  # so USalign(sampled_struct, GT_struct) measures noise — there's no reason for
+  # the sampled structure to align with any particular GT. We rely on
+  # last_ckpt_every_n_steps=2000 + the final `last.ckpt` for stage-2 bootstrap.
+  # Stage-2 (seq_cond=True) re-enables this metric.
+  checkpoint_best_tmscore_median: False
 
 validation_sampling:
   dt: 0.005
   sampling_mode: sc
   sc_scale_noise: 0.45
-  # NOTE: tmscore_n_samples counts BATCHES (not samples). 8 batches of val_batch_size
-  # = 4 samples each → 32 samples in the concatenated val trajectory. Each chunk
-  # then runs at training-batch memory (see tmscore_traj_chunk_size).
-  tmscore_n_samples: 8
-  tmscore_every_n_val_epochs: 1
-  tmscore_mode: 5
-  # Cap the per-trajectory NN forward at training-batch memory. Stage 1 uses
-  # per-GPU micro-batch=8, so chunk at 8 to match training memory profile per
-  # trajectory call. With tmscore_n_samples=8 batches buffered * 8 = 64 total
-  # samples in stats, run as 8 chunks of 8 each.
-  tmscore_traj_chunk_size: 8
+  # STAGE 1 = qualitative-only validation sampling. tmscore_n_samples == 0
+  # gates the new branch in model_trainer_base._run_validation_trajectory:
+  # rank-0 generates exactly 1 sample with fresh noise + variable-length
+  # sampling and logs structure / contact map / sampled DSSP to wandb;
+  # ranks 1-3 skip the trajectory entirely (no compute waste). No USalign,
+  # no TM-score, no contact-map metrics aggregation.
+  #
+  # Stage-2 sets tmscore_n_samples=8: each rank generates 8/world_size=2
+  # samples, all ranks accumulate per-sample TM-scores into the local list,
+  # on_validation_epoch_end_data gathers everything to rank-0 for the
+  # tmscore_median/mean payload.
+  tmscore_n_samples: 0
   # STAGE 1: random L per val epoch (drawn from dataselector min/max_length =
   # 50/256). Stage 1 is generative-style pretraining without sequence info, so
   # evaluating across lengths is more informative than evaluating on each

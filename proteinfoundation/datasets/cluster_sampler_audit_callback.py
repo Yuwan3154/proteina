@@ -93,22 +93,31 @@ class ClusterSamplerAuditCallback(L.Callback):
 
         # Pad to a common length so all_gather works (different ranks see
         # slightly different partition sizes when not drop_last).
-        local_len = torch.tensor(len(rank_indices), dtype=torch.long)
+        # NCCL only supports CUDA tensors; gloo supports both. Always go via
+        # GPU when CUDA is available so the same code path works on both backends.
+        coll_device = (
+            torch.device(f"cuda:{torch.cuda.current_device()}")
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
+        local_len = torch.tensor(len(rank_indices), dtype=torch.long, device=coll_device)
         if dist.is_initialized():
             world_size = dist.get_world_size()
             rank = dist.get_rank()
             sizes = [torch.zeros_like(local_len) for _ in range(world_size)]
             dist.all_gather(sizes, local_len)
             max_len = int(max(s.item() for s in sizes))
-            padded = torch.full((max_len,), -1, dtype=torch.long)
-            padded[: len(rank_indices)] = torch.tensor(rank_indices, dtype=torch.long)
+            padded = torch.full((max_len,), -1, dtype=torch.long, device=coll_device)
+            padded[: len(rank_indices)] = torch.tensor(
+                rank_indices, dtype=torch.long, device=coll_device
+            )
             gathered = [torch.zeros_like(padded) for _ in range(world_size)]
             dist.all_gather(gathered, padded)
             if rank != 0:
                 return  # only rank 0 reports
             all_indices: List[int] = []
             for buf, sz in zip(gathered, sizes):
-                all_indices.extend(buf[: int(sz.item())].tolist())
+                all_indices.extend(buf[: int(sz.item())].cpu().tolist())
         else:
             all_indices = rank_indices
 

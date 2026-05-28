@@ -125,7 +125,12 @@ opt:
   debug_log_grads: False
   grad_and_weight_analysis: False
   dist_strategy: ddp
-  dist_backend: gloo
+  # NCCL: required for the new distributed val-trajectory path —
+  # `_run_validation_trajectory` runs `generate(nsamples=tmscore_n_samples //
+  # world_size)` on every rank and accumulates per-rank TM-scores; gloo's
+  # 30-min recv timeout was too short for the rank-0-only legacy path and
+  # blocked stage-1 entirely. See plan H2.
+  dist_backend: nccl
   use_lr_warmup: True
   warmup_steps: 3000
   warmup_start_lr_ratio: 0.0

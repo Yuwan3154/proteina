@@ -1025,6 +1025,11 @@ class ModelTrainerBase(L.LightningModule):
         self._skip_update_due_to_nonfinite_loss = False
         val_step = batch_idx == -1 or getattr(self, "_in_validation_loop", False)
         log_prefix = "validation_loss" if val_step else "train"
+        # Rate-limited diag heartbeat: every batch during val (rare, slow path),
+        # every 100 batches during training. Use to spot which rank stalls before
+        # the next gloo/nccl barrier when validation deadlocks.
+        if val_step or (int(batch_idx) % 100 == 0):
+            self._diag_log("training_step enter", f"val={val_step} batch_idx={batch_idx}")
         
         # Extract inputs from batch (our dataloader)
         # This may apply augmentations, if requested in the config file
@@ -2096,6 +2101,19 @@ class ModelTrainerBase(L.LightningModule):
     def detach_gradients(self, x):
         """Detaches gradients from sample x"""
 
+    def _diag_log(self, where: str, extra: str = "") -> None:
+        """Rank-aware diagnostic log that does NOT cross DDP barriers.
+
+        Use to pinpoint where ranks stall during DDP collectives. Every rank
+        writes through loguru's plain handler (no sync_dist, no torchmetrics).
+        Post-hoc, grep ``[diag rank=N]`` per N to see how far each rank got
+        before the timeout — the first rank that stopped logging is the one
+        holding the barrier.
+        """
+        rank = getattr(self, "global_rank", -1)
+        step = getattr(self, "global_step", -1)
+        logger.info(f"[diag rank={rank} step={step} t={time.time():.3f}] {where} {extra}")
+
     def validation_step(self, batch, batch_idx):
         """
         This is the validation step for both when generating proteins (dataloader_idx_1) and when evaluating the training
@@ -2111,7 +2129,9 @@ class ModelTrainerBase(L.LightningModule):
                 0 means the batch comes from the length dataloader, contains no data, but the info of the samples to generate (nsamples, nres, dt)
                 1 means the batch comes from the data dataloader, contains data from the dataset, we compute normal training loss
         """
+        self._diag_log("validation_step enter", f"batch_idx={batch_idx}")
         self.validation_step_data(batch, batch_idx)
+        self._diag_log("validation_step exit", f"batch_idx={batch_idx}")
 
     @staticmethod
     def _concat_val_batches(batches: List) -> dict:
@@ -2169,75 +2189,76 @@ class ModelTrainerBase(L.LightningModule):
         """
         Evaluates the training loss, without auxiliary loss nor logging.
         This is done with the function `training_step` with batch_idx -1.
+
+        After the per-batch loss, fire ``_run_validation_trajectory`` AT MOST ONCE
+        per validation epoch (gated by ``_logged_val_traj_epoch``). Two paths:
+
+        - ``tmscore_n_samples == 0`` (stage-1 default): qualitative-only. Rank-0
+          generates one sample with fresh noise + variable-length sampling and
+          logs structure / contact map / sampled DSSP to wandb. Non-rank-0
+          ranks return immediately. No TM-score, no USalign.
+        - ``tmscore_n_samples > 0`` (stage-2 default 8): TM-score path. Each
+          rank generates ``tmscore_n_samples // world_size`` samples; per-rank
+          USalign(sampled, GT) scores are gathered to rank-0 in
+          ``on_validation_epoch_end_data``. Rank-0 also renders one sample for
+          a qualitative wandb panel.
+
+        ``batch`` is not used by ``_run_validation_trajectory`` itself (val
+        sampling uses fresh noise) — it is still consumed by the training_step
+        above for the validation loss. We pass it through to the trajectory
+        helper so the GT DSSP / structure can be shown alongside the sample
+        when available, but the sampling itself doesn't condition on it.
         """
+        self._diag_log("val_step_data: pre training_step", f"batch_idx={batch_idx}")
         with torch.no_grad():
             self._in_validation_loop = True
             loss = self.training_step(batch, batch_idx=batch_idx)
             self._in_validation_loop = False
             self.validation_output_data.append(loss.item())
+        self._diag_log("val_step_data: post training_step", f"batch_idx={batch_idx}")
 
         val_sampling_cfg = self.cfg_exp.get("validation_sampling", None)
         if not val_sampling_cfg or self.global_step <= 0:
             return
-        tmscore_n = int(val_sampling_cfg.get("tmscore_n_samples", 1))
-        every_n = int(val_sampling_cfg.get("tmscore_every_n_val_epochs", 1))
-        if tmscore_n <= 0:
-            return
-        if (self.current_epoch % max(every_n, 1)) != 0:
-            return
         if self._logged_val_traj_epoch == self.current_epoch:
             return  # already fired this epoch
-        # Buffer val batches (cloned + detached) until we have N, then concat
-        # along dim 0 and run a single batched full-trajectory pass. This is the
-        # only way to amortize the ~1/dt forward passes across N samples without
-        # changing val batch_size (which would also change loss aggregation).
-        if not hasattr(self, "_val_traj_buffer") or self._val_traj_buffer is None:
-            self._val_traj_buffer = []
-        if len(self._val_traj_buffer) < tmscore_n:
-            # Snapshot each batch into a plain dict; deep-clone tensors so the
-            # buffered copy survives Lightning's per-step memory churn.
-            def _snap_value(v):
-                if isinstance(v, torch.Tensor):
-                    return v.detach().clone()
-                if isinstance(v, dict):
-                    return {kk: _snap_value(vv) for kk, vv in v.items()}
-                if isinstance(v, list):
-                    return [_snap_value(vv) for vv in v]
-                return v
-
-            buffered: Dict = {}
-            for k in batch.keys():
-                if k in ("batch", "ptr"):
-                    continue
-                buffered[k] = _snap_value(batch[k])
-            self._val_traj_buffer.append(buffered)
-        if len(self._val_traj_buffer) == tmscore_n:
-            concat_batch = self._concat_val_batches(self._val_traj_buffer)
-            self._val_traj_buffer = []
-            # Memory guard: the val-trajectory NN forward has the same per-tensor cost
-            # as training at the same batch dim. With tmscore_n_samples > 1, the
-            # concatenated batch has tmscore_n_samples × val_batch_size samples — for
-            # the user's config that's 8 × 8 = 64, and pair tensors [B, n, n, d] blow up
-            # 8x vs training's B=8 (8.6 GiB per LayerNorm with bf16→fp32 promotion).
-            # Chunk along dim 0 to keep each trajectory call's NN forward at training-
-            # memory parity. Default chunk_size = training batch_size from cfg.opt; the
-            # user can override via validation_sampling.tmscore_traj_chunk_size.
-            opt_batch_size = int(self.cfg_exp.opt.get("batch_size", 1))
-            chunk_size = int(val_sampling_cfg.get("tmscore_traj_chunk_size", opt_batch_size))
-            chunk_size = max(1, chunk_size)
-            nsamples_total = concat_batch["mask"].shape[0]
-            for chunk_idx, start in enumerate(range(0, nsamples_total, chunk_size)):
-                end = min(start + chunk_size, nsamples_total)
-                chunk_batch = self._slice_concat_batch(concat_batch, start, end)
-                # Visualization fires only for the first chunk's first sample;
-                # subsequent chunks just accumulate TM-scores into the shared list.
-                self._run_validation_trajectory(
-                    chunk_batch,
-                    val_sampling_cfg,
-                    log_visualization=(chunk_idx == 0),
-                    accumulate_metric=True,
-                )
-            self._logged_val_traj_epoch = self.current_epoch
+        tmscore_n = int(val_sampling_cfg.get("tmscore_n_samples", 0))
+        # Mark the epoch on ALL ranks BEFORE the call so subsequent val
+        # batches across all ranks skip the trajectory consistently. Without
+        # this, the previous code only set the flag on rank 0 (inside the
+        # for-loop), so ranks 1-3 re-entered the buffer/chunk path on every
+        # subsequent val batch.
+        self._logged_val_traj_epoch = self.current_epoch
+        if tmscore_n == 0:
+            # Qualitative path: rank-0 generates 1 sample for viz; others skip.
+            # The early return on non-rank-0 lives inside
+            # _run_validation_trajectory so the diag log fires for both
+            # branches.
+            self._diag_log("val_step_data: traj enter qualitative", "nsamples=1")
+            self._run_validation_trajectory(
+                batch,
+                val_sampling_cfg,
+                nsamples=1,
+                qualitative_only=True,
+            )
+            self._diag_log("val_step_data: traj done qualitative", "")
+        else:
+            # TM-score path: distribute samples across ranks. With world=4 and
+            # tmscore_n=8, each rank does 2 samples in one generate() call —
+            # forwards are shared across the per-rank batch.
+            world_size = max(1, int(getattr(self.trainer, "world_size", 1)))
+            per_rank = max(1, tmscore_n // world_size)
+            self._diag_log(
+                "val_step_data: traj enter distributed",
+                f"world={world_size} per_rank={per_rank} total={per_rank * world_size}",
+            )
+            self._run_validation_trajectory(
+                batch,
+                val_sampling_cfg,
+                nsamples=per_rank,
+                qualitative_only=False,
+            )
+            self._diag_log("val_step_data: traj done distributed", "")
 
     @staticmethod
     def _slice_concat_batch(batch: dict, start: int, end: int) -> dict:
@@ -2276,8 +2297,38 @@ class ModelTrainerBase(L.LightningModule):
         self._val_traj_buffer: List[dict] = []
 
     def on_validation_epoch_end_data(self):
+        # Stage-2 distributed path accumulates per-rank TM-scores + contact
+        # metrics in ``_validation_tmscore_results`` / ``_validation_contact_results``.
+        # Gather every rank's lists to a single flat list before the rank-0
+        # aggregation. NCCL doesn't have a native object collective so we use
+        # the gloo subgroup Lightning creates automatically alongside the
+        # NCCL default group; if that's missing we fall back to using only
+        # the local list (rank-0 still has its share).
+        local_tm = list(getattr(self, "_validation_tmscore_results", []) or [])
+        local_cm = list(getattr(self, "_validation_contact_results", []) or [])
+        results: List[Dict[str, float]] = local_tm
+        contact_results: List[Dict[str, float]] = local_cm
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                world_size = dist.get_world_size()
+                tm_gathered: List = [None] * world_size
+                cm_gathered: List = [None] * world_size
+                dist.all_gather_object(tm_gathered, local_tm)
+                dist.all_gather_object(cm_gathered, local_cm)
+                results = [r for sub in tm_gathered for r in (sub or [])]
+                contact_results = [r for sub in cm_gathered for r in (sub or [])]
+                self._diag_log(
+                    "val_end: gather",
+                    f"world={world_size} tm_total={len(results)} cm_total={len(contact_results)}",
+                )
+        except (RuntimeError, ImportError) as e:
+            logger.warning(
+                f"on_validation_epoch_end_data: dist.all_gather_object failed ({e!r}); "
+                f"falling back to local rank-only aggregation."
+            )
+
         # Aggregate per-sample TMscores accumulated by _run_validation_trajectory.
-        results = getattr(self, "_validation_tmscore_results", None)
         if results and self.logger is not None and hasattr(self.logger, "experiment"):
             if not (hasattr(self.trainer, "is_global_zero") and not self.trainer.is_global_zero):
                 tm_gt = np.array([r["tm_gt_norm"] for r in results], dtype=np.float64)
@@ -2313,10 +2364,10 @@ class ModelTrainerBase(L.LightningModule):
                     )
 
         # Aggregate per-sample contact-map metrics (only present in contact_map_mode
-        # with discrete diffusion). Mean over the per-sample dicts. Each metric key
-        # is logged independently so a sample missing one metric (e.g. no long-range
-        # pairs at all) doesn't poison the rest.
-        contact_results = getattr(self, "_validation_contact_results", None)
+        # with discrete diffusion). Mean over the per-sample dicts (gathered
+        # across ranks above). Each metric key is logged independently so a
+        # sample missing one metric (e.g. no long-range pairs at all) doesn't
+        # poison the rest.
         if contact_results and self.logger is not None and hasattr(self.logger, "experiment"):
             if not (hasattr(self.trainer, "is_global_zero") and not self.trainer.is_global_zero):
                 # Collect all metric keys across the samples (some are optional).
@@ -2393,14 +2444,47 @@ class ModelTrainerBase(L.LightningModule):
         self,
         batch,
         val_sampling_cfg,
-        log_visualization: bool = True,
-        accumulate_metric: bool = False,
+        nsamples: int = 1,
+        qualitative_only: bool = True,
     ):
-        if self.logger is None or not hasattr(self.logger, "experiment"):
+        """Run reverse-diffusion sampling and log/accumulate val metrics.
+
+        Two paths (selected by caller via ``qualitative_only``):
+
+        - ``qualitative_only=True`` (stage-1): only rank-0 runs ``generate()``,
+          logs one sample's structure / contact map / DSSP to wandb. Non-rank-0
+          ranks return immediately so we don't burn 3x compute on duplicate
+          generations that nobody can render (only rank-0 has a wandb logger).
+        - ``qualitative_only=False`` (stage-2): every rank runs ``generate()``
+          on its share of ``nsamples`` samples and locally accumulates per-sample
+          TM-scores + contact-map metrics into ``self._validation_tmscore_results``
+          / ``self._validation_contact_results``. These per-rank lists are
+          gathered to rank-0 in ``on_validation_epoch_end_data``. Rank-0 also
+          renders one sample for a qualitative wandb panel.
+
+        ``nsamples`` is the per-rank sample count (caller already divides
+        total by world_size). Sliced from ``batch`` so the GT/residue_type
+        used for TM-score scoring and CATH/motif conditioning is per-sample
+        consistent.
+        """
+        is_rank0 = not (
+            hasattr(self.trainer, "is_global_zero") and not self.trainer.is_global_zero
+        )
+
+        if qualitative_only and not is_rank0:
+            # Stage-1: only rank-0 generates; others skip to save compute.
+            # The caller-side per-rank sync barrier (the sync_dist=True
+            # self.log calls inside the next validation_step_data invocation)
+            # is what eventually re-aligns the ranks.
+            self._diag_log("traj: skipped (qualitative non-rank-0)", "")
             return
-        if hasattr(self.trainer, "is_global_zero") and not self.trainer.is_global_zero:
+        if is_rank0 and (self.logger is None or not hasattr(self.logger, "experiment")):
+            # Rank-0 without a logger means we couldn't render anyway.
+            self._diag_log("traj: skipped (no logger)", "")
             return
 
+        self._diag_log("traj: enter", f"nsamples={nsamples} qualitative={qualitative_only}")
+        _traj_t0 = time.time()
         dt = float(val_sampling_cfg.get("dt", 0.005))
         sampling_mode = val_sampling_cfg.get("sampling_mode", "sc")
         sc_scale_noise = float(val_sampling_cfg.get("sc_scale_noise", 0.45))
@@ -2409,16 +2493,28 @@ class ModelTrainerBase(L.LightningModule):
         schedule_p = float(val_sampling_cfg.get("schedule_p", 1.0))
         sampling_grid = val_sampling_cfg.get("sampling_grid", None)
 
-        # Take ALL samples in the (possibly concat-buffered) batch — the caller
-        # already restricted the batch to tmscore_n_samples via _concat_val_batches.
-        # All samples share trajectory NN forward passes.
-        mask = batch["mask"].to(self.device)
-        nsamples = mask.shape[0]
+        # Slice the val batch to ``nsamples`` per-sample tensors. The val
+        # dataloader yields batches of size val_batch_size (= train batch_size,
+        # 4 in the user's config); the caller's ``nsamples`` is at most this
+        # (1 for qualitative; 2 = 8/world_size for stage-2 distributed). If
+        # the batch is smaller than requested, we clamp to what's available
+        # and log a warning.
+        mask_all = batch["mask"].to(self.device)
+        avail = int(mask_all.shape[0])
+        if nsamples > avail:
+            logger.warning(
+                f"validation_sampling: requested nsamples={nsamples} > val "
+                f"batch size {avail}; clamping to {avail}."
+            )
+            nsamples = avail
+        mask = mask_all[:nsamples]
         n = mask.shape[-1]
         # Use unmasked sequence for validation sampling (training masks residue_type for seq_cond)
         residue_type = batch.get("residue_type_unmasked", batch.get("residue_type"))
         if residue_type is not None:
-            residue_type = residue_type.to(self.device)
+            residue_type = residue_type[:nsamples].to(self.device)
+        log_visualization = is_rank0  # render only on rank-0 (only it has wandb)
+        accumulate_metric = not qualitative_only  # stage-2 accumulates TM-score + contact
         # Prediction-eval semantics: at inference we don't condition on a known fold.
         # Build fresh all-unknown CATH from scratch instead of reading the buffered
         # cath_code_indices: with tmscore_n_samples>1 the val-traj buffer concatenates
@@ -2575,10 +2671,22 @@ class ModelTrainerBase(L.LightningModule):
             if contact_map is not None:
                 _viz = self._contact_map_to_viz(contact_map)
                 cmap_first = _viz[0] if _viz.dim() >= 2 else _viz
+            # SAMPLED DSSP from generate() — this is what the diffusion model
+            # produced (decoded long indices in {0=loop, 1=helix, 2=strand}).
+            # Lets the user qualitatively check whether the joint
+            # contact-map / structure / DSSP sample looks coherent (e.g. is
+            # the helix annotation consistent with the dihedral profile of
+            # the sampled CA trace). The visualization helper renders this
+            # under `validation_sampling/dssp_pred`.
+            dssp_sampled = result.get("dssp") if isinstance(result, dict) else None
+            dssp_pred_first = (
+                dssp_sampled[0]
+                if isinstance(dssp_sampled, torch.Tensor) and dssp_sampled.numel() > 0
+                else None
+            )
             # GT DSSP from the batch (present whenever DSSPTargetTransform runs;
-            # values in {0,1,2,-1}). The val trajectory doesn't predict DSSP itself,
-            # so we slot the GT into the `dssp_gt` strip (logs cleanly as
-            # `validation_sampling/dssp_gt`).
+            # values in {0,1,2,-1}). Render alongside the sampled DSSP for
+            # side-by-side comparison under `validation_sampling/dssp_gt`.
             dssp_target_raw = batch.get("dssp_target") if isinstance(batch, dict) else None
             dssp_gt_first = (
                 dssp_target_raw[0]
@@ -2593,6 +2701,7 @@ class ModelTrainerBase(L.LightningModule):
                 pair_logits=distogram[0] if distogram is not None else None,
                 residue_type=residue_type[0] if residue_type is not None else None,
                 use_template_inference=predict_from_dist,
+                dssp_pred=dssp_pred_first,
                 dssp_gt=dssp_gt_first,
             )
 
@@ -2676,6 +2785,10 @@ class ModelTrainerBase(L.LightningModule):
                     )
                     if metrics_s is not None:
                         self._validation_contact_results.append(metrics_s)
+        self._diag_log(
+            "traj: exit",
+            f"elapsed={time.time() - _traj_t0:.2f}s nsamples={nsamples}",
+        )
 
     @staticmethod
     def _compute_contact_map_metrics(
