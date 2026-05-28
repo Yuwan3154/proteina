@@ -638,9 +638,33 @@ class PDBDataset(Dataset):
             # precompute_frame2confind_maps before the to("cpu") fix); without
             # this the load fails on CPU-only DataLoader workers and OOMs the
             # GPU when forked workers inherit a CUDA context.
-            self.data = [torch.load(self._processed_path_for(f),
-                                    map_location="cpu", weights_only=False)
-                         for f in tqdm(file_names)]
+            # Skip missing/corrupt files instead of failing the whole load —
+            # 174k+ files mean a handful of zero-byte / truncated artifacts
+            # (e.g. from killed F2C precompute) would otherwise abort training.
+            self.data = []
+            self._skipped_in_memory = []
+            for f in tqdm(file_names):
+                p = self._processed_path_for(f)
+                try:
+                    self.data.append(
+                        torch.load(p, map_location="cpu", weights_only=False)
+                    )
+                except (FileNotFoundError, EOFError, RuntimeError,
+                        OSError) as e:
+                    self._skipped_in_memory.append((str(p), type(e).__name__))
+                    continue
+            if self._skipped_in_memory:
+                rank_zero_info(
+                    f"in_memory load: skipped {len(self._skipped_in_memory)} "
+                    f"file(s); first few: {self._skipped_in_memory[:5]}"
+                )
+            # Rebuild file_names to match self.data ordering for downstream
+            # indexing assumptions in __len__ and __getitem__.
+            kept_paths = {str(self._processed_path_for(f)) for f in file_names
+                          if str(self._processed_path_for(f)) not in
+                          {p for p, _ in self._skipped_in_memory}}
+            self.file_names = [f for f in file_names
+                               if str(self._processed_path_for(f)) in kept_paths]
 
     def _processed_path_for(self, fname: str) -> pathlib.Path:
         """Return the processed .pt path for ``fname`` (stem OR ``stem.pt``).
