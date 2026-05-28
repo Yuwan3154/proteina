@@ -1822,6 +1822,11 @@ class ModelTrainerBase(L.LightningModule):
 
         def _log_contact_image(cmap_tensor: torch.Tensor, key: str, title: str):
             cmap_prob = cmap_tensor.float().clamp(0.0, 1.0).detach().cpu().numpy()
+            # UDLM contact maps come as 2-class softmax (..., 2) - take the
+            # positive (contact=1) class for the heatmap. CB-distance/precomputed
+            # maps come as plain 2D - no reduction needed.
+            if cmap_prob.ndim == 3 and cmap_prob.shape[-1] == 2:
+                cmap_prob = cmap_prob[..., 1]
             cmap_np = cmap_prob * pair_mask_np
             fig, ax = plt.subplots(figsize=(6, 6))
             im = ax.imshow(cmap_np, cmap="viridis", aspect="auto", vmin=0, vmax=1)
