@@ -1,7 +1,7 @@
 datamodule:
   _target_: "proteinfoundation.datasets.pdb_data.PDBLightningDataModule"
   data_dir: ${oc.env:DATA_PATH}/pdb_train/ # Directory where the dataset is stored
-  in_memory: False
+  in_memory: True  # policy switch 2026-05-26: load processed .pt files into RAM at training start (one-time ~15-30 min cost; every subsequent epoch is RAM-fast)
   format: "cif" # format for file download
   overwrite: False # Whether to overwrite existing dataset files and reprocess the raw data
   regenerate_missing: True # When True, regenerate only missing .pt files (e.g. after purge_invalid_pt_files)
