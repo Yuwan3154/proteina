@@ -15,7 +15,7 @@ per-step training losses:
    *expected* — every inner frame Dynamo identifies needs a separate cache
    variant for each (dtype, grad_mode) combination it's invoked under, and
    building them is a one-time warmup cost. The real failure mode is when a
-   frame's variant count exceeds Dynamo's ``cache_size_limit`` (default 8) —
+   frame's variant count exceeds Dynamo's ``recompile_limit`` (raised to 32) —
    that triggers eviction and the cache thrashes (extreme slowdown). The test
    flags any frame exceeding ``MAX_VARIANTS_PER_FRAME``, AND any total recompile
    count exceeding ``MAX_TOTAL_RECOMPILES_SC`` (the warmup ceiling).
@@ -64,16 +64,17 @@ MAX_STEPS = 10
 LOSS_REL_TOL = 0.03
 
 # Cap on how many distinct CACHE VARIANTS Dynamo creates per top-level frame.
-# Dynamo's default cache_size_limit is 8 — anything below that means each
-# variant is a one-time warmup compile, not eviction-driven thrash. If any
-# frame exceeds this, the cache is genuinely thrashing (frames being evicted
-# and recompiled repeatedly), which causes "extreme slowdown" the user warned
-# about. ~5 leaves margin: train + SC variants × {sanity-fp32, training-bf16}
-# typically tops out at 3-4. >8 = recompile loop = failure.
-MAX_VARIANTS_PER_FRAME = 6
+# recompile_limit is raised to 32 (train.py/inference.py) — anything below
+# that means each variant is a one-time warmup compile, not eviction-driven
+# thrash. If any frame exceeds the limit, the cache thrashes (frames evicted
+# and recompiled repeatedly), causing the "extreme slowdown" the user warned
+# about. Measured peak with the alias val-routing fix: ~11 (val-loss only) /
+# ~14 (with validation sampling) on frame 25 (rigid_utils Rotation). 24 leaves
+# headroom above the observed peak while still flagging any approach to 32.
+MAX_VARIANTS_PER_FRAME = 24
 
-# Sanity bound on the absolute count of recompile events. With cache_size_limit
-# unchanged at 8 and ~40 unique inner frames in the model, expect O(60) warmup
+# Sanity bound on the absolute count of recompile events. With recompile_limit
+# raised to 32 and ~40 unique inner frames in the model, expect O(60) warmup
 # recompiles when SC compile is enabled (each frame * each (dtype, grad_mode)
 # variant). The eager baseline normally sees only a handful (sanity-check
 # vs. training dtype variants on the train forward). Flag anything wildly
@@ -283,13 +284,13 @@ def compare(baseline: dict, test: dict) -> int:
         )
 
     # 3b) Per-frame thrash check — high variant count per frame is the real
-    # signal of cache thrash. One frame compiling 8+ times means Dynamo is
+    # signal of cache thrash. One frame compiling 32+ times means Dynamo is
     # evicting and recompiling, not just adding new (dtype, grad_mode) variants.
     if test["n_variants_per_frame"]:
         worst = max(test["n_variants_per_frame"].items(), key=lambda kv: kv[1])
         worst_frame, worst_n = worst
         print(f"  highest variant count per frame: frame {worst_frame} → {worst_n}")
-        print(f"  (threshold {MAX_VARIANTS_PER_FRAME}; >8 implies cache eviction)")
+        print(f"  (threshold {MAX_VARIANTS_PER_FRAME}; >32 implies cache eviction)")
         thrashers = {
             f: n for f, n in test["n_variants_per_frame"].items()
             if n > MAX_VARIANTS_PER_FRAME

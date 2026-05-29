@@ -465,3 +465,79 @@ Back-compat: when `self_cond_mode` is absent it derives from the legacy `self_co
 - `scripts/debug_dynamo_alias_isolation.py` (new) — isolated alias cache-isolation pre-validation.
 
 The production default is now `alias` (flipped after the verification in 9d passed); `deepcopy` and `none` remain selectable via `self_cond_mode`.
+
+## 10. Phase 6 — Eval-pass compile + recompile-limit headroom
+
+Phase 5 made the self-conditioning (SC) prior pass compile-friendly via parameter aliasing (`self_cond_mode: alias`, now the production default). Phase 6 closes two remaining gaps: training-time **validation** still ran eager, and the Dynamo recompile limit (default 8) left no headroom for the extra caches plus validation-sampling shape variants.
+
+### 10a. Two eager validation paths (before fix)
+
+Dedicated inference (`predict_step` → `generate(force_compile=True)`) already compiled via the `force_compile` eval branch on `self.nn`. But training-time validation ran eager on both of its forwards:
+
+1. **Validation loss** — `validation_step_data` runs `training_step` under `torch.no_grad()` → `predict_clean` → `self.nn(batch)`. In alias mode `self.nn.use_torch_compile_sc=False`, so this fell to eager.
+2. **Validation sampling** — `_run_validation_trajectory` → `generate(...)` **without** `force_compile` → `predict_clean_n_v_w_guidance` with `force_compile=False` → eager on both the main forward and the unconditional CFG forward.
+
+### 10b. Fix: route no-grad eval forwards through alias `nn_sc`
+
+`model_trainer_base.py` gains a helper, `_eval_forward_module(force_compile=False)`, used by `predict_clean` and `predict_clean_n_v_w_guidance`:
+
+```python
+def _eval_forward_module(self, force_compile: bool = False):
+    if (
+        not force_compile
+        and not torch.is_grad_enabled()
+        and getattr(self, "_nn_sc_aliased", False)
+        and self.nn_sc is not None
+    ):
+        return self.nn_sc
+    return self.nn
+```
+
+In **alias** mode (`_nn_sc_aliased`, set in `proteina.__init__`) a no-grad eval forward returns `nn_sc`, which:
+- **shares live weights** with `self.nn` (alias rebinds leaves to the same storage; the EMA callback swaps weights in place via `swap_tensors`/`copy_`), so validation numerics are identical to running `self.nn`;
+- owns a **separate Dynamo cache** (`_forward_impl_sc`'s distinct `__code__`), so adding validation's no-grad shape contexts never lands grad/no-grad variants on the **training** graph's cache → no train-path thrash.
+
+Fall-backs to `self.nn`: `force_compile=True` (dedicated inference keeps its own eval path), grad enabled (training), and `deepcopy`/`none` modes (where `nn_sc` is stale or `None`). The autoguidance forward (`self.nn_ag`) is a separate checkpoint and is left untouched.
+
+### 10c. Recompile-limit headroom: 8 → 32
+
+`torch._dynamo.config.recompile_limit = 32` is set in both `train.py` and `inference.py` (canonical name in torch 2.7.1; `cache_size_limit` is its alias). Stock default is 8; once a single frame exceeds the limit Dynamo evicts and the cache thrashes (extreme slowdown). The accumulated limit (256) is untouched. Headroom is needed because there are now up to three distinct compiled graphs — train (`_forward_impl`, grad), SC/eval (`_forward_impl_sc`, no-grad), inference (`_forward_impl`, no-grad) — plus a new dynamic-shape variant per validation-sampling length.
+
+### 10d. Verification
+
+**Numeric parity, no thrash** — `SELF_COND_MODE=alias scripts/test_sc_compile.py` after the routing edits and threshold update:
+
+| Metric | Value |
+|---|---|
+| max rel\|grad diff\| vs SC-eager baseline | 0.000e+00 |
+| recompiles (baseline SC-eager) | 2 |
+| recompiles (SC compiled) | 55 |
+| highest variant count per frame | frame 25 → 11 |
+| eviction / `recompile_limit reached` messages | none |
+
+Gradients are bit-identical; the worst frame (25 = `rigid_utils.Rotation.__init__`, recompiling on rotation-tensor rank/size) holds 11 variants — under the new test threshold of 24 and far under the 32 limit. Because validation now calls the **same** `_forward_impl_sc` this test proves is bit-identical to eager, and `nn_sc` shares `self.nn`'s storage, **validation loss is numerically unchanged** by the routing. No separate SC-off val-loss control is run: validation loss is sampled at random diffusion timesteps and is not comparable across runs without seed control, so the deterministic per-step parity above is the authoritative evidence.
+
+**Eval-pass compile + cold compile-time** — a 12-step training run with validation firing every 3 optim steps, SC compile on, fresh Inductor cache, `TORCH_LOGS=recompiles` (20M model, padded length 64, batch 4, A100):
+
+| Phase | Cold wall-time |
+|---|---|
+| First train batch — train graph `_forward_impl` (grad), cold | 203 s |
+| Sanity validation — SC/eval graph `_forward_impl_sc` (no-grad), cold | 231 s |
+| First validation **sampling** (step 3) — new lengths in the `generate` trajectory | 242 s (one-time) |
+| Warm validations (steps 6, 9, 12) | 58–59 s each |
+| New-length train recompile (epoch 1) | 19 s |
+| Steady-state train step | 0.3–0.5 s |
+| Peak variants/frame **with** validation sampling | frame 25 → **14** (no eviction) |
+
+Validation forwards are confirmed **compiled, not eager** (recompiles during the val window tag the `_forward_impl_sc` frames; zero eager-fallback / `recompile_limit reached` messages), and the peak per-frame variant count even with sampling (14) stays well under 32.
+
+### 10e. Compile-time expectation (answering "it used to be ~1-2 min")
+
+On a **cold** Inductor cache each graph now traces + Inductor-compiles in ≈ 3.4 min (train) / ≈ 3.8 min (SC), so a cold run pays ≈ 7 min before steady state, plus a one-time ≈ 4 min the first time validation sampling hits new lengths. The earlier "1-2 min" reflected a single compiled graph; the increase is (a) a second/third graph (SC + eval) and (b) cold-cache cost. On a **warm** Inductor cache (the normal case for repeat runs / resumed training, when `TORCHINDUCTOR_CACHE_DIR` persists) these collapse to ~19 s incremental recompiles and near-instant cache hits; steady-state training stays at ~0.3–0.5 s/step.
+
+### 10f. Files
+
+- `proteinfoundation/train.py`, `proteinfoundation/inference.py` — `torch._dynamo.config.recompile_limit = 32`.
+- `proteinfoundation/proteinflow/proteina.py` — `self._nn_sc_aliased = (sc_mode == "alias")` in `__init__`.
+- `proteinfoundation/proteinflow/model_trainer_base.py` — `_eval_forward_module` helper; `predict_clean` and `predict_clean_n_v_w_guidance` route no-grad eval forwards through it.
+- `scripts/test_sc_compile.py` — `MAX_VARIANTS_PER_FRAME` 6 → 24 and threshold comments updated for `recompile_limit=32`.

@@ -207,6 +207,9 @@ class Proteina(ModelTrainerBase):
             # wrapper keeps grad-mode specialization off the training cache,
             # so this is safe to combine with use_torch_compile=True.
             self.nn.use_torch_compile_sc = True
+        # Phase 6: only the alias shares live weights with self.nn, so it is
+        # the only SC module safe to also serve no-grad eval forwards (val).
+        self._nn_sc_aliased = (sc_mode == "alias")
         self.non_contact_value = cfg_exp.model.nn.get("non_contact_value", 0)
         if self.non_contact_value not in (0, -1):
             raise ValueError(f"non_contact_value must be 0 or -1, got {self.non_contact_value}")

@@ -25,6 +25,10 @@ import lightning as L
 import loralib as lora
 import torch
 torch._dynamo.config.optimize_ddp = False
+# Headroom for the extra Dynamo caches (train + SC + eval) and for
+# validation-sampling shape variants; default 8 thrashes (eviction) once a
+# frame exceeds it. accumulated limit (256) is untouched.
+torch._dynamo.config.recompile_limit = 32
 import wandb
 from dotenv import load_dotenv
 from lightning.pytorch.loggers import WandbLogger

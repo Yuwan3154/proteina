@@ -467,6 +467,25 @@ class ModelTrainerBase(L.LightningModule):
         else:
             raise ValueError(f"non_contact_value must be 0 or -1, got {non_contact_value}")
 
+    def _eval_forward_module(self, force_compile: bool = False):
+        """Module to run a no-grad eval forward through.
+
+        Alias nn_sc shares live weights with self.nn (EMA copies in place) but
+        owns a separate Dynamo cache (_forward_impl_sc), so routing validation
+        forwards through it gives compile speedup without adding grad/no-grad
+        variants to the training graph's cache. Dedicated inference
+        (force_compile=True) keeps self.nn's force_compile eval path.
+        deepcopy/none modes and grad-enabled (training) fall back to self.nn.
+        """
+        if (
+            not force_compile
+            and not torch.is_grad_enabled()
+            and getattr(self, "_nn_sc_aliased", False)
+            and self.nn_sc is not None
+        ):
+            return self.nn_sc
+        return self.nn
+
     def predict_clean(
         self,
         batch: Dict,
@@ -489,7 +508,7 @@ class ModelTrainerBase(L.LightningModule):
                 - For CAflow it returns a tensor of shape [*, n, 3].
             Other things predicted by nn (pair_pred for distogram loss)
         """
-        return self.nn(batch)
+        return self._eval_forward_module()(batch)
 
     def _get_template_inference_module(self, num_bins: int):
         raise NotImplementedError("This method is not implemented")
@@ -577,7 +596,8 @@ class ModelTrainerBase(L.LightningModule):
         if getattr(self, "_inf_zero_sin_pos_emb", False):
             batch["_zero_idx_emb"] = True
 
-        nn_out = self.nn(batch, force_compile=force_compile)
+        eval_nn = self._eval_forward_module(force_compile)
+        nn_out = eval_nn(batch, force_compile=force_compile)
         x_pred = self._nn_out_to_x_clean(nn_out, batch)
         c_pred = self._nn_out_to_c_clean(nn_out, batch)
         c_logits = self._nn_out_to_c_logits(nn_out, batch)
@@ -610,7 +630,7 @@ class ModelTrainerBase(L.LightningModule):
                 uncond_batch.pop("cath_code", None)
                 uncond_batch.pop("cath_code_indices", None)
                 uncond_batch.pop("cath_code_indices_mask", None)
-                nn_out_uncond = self.nn(uncond_batch)
+                nn_out_uncond = eval_nn(uncond_batch)
                 x_pred_uncond = self._nn_out_to_x_clean(nn_out_uncond, uncond_batch) if x_pred is not None else None
                 c_pred_uncond = self._nn_out_to_c_clean(nn_out_uncond, uncond_batch) if c_pred is not None else None
                 c_logits_uncond = self._nn_out_to_c_logits(nn_out_uncond, uncond_batch) if c_logits is not None else None
