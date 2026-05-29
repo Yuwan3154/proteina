@@ -20,6 +20,7 @@ Run on Engaging (DATA_PATH set), CPU-only salloc:
 """
 
 import argparse
+import csv
 import json
 import multiprocessing as mp
 import os
@@ -46,6 +47,10 @@ from proteinfoundation.utils.ff_utils.pdb_utils import write_prot_to_pdb
 DEFAULT_CLUSTER_TSV_NAME = (
     "cluster_seqid_0.25_df_pdb_f1_minl50_maxl256_mtprotein_etdiffractionEM_"
     "minoNone_maxoNone_minr0.0_maxr5.0_hl_rl_rnsrTrue_rpuTrue_l_rcuFalse.tsv"
+)
+DEFAULT_RES_CSV_NAME = (
+    "df_pdb_f1_minl50_maxl256_mtprotein_etdiffractionEM_"
+    "minoNone_maxoNone_minr0.0_maxr5.0_hl_rl_rnsrTrue_rpuTrue_l_rcuFalse.csv"
 )
 DEFAULT_THRESHOLDS = [0.4, 0.5, 0.6]
 _CA_IDX = rc.atom_order["CA"]
@@ -88,10 +93,41 @@ def reconstruct_ca_pdb(stem, processed_dir, manifest, out_pdb):
     return out_pdb
 
 
-def select_cat_reps(cluster_dict, chain_to_cat):
+def load_resolution_map(csv_path):
+    """id -> resolution (float). Skips empty / 'None' values."""
+    res = {}
+    with open(csv_path, newline="") as f:
+        for row in csv.DictReader(f):
+            v = row.get("resolution")
+            if v in (None, "", "None"):
+                continue
+            res[row["id"]] = float(v)
+    return res
+
+
+def _pick_rep(ms, cname, rep_pick, res_map):
+    """Within-cluster representative for a CAT. Returns (rep_seqid, used_fallback).
+    'lexmin'=lowest id; 'mmseqs'=cluster mmseqs rep (=cluster name) if it is a
+    single-domain member of the CAT else fall back to lexmin; 'hires'=lowest
+    resolution value (best quality), ties broken by id."""
+    if rep_pick == "mmseqs":
+        if cname in ms:
+            return cname, False
+        return min(ms), True
+    if rep_pick == "hires":
+        return min(ms, key=lambda x: (res_map.get(x, float("inf")), x)), False
+    return min(ms), False
+
+
+def select_cat_reps(cluster_dict, chain_to_cat, rep_pick="lexmin", res_map=None):
     """CAT -> (cluster_size, cluster_name, rep_seqid) from the largest cluster
-    holding a single-domain member of that CAT (deterministic tie-breaks)."""
+    holding a single-domain member of that CAT (deterministic tie-breaks).
+    The winning cluster is chosen by (size, cluster_name) independent of rep_pick;
+    rep_pick only selects which member within that cluster becomes the rep."""
+    if rep_pick == "hires":
+        assert res_map is not None, "rep_pick='hires' requires res_map."
     best = {}
+    winner_fb = {}
     for cname in sorted(cluster_dict):
         members = cluster_dict[cname]
         size = len(members)
@@ -101,10 +137,15 @@ def select_cat_reps(cluster_dict, chain_to_cat):
             if cats and len(cats) == 1:
                 per_cat[cats[0]].append(m)
         for cat, ms in per_cat.items():
-            cand = (size, cname, min(ms))
             cur = best.get(cat)
             if cur is None or size > cur[0] or (size == cur[0] and cname < cur[1]):
-                best[cat] = cand
+                rep, fb = _pick_rep(ms, cname, rep_pick, res_map)
+                best[cat] = (size, cname, rep)
+                winner_fb[cat] = fb
+    if rep_pick == "mmseqs":
+        n_fb = sum(1 for v in winner_fb.values() if v)
+        print(f"[rep_pick=mmseqs] winning clusters whose mmseqs rep is NOT a single-domain "
+              f"member of the CAT (fell back to lexmin): {n_fb}/{len(best)}")
     return best
 
 
@@ -207,6 +248,12 @@ def main():
     parser.add_argument("--limit-queries", type=int, default=None, help="cap #queries (smoke test)")
     parser.add_argument("--tm-thresholds", type=float, nargs="+", default=DEFAULT_THRESHOLDS)
     parser.add_argument("--report-only", action="store_true")
+    parser.add_argument("--rep-pick", choices=["lexmin", "mmseqs", "hires"], default="lexmin",
+                        help="within-cluster CAT representative selection")
+    parser.add_argument("--resolution-csv", default=None,
+                        help="df CSV with id,resolution (default: $DATA_PATH/pdb_train/<known name>)")
+    parser.add_argument("--reps-only", action="store_true",
+                        help="build rep library + reps_manifest.tsv, then exit before alignment")
     args = parser.parse_args()
 
     data_path = os.environ.get("DATA_PATH")
@@ -234,6 +281,13 @@ def main():
     cluster_dict = read_cluster_tsv(cluster_tsv)
     print(f"clusters={len(cluster_dict)} chains_labeled={len(chain_to_cat)} sharded={manifest is not None}")
 
+    res_csv = args.resolution_csv or (os.path.join(data_path, "pdb_train", DEFAULT_RES_CSV_NAME) if data_path else None)
+    res_map = load_resolution_map(res_csv) if (res_csv and os.path.exists(res_csv)) else {}
+    if args.rep_pick == "hires" and not res_map:
+        parser.error(f"--rep-pick hires needs a resolution CSV; not found at {res_csv}")
+    if res_map:
+        print(f"resolution map: {len(res_map)} chains from {res_csv}")
+
     reps_dir = os.path.join(out_dir, "reps")
     queries_dir = os.path.join(out_dir, "queries")
     rep_list_path = os.path.join(out_dir, "rep_list.txt")
@@ -241,19 +295,29 @@ def main():
     os.makedirs(queries_dir, exist_ok=True)
 
     # E1: representative library
-    cat_reps = select_cat_reps(cluster_dict, chain_to_cat)
+    cat_reps = select_cat_reps(cluster_dict, chain_to_cat, rep_pick=args.rep_pick, res_map=res_map)
     all_cats = {cat for cats in chain_to_cat.values() for cat in cats}
     print(f"distinct CAT (any chain in labeled set)={len(all_cats)}; CAT with single-domain rep={len(cat_reps)}; "
           f"CAT without single-domain rep={len(all_cats - set(cat_reps))}")
+    manifest_rows = []
     rep_names = []
     for cat in sorted(cat_reps):
-        _, _, seqid = cat_reps[cat]
+        size, cname, seqid = cat_reps[cat]
+        manifest_rows.append((cat, size, cname, seqid, res_map.get(seqid, "")))
         out_pdb = os.path.join(reps_dir, f"{cat}.pdb")
         if reconstruct_ca_pdb(seqid, processed_dir, manifest, out_pdb) is not None:
             rep_names.append(f"{cat}.pdb")
     with open(rep_list_path, "w") as f:
         f.write("\n".join(rep_names) + "\n")
+    reps_manifest_path = os.path.join(out_dir, "reps_manifest.tsv")
+    with open(reps_manifest_path, "w") as f:
+        f.write("cat\tcluster_size\tcluster\trep_seqid\tresolution\n")
+        for row in manifest_rows:
+            f.write("\t".join(str(x) for x in row) + "\n")
     print(f"rep library: {len(rep_names)} reps -> {reps_dir}")
+    print(f"reps manifest -> {reps_manifest_path}")
+    if args.reps_only:
+        return
 
     # E2: no-CAT cluster representatives as queries
     nocat_reps = find_nocat_cluster_reps(cluster_dict, chain_to_cat)
