@@ -328,6 +328,22 @@ if __name__ == "__main__":
         config_path = "../configs/datasets_config/"
     with hydra.initialize(config_path, version_base=hydra.__version__):
         cfg_data = hydra.compose(config_name=cfg_exp["dataset"])
+        # The experiment YAML's top-level `datamodule:` block overrides keys in
+        # the dataset YAML (e.g. in_memory). train.py composes cfg_data
+        # separately, so merge that block here for the overrides to take effect
+        # (and to let `datamodule.<key>=...` CLI overrides, which land on
+        # cfg_exp, flow through). Placed before the explicit propagations below
+        # so runtime/opt-derived values (num_workers, batch_size) win on overlap.
+        exp_datamodule = OmegaConf.select(cfg_exp, "datamodule")
+        if exp_datamodule is not None:
+            was_struct = OmegaConf.is_struct(cfg_data.datamodule)
+            OmegaConf.set_struct(cfg_data.datamodule, False)
+            cfg_data.datamodule.merge_with(exp_datamodule)
+            OmegaConf.set_struct(cfg_data.datamodule, was_struct)
+            log_info(
+                f"Merged cfg_exp.datamodule into cfg_data.datamodule: "
+                f"{OmegaConf.to_container(exp_datamodule, resolve=False)}"
+            )
         cfg_data.datamodule.num_workers = num_cpus  # Overwrite number of cpus
         # Propagate multilabel_mode from model config (single source of truth)
         multilabel_mode = OmegaConf.select(cfg_exp, "model.nn.multilabel_mode")
