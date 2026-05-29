@@ -39,6 +39,27 @@ def create_dir(dir):
         os.makedirs(dir, exist_ok=True)
 
 
+def _make_nn_sc_alias(nn: torch.nn.Module) -> torch.nn.Module:
+    """Structural deep-copy of nn with all parameters and buffers re-bound
+    to reference the originals. Two distinct Module instances over one set of
+    weights: Dynamo gets separate compile caches per instance, while autograd,
+    optimizer, DDP, EMA, and state_dict only ever see one copy of each param
+    (deduped by tensor identity in named_parameters()).
+    """
+    sc = copy.deepcopy(nn)
+    src_params = dict(nn.named_parameters(recurse=True))
+    src_buffers = dict(nn.named_buffers(recurse=True))
+    for full_name in list(src_params.keys()):
+        parent_name, _, leaf = full_name.rpartition(".")
+        parent = sc.get_submodule(parent_name) if parent_name else sc
+        parent._parameters[leaf] = src_params[full_name]
+    for full_name in list(src_buffers.keys()):
+        parent_name, _, leaf = full_name.rpartition(".")
+        parent = sc.get_submodule(parent_name) if parent_name else sc
+        parent._buffers[leaf] = src_buffers[full_name]
+    return sc
+
+
 def sample_uniform_rotation(
     shape=tuple(), dtype=None, device=None
 ) -> Float[Tensor, "*batch 3 3"]:
@@ -143,22 +164,49 @@ class Proteina(ModelTrainerBase):
         # Pass the DictConfig through so OmegaConf interpolations (e.g. ${oc.env:DATA_PATH})
         # resolve correctly in the actual training environment.
         self.nn = ProteinTransformerAF3(**cfg_exp.model.nn)
+        # Single switch for compiling the self-conditioning forward via the
+        # _forward_impl_sc wrapper (separate Dynamo cache, isolates grad-mode
+        # specialization from the training cache). Applies to whichever module
+        # actually serves SC requests: nn_sc (in deepcopy or alias modes) or
+        # self.nn (none mode, per the fallback in model_trainer_base._set_self_cond).
+        sc_compile = bool(cfg_exp.training.get("use_torch_compile_sc", False))
+
+        # Resolve SC mode (deepcopy | alias | none). Back-compat: legacy
+        # self_cond_use_copy=True maps to deepcopy, False maps to none.
+        sc_mode = cfg_exp.training.get("self_cond_mode", None)
+        if sc_mode is None:
+            sc_mode = "deepcopy" if cfg_exp.training.get("self_cond_use_copy", False) else "none"
+        if sc_mode not in ("deepcopy", "alias", "none"):
+            raise ValueError(f"training.self_cond_mode must be deepcopy|alias|none, got {sc_mode!r}")
+
         self.nn_sc = None
-        if cfg_exp.training.get("self_cond_use_copy", False):
+        if sc_mode == "deepcopy":
             self.nn_sc = copy.deepcopy(self.nn)
             for p in self.nn_sc.parameters():
                 p.requires_grad = False
-            # Force the self-cond copy to eager mode. It runs once per training
-            # step under torch.no_grad() (see model_trainer_base._set_self_cond);
-            # if it goes through torch.compile, Dynamo sees the SAME _forward_impl
-            # code object with grad_mode=False (here) AND grad_mode=True (real
-            # training step). Each inner frame then specializes on grad_mode,
-            # blowing past `cache_size_limit=8` and forcing repeated recompiles.
-            # See TORCH_LOGS=recompiles trace: every recompile reads
-            # `GLOBAL_STATE changed: grad_mode`. Setting use_torch_compile=False
-            # on nn_sc only removes the toggle: the training nn's compiled
-            # frames now only ever see grad_mode=True.
+        elif sc_mode == "alias":
+            # Shared-parameter alias: 1x memory, live SC weights, separate
+            # Dynamo cache per Module instance. Combined with Phase 2 and
+            # Phase 4 fixes, gives compile speedup on both SC and training
+            # without thrash or memory waste.
+            self.nn_sc = _make_nn_sc_alias(self.nn)
+            # Do NOT freeze shared params (would freeze nn too). SC runs under
+            # no_grad so requires_grad is irrelevant during the SC pass.
+
+        if self.nn_sc is not None:
+            # nn_sc never runs the training compile; only the SC compile when
+            # use_torch_compile_sc is requested. Keeping the two caches keyed
+            # on separate code objects (Phase 2) avoids grad-mode thrash.
             self.nn_sc.use_torch_compile = False
+            self.nn_sc.use_torch_compile_sc = sc_compile
+        elif sc_compile:
+            # No deepcopy → SC will go through self.nn under no_grad. Enable
+            # the SC compile branch on the main module so those calls land in
+            # _forward_compiled_sc with its isolated Dynamo cache instead of
+            # silently falling back to eager. The same _forward_impl_sc
+            # wrapper keeps grad-mode specialization off the training cache,
+            # so this is safe to combine with use_torch_compile=True.
+            self.nn.use_torch_compile_sc = True
         self.non_contact_value = cfg_exp.model.nn.get("non_contact_value", 0)
         if self.non_contact_value not in (0, -1):
             raise ValueError(f"non_contact_value must be 0 or -1, got {self.non_contact_value}")

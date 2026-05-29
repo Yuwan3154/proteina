@@ -225,6 +225,14 @@ class ModelTrainerBase(L.LightningModule):
         nn_sc = getattr(self, "nn_sc", None)
         if nn_sc is None:
             return
+        # Alias mode: nn_sc shares parameter tensors with self.nn, so a periodic
+        # state_dict copy would at best be Tensor.copy_(self) (a no-op that still
+        # adds dispatcher overhead). Detect via tensor identity on the first
+        # registered parameter and skip when params are aliased.
+        nn_first = next(iter(self.nn.parameters()), None)
+        sc_first = next(iter(nn_sc.parameters()), None)
+        if nn_first is not None and sc_first is not None and nn_first is sc_first:
+            return
         update_every = int(self.cfg_exp.training.get("self_cond_copy_update_every", 1))
         if update_every <= 0:
             return
@@ -960,6 +968,11 @@ class ModelTrainerBase(L.LightningModule):
                     pred_sc = self._nn_out_to_c_clean(nn_out_sc, batch)
                 else:
                     pred_sc = self._nn_out_to_x_clean(nn_out_sc, batch)
+            # PyTorch #105211: under an outer autocast context (Lightning bf16-mixed),
+            # weights cast inside the no_grad SC pass get cached with requires_grad=False
+            # and reuse in the next grad forward disconnects params from autograd. Only
+            # bites when sc_model is self.nn (no-deepcopy); harmless otherwise.
+            torch.clear_autocast_cache()
             if pred_sc is not None:
                 batch[sc_key] = self.detach_gradients(pred_sc)
             # DSSP SC: use softmax of dssp logits as probability distribution

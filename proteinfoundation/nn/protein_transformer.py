@@ -180,7 +180,16 @@ class MultiHeadBiasedAttentionADALN_MM(torch.nn.Module):
     """Pair biased multi-head self-attention with adaptive layer norm applied to input
     and adaptive scaling applied to output."""
 
-    def __init__(self, dim_token, dim_pair, nheads, dim_cond, use_qkln):
+    def __init__(
+        self,
+        dim_token,
+        dim_pair,
+        nheads,
+        dim_cond,
+        use_qkln,
+        attn_impl: str = "vanilla",
+        attn_impl_eager: Optional[str] = None,
+    ):
         super().__init__()
         dim_head = int(dim_token // nheads)
         self.adaln = AdaptiveLayerNorm(dim=dim_token, dim_cond=dim_cond)
@@ -192,6 +201,8 @@ class MultiHeadBiasedAttentionADALN_MM(torch.nn.Module):
             dim_out=dim_token,
             qkln=use_qkln,
             pair_dim=dim_pair,
+            attn_impl=attn_impl,
+            attn_impl_eager=attn_impl_eager,
         )
         self.scale_output = AdaptiveLayerNormOutputScale(
             dim=dim_token, dim_cond=dim_cond
@@ -271,6 +282,8 @@ class MultiheadAttnAndTransition(torch.nn.Module):
         parallel_mha_transition,
         use_attn_pair_bias,
         use_qkln,
+        attn_impl: str = "vanilla",
+        attn_impl_eager: Optional[str] = None,
         dropout=0.0,
         expansion_factor=4,
     ):
@@ -291,6 +304,8 @@ class MultiheadAttnAndTransition(torch.nn.Module):
             nheads=nheads,
             dim_cond=dim_cond,
             use_qkln=use_qkln,
+            attn_impl=attn_impl,
+            attn_impl_eager=attn_impl_eager,
         )
 
         self.transition = TransitionADALN(
@@ -599,6 +614,11 @@ class ProteinTransformerAF3(torch.nn.Module):
         self.feats_pair_cond = kwargs.get("feats_pair_cond", [])
         self.use_qkln = kwargs.get("use_qkln", False)
         self.use_torch_compile = bool(kwargs.get("use_torch_compile", True))
+        # Whether to also compile the no-grad self-conditioning / validation forward
+        # pass via a SEPARATE Python function object (_forward_impl_sc) so that its
+        # Dynamo cache is keyed independently of the training cache. See
+        # ProteinTransformerAF3.forward() for the dispatcher and the rationale.
+        self.use_torch_compile_sc = bool(kwargs.get("use_torch_compile_sc", False))
         self.num_buckets_predict_pair = kwargs.get(
             "num_buckets_predict_pair", None
         )
@@ -731,6 +751,8 @@ class ProteinTransformerAF3(torch.nn.Module):
                     parallel_mha_transition=kwargs["parallel_mha_transition"],
                     use_attn_pair_bias=kwargs["use_attn_pair_bias"],
                     use_qkln=self.use_qkln,
+                    attn_impl=kwargs.get("attn_impl", "vanilla"),
+                    attn_impl_eager=kwargs.get("attn_impl_eager", None),
                 )
                 for _ in range(self.nlayers)
             ]
@@ -980,9 +1002,12 @@ class ProteinTransformerAF3(torch.nn.Module):
         # is quickly exhausted. TORCH_LOGS=recompiles shows dozens of
         # `GLOBAL_STATE changed: grad_mode` events under the previous setup.
         #
-        # Fix: keep compile ONLY for the grad-enabled training path. Validation,
-        # sanity-check, and self-cond no-grad forwards all run eager. Val/sanity
-        # are < 1% of training wall-time, so we lose nothing material.
+        # Resolution: compile no-grad paths via a *distinct* Python function
+        # (_forward_impl_sc) whose __code__ object is separate from _forward_impl.
+        # Dynamo then maintains two independent caches — _forward_impl sees only
+        # grad=True, _forward_impl_sc sees only grad=False — and neither thrashes.
+        # Opt in with use_torch_compile_sc=True; otherwise no-grad forwards keep
+        # running eager and the historical safe behavior is preserved.
         if self.use_torch_compile and torch.is_grad_enabled():
             if getattr(self, "_forward_compiled_train", None) is None:
                 self._forward_compiled_train = torch.compile(self._forward_impl)
@@ -1001,6 +1026,33 @@ class ProteinTransformerAF3(torch.nn.Module):
                     self._forward_impl, dynamic=dynamic_shapes
                 )
             return self._forward_compiled_eval(batch_nn)
+        # Self-conditioning / validation compile path. dynamic=True because batch
+        # length varies across iterations (different padded lengths in different
+        # batches); we want one graph to handle all of them. The _forward_impl_sc
+        # wrapper exists solely to give Dynamo a distinct top-level __code__
+        # object, isolating this cache from _forward_compiled_train above.
+        if self.use_torch_compile_sc and not torch.is_grad_enabled():
+            if getattr(self, "_forward_compiled_sc", None) is None:
+                self._forward_compiled_sc = torch.compile(
+                    self._forward_impl_sc, dynamic=True
+                )
+            return self._forward_compiled_sc(batch_nn)
+        return self._forward_impl(batch_nn)
+
+    def _forward_impl_sc(self, batch_nn: Dict[str, torch.Tensor]):
+        """Thin wrapper around :meth:`_forward_impl` with a distinct ``__code__``.
+
+        Used only as the entry point for the self-conditioning / validation
+        ``torch.compile`` cache. Dynamo keys its compile cache on the entry
+        function's code object; by routing no-grad calls through this wrapper,
+        we ensure those compiles never collide with the training cache (which
+        is keyed on :meth:`_forward_impl`'s code object). Each cache then only
+        ever observes one ``grad_mode`` state, eliminating the recompile thrash.
+
+        Body must remain a single delegating call — adding logic here would
+        change the trace and could re-introduce cache key collisions if the same
+        helper were ever called from _forward_impl.
+        """
         return self._forward_impl(batch_nn)
 
     def _forward_impl(self, batch_nn: Dict[str, torch.Tensor]):

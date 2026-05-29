@@ -99,6 +99,7 @@ training:
   finetune_seq_cond_lora_only: False
   self_cond_use_copy: True
   self_cond_copy_update_every: 10
+  self_cond_mode: alias   # Phase 5 default: shared params (1x memory, live SC weights, full compile speedup). Alternatives: 'deepcopy' (separate weights, periodic resync) or 'none' (SC/training share self.nn; requires Phase 4 fix; may thrash compile cache).
   zero_sin_pos_emb: True
 
 lora:
