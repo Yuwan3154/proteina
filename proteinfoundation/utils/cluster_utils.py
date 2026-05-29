@@ -224,6 +224,242 @@ class ClusterSampler(Sampler):
             return len(self.cluster_names)
 
 
+class CATBalancedSampler(Sampler):
+    """CAT-balanced epoch sampler layered on top of sequence-similarity clusters.
+
+    Each epoch presents exactly one chain per CAT family (CATH 3-level
+    Class.Architecture.Topology). Per the design:
+      1. Epoch length = number of distinct CAT topologies in the (split) mapping.
+      2. For each topology, draw a seq-sim cluster that contains it
+         (cat_cluster_draw: "random" | "largest").
+      3. From the drawn cluster, draw a chain (member_mode: "cluster-random" |
+         "cluster-reps"), mirroring ClusterSampler's member selection.
+
+    Clusters are REUSED (no re-clustering) with multi-membership: a cluster is
+    registered under every CAT present among its labeled members. Unlabeled
+    members are infilled only in PURE clusters (single CAT among labeled members).
+    Clusters with zero labeled members form a separate no-CAT bucket, sampled via
+    nocat_bucket_draws extra draws per epoch (per rank under DDP).
+
+    DDP: topology order is shuffled with a rank-synchronized generator and padded
+    to an equal per-rank count (mirrors ClusterSampler) so every rank yields the
+    same number of samples; per-rank draws use a rank-distinct generator.
+    """
+
+    def __init__(
+        self,
+        dataset: torch_geometric.data.Dataset,
+        clusterid_to_seqid_mapping: Dict[str, List[str]],
+        chain_to_cat: Dict[str, List[str]],
+        cat_cluster_draw: Literal["random", "largest"] = "largest",
+        member_mode: Literal["cluster-random", "cluster-reps"] = "cluster-random",
+        nocat_bucket: bool = True,
+        nocat_bucket_draws: int = 1,
+        shuffle: bool = True,
+        drop_last: bool = False,
+        seed: int = 0,
+        v2: bool = True,
+    ):
+        self.dataset = dataset
+        self.clusterid_to_seqid_mapping = clusterid_to_seqid_mapping
+        self.cluster_names = list(clusterid_to_seqid_mapping.keys())
+        self.chain_to_cat = chain_to_cat
+        self.cat_cluster_draw = cat_cluster_draw
+        self.member_mode = member_mode
+        self.nocat_bucket = bool(nocat_bucket)
+        self.nocat_bucket_draws = int(nocat_bucket_draws)
+        if dataset.database == "pdb" or dataset.database == "scop":
+            self.sequence_id_to_idx = {
+                fname.split(".")[0]: i for i, fname in enumerate(dataset.file_names)
+            }
+        elif dataset.database == "pinder":
+            self.sequence_id_to_idx = dataset.pinder_id_to_idx
+        else:
+            self.sequence_id_to_idx = dataset.protein_to_idx
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.log_first = True
+        self.num_replicas = None
+        self.rank = 0
+        self.seed = int(seed)
+        self.v2 = bool(v2)
+        self.epoch = 0
+        self._build_cat_index()
+
+    def _build_cat_index(self) -> None:
+        """Build the CAT -> cluster -> member indices once at construction.
+
+        cluster_cats: cluster -> set of CAT codes (union over labeled members).
+        eligible: (cluster, cat) -> member seqids carrying cat (+ infill in pure clusters).
+        rep_for_T: (cluster, cat) -> representative seqid for member_mode='cluster-reps'.
+        cluster_size_for_T: (cluster, cat) -> len(eligible) for cat_cluster_draw='largest'.
+        topology_to_clusters: cat -> [clusters carrying it].
+        nocat_clusters: clusters with zero labeled members.
+        """
+        cluster_cats: Dict[str, set] = {}
+        eligible: Dict[Tuple[str, str], List[str]] = {}
+        rep_for_T: Dict[Tuple[str, str], str] = {}
+        topology_to_clusters: Dict[str, List[str]] = {}
+        nocat_clusters: List[str] = []
+
+        for cluster_name, members in self.clusterid_to_seqid_mapping.items():
+            member_cats = {m: self.chain_to_cat.get(m.lower(), []) for m in members}
+            cats_here = set()
+            for cl in member_cats.values():
+                cats_here.update(cl)
+            cluster_cats[cluster_name] = cats_here
+            if not cats_here:
+                nocat_clusters.append(cluster_name)
+                continue
+            pure = len(cats_here) == 1
+            unlabeled = [m for m in members if not member_cats[m]] if pure else []
+            rep_cats = member_cats.get(cluster_name, [])  # rep seqid == cluster_name (mmseqs rep)
+            for cat in cats_here:
+                elig = [m for m in members if cat in member_cats[m]]
+                if pure:
+                    elig = elig + unlabeled  # infill the whole pure cluster to its single CAT
+                eligible[(cluster_name, cat)] = elig
+                topology_to_clusters.setdefault(cat, []).append(cluster_name)
+                if cat in rep_cats:
+                    rep_for_T[(cluster_name, cat)] = cluster_name
+                else:
+                    rep_for_T[(cluster_name, cat)] = elig[0]
+
+        self.cluster_cats = cluster_cats
+        self.eligible = eligible
+        self.rep_for_T = rep_for_T
+        self.cluster_size_for_T = {k: len(v) for k, v in eligible.items()}
+        self.topology_to_clusters = topology_to_clusters
+        self.nocat_clusters = nocat_clusters
+        self._topologies = sorted(topology_to_clusters.keys())
+        log_info(
+            f"CATBalancedSampler: {len(self._topologies)} CAT topologies, "
+            f"{len(self.cluster_names)} clusters ({len(nocat_clusters)} no-CAT), "
+            f"cat_cluster_draw={self.cat_cluster_draw}, member_mode={self.member_mode}, "
+            f"nocat_bucket={self.nocat_bucket} (draws={self.nocat_bucket_draws})"
+        )
+
+    def set_epoch(self, epoch: int) -> None:
+        """Lightning calls this each train epoch start; seeds the per-epoch generators."""
+        self.epoch = int(epoch)
+
+    def _make_generator(self, *parts: int) -> torch.Generator:
+        """Fresh torch.Generator seeded by (seed, epoch, *parts); same inputs -> same state across ranks."""
+        s = (self.seed & 0xFFFFFFFF)
+        for p in (self.epoch, *parts):
+            s = ((s * 0x9E3779B97F4A7C15) ^ (int(p) & 0xFFFFFFFFFFFFFFFF)) & 0xFFFFFFFFFFFFFFFF
+        g = torch.Generator()
+        g.manual_seed(s if s != 0 else 1)
+        return g
+
+    def _draw_for_topology(self, cat: str, gen) -> int:
+        clusters = self.topology_to_clusters[cat]
+        if self.cat_cluster_draw == "largest":
+            # max eligible size; deterministic tie-break by cluster name
+            chosen = sorted(clusters, key=lambda c: (-self.cluster_size_for_T[(c, cat)], c))[0]
+        elif self.cat_cluster_draw == "random":
+            if self.v2:
+                j = torch.randint(0, len(clusters), (1,), generator=gen).item()
+            else:
+                j = torch.randint(0, len(clusters), (1,)).item()
+            chosen = clusters[j]
+        else:
+            raise ValueError(
+                f"Unknown cat_cluster_draw {self.cat_cluster_draw}, expected 'random' or 'largest'"
+            )
+        if self.member_mode == "cluster-reps":
+            seqid = self.rep_for_T[(chosen, cat)]
+        elif self.member_mode == "cluster-random":
+            elig = self.eligible[(chosen, cat)]
+            if self.v2:
+                k = torch.randint(0, len(elig), (1,), generator=gen).item()
+            else:
+                k = torch.randint(0, len(elig), (1,)).item()
+            seqid = elig[k]
+        else:
+            raise ValueError(
+                f"Unknown member_mode {self.member_mode}, expected 'cluster-random' or 'cluster-reps'"
+            )
+        if self.log_first:
+            logger.info(
+                f"First CAT sampling: topology {cat} -> cluster {chosen} -> {seqid}, rank {self.rank}"
+            )
+            self.log_first = False
+        return self.sequence_id_to_idx[seqid]
+
+    def _draw_nocat(self, gen) -> List[int]:
+        out: List[int] = []
+        if not self.nocat_clusters:
+            return out
+        for _ in range(self.nocat_bucket_draws):
+            if self.v2:
+                j = torch.randint(0, len(self.nocat_clusters), (1,), generator=gen).item()
+            else:
+                j = torch.randint(0, len(self.nocat_clusters), (1,)).item()
+            cluster_name = self.nocat_clusters[j]
+            if self.member_mode == "cluster-reps":
+                seqid = cluster_name
+            else:
+                members = self.clusterid_to_seqid_mapping[cluster_name]
+                if self.v2:
+                    k = torch.randint(0, len(members), (1,), generator=gen).item()
+                else:
+                    k = torch.randint(0, len(members), (1,)).item()
+                seqid = members[k]
+            out.append(self.sequence_id_to_idx[seqid])
+        return out
+
+    def __iter__(self):
+        self.log_first = True
+        if torch.distributed.is_initialized():
+            self.num_replicas = torch.distributed.get_world_size()
+            self.rank = torch.distributed.get_rank()
+        else:
+            self.num_replicas = None
+            self.rank = 0
+            logger.info("Distributed sampler is not initialized, assuming single-device setup.")
+
+        n = len(self._topologies)
+        shuffle_gen = self._make_generator(0) if self.v2 else None
+        if self.shuffle:
+            if self.v2:
+                perm = torch.randperm(n, generator=shuffle_gen).tolist()
+            else:
+                perm = torch.randperm(n).tolist()
+        else:
+            perm = list(range(n))
+
+        if self.num_replicas is not None:
+            self.num_samples = math.ceil(n * 1.0 / self.num_replicas)
+            self.total_size = self.num_samples * self.num_replicas
+            if self.drop_last:
+                perm = perm[: self.total_size - self.num_replicas]
+            else:
+                padding_size = self.total_size - len(perm)
+                if padding_size <= len(perm):
+                    perm += perm[:padding_size]
+                else:
+                    perm += (perm * math.ceil(padding_size / len(perm)))[:padding_size]
+            perm = perm[self.rank : self.total_size : self.num_replicas]
+            draw_gen = self._make_generator(1, self.rank) if self.v2 else None
+        else:
+            draw_gen = self._make_generator(1, 0) if self.v2 else None
+
+        indices = [self._draw_for_topology(self._topologies[i], draw_gen) for i in perm]
+        if self.nocat_bucket:
+            indices.extend(self._draw_nocat(draw_gen))
+        return iter(indices)
+
+    def __len__(self):
+        if self.num_replicas is not None:
+            base = self.num_samples
+        else:
+            base = len(self._topologies)
+        if self.nocat_bucket and self.nocat_clusters:
+            base += self.nocat_bucket_draws
+        return base
+
+
 def split_dataframe(
     df: pd.DataFrame,
     splits: List[str],

@@ -26,7 +26,7 @@ import torch
 import torch.distributed as dist
 from loguru import logger
 
-from proteinfoundation.utils.cluster_utils import ClusterSampler
+from proteinfoundation.utils.cluster_utils import ClusterSampler, CATBalancedSampler
 
 
 class ClusterSamplerAuditCallback(L.Callback):
@@ -64,9 +64,10 @@ class ClusterSamplerAuditCallback(L.Callback):
         # re-shards the materialized indices per rank, which combined with our
         # ClusterSampler's internal partitioning yields ~1/W² coverage on
         # multi-GPU. The fix is to set Trainer(use_distributed_sampler=False).
-        if not isinstance(sampler, ClusterSampler):
+        audited_types = (ClusterSampler, CATBalancedSampler)
+        if not isinstance(sampler, audited_types):
             inner = getattr(getattr(sampler, "dataset", None), "_sampler", None)
-            if isinstance(inner, ClusterSampler):
+            if isinstance(inner, audited_types):
                 logger.warning(
                     f"[cluster_sampler_audit] train sampler is {type(sampler).__name__} "
                     f"wrapping ClusterSampler — Lightning is auto-wrapping. The DDP partition "
@@ -76,10 +77,11 @@ class ClusterSamplerAuditCallback(L.Callback):
                 sampler = inner
             else:
                 logger.info(
-                    "[cluster_sampler_audit] train sampler is not ClusterSampler "
+                    "[cluster_sampler_audit] train sampler is not ClusterSampler/CATBalancedSampler "
                     f"({type(getattr(train_dl, 'sampler', None)).__name__}); skipping audit."
                 )
                 return
+        is_cat_balanced = isinstance(sampler, CATBalancedSampler)
         # Make sure the sampler has the right epoch (Lightning normally does
         # this via _set_sampler_epoch; we do it explicitly here too).
         sampler.set_epoch(int(trainer.current_epoch))
@@ -133,14 +135,20 @@ class ClusterSamplerAuditCallback(L.Callback):
             f"coverage_ratio={ratio:.4f}"
         )
         if duplicates > 0:
-            (logger.error if self._strict else logger.warning)(msg)
-            if self._strict:
-                raise RuntimeError(
-                    "ClusterSampler DDP partitioning violated: ranks see overlapping clusters. "
-                    "Check that BaseLightningDataModule.cluster_sampler_v2=True and that "
-                    "set_epoch is being called by Lightning. "
-                    f"({duplicates} duplicate index assignments out of {total})"
+            if is_cat_balanced:
+                logger.warning(
+                    f"{msg} (CATBalancedSampler: cross-rank duplicates are expected "
+                    f"from multi-domain/multi-CAT chains; not a partitioning error)"
                 )
+            else:
+                (logger.error if self._strict else logger.warning)(msg)
+                if self._strict:
+                    raise RuntimeError(
+                        "ClusterSampler DDP partitioning violated: ranks see overlapping clusters. "
+                        "Check that BaseLightningDataModule.cluster_sampler_v2=True and that "
+                        "set_epoch is being called by Lightning. "
+                        f"({duplicates} duplicate index assignments out of {total})"
+                    )
         else:
             logger.info(msg)
 

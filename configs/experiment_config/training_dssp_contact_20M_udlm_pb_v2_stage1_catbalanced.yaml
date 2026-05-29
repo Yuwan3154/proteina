@@ -1,0 +1,268 @@
+run_name_: dssp_contact_20M_udlm_pb_v2_stage1_catbalanced
+
+# Initialize IPA from AF2 model 1 ptm at epoch 0
+af2_ipa_weights_path: /home/ubuntu/params/params_model_1_ptm.npz
+# Freeze pretrained IPA structure module weights; only train projection layers
+freeze_ipa: true
+# Fallback pretrain if IPA not found or for other layers
+pretrain_ckpt_path: null
+
+hardware:
+  ncpus_per_task_train_: 16
+  ncpus_per_task_prepro_: 16
+  accelerator: gpu
+  ngpus_per_node_: 4  # STAGE 1: 4-GPU setup. Effective batch = 4 * 8 micro * 4 accum = 128.
+  nnodes_: 1
+
+loss:
+  t_distribution:
+    name: uniform
+    p1: 0.0
+    p2: 1.0
+  loss_t_clamp: 0.9
+  use_aux_loss: True
+  aux_loss_t_lim: 0.3
+  thres_aux_2d_loss: 0.6
+  aux_loss_weight: 1.0
+  dssp_aux_loss_weight: 0.0
+  # Distogram settings (AlphaFold format: 38 bins of 1.25Å width between 3.25-50.75Å + 1 overflow)
+  # Must match num_buckets_predict_pair in nn config
+  num_dist_buckets: 39  # 38 bins + 1 underflow bucket (distances < 3.25Å are rare for CA/CB)
+  distogram_min_bin: 0.325  # 3.25Å in nm (first boundary)
+  distogram_max_bin: 5.075  # 50.75Å in nm (last boundary, overflow bin for >= this)
+
+defaults:
+  - model: contactflow_discrete_uniform
+  - override model/nn: contact_af3_20M_tri_individual-embed_coor_ipa-coord_dssp
+  - _self_
+
+model:
+  dssp_diffusion:
+    enabled: true
+    type: udlm
+    loss_weight: 1.0
+    vocab_size: 3  # loop, helix, strand
+    noise_schedule: cosine
+    timesteps: 1000
+    cont_time: true
+    sampling_grid: cosine
+    eps: 1e-4
+
+  nn:
+    multilabel_mode: sum # Note inherited from 190828
+    # CATH lists each structural domain as a separate entry (e.g., 1n7d_A has 5 LA
+    # domains all classified as 4.10.400.10). With cath_dedupe_codes: True we
+    # collapse repeated (C, A, T) triples per chain so each unique fold contributes
+    # once to the sum. See also `validation_sampling.cath` plumbing.
+    cath_dedupe_codes: True
+    # STAGE 1: disable all four residue_type embedding paths (init seq/pair +
+    # cond seq/pair). The trunk's feature factories don't pull `residue_type`
+    # from the batch under these flags (see feature_factory.py:812-815 — the
+    # `use_residue_type_emb` gate). residue_type is still present in the batch
+    # (kept by the contact_map_mode + predict_coords=ipa exception in
+    # model_trainer_base.py:1055-1061), so IPA's atom-mask logic and downstream
+    # logging (USalign TMscore, PDB structure viz) work unchanged. Restored to
+    # True in the Stage-2 fine-tune config.
+    residue_type_emb_init_seq: False
+    residue_type_emb_cond_seq: False
+    residue_type_emb_init_pair: False
+    residue_type_emb_cond_pair: False
+    seq_emb_dim: 2
+    predict_dssp: true
+    dssp_diffusion_mode: true # For transformer native embedding
+    ext_lig_emb_init_seq: True
+    ext_lig_emb_cond_seq: True
+    ext_lig_emb_dim: 3
+
+# Dataset: PDB only (purge-test, no mixed d_FS).
+# ConFind-derived contacts at threshold 0.01 (rotamer-based, more physical).
+# Stage-1 data expansion (length cap, AFDB mix, S30 cluster, etc.) is a deferred
+# TODO — see project_proteina_stage1_data_todo.md.
+dataset: pdb_train_contact-confind_S25_max256_purge-test_cutoff-190828_catbalanced
+dataset_config_subdir: pdb
+
+# Load processed .pt files into RAM at training start (policy switch 2026-05-26).
+# Overrides datamodule.in_memory in the dataset YAML.
+datamodule:
+  in_memory: True
+
+force_precision_f32: False
+
+training:
+  # STAGE 1: no sequence conditioning. training_step pops `residue_type_unmasked`
+  # writing and the masking branch; with contact_map_mode + predict_coords=ipa,
+  # `residue_type` itself stays in the batch (line 1055-1061) so IPA still
+  # functions and validation logging that needs a PDB still works.
+  self_cond: True
+  seq_cond: False
+  fold_cond: True
+  # Enable UDLM position bias for wavefront curriculum
+  position_bias:
+    enabled: true
+    mode: sigmoid
+    k: 10.0
+  mask_T_prob: 0.5
+  mask_A_prob: 0.5
+  mask_C_prob: 0.5
+  fold_label_sample_ratio: [0.67, 0.13, 0.2, 0.0]
+  mask_seq_proportion: 0.15
+  mask_extlig_proportion: 0.3
+  finetune_seq_cond_lora_only: False
+  self_cond_use_copy: True
+  self_cond_copy_update_every: 10
+  self_cond_mode: alias   # Phase 5 default: shared params (1x memory, live SC weights, full compile speedup). Alternatives: 'deepcopy' (separate weights, periodic resync) or 'none' (SC/training share self.nn; requires Phase 4 fix; may thrash compile cache).
+  # STAGE 1: USE sinusoidal positional embeddings as a learning crutch. The model
+  # has no sequence info (residue_type embeddings disabled), so positional indices
+  # are one of the few stable training signals available. Restored to True
+  # (zero out pos emb) in the Stage-2 finetune to match the inference setting
+  # there. Note: validation trajectory + r3n_fm.full_simulation now propagate this
+  # flag (fix applied in P0-4 below), so val sampling matches training.
+  zero_sin_pos_emb: False
+
+lora:
+  use: False
+  lora_alpha: 32.0
+  lora_dropout: 0.0
+  r: 0
+  train_bias: none
+
+opt:
+  lr: 0.0001
+  # STAGE 1: backbone pretraining. Targets 150K optim steps (~19M samples at
+  # effective batch 128). max_epochs is a loose upper-bound for the cosine
+  # annealer's horizon; max_steps is the hard stop.
+  max_epochs: 2500
+  max_steps: 150000
+  batch_size: 8  # per-GPU micro-batch
+  accumulate_grad_batches: 4  # effective = 4 GPU * 8 micro * 4 accum = 128
+  optimizer: muon
+  val_check_interval_optim_steps: 500  # 300 val cycles over 150K steps. Val-traj at chunk=8 is sampling-heavy, so leaner cadence saves compute.
+  skip_nan_grad: False
+  # Set True to print ipa_linear_s/z grad norms + frames_pred stats every 100
+  # train steps. For the FAPE/IPA debug experiments only — keep False in prod.
+  debug_log_grads: False
+  grad_and_weight_analysis: False
+  dist_strategy: ddp
+  # NCCL: gloo's 30-min recv timeout was firing during stage-1 val (validation
+  # trajectory on rank-0 takes longer than ranks-1-3's sync_dist wait). NCCL is
+  # the right GPU collective anyway; gloo was a leftover from before stage-1
+  # had heavy val sampling. Callback `cluster_sampler_audit_callback.py`
+  # all_gather'd CPU tensors which NCCL refuses — fixed alongside this switch.
+  dist_backend: nccl
+  use_lr_warmup: True
+  warmup_steps: 3000
+  warmup_start_lr_ratio: 0.0
+  lr_scheduler_type: cosine
+  use_cueq: False
+
+log:
+  wandb_project: protein_transformer_big_runs
+  log_wandb: True
+  log_every_n_steps: 1
+  log_structure_every_n_steps: 100
+  checkpoint: True
+  last_ckpt_every_n_steps: 2000
+  # Disabled in stage-1: training has no sequence conditioning (seq_cond=False),
+  # so USalign(sampled_struct, GT_struct) measures noise — there's no reason for
+  # the sampled structure to align with any particular GT. We rely on
+  # last_ckpt_every_n_steps=2000 + the final `last.ckpt` for stage-2 bootstrap.
+  # Stage-2 (seq_cond=True) re-enables this metric.
+  checkpoint_best_tmscore_median: False
+
+validation_sampling:
+  dt: 0.005
+  sampling_mode: sc
+  sc_scale_noise: 0.45
+  # STAGE 1 = qualitative-only validation sampling. tmscore_n_samples == 0
+  # gates the new branch in model_trainer_base._run_validation_trajectory:
+  # rank-0 generates exactly 1 sample with fresh noise + variable-length
+  # sampling and logs structure / contact map / sampled DSSP to wandb;
+  # ranks 1-3 skip the trajectory entirely (no compute waste). No USalign,
+  # no TM-score, no contact-map metrics aggregation.
+  #
+  # Stage-2 sets tmscore_n_samples=8: each rank generates 8/world_size=2
+  # samples, all ranks accumulate per-sample TM-scores into the local list,
+  # on_validation_epoch_end_data gathers everything to rank-0 for the
+  # tmscore_median/mean payload.
+  tmscore_n_samples: 0
+  # STAGE 1: random L per val epoch (drawn from dataselector min/max_length =
+  # 50/256). Stage 1 is generative-style pretraining without sequence info, so
+  # evaluating across lengths is more informative than evaluating on each
+  # protein's real length. Mask shape stays [B, 256] (value-only change), so no
+  # torch._dynamo recompile from this. Restored to False in Stage 2.
+  variable_length_sampling: True
+
+seed: 42
+
+ema:
+  decay: 0.999
+  validate_original_weights: False
+  every_n_steps: 1
+  cpu_offload: False
+
+# ==============================================================================
+# Inference Configuration Section
+# Used when calling inference scripts (inference.py / motif_inference.py)
+# directly with this unified config file.
+# Stage-1 inference mirrors training: seq_cond=False, zero_sin_pos_emb=False
+# (matching the residue_type embeddings disabled + sinusoidal-pos-emb-on regime).
+# ==============================================================================
+inference:
+  # 'best' resolves the run's best TM-score ckpt from
+  # ./store/{run_name_}/checkpoints/ (writer is log.checkpoint_best_tmscore_median).
+  # 'last' resolves the most-recent checkpoint instead.
+  checkpoint_mode: "best"
+  # Backward-compatibility explicit path (overrides checkpoint_mode if set).
+  ckpt_path: null
+  ckpt_name: null
+
+  ncpus_: 24
+  seed: 42
+
+  # Lengths to sample (uses nres_lens if set, else arange(min_len, max_len+1, step))
+  nres_lens: [50, 100, 150, 200, 250]
+  min_len: null
+  max_len: null
+  step_len: null
+
+  nsamples_per_len: 1024
+  max_nsamples: 32
+
+  # Sampling
+  dt: 0.005
+  self_cond: True
+  fold_cond: False
+  cath_code_level: "T"
+  seq_cond: False
+  zero_sin_pos_emb: False
+
+  data_dir: ${oc.env:DATA_PATH}/pdb_train/
+  cath_code_file: cath_codes_train_df_pdb_f1_minl50_maxl256_mtprotein_etdiffractionEM_minoNone_maxoNone_minr0.0_maxr5.0_hl_rl_rnsrTrue_rpuTrue_l_rcuFalse.csv
+
+  # ext_lig default for inference: "unknown" (2, AFDB-style) or "absent" (0, apo).
+  ext_lig_default: "unknown"
+
+  # Sampling params for the caflow/contactflow sampler used by this model class
+  sampling_caflow:
+    sampling_mode: sc
+    sc_scale_noise: 0.45
+    sc_scale_score: 1.0
+    gt_mode: "1/t"
+    gt_p: 1.0
+    gt_clamp_val: null
+
+  schedule:
+    schedule_mode: log
+    schedule_p: 2.0
+
+  # LoRA — mirror training if you use lora
+  lora:
+    use: False
+    lora_alpha: 32.0
+    lora_dropout: 0.0
+    r: 0
+    train_bias: "none"
+
+  designability_seqs_per_struct: 8
+  compute_designability: False
+  compute_fid: False
