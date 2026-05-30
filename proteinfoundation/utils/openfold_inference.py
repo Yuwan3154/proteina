@@ -722,6 +722,51 @@ class OpenFoldTemplateInference(nn.Module):
     # Single-sample batch construction
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _zero_template_noncovered(batch: dict, segment_mask) -> None:
+        """Zero template coord masks on uncovered (gap) residues so the composite
+        template's placeholder CAs contribute no geometry. Applied in BOTH the
+        mask and nomask cells (independent of the cross-segment toggle)."""
+        if segment_mask is None:
+            return
+        ref = batch.get("template_all_atom_mask", batch.get("template_pseudo_beta_mask"))
+        if ref is None:
+            return
+        cov = torch.as_tensor(segment_mask, device=ref.device, dtype=ref.dtype).reshape(-1)
+        if "template_all_atom_mask" in batch:
+            m = batch["template_all_atom_mask"]
+            batch["template_all_atom_mask"] = m * cov.reshape(*([1] * (m.dim() - 3)), -1, 1, 1)
+        if "template_pseudo_beta_mask" in batch:
+            m = batch["template_pseudo_beta_mask"]
+            batch["template_pseudo_beta_mask"] = m * cov.reshape(*([1] * (m.dim() - 2)), -1, 1)
+
+    @staticmethod
+    def _inject_template_segment_compat(batch: dict, segment_ids) -> None:
+        """Inject a block-diagonal cross-segment compatibility mask under key
+        'template_segment_compat_2d' (shape [T, N, N, E]). TemplateEmbedder.forward
+        multiplies it into pair_mask, removing ordered-to-ordered cross-segment
+        template pairs. Mirrors _inject_template_dgram_probs (trailing ensemble dim
+        is required because the outer forward slices the recycling dim). Only called
+        when the --mask_inter_segment toggle is ON."""
+        if segment_ids is None or "template_aatype" not in batch:
+            return
+        ta = batch["template_aatype"]
+        device = ta.device
+        seg = torch.as_tensor(segment_ids, device=device, dtype=torch.long).reshape(-1)
+        num_res = ta.shape[1]
+        if seg.shape[0] != num_res:
+            raise ValueError(f"segment_ids length {seg.shape[0]} != template length {num_res}")
+        compat = (seg[:, None] == seg[None, :]) & (seg[:, None] >= 0)  # [N, N]
+        num_templates = ta.shape[0]
+        compat = compat.unsqueeze(0).expand(num_templates, -1, -1)  # [T, N, N]
+        num_ensembles = ta.shape[-1] if ta.dim() > 2 else 1
+        compat = compat.unsqueeze(-1).expand(-1, -1, -1, num_ensembles)  # [T, N, N, E]
+        dtype = (
+            batch["template_all_atom_positions"].dtype
+            if "template_all_atom_positions" in batch else torch.float32
+        )
+        batch["template_segment_compat_2d"] = compat.to(device=device, dtype=dtype)
+
     def build_batch(
         self,
         distogram_probs: torch.Tensor,
@@ -736,6 +781,8 @@ class OpenFoldTemplateInference(nn.Module):
         zero_template_unit_vector: bool = False,
         zero_template_torsion_angles: bool = False,
         _pad_to_length: Optional[int] = None,
+        segment_ids=None,
+        segment_mask=None,
         seed: Optional[int] = None,
     ):
         """
@@ -884,6 +931,10 @@ class OpenFoldTemplateInference(nn.Module):
             mask_template_aatype=mask_template_aatype,
             zero_template_torsion_angles=zero_template_torsion_angles,
         )
+        if segment_mask is not None:
+            self._zero_template_noncovered(batch, segment_mask)
+        if segment_ids is not None:
+            self._inject_template_segment_compat(batch, segment_ids)
         return batch
 
     @staticmethod
