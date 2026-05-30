@@ -303,7 +303,9 @@ class CATBalancedSampler(Sampler):
         nocat_clusters: List[str] = []
 
         for cluster_name, members in self.clusterid_to_seqid_mapping.items():
-            member_cats = {m: self.chain_to_cat.get(m.lower(), []) for m in members}
+            # Exact-case first (AFDB v6 stems are case-sensitive), then lowercased
+            # (PDB chain_to_cat keys are lowercased); supports both datasets.
+            member_cats = {m: (self.chain_to_cat.get(m) or self.chain_to_cat.get(m.lower(), [])) for m in members}
             cats_here = set()
             for cl in member_cats.values():
                 cats_here.update(cl)
