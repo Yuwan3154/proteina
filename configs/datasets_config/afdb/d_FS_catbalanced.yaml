@@ -20,7 +20,7 @@ datamodule:
   in_memory: False  # 1.05M chains won't fit in RAM; CAT-balanced touches ~1176/epoch -> per-batch disk read
   format: "pdb"
   overwrite: False
-  regenerate_missing: True
+  regenerate_missing: False  # read-only over already-processed d_FS; 2 of 1.05M .pt are unregenerable (raw parse fails)
   cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/
   multilabel_mode: "sample"
   cath_dedupe_codes: True
