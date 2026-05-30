@@ -398,6 +398,36 @@ def build_composite_template_cif(query_sequence, segments, segment_pdbs, chain_i
     return cif_path, seg_ids, seg_mask
 
 
+def composite_from_per_segment_joints(query_sequence, segments, seg_source_pdbs, chain_id=None):
+    """Round-2 refinement: build a composite picking each segment k's coords from its own
+    chosen JOINT pdb (M residues, segment-concatenation order). All joints share the segment
+    layout, so segment k sits at the same joint offset. Returns (cif_path, seg_ids, seg_mask)."""
+    L = len(query_sequence)
+    seg_ids = _composite_seg_ids(L, segments)
+    if len(seg_source_pdbs) != len(segments):
+        raise ValueError(f"got {len(seg_source_pdbs)} source PDBs for {len(segments)} segments")
+    seg_lens = [e - s for (s, e) in segments]
+    offsets = [0]
+    for ln in seg_lens:
+        offsets.append(offsets[-1] + ln)
+    M = offsets[-1]
+    atom_positions = np.zeros((L, rc.atom_type_num, 3), dtype=np.float32)
+    atom_mask = np.zeros((L, rc.atom_type_num), dtype=np.float32)
+    for k, (s, e) in enumerate(segments):
+        with open(seg_source_pdbs[k]) as f:
+            prot = openfold_protein.from_pdb_string(f.read(), chain_id=chain_id)
+        if prot.aatype.shape[0] != M:
+            raise ValueError(
+                f"source joint PDB for segment {k} has {prot.aatype.shape[0]} residues, expected {M}"
+            )
+        for off, ti in enumerate(range(s, e)):
+            jpos = offsets[k] + off
+            atom_positions[ti] = prot.atom_positions[jpos]
+            atom_mask[ti] = prot.atom_mask[jpos]
+    cif_path = _write_composite_cif(query_sequence, seg_ids, atom_positions, atom_mask)
+    return cif_path, seg_ids, (seg_ids >= 0).astype(np.float32)
+
+
 def get_sequence_from_structure(pdb_file, chain=None):
     """Extract amino acid sequence from PDB/CIF file using BioPython."""
     is_cif = pdb_file.lower().endswith('.cif')
@@ -947,6 +977,38 @@ class OpenFoldAF2Rank:
 
         return scores
 
+    def score_refined(self, segment_source_pdbs, seed: int = 0) -> Dict:
+        """Round-2: assemble a composite picking each segment's coords from its own source
+        joint PDB (all-atom) and score it. Mirrors _featurize's build_batch call + forward."""
+        temp_cif, seg_ids, seg_mask = composite_from_per_segment_joints(
+            self.reference_sequence, self._segments, segment_source_pdbs
+        )
+        try:
+            cif_chain = _detect_chain_in_cif(temp_cif)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            batch = self.model.build_batch(
+                distogram_probs=None,
+                residue_type=self._residue_type,
+                mask=self._mask,
+                template_mode="full_template",
+                template_mmcif_path=temp_cif,
+                template_chain_id=cif_chain,
+                kalign_binary_path=KALIGN_BINARY_PATH,
+                mask_template_aatype=True,
+                segment_mask=seg_mask,
+                segment_ids=(seg_ids if self._mask_inter_segment else None),
+            )
+        finally:
+            if os.path.exists(temp_cif):
+                os.unlink(temp_cif)
+        with torch.no_grad():
+            out = self.model.model(batch)
+        scores = self._extract_scores(out, seg_ids)
+        gc.collect()
+        torch.cuda.empty_cache()
+        return scores
+
     def _extract_scores(self, out: dict, seg_ids=None) -> Dict:
         """Extract AF2 confidence metrics from OpenFold output."""
         scores = {}
@@ -1005,6 +1067,7 @@ def score_proteina_structures_openfold(
     predicted_structure_dir: Optional[str] = None,
     segments=None,
     mask_inter_segment: bool = True,
+    refine: bool = True,
 ) -> List[Dict]:
     """Score all Proteina-generated structures using AF2Rank with OpenFold backend.
 
@@ -1140,6 +1203,36 @@ def score_proteina_structures_openfold(
 
             if i + 1 < len(items):
                 future = next_future
+
+    # ---- Round 2: per-segment AF2Rank refinement (joint segment mode, >=2 segments) ----
+    if refine and scorer._segments is not None and len(scorer._segments) >= 2:
+        n_seg = len(scorer._segments)
+        best = {}  # segment idx -> (per_segment_ptm, orig_joint_pdb)
+        for row in scores:
+            psp = row.get("per_segment_ptm")
+            src = row.get("structure_path")
+            if not psp or not src:
+                continue
+            d = json.loads(psp)
+            for k in range(n_seg):
+                v = d.get(str(k))
+                if v is None:
+                    continue
+                if k not in best or v > best[k][0]:
+                    best[k] = (float(v), src)
+        if len(best) == n_seg:
+            segment_source_pdbs = [allatom_map.get(best[k][1], best[k][1]) for k in range(n_seg)]
+            provenance = {str(k): os.path.basename(best[k][1]) for k in range(n_seg)}
+            refined = scorer.score_refined(segment_source_pdbs)
+            refined.update({
+                "protein_id": protein_id,
+                "structure_file": "refinement",
+                "structure_path": "",
+                "round": "refinement",
+                "provenance": json.dumps(provenance),
+            })
+            scores.append(refined)
+            logger.info(f"Round-2 refinement for {protein_id}: provenance {provenance}")
 
     # Clean up batch-reconstructed temp files
     for temp_path in allatom_map.values():
