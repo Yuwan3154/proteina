@@ -703,6 +703,7 @@ class OpenFoldAF2Rank:
         inference_attn_kernel: str = "sdpa",
         compile_strategy: str = "per_block",
         use_cueq_triangle_mul: bool = False,
+        mask_inter_segment: bool = True,
     ):
         if chain is None:
             chain = "A"
@@ -711,6 +712,8 @@ class OpenFoldAF2Rank:
         self.debug = debug
         self.recycles = recycles
         self.skip_ref_metrics = skip_ref_metrics
+        self._segments = None
+        self._mask_inter_segment = mask_inter_segment
 
         # Detect correct chain in reference CIF
         is_cif = reference_pdb.lower().endswith('.cif')
@@ -796,6 +799,13 @@ class OpenFoldAF2Rank:
         )
         self._mask = torch.ones((1, len(self.reference_sequence)), dtype=torch.float32)
         logger.info(f"reset_reference: new sequence length {len(self.reference_sequence)}")
+        self._segments = None
+
+    def set_segments(self, segments) -> None:
+        """Enable joint-discontinuous composite-template scoring for the current
+        reference. `segments` = list of (start, end) 0-based half-open over the
+        reference (query) sequence; None disables segment mode."""
+        self._segments = segments
 
     def _featurize(
         self,
@@ -827,7 +837,13 @@ class OpenFoldAF2Rank:
             allatom_pdb = None
             pdb_for_template = decoy_pdb
 
-        temp_cif = convert_pdb_to_cif(pdb_for_template, chain_id=decoy_chain)
+        seg_ids = seg_mask = None
+        if self._segments is not None:
+            temp_cif, seg_ids, seg_mask = composite_from_joint(
+                self.reference_sequence, self._segments, pdb_for_template, chain_id=decoy_chain
+            )
+        else:
+            temp_cif = convert_pdb_to_cif(pdb_for_template, chain_id=decoy_chain)
         try:
             cif_chain = _detect_chain_in_cif(temp_cif)
             # Set numpy/torch CPU seeds before build_batch.
@@ -845,6 +861,8 @@ class OpenFoldAF2Rank:
                 template_chain_id=cif_chain,
                 kalign_binary_path=KALIGN_BINARY_PATH,
                 mask_template_aatype=True,  # AF2Rank: mask template sequence to all-X post-pipeline
+                segment_mask=seg_mask,
+                segment_ids=(seg_ids if self._mask_inter_segment else None),
             )
         finally:
             if os.path.exists(temp_cif):
@@ -852,7 +870,7 @@ class OpenFoldAF2Rank:
             if allatom_pdb and os.path.exists(allatom_pdb):
                 os.unlink(allatom_pdb)
 
-        return batch, template_coords
+        return batch, template_coords, seg_ids
 
     def score_structure(
         self,
@@ -883,7 +901,7 @@ class OpenFoldAF2Rank:
             logger.warning("Skipping %s: %s", os.path.basename(ca_source), ca_gap_error)
             return _invalid_template_scores(ca_gap_error)
 
-        batch, template_coords = self._featurize(
+        batch, template_coords, seg_ids = self._featurize(
             decoy_pdb,
             decoy_chain=decoy_chain,
             seed=seed,
@@ -896,7 +914,7 @@ class OpenFoldAF2Rank:
             else:
                 out = self.model.model(batch)
 
-        scores = self._extract_scores(out)
+        scores = self._extract_scores(out, seg_ids)
         if output_pdb is not None:
             _save_openfold_prediction_pdb(self.reference_sequence, out, output_pdb)
             scores["predicted_structure_path"] = output_pdb
@@ -928,7 +946,7 @@ class OpenFoldAF2Rank:
 
         return scores
 
-    def _extract_scores(self, out: dict) -> Dict:
+    def _extract_scores(self, out: dict, seg_ids=None) -> Dict:
         """Extract AF2 confidence metrics from OpenFold output."""
         scores = {}
 
@@ -967,6 +985,8 @@ def score_proteina_structures_openfold(
     use_cuequivariance_multiplicative_update: bool = True,
     scorer: Optional["OpenFoldAF2Rank"] = None,
     predicted_structure_dir: Optional[str] = None,
+    segments=None,
+    mask_inter_segment: bool = True,
 ) -> List[Dict]:
     """Score all Proteina-generated structures using AF2Rank with OpenFold backend.
 
@@ -1002,7 +1022,9 @@ def score_proteina_structures_openfold(
             use_deepspeed_evoformer_attention=use_deepspeed_evoformer_attention,
             use_cuequivariance_attention=use_cuequivariance_attention,
             use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
+            mask_inter_segment=mask_inter_segment,
         )
+    scorer.set_segments(segments)
 
     scores = []
     valid_items = []
@@ -1035,10 +1057,10 @@ def score_proteina_structures_openfold(
 
     def _featurize_item(item):
         orig_pdb, scored_pdb = item
-        batch, template_coords = scorer._featurize(
+        batch, template_coords, seg_ids = scorer._featurize(
             scored_pdb, decoy_chain="A", _original_pdb=orig_pdb,
         )
-        return orig_pdb, batch, template_coords
+        return orig_pdb, batch, template_coords, seg_ids
 
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(_featurize_item, items[0])
@@ -1056,12 +1078,12 @@ def score_proteina_structures_openfold(
                 next_future = executor.submit(_featurize_item, items[i + 1])
 
             try:
-                _, batch, template_coords = future.result()
+                _, batch, template_coords, seg_ids = future.result()
 
                 with torch.no_grad():
                     out = scorer.model.model(batch)
 
-                structure_scores = scorer._extract_scores(out)
+                structure_scores = scorer._extract_scores(out, seg_ids)
                 if output_pdb is not None:
                     _save_openfold_prediction_pdb(scorer.reference_sequence, out, output_pdb)
                     structure_scores["predicted_structure_path"] = output_pdb
