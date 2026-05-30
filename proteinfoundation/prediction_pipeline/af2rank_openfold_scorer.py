@@ -296,6 +296,107 @@ def convert_pdb_to_cif(pdb_file, chain_id=None):
     return temp_cif.name
 
 
+# --- Composite full-length template builders (joint-discontinuous segment mode) ---
+# Produce a (cif_path, seg_ids[L], seg_mask[L]) interface: a FULL-LENGTH-L template
+# carrying ordered-residue coords at TRUE chain indices + a placeholder CA on every
+# uncovered residue (OpenFold's mmcif parser drops atom-less residues, which would
+# shift the skip_alignment 1:1 mapping). Built as a Protein directly + to_modelcif;
+# NOT routed through convert_pdb_to_cif (which re-derives n / drops residues).
+
+def _composite_seg_ids(query_len, segments):
+    """seg_ids[L]: segment index k on each [s,e) (0-based half-open), -1 elsewhere."""
+    seg_ids = np.full((query_len,), -1, dtype=np.int64)
+    for k, (s, e) in enumerate(segments):
+        seg_ids[s:e] = k
+    return seg_ids
+
+
+def _write_composite_cif(query_sequence, seg_ids, atom_positions, atom_mask):
+    """Assemble a full-length-L Protein from coords + write a modelcif; returns cif path.
+
+    Carry-forward placeholder CA on every uncovered residue (seg_ids<0) so each of the
+    L residues has >=1 atom and survives mmcif parsing in true-index order.
+    """
+    L = len(query_sequence)
+    aatype = np.array(
+        [rc.restype_order.get(aa, rc.restype_num) for aa in query_sequence],
+        dtype=np.int64,
+    )
+    ca = rc.atom_order["CA"]
+    last_ca = None
+    for i in range(L):
+        if seg_ids[i] >= 0:
+            if atom_mask[i, ca] > 0.5:
+                last_ca = atom_positions[i, ca].astype(np.float32).copy()
+        else:
+            atom_positions[i, ca] = last_ca if last_ca is not None else np.zeros(3, dtype=np.float32)
+            atom_mask[i, ca] = 1.0
+    prot = openfold_protein.Protein(
+        atom_positions=atom_positions,
+        atom_mask=atom_mask,
+        aatype=aatype,
+        residue_index=np.arange(1, L + 1, dtype=np.int32),
+        chain_index=np.zeros(L, dtype=np.int32),
+        b_factors=np.zeros((L, rc.atom_type_num), dtype=np.float32),
+    )
+    assert len(prot.aatype) == L, f"composite Protein has {len(prot.aatype)} residues, expected {L}"
+    cif_str = openfold_protein.to_modelcif(prot)
+    temp_cif = tempfile.NamedTemporaryFile(mode="w", suffix=".cif", delete=False)
+    temp_cif.write(cif_str)
+    temp_cif.close()
+    return temp_cif.name
+
+
+def composite_from_joint(query_sequence, segments, joint_pdb, chain_id=None):
+    """Round-1 (PRIMARY): map the joint proteina output's M ordered residues onto their
+    TRUE indices in the L-length chain. joint_pdb residues are in segment-concatenation
+    order (build_discontinuous_pt). Returns (cif_path, seg_ids[L], seg_mask[L])."""
+    L = len(query_sequence)
+    seg_ids = _composite_seg_ids(L, segments)
+    with open(joint_pdb) as f:
+        prot = openfold_protein.from_pdb_string(f.read(), chain_id=chain_id)
+    true_idx = [i for (s, e) in segments for i in range(s, e)]
+    M = len(true_idx)
+    if prot.aatype.shape[0] != M:
+        raise ValueError(
+            f"joint PDB {joint_pdb} has {prot.aatype.shape[0]} residues, "
+            f"expected {M} (sum of segment lengths)"
+        )
+    atom_positions = np.zeros((L, rc.atom_type_num, 3), dtype=np.float32)
+    atom_mask = np.zeros((L, rc.atom_type_num), dtype=np.float32)
+    for j, ti in enumerate(true_idx):
+        atom_positions[ti] = prot.atom_positions[j]
+        atom_mask[ti] = prot.atom_mask[j]
+    cif_path = _write_composite_cif(query_sequence, seg_ids, atom_positions, atom_mask)
+    seg_mask = (seg_ids >= 0).astype(np.float32)
+    return cif_path, seg_ids, seg_mask
+
+
+def build_composite_template_cif(query_sequence, segments, segment_pdbs, chain_id=None):
+    """Round-2 / fallback: place per-segment coords (one source PDB per segment, residues
+    in that segment's order) at TRUE indices. Returns (cif_path, seg_ids[L], seg_mask[L])."""
+    L = len(query_sequence)
+    seg_ids = _composite_seg_ids(L, segments)
+    if len(segment_pdbs) != len(segments):
+        raise ValueError(f"got {len(segment_pdbs)} segment PDBs for {len(segments)} segments")
+    atom_positions = np.zeros((L, rc.atom_type_num, 3), dtype=np.float32)
+    atom_mask = np.zeros((L, rc.atom_type_num), dtype=np.float32)
+    for (s, e), seg_pdb in zip(segments, segment_pdbs):
+        with open(seg_pdb) as f:
+            prot = openfold_protein.from_pdb_string(f.read(), chain_id=chain_id)
+        seg_len = e - s
+        if prot.aatype.shape[0] != seg_len:
+            raise ValueError(
+                f"segment PDB {seg_pdb} has {prot.aatype.shape[0]} residues, expected {seg_len}"
+            )
+        for off in range(seg_len):
+            atom_positions[s + off] = prot.atom_positions[off]
+            atom_mask[s + off] = prot.atom_mask[off]
+    cif_path = _write_composite_cif(query_sequence, seg_ids, atom_positions, atom_mask)
+    seg_mask = (seg_ids >= 0).astype(np.float32)
+    return cif_path, seg_ids, seg_mask
+
+
 def get_sequence_from_structure(pdb_file, chain=None):
     """Extract amino acid sequence from PDB/CIF file using BioPython."""
     is_cif = pdb_file.lower().endswith('.cif')
