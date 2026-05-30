@@ -596,6 +596,16 @@ class ModelTrainerBase(L.LightningModule):
         if getattr(self, "_inf_zero_sin_pos_emb", False):
             batch["_zero_idx_emb"] = True
 
+        # Joint-discontinuous: inject per-residue position/break feats (stashed in predict_step)
+        _xt = batch.get("x_t")
+        _nb = _xt.shape[0] if _xt is not None else None
+        for _k, _attr in (("residue_pdb_idx", "_gen_residue_pdb_idx"), ("chain_breaks_per_residue", "_gen_chain_breaks")):
+            _v = getattr(self, _attr, None)
+            if _v is not None:
+                if _v.dim() == 2 and _v.shape[0] == 1 and _nb and _nb > 1:
+                    _v = _v.expand(_nb, -1)
+                batch[_k] = _v.to(_xt.device) if _xt is not None else _v
+
         eval_nn = self._eval_forward_module(force_compile)
         nn_out = eval_nn(batch, force_compile=force_compile)
         x_pred = self._nn_out_to_x_clean(nn_out, batch)
@@ -3001,6 +3011,8 @@ class ModelTrainerBase(L.LightningModule):
         if cath_code_indices is None:
             cath_code_raw = cath_code_raw or [["x.x.x.x"] for _ in range(batch["nsamples"])]
         residue_type = batch["residue_type"] if self.inf_cfg.get("seq_cond", False) else None
+        self._gen_residue_pdb_idx = batch.get("residue_pdb_idx")
+        self._gen_chain_breaks = batch.get("chain_breaks_per_residue")
         guidance_weight = self.inf_cfg.get("guidance_weight", 1.0)
         autoguidance_ratio = self.inf_cfg.get("autoguidance_ratio", 0.0)
         

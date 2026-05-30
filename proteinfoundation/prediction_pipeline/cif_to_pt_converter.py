@@ -99,7 +99,7 @@ def extract_sequence_from_cif(cif_file: str, chain_id: str) -> Optional[List[str
         return None
 
 
-def sequence_to_pt_data(sequence: List[str], protein_id: str) -> Data:
+def sequence_to_pt_data(sequence: List[str], protein_id: str, residue_pdb_idx=None, chain_breaks=None) -> Data:
     """
     Convert amino acid sequence to PyTorch Geometric Data object.
     
@@ -129,6 +129,11 @@ def sequence_to_pt_data(sequence: List[str], protein_id: str) -> Data:
     # Add sequence position information
     seq_pos = torch.arange(len(sequence)).unsqueeze(1)
     data.seq_pos = seq_pos
+
+    if residue_pdb_idx is not None:
+        data.residue_pdb_idx = torch.tensor(residue_pdb_idx, dtype=torch.long)
+    if chain_breaks is not None:
+        data.chain_breaks_per_residue = torch.tensor(chain_breaks, dtype=torch.bool)
     
     return data
 

@@ -146,6 +146,10 @@ class GenDatasetWithSeqCath(Dataset):
             "cath_code": cath_code_batch,
             "residue_type": residue_type,
         }
+        for _k in ("residue_pdb_idx", "chain_breaks_per_residue"):
+            _v = getattr(self.pt, _k, None)
+            if _v is not None:
+                result[_k] = _v
         return result
 
 

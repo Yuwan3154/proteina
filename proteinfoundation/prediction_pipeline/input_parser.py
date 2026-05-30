@@ -109,6 +109,26 @@ def create_pt_files(df: pd.DataFrame) -> str:
     return processed_dir
 
 
+def build_discontinuous_pt(parent_id, parent_seq, segments):
+    """Build one PyG Data for a chain's ordered residues as a DISCONTINUOUS
+    sequence (joint-discontinuous mode). `segments` = list of [start, end)
+    (0-based, half-open) in chain order. residue_pdb_idx carries TRUE 1-based
+    chain positions (with gaps between segments); chain_breaks marks each
+    segment's last residue (except the final) as followed by a break."""
+    residues, residue_pdb_idx, chain_breaks = [], [], []
+    for k, (s, e) in enumerate(segments):
+        sub = list(parent_seq[s:e])
+        residues.extend(sub)
+        residue_pdb_idx.extend(range(s + 1, e + 1))
+        cb = [False] * len(sub)
+        if sub and k < len(segments) - 1:
+            cb[-1] = True
+        chain_breaks.extend(cb)
+    return sequence_to_pt_data(residues, parent_id,
+                               residue_pdb_idx=residue_pdb_idx,
+                               chain_breaks=chain_breaks)
+
+
 def create_working_csv(df: pd.DataFrame, output_path: str) -> str:
     """
     Write a working CSV with 'id' column for downstream pipeline scripts.
