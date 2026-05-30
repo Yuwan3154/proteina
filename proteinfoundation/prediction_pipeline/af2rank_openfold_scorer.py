@@ -30,6 +30,7 @@ from tqdm import tqdm
 
 import openfold.np.residue_constants as rc
 from openfold.np import protein as openfold_protein
+from openfold.utils.loss import compute_tm
 from proteinfoundation.utils.openfold_inference import OpenFoldTemplateInference
 from proteinfoundation.utils.ff_utils.pdb_utils import write_prot_to_pdb
 from proteinfoundation.prediction_pipeline.cif_chain_mapping import resolve_biopython_chain_for_structure
@@ -968,6 +969,23 @@ class OpenFoldAF2Rank:
 
         # Composite score
         scores["composite"] = scores["ptm"] * scores["plddt"]
+
+        # Per-segment pTM/pLDDT (joint-discontinuous mode): pTM residue weights
+        # restricted to each segment (compute_tm d0 uses the segment length).
+        if seg_ids is not None:
+            seg = torch.as_tensor(seg_ids).reshape(-1)
+            tm_logits = out.get("tm_logits")
+            plddt = out.get("plddt")
+            per_ptm, per_plddt = {}, {}
+            for sseg in sorted({int(x) for x in seg.tolist() if x >= 0}):
+                sel = seg == sseg
+                if tm_logits is not None:
+                    rw = sel.to(device=tm_logits.device, dtype=tm_logits.dtype)
+                    per_ptm[sseg] = float(compute_tm(tm_logits, residue_weights=rw).item())
+                if plddt is not None:
+                    per_plddt[sseg] = float(plddt[sel.to(plddt.device)].mean().item()) / 100.0
+            scores["per_segment_ptm"] = json.dumps(per_ptm)
+            scores["per_segment_plddt"] = json.dumps(per_plddt)
 
         return scores
 
