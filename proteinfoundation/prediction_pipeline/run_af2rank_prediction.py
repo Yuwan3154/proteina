@@ -34,6 +34,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import json
 import pandas as pd
 import torch
 
@@ -62,6 +63,24 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _segments_by_protein(csv_file, csv_col, segments_col, min_len):
+    """protein -> [[s,e],...] ordered segments with length >= min_len, from the annotated CSV."""
+    df = pd.read_csv(csv_file)
+    df.columns = df.columns.str.strip()
+    if segments_col not in df.columns:
+        raise KeyError(f"--segments_col '{segments_col}' not in {csv_file}; columns={list(df.columns)}")
+    out = {}
+    for _, row in df.iterrows():
+        name = str(row[csv_col]).strip()
+        raw = row[segments_col]
+        if not isinstance(raw, str):
+            continue
+        segs = [[int(a), int(b)] for a, b in json.loads(raw) if (int(b) - int(a)) >= min_len]
+        if segs:
+            out[name] = segs
+    return out
+
 
 def _load_protein_ids(csv_file: str, id_col: str) -> List[str]:
     df = pd.read_csv(csv_file)
@@ -398,6 +417,14 @@ def main() -> None:
                         help="Thread workers for progress checks (default: min(32, cpu_count * 4)).")
     parser.add_argument("--dynamic_resharding", action=argparse.BooleanOptionalAction, default=True,
                         help="Filter global progress before sharding each step to reduce idle shards (default: True).")
+    parser.add_argument('--segment_mode', choices=['off', 'joint'], default='off',
+                        help='Joint-discontinuous segment scoring (default: off = whole-chain).')
+    parser.add_argument('--segments_col', default='ordered_segments',
+                        help='CSV column with ordered_segments JSON (segment_mode=joint).')
+    parser.add_argument('--segment_min_len', type=int, default=50,
+                        help='Drop ordered segments shorter than this (segment_mode=joint, default 50).')
+    parser.add_argument('--mask_inter_segment', action=argparse.BooleanOptionalAction, default=True,
+                        help='Mask cross-segment template pairs in AF2Rank (segment_mode=joint, default True).')
     add_shard_args(parser)
 
     args = parser.parse_args()
@@ -409,6 +436,10 @@ def main() -> None:
     global_protein_ids = _load_protein_ids(args.csv_file, args.csv_col)
     protein_ids = list(global_protein_ids)
     logger.info(f"Loaded {len(global_protein_ids)} proteins from {args.csv_file}")
+    seg_by_protein = {}
+    if args.segment_mode == 'joint':
+        seg_by_protein = _segments_by_protein(args.csv_file, args.csv_col, args.segments_col, args.segment_min_len)
+        logger.info(f"segment_mode=joint: {len(seg_by_protein)} proteins with >=1 segment >={args.segment_min_len}; mask_inter_segment={args.mask_inter_segment}")
 
     shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
     lengths = lengths_from_csv(args.csv_file, args.csv_col, args.len_col)
@@ -561,6 +592,8 @@ def main() -> None:
             protein_configs=protein_configs,
             model_name="model_1_ptm",
             out_dir_key="out_dir_m1",
+            seg_by_protein=seg_by_protein,
+            mask_inter_segment=args.mask_inter_segment,
             recycles=args.recycles,
             filter_existing=args.filter_existing,
             use_deepspeed_evoformer_attention=args.use_deepspeed_evoformer_attention,
@@ -580,6 +613,8 @@ def main() -> None:
             protein_configs=protein_configs,
             model_name="model_2_ptm",
             out_dir_key="out_dir_m2",
+            seg_by_protein=seg_by_protein,
+            mask_inter_segment=args.mask_inter_segment,
             recycles=args.recycles,
             filter_existing=args.filter_existing,
             use_deepspeed_evoformer_attention=args.use_deepspeed_evoformer_attention,
@@ -731,6 +766,8 @@ def _run_model_pass(
     inference_attn_kernel: str = "sdpa",
     compile_strategy: str = "per_block",
     use_cueq_triangle_mul: bool = False,
+    seg_by_protein: Dict = None,
+    mask_inter_segment: bool = True,
 ) -> None:
     """Load model_name ONCE, then iterate over all proteins.
 
@@ -779,6 +816,8 @@ def _run_model_pass(
                 logger.error(f"  {protein_id}: reset_reference failed: {e}; skipping")
                 continue
 
+        scorer.set_segments(seg_by_protein.get(protein_id) if seg_by_protein else None)
+        scorer._mask_inter_segment = mask_inter_segment
         try:
             _score_protein_with_scorer(
                 scorer=scorer,

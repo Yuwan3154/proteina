@@ -71,7 +71,7 @@ from proteinfoundation.prediction_pipeline.protein_tar_utils import (
     read_protein_text,
     restore_selected_protein_dirs,
 )
-from proteinfoundation.prediction_pipeline.input_parser import create_pt_files, create_working_csv, parse_input
+from proteinfoundation.prediction_pipeline.input_parser import build_discontinuous_pt, create_pt_files, create_working_csv, parse_input
 
 logging.basicConfig(
     level=logging.INFO,
@@ -190,6 +190,35 @@ def run_with_conda_env(env_name: str, command_list: list, cwd: str | None = None
 
 
 # ── Step 1: Parse input and create PT files ──────────────────────────────────
+
+def step_build_segment_pts(dataset_file, id_col, sequence_col, segments_col, segment_min_len):
+    """Build discontinuous (joint) PT files from a pre-annotated CSV (sequence + ordered_segments).
+    Drops segments shorter than segment_min_len; skips proteins with no qualifying segment.
+    Returns the list of protein ids for which a discontinuous PT was written."""
+    data_path = os.environ.get("DATA_PATH", os.path.join(PROTEINA_BASE_DIR, "data"))
+    processed_dir = os.path.join(data_path, "pdb_train", "processed")
+    os.makedirs(processed_dir, exist_ok=True)
+    df = pd.read_csv(dataset_file)
+    df.columns = df.columns.str.strip()
+    for col in (sequence_col, segments_col):
+        if col not in df.columns:
+            raise KeyError(f"segment_mode=joint requires column '{col}' in {dataset_file}; columns={list(df.columns)}")
+    built, skipped = [], 0
+    for _, row in df.iterrows():
+        pid = str(row[id_col]).strip()
+        seq, raw = row[sequence_col], row[segments_col]
+        if not isinstance(seq, str) or not isinstance(raw, str):
+            skipped += 1
+            continue
+        segs = [(int(a), int(b)) for a, b in json.loads(raw) if (int(b) - int(a)) >= segment_min_len]
+        if not segs:
+            skipped += 1
+            continue
+        torch.save(build_discontinuous_pt(pid, seq, segs), os.path.join(processed_dir, f"{pid}.pt"))
+        built.append(pid)
+    logger.info(f"Segment PTs: built {len(built)}, skipped {skipped} (no segment >={segment_min_len}) in {processed_dir}")
+    return built
+
 
 def step_parse_input(input_file: str, id_col: str, sequence_col: str, output_dir: str):
     """Parse input file, create PT files, and write working CSV."""
@@ -392,6 +421,10 @@ def step_af2rank_topk(
     dynamic_resharding: bool = True,
     progress_check_workers: int | None = None,
     force_regenerate_topk_summary: bool = False,
+    segment_mode: str = "off",
+    segments_col: str = "ordered_segments",
+    segment_min_len: int = 50,
+    mask_inter_segment: bool = True,
 ) -> bool:
     """Run AF2Rank on ProteinEBM top-k templates.
 
@@ -412,6 +445,10 @@ def step_af2rank_topk(
         "--recycles", str(recycles),
         "--proteinebm_analysis_subdir", proteinebm_analysis_subdir,
     ]
+    if segment_mode == "joint":
+        cmd.extend(["--segment_mode", "joint", "--segments_col", segments_col,
+                    "--segment_min_len", str(segment_min_len)])
+        cmd.append("--mask_inter_segment" if mask_inter_segment else "--no-mask_inter_segment")
     if cif_dir:
         cmd.extend(["--cif_dir", cif_dir])
     if filter_existing:
@@ -1213,6 +1250,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Thread workers for per-step progress checks (default: child script uses min(32, cpu_count * 4)).",
     )
+    parser.add_argument('--segment_mode', choices=['off', 'joint'], default='off',
+                        help='Joint-discontinuous segment mode (default: off = full-sequence/whole-chain).')
+    parser.add_argument('--segments_col', default='ordered_segments',
+                        help='CSV column with ordered_segments JSON (segment_mode=joint).')
+    parser.add_argument('--segment_min_len', type=int, default=50,
+                        help='Drop ordered segments shorter than this (segment_mode=joint, default 50).')
+    parser.add_argument('--mask_inter_segment', action=argparse.BooleanOptionalAction, default=True,
+                        help='Mask cross-segment template pairs in AF2Rank (segment_mode=joint, default True).')
     return parser
 
 
@@ -1305,6 +1350,12 @@ def main(argv: list[str] | None = None):
         protein_ids = [str(p).strip() for p in df[args.id_col].dropna().unique() if str(p).strip()]
         working_csv = args.dataset_file
         working_csv_id_col = args.id_col
+        if args.segment_mode == "joint":
+            os.environ["PROTEINA_CONDITIONING_MODE"] = "seq"
+            _built = step_build_segment_pts(args.dataset_file, args.id_col, args.sequence_col, args.segments_col, args.segment_min_len)
+            _built_set = set(_built)
+            protein_ids = [p for p in protein_ids if p in _built_set]
+            logger.info(f"segment_mode=joint: {len(protein_ids)} proteins with >=1 segment >={args.segment_min_len} (discontinuous PTs built); conditioning=seq")
     logger.info(f"Loaded {len(protein_ids)} proteins")
 
     inference_base = _inference_base(args.inference_config)
@@ -1330,7 +1381,7 @@ def main(argv: list[str] | None = None):
         # --dataset_file mode → use --cif_dir to convert CIF → PT (if PT files don't exist)
         # When --dataset_file mode AND --cif_dir set, run CIF→PT conversion.
         # When --dataset_file mode AND no --cif_dir, assume PT files exist (skip_pt_conversion=True).
-        skip_pt = (input_mode == "input") or (not has_gt)
+        skip_pt = (input_mode == "input") or (not has_gt) or (args.segment_mode == "joint")
         if not step_proteina_inference(
             csv_file=working_csv,
             csv_col=working_csv_id_col,
@@ -1461,6 +1512,10 @@ def main(argv: list[str] | None = None):
             # + per-protein af2rank-vs-proteinebm pTM scatter even for
             # proteins whose AF2Rank scoring is already complete.
             force_regenerate_topk_summary=bool(args.rerun_score),
+            segment_mode=args.segment_mode,
+            segments_col=args.segments_col,
+            segment_min_len=args.segment_min_len,
+            mask_inter_segment=args.mask_inter_segment,
         ):
             logger.error("AF2Rank top-k step failed")
             success = False

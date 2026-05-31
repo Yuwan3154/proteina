@@ -179,6 +179,8 @@ def process_single_protein_af2rank(args):
     use_ds = rest[1] if len(rest) > 1 else True
     use_cue_attn = rest[2] if len(rest) > 2 else True
     use_cue_mul = rest[3] if len(rest) > 3 else True
+    segments = rest[4] if len(rest) > 4 else None
+    mask_inter_segment = rest[5] if len(rest) > 5 else True
     
     # Set GPU for this process
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
@@ -214,6 +216,8 @@ def process_single_protein_af2rank(args):
         use_deepspeed_evoformer_attention=use_ds,
         use_cuequivariance_attention=use_cue_attn,
         use_cuequivariance_multiplicative_update=use_cue_mul,
+        segments=segments,
+        mask_inter_segment=mask_inter_segment,
     )
 
     if result.returncode != 0:
@@ -247,8 +251,12 @@ def run_af2rank_scoring(
     use_deepspeed_evoformer_attention=True,
     use_cuequivariance_attention=True,
     use_cuequivariance_multiplicative_update=True,
+    segments=None,
+    mask_inter_segment=True,
 ):
     """Run AF2Rank scoring for a single protein."""
+    if segments is not None and backend != "openfold":
+        raise ValueError("segment_mode=joint requires --af2rank_backend openfold")
     if backend == "openfold":
         wrapper_script = os.path.join(PROTEINA_BASE_DIR, 'proteinfoundation', 'prediction_pipeline', 'run_with_proteina_env.sh')
         python_code = f"""
@@ -267,6 +275,8 @@ af2rank_dir = '{inference_output_dir}/af2rank_analysis'
 os.makedirs(af2rank_dir, exist_ok=True)
 
 result = run_af2rank_analysis_openfold(
+    segments={segments!r},
+    mask_inter_segment={mask_inter_segment},
     protein_id=protein_id,
     reference_cif='{reference_cif}',
     inference_output_dir='{inference_output_dir}',
@@ -493,7 +503,9 @@ def process_single_protein_af2rank_wrapper(args_tuple):
     use_ds = rest[1] if len(rest) > 1 else True
     use_cue_attn = rest[2] if len(rest) > 2 else True
     use_cue_mul = rest[3] if len(rest) > 3 else True
-    full_args = (protein_name, cif_dir, inference_config, recycles, gpu_id, False, backend, use_ds, use_cue_attn, use_cue_mul)
+    segments = rest[4] if len(rest) > 4 else None
+    mask_inter_segment = rest[5] if len(rest) > 5 else True
+    full_args = (protein_name, cif_dir, inference_config, recycles, gpu_id, False, backend, use_ds, use_cue_attn, use_cue_mul, segments, mask_inter_segment)
     return process_single_protein_af2rank(full_args)
 
 def has_multi_char_chain_id(protein_name):
@@ -520,6 +532,24 @@ def get_protein_names(csv_file, csv_col):
     df.columns = df.columns.str.strip()
     proteins = df[csv_col].dropna().unique().tolist()
     return [p.strip() for p in proteins if p and p.strip()]
+
+def _segments_by_protein(csv_file, csv_col, segments_col, min_len):
+    """protein -> [[s,e],...] ordered segments with length >= min_len, from the annotated CSV.
+    Proteins with no qualifying segment are omitted (callers treat missing as None)."""
+    df = pd.read_csv(csv_file)
+    df.columns = df.columns.str.strip()
+    if segments_col not in df.columns:
+        raise KeyError(f"--segments_col '{segments_col}' not in {csv_file}; columns={list(df.columns)}")
+    out = {}
+    for _, row in df.iterrows():
+        name = str(row[csv_col]).strip()
+        raw = row[segments_col]
+        if not isinstance(raw, str):
+            continue
+        segs = [[int(a), int(b)] for a, b in json.loads(raw) if (int(b) - int(a)) >= min_len]
+        if segs:
+            out[name] = segs
+    return out
 
 def find_proteins_needing_af2rank(
     csv_file,
@@ -604,6 +634,14 @@ def main():
                         help="Thread workers for progress checks (default: min(32, cpu_count * 4)).")
     parser.add_argument("--dynamic_resharding", action=argparse.BooleanOptionalAction, default=True,
                         help="Filter global progress before sharding each step to reduce idle shards (default: True).")
+    parser.add_argument('--segment_mode', choices=['off', 'joint'], default='off',
+                        help='Joint-discontinuous segment scoring (default: off = whole-chain).')
+    parser.add_argument('--segments_col', default='ordered_segments',
+                        help='CSV column with ordered_segments JSON (segment_mode=joint).')
+    parser.add_argument('--segment_min_len', type=int, default=50,
+                        help='Drop ordered segments shorter than this (segment_mode=joint, default 50).')
+    parser.add_argument('--mask_inter_segment', action=argparse.BooleanOptionalAction, default=True,
+                        help='Mask cross-segment template pairs in AF2Rank (segment_mode=joint, default True).')
     add_shard_args(parser)
 
     args = parser.parse_args()
@@ -620,6 +658,10 @@ def main():
     global_protein_names = get_protein_names(args.csv_file, args.csv_col)
     protein_names = list(global_protein_names)
     logger.info(f"Found {len(global_protein_names)} proteins in CSV file")
+    seg_by_protein = {}
+    if args.segment_mode == 'joint':
+        seg_by_protein = _segments_by_protein(args.csv_file, args.csv_col, args.segments_col, args.segment_min_len)
+        logger.info(f"segment_mode=joint: {len(seg_by_protein)} proteins with >=1 segment >={args.segment_min_len}; mask_inter_segment={args.mask_inter_segment}")
 
     if not global_protein_names:
         logger.warning("No proteins to process")
@@ -733,7 +775,8 @@ def main():
             scoring_work_items = [
                 (protein_name, args.cif_dir, args.inference_config, args.recycles, args.backend,
                  args.use_deepspeed_evoformer_attention, args.use_cuequivariance_attention,
-                 args.use_cuequivariance_multiplicative_update)
+                 args.use_cuequivariance_multiplicative_update,
+                 seg_by_protein.get(protein_name), args.mask_inter_segment)
                 for protein_name in proteins_needing_scoring
             ]
             future_to_protein = {executor.submit(process_single_protein_af2rank_wrapper, item): scoring_work_items[i][0]
