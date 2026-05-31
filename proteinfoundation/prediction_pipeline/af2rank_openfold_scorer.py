@@ -1257,6 +1257,8 @@ def run_af2rank_analysis_openfold(
     use_cuequivariance_attention: bool = False,
     use_cuequivariance_multiplicative_update: bool = True,
     scorer: Optional["OpenFoldAF2Rank"] = None,
+    segments=None,
+    mask_inter_segment: bool = True,
 ) -> str:
     """Run complete AF2Rank analysis using OpenFold backend.
 
@@ -1287,6 +1289,8 @@ def run_af2rank_analysis_openfold(
             use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
             scorer=scorer,
             predicted_structure_dir=os.path.join(output_dir, "predicted_structures"),
+            segments=segments,
+            mask_inter_segment=mask_inter_segment,
         )
         if not scores:
             logger.warning(f"No scores generated for {protein_id}")
