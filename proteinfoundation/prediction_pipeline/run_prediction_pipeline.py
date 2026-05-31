@@ -72,6 +72,7 @@ from proteinfoundation.prediction_pipeline.protein_tar_utils import (
     restore_selected_protein_dirs,
 )
 from proteinfoundation.prediction_pipeline.input_parser import build_discontinuous_pt, create_pt_files, create_working_csv, parse_input
+from proteinfoundation.prediction_pipeline.cif_to_pt_converter import sequence_to_pt_data
 
 logging.basicConfig(
     level=logging.INFO,
@@ -192,9 +193,12 @@ def run_with_conda_env(env_name: str, command_list: list, cwd: str | None = None
 # ── Step 1: Parse input and create PT files ──────────────────────────────────
 
 def step_build_segment_pts(dataset_file, id_col, sequence_col, segments_col, segment_min_len):
-    """Build discontinuous (joint) PT files from a pre-annotated CSV (sequence + ordered_segments).
-    Drops segments shorter than segment_min_len; skips proteins with no qualifying segment.
-    Returns the list of protein ids for which a discontinuous PT was written."""
+    """Build per-protein PTs from a pre-annotated CSV (sequence + ordered_segments).
+    Proteins with >=1 ordered segment >= segment_min_len -> discontinuous (joint) PT.
+    Proteins with no qualifying segment -> WHOLE-CHAIN fallback PT (experimentally ordered
+    but AIUPred-disordered: small folds / structured-upon-binding). The af2rank step's
+    per-protein segment lookup returns None for these -> whole-chain scoring (no change there).
+    Returns all built ids (segment + fallback) so every protein is sampled."""
     data_path = os.environ.get("DATA_PATH", os.path.join(PROTEINA_BASE_DIR, "data"))
     processed_dir = os.path.join(data_path, "pdb_train", "processed")
     os.makedirs(processed_dir, exist_ok=True)
@@ -203,20 +207,23 @@ def step_build_segment_pts(dataset_file, id_col, sequence_col, segments_col, seg
     for col in (sequence_col, segments_col):
         if col not in df.columns:
             raise KeyError(f"segment_mode=joint requires column '{col}' in {dataset_file}; columns={list(df.columns)}")
-    built, skipped = [], 0
+    built, fallback, bad = [], 0, 0
     for _, row in df.iterrows():
         pid = str(row[id_col]).strip()
         seq, raw = row[sequence_col], row[segments_col]
         if not isinstance(seq, str) or not isinstance(raw, str):
-            skipped += 1
+            bad += 1
             continue
         segs = [(int(a), int(b)) for a, b in json.loads(raw) if (int(b) - int(a)) >= segment_min_len]
-        if not segs:
-            skipped += 1
-            continue
-        torch.save(build_discontinuous_pt(pid, seq, segs), os.path.join(processed_dir, f"{pid}.pt"))
+        out_path = os.path.join(processed_dir, f"{pid}.pt")
+        if segs:
+            torch.save(build_discontinuous_pt(pid, seq, segs), out_path)
+        else:
+            torch.save(sequence_to_pt_data(list(seq), pid), out_path)
+            fallback += 1
         built.append(pid)
-    logger.info(f"Segment PTs: built {len(built)}, skipped {skipped} (no segment >={segment_min_len}) in {processed_dir}")
+    logger.info("Segment PTs: %d built (%d segment, %d whole-chain fallback), %d bad-row skipped in %s"
+                % (len(built), len(built) - fallback, fallback, bad, processed_dir))
     return built
 
 
