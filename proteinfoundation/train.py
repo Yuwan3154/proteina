@@ -459,6 +459,33 @@ if __name__ == "__main__":
         def _run_confind_precompute():
             log_info("Confind contact maps requested; precomputing raw maps...")
             processed_dir = os.path.join(cfg_data.datamodule.data_dir, "processed")
+            # FAILLOUD-CONFIND-GUARD: the inline CPU confind enumerator
+            # (precompute_confind_maps._iter_processed_files) is a flat os.listdir that
+            # does NOT recurse into the sharded processed/<bucket>/*.pt layout. On sharded
+            # datasets it sees 0 files, silently no-ops, and every chain missing
+            # contact_map_confind is then silently dropped by PDBDataset.__getitem__.
+            _pd = Path(processed_dir)
+            _top_pt = _pd.is_dir() and any(_n.endswith(".pt") for _n in os.listdir(_pd))
+            _bucketed = None
+            if _pd.is_dir():
+                for _p in _pd.rglob("*.pt"):
+                    if _p.parent != _pd:
+                        _bucketed = _p
+                        break
+            if not _pd.is_dir() or (not _top_pt and _bucketed is None):
+                raise RuntimeError(
+                    f"Inline confind precompute: no .pt files under {processed_dir}; "
+                    "is the dataset processed?"
+                )
+            if _bucketed is not None:
+                raise RuntimeError(
+                    f"Inline confind precompute cannot enumerate the sharded/bucketed layout "
+                    f"under {processed_dir} (e.g. {_bucketed}); the CPU enumerator is a flat "
+                    "os.listdir and would silently process the top level only, dropping every "
+                    "bucketed chain that lacks contact_map_confind. Run the offline Frame2ConFind "
+                    "GPU backfill (python -m proteinfoundation.utils.precompute_frame2confind_maps) "
+                    "and re-launch with SKIP_CONFIND_PRECOMPUTE=1."
+                )
             rotlib = confind_transform.get("confind_rotamer_lib")
             dataselector_cfg = cfg_data.datamodule.get("dataselector")
             dataselector_dict = (
