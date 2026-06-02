@@ -102,6 +102,8 @@ def _inference_base(inference_config):
     label = {"seq": "seq_cond", "seq_cath": "seq_cath_cond"}.get(
         os.environ.get("PROTEINA_CONDITIONING_MODE", ""), ""
     )
+    if label == "seq_cond" and os.environ.get("PROTEINA_SEGMENT_MODE", "") == "joint":
+        label = "seq_cond_segment"
     if label:
         parts.append(label)
     return os.path.join(*parts)

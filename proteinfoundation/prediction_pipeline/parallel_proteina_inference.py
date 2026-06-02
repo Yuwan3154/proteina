@@ -162,11 +162,14 @@ def _get_or_load_worker_model(inference_config, conditioning_mode, force_compile
 def _conditioning_label(conditioning_mode):
     """Map a conditioning_mode CLI value to the output-dir segment.
 
-    'seq'        -> 'seq_cond'
+    'seq'        -> 'seq_cond'   ('seq_cond_segment' when PROTEINA_SEGMENT_MODE=joint,
+                                  since joint-discontinuous runs sample different PDBs)
     'seq_cath'   -> 'seq_cath_cond'
     None         -> 'legacy'           # backward-compat: keeps the old un-namespaced layout in a labeled subdir
     """
     if conditioning_mode == "seq":
+        if os.environ.get("PROTEINA_SEGMENT_MODE", "") == "joint":
+            return "seq_cond_segment"
         return "seq_cond"
     if conditioning_mode == "seq_cath":
         return "seq_cath_cond"

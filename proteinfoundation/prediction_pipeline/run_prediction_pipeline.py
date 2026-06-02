@@ -119,6 +119,10 @@ def _inference_base(inference_config):
     label = {"seq": "seq_cond", "seq_cath": "seq_cath_cond"}.get(
         os.environ.get("PROTEINA_CONDITIONING_MODE", ""), ""
     )
+    # Segment (joint-discontinuous) runs sample DIFFERENT PDBs than whole-chain for
+    # the same conditioning, so they live under a distinct <mode_base> subdir.
+    if label == "seq_cond" and os.environ.get("PROTEINA_SEGMENT_MODE", "") == "joint":
+        label = "seq_cond_segment"
     if label:
         parts.append(label)
     return os.path.join(*parts)
@@ -432,6 +436,7 @@ def step_af2rank_topk(
     segments_col: str = "ordered_segments",
     segment_min_len: int = 50,
     mask_inter_segment: bool = True,
+    af2rank_subdir: str = "af2rank_on_proteinebm_top_k",
 ) -> bool:
     """Run AF2Rank on ProteinEBM top-k templates.
 
@@ -451,6 +456,7 @@ def step_af2rank_topk(
         "--top_k", str(af2rank_top_k),
         "--recycles", str(recycles),
         "--proteinebm_analysis_subdir", proteinebm_analysis_subdir,
+        "--af2rank_subdir", af2rank_subdir,
     ]
     if segment_mode == "joint":
         cmd.extend(["--segment_mode", "joint", "--segments_col", segments_col,
@@ -643,6 +649,7 @@ def step_collect_results(
     ptm_cutoff: float,
     proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
     tar_protein_dirs: bool = False,
+    af2rank_subdir: str = "af2rank_on_proteinebm_top_k",
 ) -> list:
     """
     Read AF2Rank scores, select best structure per protein, copy to output.
@@ -661,7 +668,7 @@ def step_collect_results(
 
     for protein_id in protein_ids:
         protein_dir = Path(inference_base) / protein_id
-        topk_dir = protein_dir / "af2rank_on_proteinebm_top_k"
+        topk_dir = protein_dir / af2rank_subdir
         m1_csv = topk_dir / "af2rank_analysis" / f"af2rank_scores_{protein_id}.csv"
         m2_csv = topk_dir / "af2rank_analysis_model_2_ptm" / f"af2rank_scores_{protein_id}.csv"
 
@@ -684,12 +691,12 @@ def step_collect_results(
             m1_text = read_protein_text(
                 inference_base,
                 protein_id,
-                Path("af2rank_on_proteinebm_top_k") / "af2rank_analysis" / f"af2rank_scores_{protein_id}.csv",
+                Path(af2rank_subdir) / "af2rank_analysis" / f"af2rank_scores_{protein_id}.csv",
             )
             m2_text = read_protein_text(
                 inference_base,
                 protein_id,
-                Path("af2rank_on_proteinebm_top_k") / "af2rank_analysis_model_2_ptm" / f"af2rank_scores_{protein_id}.csv",
+                Path(af2rank_subdir) / "af2rank_analysis_model_2_ptm" / f"af2rank_scores_{protein_id}.csv",
             )
         else:
             m1_text = m1_csv.read_text() if m1_csv.exists() else None
@@ -1265,11 +1272,30 @@ def build_parser() -> argparse.ArgumentParser:
                         help='Drop ordered segments shorter than this (segment_mode=joint, default 50).')
     parser.add_argument('--mask_inter_segment', action=argparse.BooleanOptionalAction, default=True,
                         help='Mask cross-segment template pairs in AF2Rank (segment_mode=joint, default True).')
+    parser.add_argument('--af2rank_subdir', default=None,
+                        help='Per-protein AF2Rank-on-top-k output subdir name. Default: auto '
+                             '(af2rank_on_proteinebm_top_k for whole-chain; ..._mask / ..._nomask for '
+                             'segment_mode=joint with/without --mask_inter_segment) so mask vs nomask '
+                             'runs coexist under the same shared inference dir. Override to force a name.')
     return parser
 
 
 def main(argv: list[str] | None = None):
     args = build_parser().parse_args(argv)
+
+    # Resolve the per-protein AF2Rank-on-top-k output subdir. For segment mode the
+    # mask and nomask cells share ONE inference + ProteinEBM pass and differ only in
+    # the AF2Rank scoring step, so they must write to distinct subdirs to coexist.
+    if args.af2rank_subdir:
+        af2rank_subdir = args.af2rank_subdir
+    elif args.segment_mode == "joint":
+        af2rank_subdir = "af2rank_on_proteinebm_top_k_" + ("mask" if args.mask_inter_segment else "nomask")
+    else:
+        af2rank_subdir = "af2rank_on_proteinebm_top_k"
+
+    # Drive the inference <mode_base> (seq_cond vs seq_cond_segment) for every
+    # _inference_base call (here + the child scripts, which inherit os.environ).
+    os.environ["PROTEINA_SEGMENT_MODE"] = args.segment_mode
 
     # Resolve input mode and validate flag combinations
     if args.input is not None:
@@ -1523,6 +1549,7 @@ def main(argv: list[str] | None = None):
             segments_col=args.segments_col,
             segment_min_len=args.segment_min_len,
             mask_inter_segment=args.mask_inter_segment,
+            af2rank_subdir=af2rank_subdir,
         ):
             logger.error("AF2Rank top-k step failed")
             success = False
@@ -1617,6 +1644,7 @@ def main(argv: list[str] | None = None):
             protein_ids, args.inference_config, args.output_dir,
             args.ptm_cutoff, args.proteinebm_analysis_subdir,
             tar_protein_dirs=args.tar_protein_dirs,
+            af2rank_subdir=af2rank_subdir,
         )
     elif args.skip_collect_results:
         logger.info("Skipping result collection / summary writeout")

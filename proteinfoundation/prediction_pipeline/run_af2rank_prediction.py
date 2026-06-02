@@ -60,6 +60,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Per-protein AF2Rank-on-top-k output subdir name. Overridden by --af2rank_subdir
+# in main() so a mask vs nomask run can coexist under the SAME shared inference
+# dir without overwriting each other. Default keeps the original path.
+TOPK_SUBDIR = "af2rank_on_proteinebm_top_k"
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -233,7 +238,7 @@ def _persist_allatom_files(
         protein_id = template_to_protein.get(ca_path, Path(ca_path).parent.name)
         cg2all_dir = (
             inference_base / protein_id
-            / "af2rank_on_proteinebm_top_k"
+            / TOPK_SUBDIR
             / "cg2all_topk_structures"
         )
         cg2all_dir.mkdir(parents=True, exist_ok=True)
@@ -425,12 +430,19 @@ def main() -> None:
                         help='Drop ordered segments shorter than this (segment_mode=joint, default 50).')
     parser.add_argument('--mask_inter_segment', action=argparse.BooleanOptionalAction, default=True,
                         help='Mask cross-segment template pairs in AF2Rank (segment_mode=joint, default True).')
+    parser.add_argument('--af2rank_subdir', default='af2rank_on_proteinebm_top_k',
+                        help='Per-protein AF2Rank-on-top-k output subdir name. Use a distinct name '
+                             '(e.g. af2rank_on_proteinebm_top_k_mask) so mask vs nomask runs coexist '
+                             'under the same shared inference dir without overwriting.')
     add_shard_args(parser)
 
     args = parser.parse_args()
 
     inference_base = Path(args.inference_dir)
     cif_dir = args.cif_dir.strip() or None
+
+    global TOPK_SUBDIR
+    TOPK_SUBDIR = args.af2rank_subdir
 
     # ── Build per-protein work list ──────────────────────────────────────────
     global_protein_ids = _load_protein_ids(args.csv_file, args.csv_col)
@@ -479,15 +491,15 @@ def main() -> None:
             m1_done = _all_scored_from_tar_or_dir(
                 inference_base,
                 protein_id,
-                Path("af2rank_on_proteinebm_top_k") / "af2rank_analysis" / f"af2rank_scores_{protein_id}.csv",
-                Path("af2rank_on_proteinebm_top_k") / "af2rank_analysis" / "predicted_structures",
+                Path(TOPK_SUBDIR) / "af2rank_analysis" / f"af2rank_scores_{protein_id}.csv",
+                Path(TOPK_SUBDIR) / "af2rank_analysis" / "predicted_structures",
                 desired,
             )
             m2_done = _all_scored_from_tar_or_dir(
                 inference_base,
                 protein_id,
-                Path("af2rank_on_proteinebm_top_k") / "af2rank_analysis_model_2_ptm" / f"af2rank_scores_{protein_id}.csv",
-                Path("af2rank_on_proteinebm_top_k") / "af2rank_analysis_model_2_ptm" / "predicted_structures",
+                Path(TOPK_SUBDIR) / "af2rank_analysis_model_2_ptm" / f"af2rank_scores_{protein_id}.csv",
+                Path(TOPK_SUBDIR) / "af2rank_analysis_model_2_ptm" / "predicted_structures",
                 desired,
             )
             if m1_done and m2_done:
@@ -530,8 +542,8 @@ def main() -> None:
 
         reference_path, chain = _pick_reference(topk_df, cif_dir, protein_id)
 
-        out_dir_m1 = protein_dir / "af2rank_on_proteinebm_top_k" / "af2rank_analysis"
-        out_dir_m2 = protein_dir / "af2rank_on_proteinebm_top_k" / "af2rank_analysis_model_2_ptm"
+        out_dir_m1 = protein_dir / TOPK_SUBDIR / "af2rank_analysis"
+        out_dir_m2 = protein_dir / TOPK_SUBDIR / "af2rank_analysis_model_2_ptm"
 
         protein_configs.append({
             "protein_id": protein_id,
@@ -632,7 +644,7 @@ def main() -> None:
         # ── Generate per-protein summary CSVs (for the scored proteins) ─────
         for cfg in protein_configs:
             protein_id = cfg["protein_id"]
-            out_dir = inference_base / protein_id / "af2rank_on_proteinebm_top_k"
+            out_dir = inference_base / protein_id / TOPK_SUBDIR
             m1_csv = out_dir / "af2rank_analysis" / f"af2rank_scores_{protein_id}.csv"
             m2_csv = out_dir / "af2rank_analysis_model_2_ptm" / f"af2rank_scores_{protein_id}.csv"
             if not m1_csv.exists() or not m2_csv.exists():
@@ -669,7 +681,7 @@ def main() -> None:
             except Exception as e:
                 logger.warning(f"{protein_id}: top-k selection failed during summary regen: {e}")
                 continue
-            out_dir = protein_dir / "af2rank_on_proteinebm_top_k"
+            out_dir = protein_dir / TOPK_SUBDIR
             m1_csv = out_dir / "af2rank_analysis" / f"af2rank_scores_{protein_id}.csv"
             m2_csv = out_dir / "af2rank_analysis_model_2_ptm" / f"af2rank_scores_{protein_id}.csv"
             if not m1_csv.exists() or not m2_csv.exists():
