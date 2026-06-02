@@ -78,6 +78,11 @@ def _protein_id_from_ref(path_ref: str | Path, levels_up: int) -> str:
     return parent.name
 
 
+# Per-protein AF2Rank-on-top-k subdir name. Overridden by --af2rank_subdir in main()
+# so mask vs nomask cross-protein plots read the matching per-protein scores.
+TOPK_SUBDIR = "af2rank_on_proteinebm_top_k"
+
+
 def find_af2rank_summaries(inference_base_dir: str) -> List[str]:
     """
     Find all AF2Rank summary JSON files in the inference directory structure.
@@ -140,17 +145,17 @@ def find_af2rank_on_proteinebm_topk_score_files(inference_base_dir: str, top_k: 
     pattern = os.path.join(
         inference_base_dir,
         "*",
-        "af2rank_on_proteinebm_top_k",
+        TOPK_SUBDIR,
         "af2rank_analysis",
         "af2rank_scores_*.csv",
     )
     score_files = glob.glob(pattern)
     for tar_path in Path(inference_base_dir).glob("*.tar"):
         protein_id = tar_path.stem
-        rel = Path("af2rank_on_proteinebm_top_k") / "af2rank_analysis" / f"af2rank_scores_{protein_id}.csv"
+        rel = Path(TOPK_SUBDIR) / "af2rank_analysis" / f"af2rank_scores_{protein_id}.csv"
         if read_protein_text(inference_base_dir, protein_id, rel) is not None:
             score_files.append(_tar_ref(inference_base_dir, protein_id, rel))
-    logger.info(f"Found {len(score_files)} AF2Rank-on-ProteinEBM-topk score files (using folder af2rank_on_proteinebm_top_k)")
+    logger.info(f"Found {len(score_files)} AF2Rank-on-ProteinEBM-topk score files (using folder {TOPK_SUBDIR})")
     return score_files
 
 
@@ -271,7 +276,7 @@ def load_af2rank_on_proteinebm_topk_data(
                 for member in protein_glob_members(
                     inference_dir,
                     protein_id,
-                    "af2rank_on_proteinebm_top_k/staged_topk_templates/*",
+                    f"{TOPK_SUBDIR}/staged_topk_templates/*",
                 )
             }
         else:
@@ -291,7 +296,7 @@ def load_af2rank_on_proteinebm_topk_data(
             m2_path = _tar_ref(
                 inference_dir,
                 protein_id,
-                Path("af2rank_on_proteinebm_top_k") / "af2rank_analysis_model_2_ptm" / f"af2rank_scores_{protein_id}.csv",
+                Path(TOPK_SUBDIR) / "af2rank_analysis_model_2_ptm" / f"af2rank_scores_{protein_id}.csv",
             )
         else:
             m2_path = Path(score_file).parent.parent / "af2rank_analysis_model_2_ptm" / Path(score_file).name
@@ -1842,6 +1847,12 @@ def main():
         default='proteinebm_v2_cathmd_analysis',
         help='Per-protein subdir containing ProteinEBM outputs (default: proteinebm_v2_cathmd_analysis)',
     )
+    parser.add_argument(
+        '--af2rank_subdir',
+        default='af2rank_on_proteinebm_top_k',
+        help='Per-protein AF2Rank-on-top-k subdir to read scores from (default: af2rank_on_proteinebm_top_k; '
+             'use ..._mask / ..._nomask to plot a specific segment cell).',
+    )
     parser.add_argument('--dataset_file', required=True,
                        help='Name of the dataset file to analyze')
     parser.add_argument('--id_col', default='natives_rcsb',
@@ -1852,7 +1863,10 @@ def main():
                        help='Enable verbose logging')
     
     args = parser.parse_args()
-    
+
+    global TOPK_SUBDIR
+    TOPK_SUBDIR = args.af2rank_subdir
+
     if args.verbose:
         logger.remove()
         logger.add(sys.stdout, level="DEBUG")

@@ -556,6 +556,7 @@ def step_central_analysis(
     tar_protein_dirs: bool = True,
     dynamic_resharding: bool = True,
     progress_check_workers: int | None = None,
+    af2rank_subdir: str = "af2rank_on_proteinebm_top_k",
 ) -> bool:
     """Run centralized TM analysis after scorer outputs and prediction PDBs exist.
     When cif_dir is provided, GT TM-score columns are added to the per-protein
@@ -572,6 +573,8 @@ def step_central_analysis(
         csv_col,
         "--proteinebm_analysis_subdir",
         proteinebm_analysis_subdir,
+        "--af2rank_subdir",
+        af2rank_subdir,
     ]
     if cif_dir:
         cmd.extend(["--cif_dir", cif_dir])
@@ -602,6 +605,7 @@ def step_cross_protein_plots(
     proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
     direct_python: bool = False,
     skip_af2rank_on_top_k: bool = False,
+    af2rank_subdir: str = "af2rank_on_proteinebm_top_k",
 ) -> bool:
     """Generate cross-protein plots (TM-vs-pTM / TM-vs-energy scatters).
 
@@ -627,6 +631,7 @@ def step_cross_protein_plots(
             cmd.extend(["--proteinebm_plot_mode", proteinebm_plot_mode])
         if scorer_name == "af2rank_on_proteinebm_topk":
             cmd.extend(["--af2rank_top_k", str(int(af2rank_top_k))])
+            cmd.extend(["--af2rank_subdir", af2rank_subdir])
         return run_with_conda_env("proteina", cmd, cwd=PRED_PIPELINE_DIR, direct_python=direct_python)
 
     ok = _one(scorer)
@@ -1583,6 +1588,7 @@ def main(argv: list[str] | None = None):
                 tar_protein_dirs=args.tar_protein_dirs,
                 dynamic_resharding=args.dynamic_resharding,
                 progress_check_workers=args.progress_check_workers,
+                af2rank_subdir=af2rank_subdir,
             ):
                 logger.error("Central analysis failed")
                 success = False
@@ -1671,6 +1677,7 @@ def main(argv: list[str] | None = None):
             proteinebm_analysis_subdir=args.proteinebm_analysis_subdir,
             direct_python=args.direct_python,
             skip_af2rank_on_top_k=args.skip_af2rank_on_top_k,
+            af2rank_subdir=af2rank_subdir,
         ):
             logger.error("Cross-protein plotting failed")
             success = False

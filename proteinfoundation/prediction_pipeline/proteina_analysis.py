@@ -63,6 +63,10 @@ from proteinfoundation.prediction_pipeline.usalign_tabular import (
 
 logger = logging.getLogger(__name__)
 
+# Per-protein AF2Rank-on-top-k subdir name. Overridden by --af2rank_subdir in main()
+# so mask vs nomask central-analysis enrichment reads the matching per-protein scores.
+TOPK_SUBDIR = "af2rank_on_proteinebm_top_k"
+
 _plot_lock = threading.Lock()
 
 _USALIGN_PARALLEL_ENV = {
@@ -1104,7 +1108,7 @@ def _regenerate_topk_summary_if_present(
     proteinebm_analysis_subdir: str,
 ) -> Optional[str]:
     protein_path = Path(protein_dir)
-    topk_dir = protein_path / "af2rank_on_proteinebm_top_k"
+    topk_dir = protein_path / TOPK_SUBDIR
     if not topk_dir.exists():
         return None
 
@@ -1190,8 +1194,8 @@ def run_analysis_for_protein(
                 for _af2rank_dir in [
                     os.path.join(protein_dir, "af2rank_analysis"),
                     os.path.join(protein_dir, "af2rank_analysis_model_2_ptm"),
-                    os.path.join(protein_dir, "af2rank_on_proteinebm_top_k", "af2rank_analysis"),
-                    os.path.join(protein_dir, "af2rank_on_proteinebm_top_k", "af2rank_analysis_model_2_ptm"),
+                    os.path.join(protein_dir, TOPK_SUBDIR, "af2rank_analysis"),
+                    os.path.join(protein_dir, TOPK_SUBDIR, "af2rank_analysis_model_2_ptm"),
                 ]:
                     enrich_af2rank_output_dir(
                         protein_id=protein_id,
@@ -1248,8 +1252,8 @@ def run_analysis_for_protein(
     af2rank_dirs = [
         os.path.join(protein_dir, "af2rank_analysis"),
         os.path.join(protein_dir, "af2rank_analysis_model_2_ptm"),
-        os.path.join(protein_dir, "af2rank_on_proteinebm_top_k", "af2rank_analysis"),
-        os.path.join(protein_dir, "af2rank_on_proteinebm_top_k", "af2rank_analysis_model_2_ptm"),
+        os.path.join(protein_dir, TOPK_SUBDIR, "af2rank_analysis"),
+        os.path.join(protein_dir, TOPK_SUBDIR, "af2rank_analysis_model_2_ptm"),
     ]
     af2rank_summaries: Dict[str, Dict[str, object]] = {}
     for af2rank_dir in af2rank_dirs:
@@ -1409,8 +1413,14 @@ def main() -> None:
                         help="Thread workers for progress checks (default: min(32, cpu_count * 4)).")
     parser.add_argument("--dynamic_resharding", action=argparse.BooleanOptionalAction, default=True,
                         help="Filter global progress before sharding each step to reduce idle shards (default: True).")
+    parser.add_argument("--af2rank_subdir", default="af2rank_on_proteinebm_top_k",
+                        help="Per-protein AF2Rank-on-top-k subdir to enrich (default: af2rank_on_proteinebm_top_k; "
+                             "use ..._mask / ..._nomask for a specific segment cell).")
     add_shard_args(parser)
     args = parser.parse_args()
+
+    global TOPK_SUBDIR
+    TOPK_SUBDIR = args.af2rank_subdir
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
