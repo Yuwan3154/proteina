@@ -196,7 +196,7 @@ def load_af2rank_on_proteinebm_topk_data(
         d = d.dropna(subset=["ptm", "tm_ref_pred", "tm_ref_template"])
         if len(d) == 0:
             return {}
-        for c in ["ptm", "tm_ref_pred", "tm_ref_template", "composite", "plddt"]:
+        for c in ["ptm", "tm_ref_pred", "tm_ref_template", "composite", "plddt", "rmsd_ref_template"]:
             if c in d.columns:
                 d[c] = pd.to_numeric(d[c], errors="coerce")
         d = d.dropna(subset=["ptm", "tm_ref_pred"]).sort_values("ptm", ascending=False).reset_index(drop=True)
@@ -213,11 +213,13 @@ def load_af2rank_on_proteinebm_topk_data(
             "top_1_ptm": float(r1["ptm"]),
             "top_1_tm_ref_pred": float(r1["tm_ref_pred"]),
             "top_1_tm_ref_template": float(r1["tm_ref_template"]),
+            "top_1_rmsd_ref_template": float(r1["rmsd_ref_template"]) if "rmsd_ref_template" in r1 and pd.notna(r1.get("rmsd_ref_template")) else float("nan"),
             "top_1_composite": float(r1["composite"]) if "composite" in r1 and pd.notna(r1.get("composite")) else float("nan"),
             "top_1_plddt": float(r1["plddt"]) if "plddt" in r1 and pd.notna(r1.get("plddt")) else float("nan"),
             "top_5_ptm": float(r5["ptm"]),
             "top_5_tm_ref_pred": float(r5["tm_ref_pred"]),
             "top_5_tm_ref_template": float(r5["tm_ref_template"]),
+            "top_5_rmsd_ref_template": float(r5["rmsd_ref_template"]) if "rmsd_ref_template" in r5 and pd.notna(r5.get("rmsd_ref_template")) else float("nan"),
             "top_5_composite": float(r5["composite"]) if "composite" in r5 and pd.notna(r5.get("composite")) else float("nan"),
             "top_5_plddt": float(r5["plddt"]) if "plddt" in r5 and pd.notna(r5.get("plddt")) else float("nan"),
         }
@@ -251,7 +253,11 @@ def load_af2rank_on_proteinebm_topk_data(
         merged["composite"] = merged[["composite_m1", "composite_m2"]].min(axis=1)
         merged["plddt"] = merged[["plddt_m1", "plddt_m2"]].min(axis=1)
         merged["tm_ref_template"] = merged[["tm_ref_template_m1", "tm_ref_template_m2"]].min(axis=1)
-        return merged[["structure_file", "ptm", "tm_ref_pred", "tm_ref_template", "composite", "plddt"]]
+        out_cols = ["structure_file", "ptm", "tm_ref_pred", "tm_ref_template", "composite", "plddt"]
+        if "rmsd_ref_template" in m1_df.columns and "rmsd_ref_template" in m2_df.columns:
+            merged["rmsd_ref_template"] = merged[["rmsd_ref_template_m1", "rmsd_ref_template_m2"]].min(axis=1)
+            out_cols.append("rmsd_ref_template")
+        return merged[out_cols]
 
     for score_file in score_files:
         protein_id = _protein_id_from_ref(score_file, 3)
@@ -363,6 +369,8 @@ def load_af2rank_on_proteinebm_topk_data(
             "top_5_tm_ref_pred": m1_metrics["top_5_tm_ref_pred"],
             "top_1_tm_ref_template": m1_metrics["top_1_tm_ref_template"],
             "top_5_tm_ref_template": m1_metrics["top_5_tm_ref_template"],
+            "top_1_rmsd_ref_template": m1_metrics.get("top_1_rmsd_ref_template", float("nan")),
+            "top_5_rmsd_ref_template": m1_metrics.get("top_5_rmsd_ref_template", float("nan")),
             "top_1_ptm": m1_metrics["top_1_ptm"],
             "top_5_ptm": m1_metrics["top_5_ptm"],
             "top_1_composite": m1_metrics["top_1_composite"],
@@ -406,11 +414,12 @@ def load_af2rank_on_proteinebm_topk_data(
         base_cols = [
             "protein_id", "n_scored",
             "top_1_tm_ref_pred", "top_5_tm_ref_pred", "top_1_tm_ref_template", "top_5_tm_ref_template",
+            "top_1_rmsd_ref_template", "top_5_rmsd_ref_template",
             "top_1_ptm", "top_5_ptm", "top_1_composite", "top_5_composite", "top_1_plddt", "top_5_plddt",
             "scores_csv", tms_col, "in_train", "length",
         ]
         for prefix in ["m2", "min"]:
-            for k in ["top_1_ptm", "top_5_ptm", "top_1_tm_ref_pred", "top_5_tm_ref_pred", "top_1_composite", "top_5_composite", "top_1_plddt", "top_5_plddt"]:
+            for k in ["top_1_ptm", "top_5_ptm", "top_1_tm_ref_pred", "top_5_tm_ref_pred", "top_1_rmsd_ref_template", "top_5_rmsd_ref_template", "top_1_composite", "top_5_composite", "top_1_plddt", "top_5_plddt"]:
                 base_cols.append(f"{prefix}_{k}")
         return pd.DataFrame(columns=base_cols)
 

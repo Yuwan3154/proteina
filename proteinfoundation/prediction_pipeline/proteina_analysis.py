@@ -802,11 +802,14 @@ def _build_af2rank_summary(
     top_5_tm_ref_template = None
     top_1_tm_ref_pred = None
     top_5_tm_ref_pred = None
+    top_1_rmsd_ref_template = None
+    top_5_rmsd_ref_template = None
 
     tm_ref_template_scores: List[float] = []
     tm_ref_pred_scores: List[float] = []
     composite_scores: List[float] = []
     ptm_scores: List[float] = []
+    rmsd_ref_template_scores: List[float] = []
 
     for score in successful_scores:
         tm_template = score.get("tm_ref_template")
@@ -818,6 +821,9 @@ def _build_af2rank_summary(
             tm_ref_pred_scores.append(float(tm_pred))
             composite_scores.append(float(composite))
             ptm_scores.append(float(ptm))
+            # RMSD is paired to the same entry; may be NaN on pre-Part-0 CSVs.
+            rmsd_template = score.get("rmsd_ref_template")
+            rmsd_ref_template_scores.append(float(rmsd_template) if pd.notna(rmsd_template) else float("nan"))
 
     if len(tm_ref_template_scores) > 1:
         spearman_rho_composite = _spearmanr(tm_ref_template_scores, composite_scores)
@@ -833,6 +839,12 @@ def _build_af2rank_summary(
         top_5_tm_ref_template = float(max([tm_ref_template_scores[idx] for idx in np.argsort(-np.asarray(composite_scores))[:5]]))
         top_1_tm_ref_pred = float(tm_ref_pred_scores[max_ptm_idx])
         top_5_tm_ref_pred = float(max([tm_ref_pred_scores[idx] for idx in np.argsort(-np.asarray(ptm_scores))[:5]]))
+        # RMSD paired with the same composite ranking (top-1 = same entry as top_1_tm;
+        # top-5 = best/lowest RMSD among the top-5-by-composite). Guard all-NaN.
+        top_1_rmsd_ref_template = float(rmsd_ref_template_scores[max_composite_idx])
+        _top5_rmsd = [rmsd_ref_template_scores[idx] for idx in np.argsort(-np.asarray(composite_scores))[:5]]
+        _top5_rmsd = [v for v in _top5_rmsd if not np.isnan(v)]
+        top_5_rmsd_ref_template = float(min(_top5_rmsd)) if _top5_rmsd else float("nan")
 
     return {
         "protein_id": protein_id,
@@ -855,6 +867,8 @@ def _build_af2rank_summary(
         "scores_csv": scores_csv_path,
         "top_1_tm_ref_template": top_1_tm_ref_template,
         "top_5_tm_ref_template": top_5_tm_ref_template,
+        "top_1_rmsd_ref_template": top_1_rmsd_ref_template,
+        "top_5_rmsd_ref_template": top_5_rmsd_ref_template,
         "top_1_tm_ref_pred": top_1_tm_ref_pred,
         "top_5_tm_ref_pred": top_5_tm_ref_pred,
     }

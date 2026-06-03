@@ -541,6 +541,9 @@ def _invalid_template_scores(error_message: str) -> Dict[str, float | str]:
         "tm_ref_template": nan,
         "tm_ref_pred": nan,
         "tm_template_pred": nan,
+        "rmsd_ref_template": nan,
+        "rmsd_ref_pred": nan,
+        "rmsd_template_pred": nan,
         "error": error_message,
     }
 
@@ -951,20 +954,21 @@ class OpenFoldAF2Rank:
             scores["predicted_structure_path"] = output_pdb
             scores["predicted_structure_file"] = os.path.basename(output_pdb)
 
-        # TM scores: reference vs template/prediction, template vs prediction
+        # TM + RMSD: reference vs template/prediction, template vs prediction.
+        # tmscore() returns both {"tms", "rms"} from one USalign call — record both.
         if not self.skip_ref_metrics:
-            scores["tm_ref_template"] = tmscore(
-                self.reference_coords, template_coords, env=_USALIGN_PARALLEL_ENV
-            ).get("tms", 0.0)
+            _r = tmscore(self.reference_coords, template_coords, env=_USALIGN_PARALLEL_ENV)
+            scores["tm_ref_template"] = _r.get("tms", 0.0)
+            scores["rmsd_ref_template"] = _r.get("rms", float("nan"))
         if "final_atom_positions" in out:
             pred_ca = out["final_atom_positions"][:, 1, :].detach().cpu().numpy()
             if not self.skip_ref_metrics:
-                scores["tm_ref_pred"] = tmscore(
-                    self.reference_coords, pred_ca, env=_USALIGN_PARALLEL_ENV
-                ).get("tms", 0.0)
-            scores["tm_template_pred"] = tmscore(
-                template_coords, pred_ca, env=_USALIGN_PARALLEL_ENV
-            ).get("tms", 0.0)
+                _rp = tmscore(self.reference_coords, pred_ca, env=_USALIGN_PARALLEL_ENV)
+                scores["tm_ref_pred"] = _rp.get("tms", 0.0)
+                scores["rmsd_ref_pred"] = _rp.get("rms", float("nan"))
+            _tp = tmscore(template_coords, pred_ca, env=_USALIGN_PARALLEL_ENV)
+            scores["tm_template_pred"] = _tp.get("tms", 0.0)
+            scores["rmsd_template_pred"] = _tp.get("rms", float("nan"))
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -1170,18 +1174,25 @@ def score_proteina_structures_openfold(
                     structure_scores["predicted_structure_path"] = output_pdb
                     structure_scores["predicted_structure_file"] = os.path.basename(output_pdb)
 
-                # TM scores: reference vs template/prediction, template vs prediction
-                structure_scores["tm_ref_template"] = tmscore(
+                # TM + RMSD: reference vs template/prediction, template vs prediction.
+                # tmscore() returns both {"tms", "rms"} from one USalign call — record both.
+                _r = tmscore(
                     scorer.reference_coords, template_coords, env=_USALIGN_PARALLEL_ENV
-                ).get("tms", 0.0)
+                )
+                structure_scores["tm_ref_template"] = _r.get("tms", 0.0)
+                structure_scores["rmsd_ref_template"] = _r.get("rms", float("nan"))
                 if "final_atom_positions" in out:
                     pred_ca = out["final_atom_positions"][:, 1, :].detach().cpu().numpy()
-                    structure_scores["tm_ref_pred"] = tmscore(
+                    _rp = tmscore(
                         scorer.reference_coords, pred_ca, env=_USALIGN_PARALLEL_ENV
-                    ).get("tms", 0.0)
-                    structure_scores["tm_template_pred"] = tmscore(
+                    )
+                    structure_scores["tm_ref_pred"] = _rp.get("tms", 0.0)
+                    structure_scores["rmsd_ref_pred"] = _rp.get("rms", float("nan"))
+                    _tp = tmscore(
                         template_coords, pred_ca, env=_USALIGN_PARALLEL_ENV
-                    ).get("tms", 0.0)
+                    )
+                    structure_scores["tm_template_pred"] = _tp.get("tms", 0.0)
+                    structure_scores["rmsd_template_pred"] = _tp.get("rms", float("nan"))
 
                 gc.collect()
                 torch.cuda.empty_cache()
