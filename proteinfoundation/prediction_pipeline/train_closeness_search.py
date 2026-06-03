@@ -34,7 +34,7 @@ import os
 import shutil
 import subprocess
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -94,53 +94,88 @@ def _pdb_worker(args: tuple[str, str, str]) -> tuple[str, bool, str]:
         return train_id, False, repr(e)[:200]
 
 
-def build_train_pdbs(train_ids: list[str], processed_dir: Path, out_dir: Path,
-                     n_workers: int) -> int:
+def _build_chunk_pdbs(chunk_ids: list[str], processed_dir: Path, out_dir: Path, n_workers: int) -> int:
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    jobs = []
-    for tid in train_ids:
-        out_pdb = out_dir / f"{tid}.pdb"
-        if out_pdb.exists() and out_pdb.stat().st_size > 0:
-            continue  # resume: skip already-written
-        jobs.append((tid, str(processed_dir / f"{tid}.pt"), str(out_pdb)))
-    if not jobs:
-        log.info("train_pdb: all %d present, nothing to build", len(train_ids))
-        return len(train_ids)
-    log.info("Building %d train PDBs (%d already present) with %d workers -> %s",
-             len(jobs), len(train_ids) - len(jobs), n_workers, out_dir)
-    n_ok, n_fail = 0, 0
+    jobs = [(tid, str(processed_dir / f"{tid}.pt"), str(out_dir / f"{tid}.pdb")) for tid in chunk_ids]
+    n_ok = 0
     with ProcessPoolExecutor(max_workers=n_workers) as ex:
-        futures = [ex.submit(_pdb_worker, j) for j in jobs]
-        for i, fut in enumerate(as_completed(futures), 1):
-            tid, ok, err = fut.result()
+        for _tid, ok, _err in ex.map(_pdb_worker, jobs):
             if ok:
                 n_ok += 1
-            else:
-                n_fail += 1
-                if n_fail <= 20:
-                    log.warning("  skip %s: %s", tid, err)
-            if i % 5000 == 0:
-                log.info("  ... %d/%d (ok=%d fail=%d)", i, len(jobs), n_ok, n_fail)
-    n_present = sum(1 for tid in train_ids if (out_dir / f"{tid}.pdb").exists())
-    log.info("train_pdb: %d present (%d new ok, %d failed this pass)", n_present, n_ok, n_fail)
-    return n_present
+    return n_ok
 
 
 # --------------------------------------------------------------------------- #
-# Stage 3: foldseek DB
+# Stage 3: foldseek DB — chunked build to keep peak disk small (the per-chain
+# PDBs are the disk hog; build a chunk, fold it into a persistent DB via
+# concatdbs, delete the chunk's PDBs, repeat). Peak ~= one chunk of PDBs + the
+# (compact) growing DB, instead of all ~160k PDBs at once.
 # --------------------------------------------------------------------------- #
-def build_foldseek_db(foldseek: str, train_pdb_dir: Path, db_path: Path,
-                      tmp_dir: Path, rebuild: bool) -> None:
+_FS_COMPONENTS = ["", "_h", "_ss", "_ca"]  # the sub-DBs a foldseek structure DB is made of
+
+
+def _rm_prefix(prefix: str) -> None:
+    import glob as _glob
+    for f in _glob.glob(prefix + "*"):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+
+
+def _mv_prefix(src: str, dst: str) -> None:
+    import glob as _glob
+    Path(dst).parent.mkdir(parents=True, exist_ok=True)
+    for f in _glob.glob(src + "*"):
+        shutil.move(f, dst + f[len(src):])
+
+
+def build_db_chunked(foldseek: str, train_ids: list[str], processed_dir: Path, db_path: Path,
+                     tmp_dir: Path, chunk_size: int, n_workers: int, rebuild: bool,
+                     min_free_gb: float = 3.0) -> None:
     sentinel = db_path.parent / "db.done"
     if sentinel.exists() and not rebuild:
-        log.info("foldseek DB present (%s); skipping createdb", db_path)
+        log.info("foldseek DB present (%s); skipping build", db_path)
         return
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    work = db_path.parent
+    work.mkdir(parents=True, exist_ok=True)
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    log.info("foldseek createdb %s -> %s", train_pdb_dir, db_path)
-    _run([foldseek, "createdb", str(train_pdb_dir), str(db_path)], tmp_dir)
+    chunk_pdb = work / "_chunk_pdb"
+    chunk_db = str(work / "_chunk_db" / "cdb")
+    acc = str(db_path)
+    _rm_prefix(acc)  # fresh build
+    n_chunks = (len(train_ids) + chunk_size - 1) // chunk_size
+    log.info("Chunked DB build: %d chains, %d chunks of %d", len(train_ids), n_chunks, chunk_size)
+    have_acc = False
+    for ci in range(n_chunks):
+        free_gb = shutil.disk_usage(work).free / 1e9
+        if free_gb < min_free_gb:
+            raise SystemExit(f"Aborting: only {free_gb:.1f} GB free (< {min_free_gb}); DB build would risk filling the disk.")
+        chunk = train_ids[ci * chunk_size:(ci + 1) * chunk_size]
+        n_ok = _build_chunk_pdbs(chunk, processed_dir, chunk_pdb, n_workers)
+        _rm_prefix(chunk_db)
+        Path(chunk_db).parent.mkdir(parents=True, exist_ok=True)
+        _run([foldseek, "createdb", str(chunk_pdb), chunk_db], tmp_dir)
+        if not have_acc:
+            _mv_prefix(chunk_db, acc)
+            have_acc = True
+        else:
+            new = str(work / "_acc_new" / "cdb")
+            _rm_prefix(new)
+            for comp in _FS_COMPONENTS:
+                _run([foldseek, "concatdbs", acc + comp, chunk_db + comp, new + comp], tmp_dir)
+            _rm_prefix(acc)
+            _mv_prefix(new, acc)
+        _rm_prefix(chunk_db)
+        shutil.rmtree(chunk_pdb, ignore_errors=True)
+        log.info("  chunk %d/%d: +%d chains (free=%.1f GB)", ci + 1, n_chunks, n_ok,
+                 shutil.disk_usage(work).free / 1e9)
+    for d in ["_chunk_pdb", "_chunk_db", "_acc_new"]:
+        shutil.rmtree(work / d, ignore_errors=True)
     sentinel.write_text("ok\n")
-    log.info("foldseek DB built: %s", db_path)
+    log.info("foldseek DB built (chunked): %s", db_path)
 
 
 # --------------------------------------------------------------------------- #
@@ -321,6 +356,8 @@ def main() -> None:
     ap.add_argument("--keep_self_hits", action="store_true",
                     help="Keep self-matches (in-train targets match themselves at TM~1).")
     ap.add_argument("--rebuild_db", action="store_true")
+    ap.add_argument("--chunk_size", type=int, default=8000,
+                    help="Train chains per chunk for the low-disk chunked DB build (peak ~= one chunk of PDBs).")
     ap.add_argument("--smoke_db_size", type=int, default=0,
                     help="If >0, build the DB over only the first N train chains (quick e2e test).")
     ap.add_argument("--n_workers", type=int, default=max(1, (os.cpu_count() or 4) - 2))
@@ -345,14 +382,11 @@ def main() -> None:
         train_ids = train_ids[: args.smoke_db_size]
         log.info("SMOKE: restricting DB to first %d train chains", len(train_ids))
 
-    # Stage 2: train PDBs
-    train_pdb_dir = work_dir / ("train_pdb_smoke" if args.smoke_db_size else "train_pdb")
-    build_train_pdbs(train_ids, processed_dir, train_pdb_dir, args.n_workers)
-
-    # Stage 3: foldseek DB
+    # Stage 2+3: chunked foldseek DB build (low peak disk; persistent + reusable)
     db_path = work_dir / ("db_smoke" if args.smoke_db_size else "db") / "trainDB"
     tmp_dir = work_dir / "fs_tmp"
-    build_foldseek_db(foldseek, train_pdb_dir, db_path, tmp_dir, args.rebuild_db)
+    build_db_chunked(foldseek, train_ids, processed_dir, db_path, tmp_dir,
+                     args.chunk_size, args.n_workers, args.rebuild_db)
 
     # Stage 4: query native PDBs
     ids = pd.read_csv(args.ids_csv, dtype={args.id_col: str}, keep_default_na=False)[args.id_col].astype(str).tolist()
