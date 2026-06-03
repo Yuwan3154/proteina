@@ -129,6 +129,26 @@ def build_discontinuous_pt(parent_id, parent_seq, segments):
                                chain_breaks=chain_breaks)
 
 
+def build_segment_pt_worker(task):
+    """Module-level (picklable) worker for parallel segment PT-build.
+    task = (pid, sequence, segments_json, segment_min_len, out_path).
+    Builds a discontinuous PT if >=1 segment >= min_len, else a whole-chain
+    fallback PT. Skip-existing. Returns (pid, kind) with kind in
+    {'segment','fallback','bad','skip'}."""
+    import json
+    pid, seq, raw, segment_min_len, out_path = task
+    if not isinstance(seq, str) or not isinstance(raw, str):
+        return (pid, "bad")
+    if os.path.exists(out_path):
+        return (pid, "skip")
+    segs = [(int(a), int(b)) for a, b in json.loads(raw) if (int(b) - int(a)) >= segment_min_len]
+    if segs:
+        torch.save(build_discontinuous_pt(pid, seq, segs), out_path)
+        return (pid, "segment")
+    torch.save(sequence_to_pt_data(list(seq), pid), out_path)
+    return (pid, "fallback")
+
+
 def create_working_csv(df: pd.DataFrame, output_path: str) -> str:
     """
     Write a working CSV with 'id' column for downstream pipeline scripts.

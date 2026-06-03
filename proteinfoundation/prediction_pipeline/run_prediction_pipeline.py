@@ -71,8 +71,8 @@ from proteinfoundation.prediction_pipeline.protein_tar_utils import (
     read_protein_text,
     restore_selected_protein_dirs,
 )
-from proteinfoundation.prediction_pipeline.input_parser import build_discontinuous_pt, create_pt_files, create_working_csv, parse_input
-from proteinfoundation.prediction_pipeline.cif_to_pt_converter import sequence_to_pt_data
+from proteinfoundation.prediction_pipeline.input_parser import build_discontinuous_pt, build_segment_pt_worker, create_pt_files, create_working_csv, parse_input
+from proteinfoundation.prediction_pipeline.cif_to_pt_converter import convert_from_csv, sequence_to_pt_data
 
 logging.basicConfig(
     level=logging.INFO,
@@ -196,13 +196,14 @@ def run_with_conda_env(env_name: str, command_list: list, cwd: str | None = None
 
 # ── Step 1: Parse input and create PT files ──────────────────────────────────
 
-def step_build_segment_pts(dataset_file, id_col, sequence_col, segments_col, segment_min_len):
+def step_build_segment_pts(dataset_file, id_col, sequence_col, segments_col, segment_min_len, workers=1):
     """Build per-protein PTs from a pre-annotated CSV (sequence + ordered_segments).
     Proteins with >=1 ordered segment >= segment_min_len -> discontinuous (joint) PT.
     Proteins with no qualifying segment -> WHOLE-CHAIN fallback PT (experimentally ordered
     but AIUPred-disordered: small folds / structured-upon-binding). The af2rank step's
     per-protein segment lookup returns None for these -> whole-chain scoring (no change there).
-    Returns all built ids (segment + fallback) so every protein is sampled."""
+    `workers` parallelizes the (CPU-bound, side-effect-free, skip-existing) build.
+    Returns all built/skipped ids (segment + fallback) so every protein is sampled."""
     data_path = os.environ.get("DATA_PATH", os.path.join(PROTEINA_BASE_DIR, "data"))
     processed_dir = os.path.join(data_path, "pdb_train", "processed")
     os.makedirs(processed_dir, exist_ok=True)
@@ -211,23 +212,24 @@ def step_build_segment_pts(dataset_file, id_col, sequence_col, segments_col, seg
     for col in (sequence_col, segments_col):
         if col not in df.columns:
             raise KeyError(f"segment_mode=joint requires column '{col}' in {dataset_file}; columns={list(df.columns)}")
-    built, fallback, bad = [], 0, 0
-    for _, row in df.iterrows():
-        pid = str(row[id_col]).strip()
-        seq, raw = row[sequence_col], row[segments_col]
-        if not isinstance(seq, str) or not isinstance(raw, str):
-            bad += 1
-            continue
-        segs = [(int(a), int(b)) for a, b in json.loads(raw) if (int(b) - int(a)) >= segment_min_len]
-        out_path = os.path.join(processed_dir, f"{pid}.pt")
-        if segs:
-            torch.save(build_discontinuous_pt(pid, seq, segs), out_path)
-        else:
-            torch.save(sequence_to_pt_data(list(seq), pid), out_path)
-            fallback += 1
-        built.append(pid)
-    logger.info("Segment PTs: %d built (%d segment, %d whole-chain fallback), %d bad-row skipped in %s"
-                % (len(built), len(built) - fallback, fallback, bad, processed_dir))
+    tasks = [
+        (str(row[id_col]).strip(), row[sequence_col], row[segments_col], segment_min_len,
+         os.path.join(processed_dir, f"{str(row[id_col]).strip()}.pt"))
+        for _, row in df.iterrows()
+    ]
+    if workers and workers > 1:
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            results = list(ex.map(build_segment_pt_worker, tasks))
+    else:
+        results = [build_segment_pt_worker(t) for t in tasks]
+    built = [pid for pid, kind in results if kind in ("segment", "fallback", "skip")]
+    n_seg = sum(1 for _, k in results if k == "segment")
+    n_fb = sum(1 for _, k in results if k == "fallback")
+    n_skip = sum(1 for _, k in results if k == "skip")
+    n_bad = sum(1 for _, k in results if k == "bad")
+    logger.info("Segment PTs: %d built/present (%d segment, %d fallback, %d pre-existing), %d bad-row skipped in %s (workers=%d)"
+                % (len(built), n_seg, n_fb, n_skip, n_bad, processed_dir, workers))
     return built
 
 
@@ -1282,6 +1284,10 @@ def build_parser() -> argparse.ArgumentParser:
                              '(af2rank_on_proteinebm_top_k for whole-chain; ..._mask / ..._nomask for '
                              'segment_mode=joint with/without --mask_inter_segment) so mask vs nomask '
                              'runs coexist under the same shared inference dir. Override to force a name.')
+    parser.add_argument('--pt_build_workers', type=int, default=max(1, (os.cpu_count() or 8) - 2),
+                        help='CPU workers for the up-front parallel PT-build pre-step (CIF->PT / '
+                             'discontinuous PT). PTs are built before GPU inference so workers never '
+                             'block on the CPU step. Default: cpu_count-2.')
     return parser
 
 
@@ -1390,10 +1396,19 @@ def main(argv: list[str] | None = None):
         working_csv_id_col = args.id_col
         if args.segment_mode == "joint":
             os.environ["PROTEINA_CONDITIONING_MODE"] = "seq"
-            _built = step_build_segment_pts(args.dataset_file, args.id_col, args.sequence_col, args.segments_col, args.segment_min_len)
+            _built = step_build_segment_pts(args.dataset_file, args.id_col, args.sequence_col,
+                                            args.segments_col, args.segment_min_len,
+                                            workers=args.pt_build_workers)
             _built_set = set(_built)
             protein_ids = [p for p in protein_ids if p in _built_set]
             logger.info(f"segment_mode=joint: {len(protein_ids)} proteins with >=1 segment >={args.segment_min_len} (discontinuous PTs built); conditioning=seq")
+        elif has_gt and not args.skip_inference:
+            # Whole-chain dataset mode: build full-chain PTs UP FRONT in parallel (CPU),
+            # so GPU inference workers never block on per-protein CIF->PT (skip_pt forced True below).
+            logger.info(f"Whole-chain PT pre-build (CIF->PT) for {len(protein_ids)} proteins, workers={args.pt_build_workers} ...")
+            convert_from_csv(args.dataset_file, args.id_col, args.cif_dir,
+                             os.path.join(PROTEINA_BASE_DIR, "data"),
+                             workers=args.pt_build_workers)
     logger.info(f"Loaded {len(protein_ids)} proteins")
 
     inference_base = _inference_base(args.inference_config)
@@ -1415,11 +1430,10 @@ def main(argv: list[str] | None = None):
         logger.info("\n" + "=" * 60)
         logger.info("STEP 2: PROTEINA INFERENCE")
         logger.info("=" * 60)
-        # --input mode → PT files already created by step_parse_input → skip_pt_conversion=True
-        # --dataset_file mode → use --cif_dir to convert CIF → PT (if PT files don't exist)
-        # When --dataset_file mode AND --cif_dir set, run CIF→PT conversion.
-        # When --dataset_file mode AND no --cif_dir, assume PT files exist (skip_pt_conversion=True).
-        skip_pt = (input_mode == "input") or (not has_gt) or (args.segment_mode == "joint")
+        # PTs are now ALWAYS built up front (parallel): --input mode via step_parse_input;
+        # dataset+segment via step_build_segment_pts; dataset+whole-chain via convert_from_csv
+        # above. So GPU workers always skip CIF->PT (never block on the CPU step).
+        skip_pt = True
         if not step_proteina_inference(
             csv_file=working_csv,
             csv_col=working_csv_id_col,

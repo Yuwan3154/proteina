@@ -178,63 +178,71 @@ def convert_cif_to_pt(cif_file: str, chain_id: str, output_file: str) -> bool:
         return False
 
 
-def convert_from_csv(csv_file: str, csv_col: str, cif_dir: str, output_dir: str, processed_subdir: str = "processed") -> None:
+def _find_cif(cif_dir: str, pdb_id: str) -> Optional[str]:
+    """Locate <pdb_id>.cif under cif_dir (flat or one level of subdirs)."""
+    flat = os.path.join(cif_dir, f"{pdb_id}.cif")
+    if os.path.exists(flat):
+        return flat
+    for subdir in os.listdir(cif_dir):
+        subdir_path = os.path.join(cif_dir, subdir)
+        if os.path.isdir(subdir_path):
+            potential = os.path.join(subdir_path, f"{pdb_id}.cif")
+            if os.path.exists(potential):
+                return potential
+    return None
+
+
+def _convert_one_from_csv(task) -> bool:
+    """Module-level (picklable) worker: build one PT for a {pdb_chain} entry.
+    task = (pdb_chain, cif_dir, processed_dir)."""
+    pdb_chain, cif_dir, processed_dir = task
+    pdb_id, chain_id = pdb_chain.split('_')
+    cif_file = _find_cif(cif_dir, pdb_id)
+    if cif_file is None:
+        logger.warning(f"CIF file not found for {pdb_id}")
+        return False
+    output_file = os.path.join(processed_dir, f"{pdb_chain}.pt")
+    return convert_cif_to_pt(cif_file, chain_id, output_file)
+
+
+def convert_from_csv(csv_file: str, csv_col: str, cif_dir: str, output_dir: str,
+                     processed_subdir: str = "processed", workers: int = 1) -> None:
     """
     Convert multiple CIF files to PT format based on a CSV file.
     Saves PT files to the shared DATA_PATH/processed directory.
-    
+
     Args:
         csv_file: Path to CSV file with protein information
         cif_dir: Directory containing CIF files
         output_dir: Output directory for PT files (ignored, uses DATA_PATH)
         processed_subdir: Subdirectory name for processed files
+        workers: Parallel CPU workers for the (CPU-bound, side-effect-free,
+                 skip-existing) per-protein conversion. 1 = serial (default).
     """
-    # Read CSV file
     df = pd.read_csv(csv_file)
-    
+
     # Use shared DATA_PATH from environment, matching inference script expectations
     data_path = os.environ.get('DATA_PATH', os.path.expanduser('~/proteina/data'))
-    # Inference script expects files in DATA_PATH/pdb_train/processed/
     processed_dir = os.path.join(data_path, 'pdb_train', processed_subdir)
     os.makedirs(processed_dir, exist_ok=True)
-    
-    logger.info(f"Saving PT files to shared data path: {processed_dir}")
-    
-    successful_conversions = 0
-    failed_conversions = 0
-    
-    for _, row in df.iterrows():
-        # Parse the pdb_chain field (e.g., "1a2y_C")
-        pdb_chain = row[csv_col]
-        if pd.isna(pdb_chain) or pdb_chain == '':
-            continue
-        
-        pdb_id, chain_id = pdb_chain.split('_')
-        
-        # Find CIF file (check subdirectories)
-        cif_file = None
-        for subdir in os.listdir(cif_dir):
-            subdir_path = os.path.join(cif_dir, subdir)
-            if os.path.isdir(subdir_path):
-                potential_cif = os.path.join(subdir_path, f"{pdb_id}.cif")
-                if os.path.exists(potential_cif):
-                    cif_file = potential_cif
-                    break
-        
-        if cif_file is None:
-            logger.warning(f"CIF file not found for {pdb_id}")
-            failed_conversions += 1
-            continue
-        
-        # Output PT file to shared data path
-        output_file = os.path.join(processed_dir, f"{pdb_chain}.pt")
-        
-        # Convert
-        if convert_cif_to_pt(cif_file, chain_id, output_file):
-            successful_conversions += 1
-        else:
-            failed_conversions += 1
-    
+    logger.info(f"Saving PT files to shared data path: {processed_dir} (workers={workers})")
+
+    tasks = [
+        (str(row[csv_col]), cif_dir, processed_dir)
+        for _, row in df.iterrows()
+        if not (pd.isna(row[csv_col]) or row[csv_col] == '')
+    ]
+
+    if workers and workers > 1:
+        from concurrent.futures import ProcessPoolExecutor
+        results = []
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            results = list(ex.map(_convert_one_from_csv, tasks))
+    else:
+        results = [_convert_one_from_csv(t) for t in tasks]
+
+    successful_conversions = sum(1 for r in results if r)
+    failed_conversions = len(results) - successful_conversions
     logger.info(f"Conversion complete: {successful_conversions} successful, {failed_conversions} failed")
 
 
