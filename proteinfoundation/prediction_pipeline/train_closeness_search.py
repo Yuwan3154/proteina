@@ -163,6 +163,7 @@ def build_db_chunked(foldseek: str, train_ids: list[str], processed_dir: Path, d
             have_acc = True
         else:
             new = str(work / "_acc_new" / "cdb")
+            (work / "_acc_new").mkdir(parents=True, exist_ok=True)
             _rm_prefix(new)
             for comp in _FS_COMPONENTS:
                 _run([foldseek, "concatdbs", acc + comp, chunk_db + comp, new + comp], tmp_dir)
