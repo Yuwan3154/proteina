@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:l40s:4
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=400G
-#SBATCH --time=12:00:00
+#SBATCH --time=2-00:00:00
 #SBATCH --requeue
 #SBATCH --signal=B:USR1@60
 #SBATCH --output=/home/chenxiou/proteina/store/dssp_contact_20M_udlm_pb_v2_stage1/slurm/%x-%j.out
