@@ -196,6 +196,23 @@ def run_with_conda_env(env_name: str, command_list: list, cwd: str | None = None
 
 # ── Step 1: Parse input and create PT files ──────────────────────────────────
 
+def _wait_for_pts(processed_dir, ids, label="", poll=15, timeout=7200):
+    """Non-builder shards wait until shard 0 has built the PT files (shared processed/).
+    Waits for >=99% of ids to have a {id}.pt (tolerates a few skips), or timeout."""
+    import time as _time
+    need = max(1, int(0.99 * len(ids)))
+    waited = 0
+    while waited < timeout:
+        have = sum(1 for i in ids if os.path.exists(os.path.join(processed_dir, f"{i}.pt")))
+        if have >= need:
+            logger.info(f"_wait_for_pts({label}): {have}/{len(ids)} PTs present, proceeding")
+            return
+        logger.info(f"_wait_for_pts({label}): {have}/{len(ids)} PTs present, waiting...")
+        _time.sleep(poll)
+        waited += poll
+    logger.warning(f"_wait_for_pts({label}): timeout after {timeout}s; proceeding with whatever PTs exist")
+
+
 def step_build_segment_pts(dataset_file, id_col, sequence_col, segments_col, segment_min_len, workers=1):
     """Build per-protein PTs from a pre-annotated CSV (sequence + ordered_segments).
     Proteins with >=1 ordered segment >= segment_min_len -> discontinuous (joint) PT.
@@ -1394,21 +1411,42 @@ def main(argv: list[str] | None = None):
         protein_ids = [str(p).strip() for p in df[args.id_col].dropna().unique() if str(p).strip()]
         working_csv = args.dataset_file
         working_csv_id_col = args.id_col
+        # Up-front PT pre-build is SHARD-SAFE: only shard 0 (or non-sharded run) builds
+        # the PTs; other array shards wait for the PT files to exist (they share the same
+        # processed/ dir). Without this guard every shard would redundantly build the FULL
+        # dataset with pt_build_workers each -> N_shards x oversubscription + concurrent
+        # writes to the same .pt files (corruption risk).
+        _build_pts = (shard_index is None) or (shard_index == 0)
+        _processed_dir = os.path.join(
+            os.environ.get("DATA_PATH", os.path.join(PROTEINA_BASE_DIR, "data")),
+            "pdb_train", "processed",
+        )
         if args.segment_mode == "joint":
             os.environ["PROTEINA_CONDITIONING_MODE"] = "seq"
-            _built = step_build_segment_pts(args.dataset_file, args.id_col, args.sequence_col,
-                                            args.segments_col, args.segment_min_len,
-                                            workers=args.pt_build_workers)
-            _built_set = set(_built)
-            protein_ids = [p for p in protein_ids if p in _built_set]
-            logger.info(f"segment_mode=joint: {len(protein_ids)} proteins with >=1 segment >={args.segment_min_len} (discontinuous PTs built); conditioning=seq")
+            # Eligible ids (>=1 segment >= min_len) computed by every shard from the CSV.
+            _eligible = set()
+            for _, _row in df.iterrows():
+                _seq, _raw = _row.get(args.sequence_col), _row.get(args.segments_col)
+                if isinstance(_seq, str) and isinstance(_raw, str):
+                    _eligible.add(str(_row[args.id_col]).strip())  # has seq+segments; build decides seg vs fallback
+            if _build_pts:
+                step_build_segment_pts(args.dataset_file, args.id_col, args.sequence_col,
+                                       args.segments_col, args.segment_min_len,
+                                       workers=args.pt_build_workers)
+            else:
+                _wait_for_pts(_processed_dir, _eligible, label="segment")
+            protein_ids = [p for p in protein_ids if p in _eligible]
+            logger.info(f"segment_mode=joint: {len(protein_ids)} proteins (build_pts={_build_pts}); conditioning=seq")
         elif has_gt and not args.skip_inference:
             # Whole-chain dataset mode: build full-chain PTs UP FRONT in parallel (CPU),
             # so GPU inference workers never block on per-protein CIF->PT (skip_pt forced True below).
-            logger.info(f"Whole-chain PT pre-build (CIF->PT) for {len(protein_ids)} proteins, workers={args.pt_build_workers} ...")
-            convert_from_csv(args.dataset_file, args.id_col, args.cif_dir,
-                             os.path.join(PROTEINA_BASE_DIR, "data"),
-                             workers=args.pt_build_workers)
+            if _build_pts:
+                logger.info(f"Whole-chain PT pre-build (CIF->PT) for {len(protein_ids)} proteins, workers={args.pt_build_workers} ...")
+                convert_from_csv(args.dataset_file, args.id_col, args.cif_dir,
+                                 os.path.join(PROTEINA_BASE_DIR, "data"),
+                                 workers=args.pt_build_workers)
+            else:
+                _wait_for_pts(_processed_dir, set(protein_ids), label="whole-chain")
     logger.info(f"Loaded {len(protein_ids)} proteins")
 
     inference_base = _inference_base(args.inference_config)
