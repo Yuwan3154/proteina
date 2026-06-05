@@ -1,0 +1,55 @@
+# Combined PDB + AFDB d_FS CAT-balanced dataset (Phase 2b).
+# Reuses the single-source PDBLightningDataModule over a combined data_dir (processed/ =
+# symlinks of both sources' bucket trees + merged shard_manifest). Joint mmseqs cluster TSV
+# cluster_seqid_0.25_pdb_dFS_combined.tsv (832,980 clusters / 1,225,180 chains; 1,289 CATs,
+# 735,471 no-CAT). Merged combined_chain_to_cat.pkl (PDB lowercased + AFDB case-sensitive keys,
+# disjoint). No dataselector (folder-style; .pt already processed). in_memory False (1.22M chains).
+# nocat_bucket_draws=322 -> ~50:50 labeled:unlabeled at 4 GPUs. BOTH label transforms:
+# CATHLabelTransform labels PDB stems, TEDLabelTransform labels AFDB stems (each no-ops the other).
+# LAUNCH: set SKIP_CONFIND_PRECOMPUTE=1 (contacts pre-filled; the 14c82db guard else raises).
+datamodule:
+  _target_: "proteinfoundation.datasets.pdb_data.PDBLightningDataModule"
+  data_dir: ${oc.env:DATA_PATH}/pdb_dFS_combined/
+  in_memory: False
+  format: "pdb"
+  overwrite: False
+  regenerate_missing: False
+  cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/
+  multilabel_mode: "sample"
+  cath_dedupe_codes: True
+  batch_padding: True
+  sampling_mode: "cath-balanced"
+  chain_to_cat_path: ${oc.env:DATA_PATH}/pdb_dFS_combined/combined_chain_to_cat.pkl
+  cat_cluster_draw: "largest"
+  cath_balanced_member_mode: "cluster-random"
+  nocat_bucket: True
+  nocat_bucket_draws: 322
+  transforms:
+    - _target_: "proteinfoundation.datasets.transforms.GlobalRotationTransform"
+    - _target_: "proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform"
+    - _target_: "proteinfoundation.datasets.transforms.CATHLabelTransform"
+      root_dir: ${oc.env:DATA_PATH}/cathdata/
+    - _target_: "proteinfoundation.datasets.transforms.TEDLabelTransform"
+      file_path: ${oc.env:DATA_PATH}/d_FS/ted_365m.domain_summary.cath.globularity.taxid.tsv
+      pkl_path: ${oc.env:DATA_PATH}/d_FS/afdb_to_cath_ted.pkl
+    - _target_: "proteinfoundation.datasets.transforms.CATHToIndicesTransform"
+      cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/
+    - _target_: "proteinfoundation.datasets.transforms.DSSPTargetTransform"
+    - _target_: "proteinfoundation.datasets.transforms.ContactMapTransform"
+      contact_method: confind
+      confind_rotamer_lib: ${oc.env:DATA_PATH}/rotlibs
+      confind_contact_threshold: 0.01
+    - _target_: "proteinfoundation.datasets.transforms.PaddingTransform"
+      max_size: 256
+  batch_size: 8
+  num_workers: 8
+  pin_memory: True
+  prefetch_factor: 2
+
+  datasplitter:
+    _target_: "proteinfoundation.datasets.pdb_data.PDBDataSplitter"
+    data_dir: ${oc.env:DATA_PATH}/pdb_dFS_combined/
+    train_val_test: [0.98, 0.019, 0.001]
+    split_type: "sequence_similarity"
+    split_sequence_similarity: 0.25
+    overwrite_sequence_clusters: False
