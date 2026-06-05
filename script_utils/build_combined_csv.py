@@ -28,8 +28,8 @@ def main():
     pdb = pdb[dep <= args.deposition_cutoff]
     n_pdb_cut = len(pdb)
     pdb_out = pdb[["pdb", "id", "sequence"]].copy()
-    pdb_out["pdb"] = pdb_out["pdb"].astype(str).str.lower()
-    pdb_out["id"] = pdb_out["id"].astype(str).str.lower()
+    # PDB ids kept in ORIGINAL case to match .pt filenames (e.g. 101m_A.pt); chain_to_cat
+    # keys are lowercased but the sampler exact-then-.lower() lookup handles that.
 
     afdb = pd.read_csv(args.afdb_csv)
     afdb_out = afdb[["pdb", "id", "sequence"]].copy()
