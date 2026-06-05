@@ -17,7 +17,6 @@ import torch
 from jaxtyping import Float
 from loguru import logger
 from torch import Tensor
-from transformers import AutoTokenizer, EsmForProteinFolding
 from transformers import logging as hf_logging
 from transformers.models.esm.openfold_utils.feats import atom14_to_atom37
 from transformers.models.esm.openfold_utils.protein import Protein as OFProtein
@@ -165,6 +164,12 @@ def run_and_store_esm(
     Returns:
         List of paths (list of str) to PDB files
     """
+    # Lazy import: pulling EsmForProteinFolding eagerly imports transformers' ESMFold
+    # module, which drags in flash_attn (a prebuilt .so that needs a newer GLIBC than
+    # some compute nodes have). Our default scoring path (ProteinEBM/AF2Rank,
+    # cuequivariance attention) never calls ESMFold, so defer this import until used.
+    from transformers import AutoTokenizer, EsmForProteinFolding
+
     is_cluster_run = os.environ.get("SLURM_JOB_ID") is not None
     cache_dir = None
     if is_cluster_run:
