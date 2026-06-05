@@ -17,15 +17,14 @@ import torch
 from jaxtyping import Float
 from loguru import logger
 from torch import Tensor
-from transformers import logging as hf_logging
-from transformers.models.esm.openfold_utils.feats import atom14_to_atom37
-from transformers.models.esm.openfold_utils.protein import Protein as OFProtein
-from transformers.models.esm.openfold_utils.protein import to_pdb
 
 from proteinfoundation.utils.align_utils.align_utils import kabsch_align_ind
 from proteinfoundation.utils.ff_utils.pdb_utils import from_pdb_string
 
-hf_logging.set_verbosity_error()
+# transformers (ESMFold + openfold_utils) is imported lazily inside the functions that
+# use it (scRMSD / convert_outputs_to_pdb). It pulls flash_attn and is only needed for
+# the ESMFold designability metric, not the default ProteinEBM/AF2Rank scoring path, so
+# keeping it out of module import lets inference run in envs without transformers.
 
 
 def pdb_name_from_path(pdb_file_path):
@@ -123,6 +122,10 @@ def run_proteinmpnn(
 # I got this function from hugging face's ESM notebook example
 def convert_outputs_to_pdb(outputs) -> List[str]:
     """Takes ESMFold outputs and converts them to a list of PDBs (as strings)."""
+    from transformers.models.esm.openfold_utils.feats import atom14_to_atom37
+    from transformers.models.esm.openfold_utils.protein import Protein as OFProtein
+    from transformers.models.esm.openfold_utils.protein import to_pdb
+
     final_atom_positions = atom14_to_atom37(outputs["positions"][-1], outputs)
     outputs = {k: v.to("cpu").numpy() for k, v in outputs.items()}
     final_atom_positions = final_atom_positions.cpu().numpy()
@@ -169,6 +172,8 @@ def run_and_store_esm(
     # some compute nodes have). Our default scoring path (ProteinEBM/AF2Rank,
     # cuequivariance attention) never calls ESMFold, so defer this import until used.
     from transformers import AutoTokenizer, EsmForProteinFolding
+    from transformers import logging as hf_logging
+    hf_logging.set_verbosity_error()
 
     is_cluster_run = os.environ.get("SLURM_JOB_ID") is not None
     cache_dir = None
