@@ -32,6 +32,7 @@ from torch_geometric import transforms as T
 from torch_geometric.data import Data
 
 from proteinfoundation.datasets.cath_utils import load_cath_mapping, parse_cath_codes_to_indices
+from proteinfoundation.utils.ff_utils.pdb_utils import extract_cath_code_by_level
 from proteinfoundation.utils.dense_padding_data_loader import FLOAT_PADDING_VALUE
 
 
@@ -480,6 +481,126 @@ class CATHToIndicesTransform(T.BaseTransform):
             )
             graph.cath_code_indices = result[0]
         return graph
+
+
+class DomainCropTransform(T.BaseTransform):
+    """Crops a chain to one CATH/TED domain (the CATBalancedSampler-chosen topology).
+
+    Requires ``graph.sampled_topology`` (set by ``PDBDataset.__getitem__`` when the
+    sampler runs with ``emit_topology=True``). Domain boundaries come from a
+    precomputed spans pickle ``{graph_id: {topology: [(start, end), ...]}}`` whose
+    inclusive start/end are matched against ``graph.residue_pdb_idx`` (PDB author
+    numbering or AFDB 1..L sequential). Discontinuous domains are the union of their
+    segments; ``residue_pdb_idx`` is NOT re-indexed, so the model's relative
+    positional features see the true inter-segment gap.
+
+    Side effects on the kept residues:
+      * all per-residue tensors + list attrs and the ``[L, L]`` ``contact_map_confind``
+        are cropped to the kept subset;
+      * ``cath_code`` is narrowed to the cropped domain's code so fold conditioning
+        (CATHToIndicesTransform, which must run after this) matches the shown structure;
+      * ``ext_lig`` is merged toward PRESENT (1): a kept residue whose CA is within
+        ``ext_lig_cutoff`` of any cropped-out same-chain atom is set to 1 (AFDB 2->1).
+
+    When ``sampled_topology`` is absent (no-CAT bucket / retry-stale chain) or no span
+    intersects the chain, the chain is left uncropped (PaddingTransform truncates).
+    """
+
+    _SKIP_KEYS = {
+        "id", "protein_id", "database", "sampled_topology",
+        "cath_code", "cath_code_indices",
+    }
+
+    def __init__(
+        self,
+        spans_path: str,
+        ext_lig_cutoff: float = 8.0,
+        ca_atom_index: int = 1,
+        on_missing: Literal["skip", "error"] = "skip",
+    ):
+        self.spans_path = spans_path
+        self.ext_lig_cutoff = float(ext_lig_cutoff)
+        self.ca_atom_index = int(ca_atom_index)
+        self.on_missing = on_missing
+        with open(spans_path, "rb") as fh:
+            self.spans = pickle.load(fh)
+        rank_zero_info(
+            f"DomainCropTransform: loaded spans for {len(self.spans)} chains from {spans_path}"
+        )
+
+    def forward(self, graph: Data) -> Data:
+        topo = getattr(graph, "sampled_topology", None)
+        if hasattr(graph, "sampled_topology"):
+            del graph["sampled_topology"]  # consume so it never reaches collation
+
+        segments = None
+        if topo is not None:
+            per_chain = self.spans.get(graph.id)
+            if per_chain is not None:
+                segments = per_chain.get(topo)
+        if not segments:
+            if self.on_missing == "error" and topo is not None:
+                raise ValueError(f"No domain span for id={graph.id} topology={topo}")
+            return graph  # leave full chain; Padding truncates to max_size
+
+        rpi = graph.residue_pdb_idx
+        keep = torch.zeros(rpi.shape[0], dtype=torch.bool)
+        for start, end in segments:
+            keep |= (rpi >= int(start)) & (rpi <= int(end))
+        if not bool(keep.any()):
+            rank_zero_warn(
+                f"DomainCropTransform: span {segments} misses residue_pdb_idx for {graph.id}; not cropping"
+            )
+            return graph
+
+        removed = ~keep
+        if getattr(graph, "ext_lig", None) is not None and bool(removed.any()):
+            graph.ext_lig = self._merge_ext_lig(graph, keep, removed)
+        self._narrow_cath_code(graph, topo)
+
+        idx = keep.nonzero(as_tuple=False).squeeze(-1)
+        L = keep.shape[0]
+        for key, value in graph:
+            if key in self._SKIP_KEYS:
+                continue
+            if isinstance(value, torch.Tensor):
+                if value.dim() == 2 and value.shape[0] == L and value.shape[1] == L:
+                    graph[key] = value[idx][:, idx]
+                elif value.dim() >= 1 and value.shape[0] == L:
+                    graph[key] = value[idx]
+            elif isinstance(value, list) and len(value) == L:
+                graph[key] = [value[j] for j in idx.tolist()]
+        return graph
+
+    def _merge_ext_lig(
+        self, graph: Data, keep: torch.Tensor, removed: torch.Tensor
+    ) -> torch.Tensor:
+        from scipy.spatial import cKDTree
+
+        ext_lig = graph.ext_lig.clone()
+        coords = graph.coords
+        coord_mask = graph.coord_mask
+        rem_atoms = coords[removed][coord_mask[removed]]  # [M, 3] valid cropped-out atoms
+        if rem_atoms.numel() == 0:
+            return ext_lig
+        tree = cKDTree(rem_atoms.detach().cpu().numpy().astype(np.float64))
+        keep_idx = keep.nonzero(as_tuple=False).squeeze(-1)
+        ca = coords[keep_idx, self.ca_atom_index, :].detach().cpu().numpy().astype(np.float64)
+        ca_valid = coord_mask[keep_idx, self.ca_atom_index]
+        hits = tree.query_ball_point(ca, r=self.ext_lig_cutoff)
+        for j, pos in enumerate(keep_idx.tolist()):
+            if int(ext_lig[pos]) == 1 or not bool(ca_valid[j]):
+                continue
+            if len(hits[j]) > 0:
+                ext_lig[pos] = 1
+        return ext_lig
+
+    def _narrow_cath_code(self, graph: Data, topo: str) -> None:
+        codes = getattr(graph, "cath_code", None) or []
+        matched = [c for c in codes if extract_cath_code_by_level(c, "T") == topo]
+        if not matched:
+            matched = [topo + ".x"] if topo.count(".") == 2 else [topo]
+        graph.cath_code = matched
 
 
 class PurgeConfindTransform(T.BaseTransform):

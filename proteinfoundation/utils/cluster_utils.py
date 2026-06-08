@@ -259,10 +259,12 @@ class CATBalancedSampler(Sampler):
         drop_last: bool = False,
         seed: int = 0,
         v2: bool = True,
+        emit_topology: bool = False,
     ):
         self.dataset = dataset
         self.clusterid_to_seqid_mapping = clusterid_to_seqid_mapping
         self.cluster_names = list(clusterid_to_seqid_mapping.keys())
+        self.emit_topology = bool(emit_topology)
         self.chain_to_cat = chain_to_cat
         self.cat_cluster_draw = cat_cluster_draw
         self.member_mode = member_mode
@@ -354,7 +356,7 @@ class CATBalancedSampler(Sampler):
         g.manual_seed(s if s != 0 else 1)
         return g
 
-    def _draw_for_topology(self, cat: str, gen) -> int:
+    def _draw_for_topology(self, cat: str, gen) -> Tuple[int, str]:
         clusters = self.topology_to_clusters[cat]
         if self.cat_cluster_draw == "largest":
             # max eligible size; deterministic tie-break by cluster name
@@ -387,9 +389,9 @@ class CATBalancedSampler(Sampler):
                 f"First CAT sampling: topology {cat} -> cluster {chosen} -> {seqid}, rank {self.rank}"
             )
             self.log_first = False
-        return self.sequence_id_to_idx[seqid]
+        return self.sequence_id_to_idx[seqid], cat
 
-    def _draw_nocat(self, gen) -> List[int]:
+    def _draw_nocat(self, gen) -> List[Tuple]:
         out: List[int] = []
         if not self.nocat_clusters:
             return out
@@ -408,7 +410,7 @@ class CATBalancedSampler(Sampler):
                 else:
                     k = torch.randint(0, len(members), (1,)).item()
                 seqid = members[k]
-            out.append(self.sequence_id_to_idx[seqid])
+            out.append((self.sequence_id_to_idx[seqid], None))
         return out
 
     def __iter__(self):
@@ -447,10 +449,12 @@ class CATBalancedSampler(Sampler):
         else:
             draw_gen = self._make_generator(1, 0) if self.v2 else None
 
-        indices = [self._draw_for_topology(self._topologies[i], draw_gen) for i in perm]
+        pairs = [self._draw_for_topology(self._topologies[i], draw_gen) for i in perm]
         if self.nocat_bucket:
-            indices.extend(self._draw_nocat(draw_gen))
-        return iter(indices)
+            pairs.extend(self._draw_nocat(draw_gen))
+        if self.emit_topology:
+            return iter(pairs)
+        return iter([idx for idx, _cat in pairs])
 
     def __len__(self):
         if self.num_replicas is not None:

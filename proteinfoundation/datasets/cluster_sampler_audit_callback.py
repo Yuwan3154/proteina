@@ -91,7 +91,8 @@ class ClusterSamplerAuditCallback(L.Callback):
         for i, idx in enumerate(iter(sampler)):
             if i >= self._max_indices_per_rank:
                 break
-            rank_indices.append(int(idx))
+            # CATBalancedSampler(emit_topology=True) yields (idx, topology) tuples.
+            rank_indices.append(int(idx[0] if isinstance(idx, tuple) else idx))
 
         # Pad to a common length so all_gather works (different ranks see
         # slightly different partition sizes when not drop_last).
