@@ -54,11 +54,32 @@ echo "[$(date)] Restart count (requeue chain): ${SLURM_RESTART_COUNT:-0}"
 # SLURM_PROCID/SLURM_NTASKS to wire DDP. Running `python` alone gets a single
 # rank (MEMBER 1/1) and Lightning's auto-spawn fallback is unreliable here.
 # --resume_option=allow: create new run if no ckpt yet, resume if present.
-exec srun python proteinfoundation/train.py \
+#
+# Self-resubmit chain: --requeue misses app crashes (NCCL timeout, OOM), so on a
+# non-zero srun exit we resubmit a fresh job -- but only if a checkpoint advanced
+# this run (loop-guard against a deterministic crash). Clean/max_steps exits 0.
+CKPT_FILE=/home/chenxiou/proteina/store/dssp_contact_20M_udlm_pb_v2_stage1/checkpoints/last.ckpt
+START_MTIME=$(stat -c %Y "$CKPT_FILE" 2>/dev/null || echo 0)
+
+if srun python proteinfoundation/train.py \
     --config_name training_dssp_contact_20M_udlm_pb_v2_stage1 \
     --ngpus_per_node 4 \
     --nnodes 1 \
     --batch_size 4 \
     --accumulate_grad_batches 8 \
     --resume_option allow \
-    af2_ipa_weights_path=/home/chenxiou/params/params_model_1_ptm.npz
+    af2_ipa_weights_path=/home/chenxiou/params/params_model_1_ptm.npz; then
+  RC=0
+else
+  RC=$?
+fi
+echo "[$(date)] srun exited rc=$RC"
+
+END_MTIME=$(stat -c %Y "$CKPT_FILE" 2>/dev/null || echo 0)
+if [ "$RC" -ne 0 ] && [ "$END_MTIME" -gt "$START_MTIME" ]; then
+  echo "[$(date)] app crash after checkpoint progress; auto-resubmitting fresh job"
+  cd /home/chenxiou/proteina && sbatch run_stage1_sbatch.sh
+elif [ "$RC" -ne 0 ]; then
+  echo "[$(date)] app crash with NO new checkpoint (loop-guard: not resubmitting). Investigate."
+fi
+exit $RC
