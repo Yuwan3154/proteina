@@ -31,6 +31,7 @@ datamodule:
   nocat_bucket: True
   nocat_bucket_draws: 322
   cath_balanced_emit_topology: True
+  cluster_sampler_seed: 42  # ties domain-crop random-window augmentation to the global seed (reproducible + resumable)
   transforms:
     - _target_: "proteinfoundation.datasets.transforms.GlobalRotationTransform"
     - _target_: "proteinfoundation.datasets.transforms.CATHLabelTransform"
@@ -41,6 +42,8 @@ datamodule:
     - _target_: "proteinfoundation.datasets.transforms.DomainCropTransform"
       spans_path: ${oc.env:DATA_PATH}/pdb_dFS_combined/combined_domain_spans.pkl
       ext_lig_cutoff: 8.0
+      crop_size: 320
+      random_crop_over_length: true
     - _target_: "proteinfoundation.datasets.transforms.CATHToIndicesTransform"
       cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/
     - _target_: "proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform"

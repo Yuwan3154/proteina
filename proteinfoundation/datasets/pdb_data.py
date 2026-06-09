@@ -811,13 +811,18 @@ class PDBDataset(Dataset):
         debug = getattr(self, "_debug_data_loading", False)
         n = len(self)
 
-        # CATBalancedSampler(emit_topology=True) yields (idx, topology) tuples so
-        # DomainCropTransform can crop to the sampled domain. The int index drives
-        # the retry loop; topology may go stale on retry (different chain) -> the
-        # crop transform then falls back to the full chain.
+        # CATBalancedSampler(emit_topology=True) yields (idx, topology, crop_seed) tuples
+        # so DomainCropTransform can crop to the sampled domain with a reproducible,
+        # seeded random window. The int index drives the retry loop; topology may go
+        # stale on retry (different chain) -> the crop transform falls back to a
+        # whole-chain window. crop_seed is present for no-CAT draws too (topology None).
         sampled_topology = None
+        crop_seed = None
         if isinstance(idx, tuple):
-            idx, sampled_topology = idx
+            if len(idx) == 3:
+                idx, sampled_topology, crop_seed = idx
+            else:
+                idx, sampled_topology = idx
 
         for attempt in range(self._MAX_GETITEM_RETRIES):
             cur = (idx + attempt) % n
@@ -925,10 +930,12 @@ class PDBDataset(Dataset):
             graph.coords = graph.coords[:, PDB_TO_OPENFOLD_INDEX_TENSOR, :]
             graph.coord_mask = graph.coord_mask[:, PDB_TO_OPENFOLD_INDEX_TENSOR]
 
-            # Pass the sampler-chosen topology to DomainCropTransform (set only when
-            # present so non-crop runs never add this attr to the collated batch).
+            # Pass the sampler-chosen topology + crop seed to DomainCropTransform (set
+            # only when present so non-crop runs never add these attrs to the batch).
             if sampled_topology is not None:
                 graph.sampled_topology = sampled_topology
+            if crop_seed is not None:
+                graph.crop_seed = crop_seed
 
             if self.transform:
                 try:

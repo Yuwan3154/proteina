@@ -53,9 +53,23 @@ def parse_chopping(chopping):
     return segs
 
 
-def pick_largest_per_topo(per_topo):
-    """per_topo: {topo: [(segments, length), ...]} -> {topo: segments_of_largest}."""
-    return {topo: max(domains, key=lambda d: d[1])[0] for topo, domains in per_topo.items()}
+def all_domains_per_topo(per_topo):
+    """per_topo: {topo: [(segments, length), ...]} -> {topo: [segments, ...]}.
+
+    Keeps ALL distinct same-topology domains (deduped by segment-set), largest first.
+    """
+    out = {}
+    for topo, domains in per_topo.items():
+        seen = set()
+        doms = []
+        for segs, _length in sorted(domains, key=lambda d: (-d[1], d[0])):
+            key = tuple(segs)
+            if key in seen:
+                continue
+            seen.add(key)
+            doms.append(segs)
+        out[topo] = doms
+    return out
 
 
 def build_pdb_spans(cathdata_dir):
@@ -88,7 +102,7 @@ def build_pdb_spans(cathdata_dir):
                 length = sum(e - s + 1 for s, e in segs)
                 per_topo[topo].append((segs, length))
         if per_topo:
-            out[stem] = pick_largest_per_topo(per_topo)
+            out[stem] = all_domains_per_topo(per_topo)
     return out
 
 
@@ -133,7 +147,7 @@ def build_afdb_spans(afdb_chain_to_cat_path, ted_tsv, workdir):
                 topo = cat3(cath)
                 if topo:
                     spans[stem][topo].append((segs, length))
-    return {stem: pick_largest_per_topo(tm) for stem, tm in spans.items()}
+    return {stem: all_domains_per_topo(tm) for stem, tm in spans.items()}
 
 
 def main():
@@ -163,6 +177,10 @@ def main():
     print(f"key overlap PDB/AFDB: {len(overlap)} (expect 0)", flush=True)
     combined = {**pdb_spans, **afdb_spans}
     print(f"combined spans: {len(combined)} chains", flush=True)
+    multi = sum(1 for tm in combined.values() for doms in tm.values() if len(doms) > 1)
+    over = sum(1 for tm in combined.values() for doms in tm.values()
+               for segs in doms if sum(e - s + 1 for s, e in segs) > 320)
+    print(f"(stem,topo) with >1 domain: {multi}; domains >320 residues: {over}", flush=True)
     with open(args.out, "wb") as f:
         pickle.dump(combined, f, protocol=pickle.HIGHEST_PROTOCOL)
     print(f"WROTE {args.out}", flush=True)

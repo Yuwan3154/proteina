@@ -484,30 +484,31 @@ class CATHToIndicesTransform(T.BaseTransform):
 
 
 class DomainCropTransform(T.BaseTransform):
-    """Crops a chain to one CATH/TED domain (the CATBalancedSampler-chosen topology).
+    """Crops a chain to a single CATH/TED domain (or a random window) for domain-crop pretraining.
 
-    Requires ``graph.sampled_topology`` (set by ``PDBDataset.__getitem__`` when the
-    sampler runs with ``emit_topology=True``). Domain boundaries come from a
-    precomputed spans pickle ``{graph_id: {topology: [(start, end), ...]}}`` whose
-    inclusive start/end are matched against ``graph.residue_pdb_idx`` (PDB author
-    numbering or AFDB 1..L sequential). Discontinuous domains are the union of their
-    segments; ``residue_pdb_idx`` is NOT re-indexed, so the model's relative
-    positional features see the true inter-segment gap.
+    Driven by ``graph.sampled_topology`` + ``graph.crop_seed`` (set by ``PDBDataset.__getitem__``
+    when the sampler runs with ``emit_topology=True``). Domain boundaries come from a precomputed
+    spans pickle ``{graph_id: {topology: [domain_segments, ...]}}`` where each ``domain_segments``
+    is ``[(start, end), ...]`` (multi-segment = discontinuous domain; a topology may list several
+    distinct domains on the same chain). Inclusive start/end are matched against
+    ``graph.residue_pdb_idx`` (PDB author numbering / AFDB 1..L sequential); ``residue_pdb_idx`` is
+    NOT re-indexed so the model's relative positional features see the true inter-segment gap.
 
-    Side effects on the kept residues:
-      * all per-residue tensors + list attrs and the ``[L, L]`` ``contact_map_confind``
-        are cropped to the kept subset;
-      * ``cath_code`` is narrowed to the cropped domain's code so fold conditioning
-        (CATHToIndicesTransform, which must run after this) matches the shown structure;
-      * ``ext_lig`` is merged toward PRESENT (1): a kept residue whose CA is within
-        ``ext_lig_cutoff`` of any cropped-out same-chain atom is set to 1 (AFDB 2->1).
+    Behaviour (all crop choices seeded by ``crop_seed`` -> reproducible + resumable):
+      * labeled chain: choose one domain of the sampled topology, crop to it; if the chosen domain
+        has > ``crop_size`` residues, crop a random contiguous ``crop_size`` window within it;
+      * no-CAT / retry-stale / span-miss chain: if it has > ``crop_size`` residues, crop a random
+        contiguous ``crop_size`` window over the whole chain; otherwise leave it whole.
 
-    When ``sampled_topology`` is absent (no-CAT bucket / retry-stale chain) or no span
-    intersects the chain, the chain is left uncropped (PaddingTransform truncates).
+    For the kept residues: all per-residue tensors + list attrs and the ``[L, L]``
+    ``contact_map_confind`` are cropped; ``cath_code`` is narrowed to the cropped domain's code
+    (only when a real domain matched) so fold conditioning matches the shown structure; ``ext_lig``
+    is merged toward PRESENT (1) for kept residues within ``ext_lig_cutoff`` of any cropped-out
+    same-chain atom (AFDB 2->1, and window edges of over-length chains).
     """
 
     _SKIP_KEYS = {
-        "id", "protein_id", "database", "sampled_topology",
+        "id", "protein_id", "database", "sampled_topology", "crop_seed",
         "cath_code", "cath_code_indices",
     }
 
@@ -516,11 +517,15 @@ class DomainCropTransform(T.BaseTransform):
         spans_path: str,
         ext_lig_cutoff: float = 8.0,
         ca_atom_index: int = 1,
+        crop_size: int = 320,
+        random_crop_over_length: bool = True,
         on_missing: Literal["skip", "error"] = "skip",
     ):
         self.spans_path = spans_path
         self.ext_lig_cutoff = float(ext_lig_cutoff)
         self.ca_atom_index = int(ca_atom_index)
+        self.crop_size = int(crop_size)
+        self.random_crop_over_length = bool(random_crop_over_length)
         self.on_missing = on_missing
         with open(spans_path, "rb") as fh:
             self.spans = pickle.load(fh)
@@ -530,36 +535,78 @@ class DomainCropTransform(T.BaseTransform):
 
     def forward(self, graph: Data) -> Data:
         topo = getattr(graph, "sampled_topology", None)
-        if hasattr(graph, "sampled_topology"):
-            del graph["sampled_topology"]  # consume so it never reaches collation
+        crop_seed = getattr(graph, "crop_seed", None)
+        for k in ("sampled_topology", "crop_seed"):
+            if hasattr(graph, k):
+                del graph[k]  # consume so they never reach collation
 
-        segments = None
-        if topo is not None:
-            per_chain = self.spans.get(graph.id)
-            if per_chain is not None:
-                segments = per_chain.get(topo)
-        if not segments:
-            if self.on_missing == "error" and topo is not None:
-                raise ValueError(f"No domain span for id={graph.id} topology={topo}")
-            return graph  # leave full chain; Padding truncates to max_size
+        gen = None
+        if crop_seed is not None:
+            gen = torch.Generator()
+            gen.manual_seed(int(crop_seed) & 0x7FFFFFFFFFFFFFFF)
 
         rpi = graph.residue_pdb_idx
-        keep = torch.zeros(rpi.shape[0], dtype=torch.bool)
-        for start, end in segments:
-            keep |= (rpi >= int(start)) & (rpi <= int(end))
-        if not bool(keep.any()):
-            rank_zero_warn(
-                f"DomainCropTransform: span {segments} misses residue_pdb_idx for {graph.id}; not cropping"
-            )
-            return graph
+        L = rpi.shape[0]
+        keep_positions = None
+        matched_topo = None
 
-        removed = ~keep
+        if topo is not None:
+            per_chain = self.spans.get(graph.id)
+            domains = per_chain.get(topo) if per_chain is not None else None
+            if domains:
+                segs = self._choose_domain(domains, gen)
+                keep = torch.zeros(L, dtype=torch.bool)
+                for s, e in segs:
+                    keep |= (rpi >= int(s)) & (rpi <= int(e))
+                if bool(keep.any()):
+                    keep_positions = keep.nonzero(as_tuple=False).squeeze(-1)
+                    matched_topo = topo
+                else:
+                    rank_zero_warn(
+                        f"DomainCropTransform: domain {segs} misses residue_pdb_idx for "
+                        f"{graph.id}; falling back to whole-chain window"
+                    )
+
+        if keep_positions is None:
+            # no-CAT / span-miss / retry-stale: random whole-chain window if over length
+            if self.random_crop_over_length and L > self.crop_size:
+                keep_positions = self._random_window(torch.arange(L), gen)
+            else:
+                if self.on_missing == "error" and topo is not None:
+                    raise ValueError(f"No domain span for id={graph.id} topology={topo}")
+                return graph  # leave whole chain; Padding truncates to max_size
+        elif self.random_crop_over_length and keep_positions.shape[0] > self.crop_size:
+            keep_positions = self._random_window(keep_positions, gen)
+
+        keep_mask = torch.zeros(L, dtype=torch.bool)
+        keep_mask[keep_positions] = True
+        removed = ~keep_mask
         if getattr(graph, "ext_lig", None) is not None and bool(removed.any()):
-            graph.ext_lig = self._merge_ext_lig(graph, keep, removed)
-        self._narrow_cath_code(graph, topo)
+            graph.ext_lig = self._merge_ext_lig(graph, keep_mask, removed)
+        if matched_topo is not None:
+            self._narrow_cath_code(graph, matched_topo)
+        self._crop_fields(graph, keep_positions, L)
+        return graph
 
-        idx = keep.nonzero(as_tuple=False).squeeze(-1)
-        L = keep.shape[0]
+    def _choose_domain(self, domains, gen):
+        """Pick one domain (list of segments) among same-topology domains, seeded."""
+        if domains and isinstance(domains[0], tuple):  # legacy flat single-domain schema
+            return list(domains)
+        if len(domains) == 1:
+            return domains[0]
+        i = int(torch.randint(0, len(domains), (1,), generator=gen).item()) if gen is not None else 0
+        return domains[i]
+
+    def _random_window(self, positions: torch.Tensor, gen) -> torch.Tensor:
+        """Return a contiguous crop_size sub-block of the (sorted) kept positions, seeded."""
+        n = positions.shape[0]
+        if n <= self.crop_size:
+            return positions
+        hi = n - self.crop_size + 1
+        start = int(torch.randint(0, hi, (1,), generator=gen).item()) if gen is not None else 0
+        return positions[start : start + self.crop_size]
+
+    def _crop_fields(self, graph: Data, idx: torch.Tensor, L: int) -> None:
         for key, value in graph:
             if key in self._SKIP_KEYS:
                 continue
@@ -570,7 +617,6 @@ class DomainCropTransform(T.BaseTransform):
                     graph[key] = value[idx]
             elif isinstance(value, list) and len(value) == L:
                 graph[key] = [value[j] for j in idx.tolist()]
-        return graph
 
     def _merge_ext_lig(
         self, graph: Data, keep: torch.Tensor, removed: torch.Tensor

@@ -347,13 +347,21 @@ class CATBalancedSampler(Sampler):
         """Lightning calls this each train epoch start; seeds the per-epoch generators."""
         self.epoch = int(epoch)
 
-    def _make_generator(self, *parts: int) -> torch.Generator:
-        """Fresh torch.Generator seeded by (seed, epoch, *parts); same inputs -> same state across ranks."""
+    def _derive_seed(self, *parts: int) -> int:
+        """Deterministic 64-bit seed from (seed, epoch, *parts); identical across ranks/runs.
+
+        Used for the per-draw crop_seed so domain-crop augmentation is a pure function of
+        (sampler seed, epoch, topology index) -> reproducible + resumable (epoch is in the
+        Lightning checkpoint; no dataloader RNG-state needed)."""
         s = (self.seed & 0xFFFFFFFF)
         for p in (self.epoch, *parts):
             s = ((s * 0x9E3779B97F4A7C15) ^ (int(p) & 0xFFFFFFFFFFFFFFFF)) & 0xFFFFFFFFFFFFFFFF
+        return s if s != 0 else 1
+
+    def _make_generator(self, *parts: int) -> torch.Generator:
+        """Fresh torch.Generator seeded by (seed, epoch, *parts); same inputs -> same state across ranks."""
         g = torch.Generator()
-        g.manual_seed(s if s != 0 else 1)
+        g.manual_seed(self._derive_seed(*parts))
         return g
 
     def _draw_for_topology(self, cat: str, gen) -> Tuple[int, str]:
@@ -449,12 +457,20 @@ class CATBalancedSampler(Sampler):
         else:
             draw_gen = self._make_generator(1, 0) if self.v2 else None
 
-        pairs = [self._draw_for_topology(self._topologies[i], draw_gen) for i in perm]
+        # Each emitted item is (idx, cat, crop_seed). crop_seed is a pure function of
+        # (seed, epoch, topology index / nocat position) so the domain choice + random
+        # crop window are reproducible across runs and resumable. _derive_seed touches no
+        # RNG stream, so the non-emit idx order is byte-identical to before.
+        pairs = []
+        for i in perm:
+            idx, cat = self._draw_for_topology(self._topologies[i], draw_gen)
+            pairs.append((idx, cat, self._derive_seed(2, i)))
         if self.nocat_bucket:
-            pairs.extend(self._draw_nocat(draw_gen))
+            for j, (idx, cat) in enumerate(self._draw_nocat(draw_gen)):
+                pairs.append((idx, cat, self._derive_seed(3, self.rank, j)))
         if self.emit_topology:
             return iter(pairs)
-        return iter([idx for idx, _cat in pairs])
+        return iter([p[0] for p in pairs])
 
     def __len__(self):
         if self.num_replicas is not None:
