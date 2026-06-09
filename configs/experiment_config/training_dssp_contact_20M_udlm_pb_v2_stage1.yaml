@@ -177,12 +177,11 @@ validation_sampling:
   dt: 0.005
   sampling_mode: sc
   sc_scale_noise: 0.45
-  # STAGE 1 = qualitative-only validation sampling. tmscore_n_samples == 0
-  # gates the new branch in model_trainer_base._run_validation_trajectory:
-  # rank-0 generates exactly 1 sample with fresh noise + variable-length
-  # sampling and logs structure / contact map / sampled DSSP to wandb;
-  # ranks 1-3 skip the trajectory entirely (no compute waste). No USalign,
-  # no TM-score, no contact-map metrics aggregation.
+  # STAGE 1 = NO validation sampling. tmscore_n_samples == 0 disables the
+  # inference trajectory entirely in validation_step_data: validation runs
+  # only the per-batch val loss. No generate(), no structure/contact/DSSP viz,
+  # no GT panels, no USalign, no TM-score, no contact-map metrics. Avoids the
+  # ~200-step generate() that previously ran every val epoch.
   #
   # Stage-2 sets tmscore_n_samples=8: each rank generates 8/world_size=2
   # samples, all ranks accumulate per-sample TM-scores into the local list,

@@ -2273,18 +2273,13 @@ class ModelTrainerBase(L.LightningModule):
         # subsequent val batch.
         self._logged_val_traj_epoch = self.current_epoch
         if tmscore_n == 0:
-            # Qualitative path: rank-0 generates 1 sample for viz; others skip.
-            # The early return on non-rank-0 lives inside
-            # _run_validation_trajectory so the diag log fires for both
-            # branches.
-            self._diag_log("val_step_data: traj enter qualitative", "nsamples=1")
-            self._run_validation_trajectory(
-                batch,
-                val_sampling_cfg,
-                nsamples=1,
-                qualitative_only=True,
-            )
-            self._diag_log("val_step_data: traj done qualitative", "")
+            # Stage-1: validation inference trajectory DISABLED. Only the
+            # per-batch val loss (computed above) runs; we skip the full
+            # generate() that otherwise ran every val epoch with no value for
+            # stage-1 (no seq conditioning -> GT comparison is meaningless).
+            # _run_validation_trajectory's qualitative_only=True branch is now dormant.
+            self._diag_log("val_step_data: trajectory disabled (tmscore_n=0)", "")
+            return
         else:
             # TM-score path: distribute samples across ranks. With world=4 and
             # tmscore_n=8, each rank does 2 samples in one generate() call —
