@@ -162,7 +162,7 @@ log:
   log_every_n_steps: 1
   log_structure_every_n_steps: 100
   checkpoint: True
-  last_ckpt_every_n_steps: 200  # 200 not 2000: at ~28s/optim-step a 6h mit_normal_gpu job reaches only ~750 steps, so 2000 never checkpoints in 6h and the self-resubmit chain has no fresh last.ckpt to resume from
+  last_ckpt_every_n_steps: 10  # every 10 optim steps (~4.6min): cap progress lost at the 6h time limit to <=10 steps. ckpt I/O time is acceptable vs redoing training; save_last overwrites last.ckpt (save_top_k=0) so disk stays bounded
   # Disabled in stage-1: training has no sequence conditioning (seq_cond=False),
   # so USalign(sampled_struct, GT_struct) measures noise — there's no reason for
   # the sampled structure to align with any particular GT. We rely on
