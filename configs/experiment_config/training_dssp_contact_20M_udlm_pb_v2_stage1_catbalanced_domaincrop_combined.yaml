@@ -162,11 +162,11 @@ log:
   log_every_n_steps: 1
   log_structure_every_n_steps: 100
   checkpoint: True
-  last_ckpt_every_n_steps: 2000
+  last_ckpt_every_n_steps: 200  # 200 not 2000: at ~28s/optim-step a 6h mit_normal_gpu job reaches only ~750 steps, so 2000 never checkpoints in 6h and the self-resubmit chain has no fresh last.ckpt to resume from
   # Disabled in stage-1: training has no sequence conditioning (seq_cond=False),
   # so USalign(sampled_struct, GT_struct) measures noise — there's no reason for
   # the sampled structure to align with any particular GT. We rely on
-  # last_ckpt_every_n_steps=2000 + the final `last.ckpt` for stage-2 bootstrap.
+  # last_ckpt_every_n_steps=200 + the final `last.ckpt` for stage-2 bootstrap.
   # Stage-2 (seq_cond=True) re-enables this metric.
   checkpoint_best_tmscore_median: False
 
