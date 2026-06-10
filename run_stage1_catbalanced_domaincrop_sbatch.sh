@@ -2,9 +2,9 @@
 #SBATCH --job-name=cb_domaincrop_s1
 #SBATCH --partition=mit_normal_gpu
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=2
+#SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:l40s:2
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=32
 #SBATCH --mem=200G
 #SBATCH --time=06:00:00
 #SBATCH --signal=B:USR1@120
@@ -51,7 +51,11 @@ echo "[$(date)] Launching $RUN on $(hostname) GPUs $(nvidia-smi --query-gpu=inde
 CKPT=$REPO/store/$RUN/checkpoints/last.ckpt
 START_MTIME=$(stat -c %Y "$CKPT" 2>/dev/null || echo 0)
 
-if srun python proteinfoundation/train.py \
+# torchrun (NOT srun): srun on mit_normal_gpu fails hydra's config-dir lookup
+# (MissingConfigException) though direct python + srun-on-other-partitions work.
+# torchrun spawns the 2 GPU workers as plain python processes (the working path) and
+# sets RANK/WORLD_SIZE/LOCAL_RANK, which train.py reads for the manual NCCL init.
+if torchrun --standalone --nnodes=1 --nproc_per_node=2 proteinfoundation/train.py \
     --config_name "$RUN" \
     --ngpus_per_node 2 \
     --nnodes 1 \
@@ -63,7 +67,7 @@ if srun python proteinfoundation/train.py \
 else
   RC=$?
 fi
-echo "[$(date)] srun exited rc=$RC"
+echo "[$(date)] torchrun exited rc=$RC"
 
 END_MTIME=$(stat -c %Y "$CKPT" 2>/dev/null || echo 0)
 if [ "$RC" -ne 0 ] && [ "$END_MTIME" -gt "$START_MTIME" ]; then
