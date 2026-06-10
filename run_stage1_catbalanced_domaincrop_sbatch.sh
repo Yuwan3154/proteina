@@ -5,6 +5,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:l40s:2
 #SBATCH --cpus-per-task=32
+#SBATCH --exclude=node3500,node4108,node3205,node3408
 #SBATCH --mem=200G
 #SBATCH --time=06:00:00
 #SBATCH --signal=B:USR1@120
