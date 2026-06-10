@@ -18,11 +18,13 @@
 # config_name verbatim to hydra. Config path resolves via the pip -e
 # proteinfoundation __file__ at /orcd/pool, independent of REPO/CWD.
 #
-# 6h chain: --resume_option=allow resumes from last.ckpt; on a non-zero srun exit
-# (time-limit SIGTERM or app crash) we resubmit a fresh job, but only if a
-# checkpoint advanced this run (loop-guard against a deterministic crash). A clean
-# finish / max_steps reached exits 0 and the chain self-terminates. No --requeue
-# (mit_normal_gpu is non-preemptable; the resubmit chain covers the time limit).
+# 6h chain: --resume_option=allow resumes from last.ckpt. On a non-zero exit we
+# resubmit: if a checkpoint advanced this run (time-limit SIGTERM, or a crash after
+# progress) we reset state and resubmit on all nodes; if NO checkpoint advanced (a
+# startup fault -- bad GPU/ECC, NCCL, node) we exclude the faulting node and resubmit,
+# capping consecutive no-progress retries at MAX_NOPROGRESS (=3) so a deterministic bug
+# can't infinite-loop. A clean finish / max_steps exits 0 and the chain self-terminates.
+# No --requeue (mit_normal_gpu is non-preemptable; the resubmit chain covers the limit).
 
 set -euo pipefail
 RUN=dssp_contact_20M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined
@@ -70,10 +72,32 @@ fi
 echo "[$(date)] torchrun exited rc=$RC"
 
 END_MTIME=$(stat -c %Y "$CKPT" 2>/dev/null || echo 0)
-if [ "$RC" -ne 0 ] && [ "$END_MTIME" -gt "$START_MTIME" ]; then
-  echo "[$(date)] non-zero exit after checkpoint progress; auto-resubmitting fresh 6h job"
+STREAK_FILE="$REPO/store/$RUN/.noprogress_streak"   # consecutive no-progress crashes
+EXCLUDE_FILE="$REPO/store/$RUN/.exclude_nodes"       # nodes that crashed with no progress
+MAX_NOPROGRESS=3                                      # give up after this many consecutive no-progress crashes
+NODE="${SLURMD_NODENAME:-$(hostname -s)}"; NODE="${NODE%%.*}"
+
+if [ "$RC" -eq 0 ]; then
+  echo "[$(date)] clean exit (max_steps reached / fit complete); chain terminates."
+  rm -f "$STREAK_FILE" "$EXCLUDE_FILE"
+elif [ "$END_MTIME" -gt "$START_MTIME" ]; then
+  # Progress this run (time-limit SIGTERM, or a crash after a checkpoint): node is fine
+  # and last.ckpt is fresh -> reset the no-progress streak/excludes, resubmit on all nodes.
+  echo "[$(date)] non-zero exit AFTER checkpoint progress; resubmitting fresh (reset streak/excludes)."
+  rm -f "$STREAK_FILE" "$EXCLUDE_FILE"
   cd "$REPO" && sbatch run_stage1_catbalanced_domaincrop_sbatch.sh
-elif [ "$RC" -ne 0 ]; then
-  echo "[$(date)] non-zero exit with NO new checkpoint (loop-guard: not resubmitting). Investigate."
+else
+  # NO progress this run: a startup fault (bad GPU/ECC, NCCL, node) or a deterministic
+  # bug. Exclude this node and resubmit, but cap consecutive no-progress retries so a
+  # real bug can't infinite-loop the chain.
+  STREAK=$(cat "$STREAK_FILE" 2>/dev/null || echo 0); STREAK=$((STREAK + 1)); echo "$STREAK" > "$STREAK_FILE"
+  echo "$NODE" >> "$EXCLUDE_FILE"
+  EXCLUDES=$(sort -u "$EXCLUDE_FILE" | paste -sd, -)
+  if [ "$STREAK" -ge "$MAX_NOPROGRESS" ]; then
+    echo "[$(date)] NO-progress crash #$STREAK on $NODE (>= $MAX_NOPROGRESS consecutive) -> likely a deterministic bug, not transient node faults. STOPPING. Crashed nodes: $EXCLUDES. Investigate, then resubmit by hand."
+  else
+    echo "[$(date)] NO-progress crash #$STREAK on $NODE; resubmitting with --exclude=$EXCLUDES."
+    cd "$REPO" && sbatch --exclude="$EXCLUDES" run_stage1_catbalanced_domaincrop_sbatch.sh
+  fi
 fi
 exit $RC
