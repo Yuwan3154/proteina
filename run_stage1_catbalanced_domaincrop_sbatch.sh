@@ -49,6 +49,18 @@ mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
 cd "$REPO"
 echo "[$(date)] Launching $RUN on $(hostname) GPUs $(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | tr '\n' ',' | sed s/,$//) jobid=${SLURM_JOB_ID:-?} restart=${SLURM_RESTART_COUNT:-0}"
 
+# Networked-FS cache warm: a compute node can serve a STALE listing of the
+# /orcd/pool config dir right after a git pull (NFS dir-cache lag, ~60s TTL),
+# making hydra raise MissingConfigException for a config that IS present. Force a
+# fresh dir lookup (revalidates after the TTL) until the config is readable, so
+# the torchrun workers on this node see it.
+CFG=/orcd/pool/006/chenxiou/proteina/configs/experiment_config/$RUN.yaml
+for a in $(seq 1 18); do
+  ls -la /orcd/pool/006/chenxiou/proteina/configs/experiment_config/ >/dev/null 2>&1
+  if [ -r "$CFG" ]; then echo "[$(date)] [fswarm] config visible (attempt $a)"; cat "$CFG" >/dev/null 2>&1; break; fi
+  echo "[$(date)] [fswarm] config not visible on $(hostname) yet (attempt $a); FS settling..."; sleep 10
+done
+
 CKPT=$REPO/store/$RUN/checkpoints/last.ckpt
 START_MTIME=$(stat -c %Y "$CKPT" 2>/dev/null || echo 0)
 
