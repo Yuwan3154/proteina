@@ -8,13 +8,14 @@
 #SBATCH --mem=200G
 #SBATCH --time=06:00:00
 #SBATCH --signal=B:USR1@120
-#SBATCH --output=/orcd/pool/006/chenxiou/proteina/store/dssp_contact_20M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined/slurm/%x-%j.out
-#SBATCH --error=/orcd/pool/006/chenxiou/proteina/store/dssp_contact_20M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined/slurm/%x-%j.err
+#SBATCH --output=/home/chenxiou/proteina/store/dssp_contact_20M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined/slurm/%x-%j.out
+#SBATCH --error=/home/chenxiou/proteina/store/dssp_contact_20M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined/slurm/%x-%j.err
 
 # CATH-balanced domain-crop Stage-1, combined PDB+AFDB, on mit_normal_gpu (2-GPU
 # per-user cap, non-preemptable, 6h job limit). Effective batch = 2 GPU * 4 micro
-# * 16 accum = 128. Runs from the pip -e source checkout so train.py + imports
-# both resolve to the same (merged-main) code -- no PYTHONPATH trap.
+# * 16 accum = 128. Runs from /home/chenxiou/proteina (configs there); imports
+# resolve to the pip -e merged-main at /orcd/pool. Running from the pip -e source
+# ROOT under srun breaks hydra's relative config_path -- /home avoids that.
 #
 # 6h chain: --resume_option=allow resumes from last.ckpt; on a non-zero srun exit
 # (time-limit SIGTERM or app crash) we resubmit a fresh job, but only if a
@@ -24,7 +25,7 @@
 
 set -euo pipefail
 RUN=dssp_contact_20M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined
-REPO=/orcd/pool/006/chenxiou/proteina
+REPO=/home/chenxiou/proteina  # NOT the pip -e source root (avoids srun+hydra relative-config-path failure); imports still resolve to pip -e merged-main
 trap 'echo "[$(date)] SIGUSR1 (time-limit warning); checkpoint should land soon."' USR1
 
 mkdir -p "$REPO/store/$RUN/slurm"
