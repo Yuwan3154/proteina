@@ -332,6 +332,22 @@ if __name__ == "__main__":
         config_path = "../configs/datasets_config/"
     with hydra.initialize(config_path, version_base=hydra.__version__):
         cfg_data = hydra.compose(config_name=cfg_exp["dataset"])
+        # The experiment YAML's top-level `datamodule:` block overrides keys in
+        # the dataset YAML (e.g. in_memory). train.py composes cfg_data
+        # separately, so merge that block here for the overrides to take effect
+        # (and to let `datamodule.<key>=...` CLI overrides, which land on
+        # cfg_exp, flow through). Placed before the explicit propagations below
+        # so runtime/opt-derived values (num_workers, batch_size) win on overlap.
+        exp_datamodule = OmegaConf.select(cfg_exp, "datamodule")
+        if exp_datamodule is not None:
+            was_struct = OmegaConf.is_struct(cfg_data.datamodule)
+            OmegaConf.set_struct(cfg_data.datamodule, False)
+            cfg_data.datamodule.merge_with(exp_datamodule)
+            OmegaConf.set_struct(cfg_data.datamodule, was_struct)
+            log_info(
+                f"Merged cfg_exp.datamodule into cfg_data.datamodule: "
+                f"{OmegaConf.to_container(exp_datamodule, resolve=False)}"
+            )
         cfg_data.datamodule.num_workers = num_cpus  # Overwrite number of cpus
         # Propagate multilabel_mode from model config (single source of truth)
         multilabel_mode = OmegaConf.select(cfg_exp, "model.nn.multilabel_mode")
@@ -447,6 +463,33 @@ if __name__ == "__main__":
         def _run_confind_precompute():
             log_info("Confind contact maps requested; precomputing raw maps...")
             processed_dir = os.path.join(cfg_data.datamodule.data_dir, "processed")
+            # FAILLOUD-CONFIND-GUARD: the inline CPU confind enumerator
+            # (precompute_confind_maps._iter_processed_files) is a flat os.listdir that
+            # does NOT recurse into the sharded processed/<bucket>/*.pt layout. On sharded
+            # datasets it sees 0 files, silently no-ops, and every chain missing
+            # contact_map_confind is then silently dropped by PDBDataset.__getitem__.
+            _pd = Path(processed_dir)
+            _top_pt = _pd.is_dir() and any(_n.endswith(".pt") for _n in os.listdir(_pd))
+            _bucketed = None
+            if _pd.is_dir():
+                for _p in _pd.rglob("*.pt"):
+                    if _p.parent != _pd:
+                        _bucketed = _p
+                        break
+            if not _pd.is_dir() or (not _top_pt and _bucketed is None):
+                raise RuntimeError(
+                    f"Inline confind precompute: no .pt files under {processed_dir}; "
+                    "is the dataset processed?"
+                )
+            if _bucketed is not None:
+                raise RuntimeError(
+                    f"Inline confind precompute cannot enumerate the sharded/bucketed layout "
+                    f"under {processed_dir} (e.g. {_bucketed}); the CPU enumerator is a flat "
+                    "os.listdir and would silently process the top level only, dropping every "
+                    "bucketed chain that lacks contact_map_confind. Run the offline Frame2ConFind "
+                    "GPU backfill (python -m proteinfoundation.utils.precompute_frame2confind_maps) "
+                    "and re-launch with SKIP_CONFIND_PRECOMPUTE=1."
+                )
             rotlib = confind_transform.get("confind_rotamer_lib")
             dataselector_cfg = cfg_data.datamodule.get("dataselector")
             dataselector_dict = (

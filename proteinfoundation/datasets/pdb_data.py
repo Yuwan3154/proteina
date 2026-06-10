@@ -10,6 +10,7 @@
 
 import os
 import pathlib
+import pickle
 import random
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -319,6 +320,8 @@ class PDBDataSplitter:
         exclude_ids_from_file: str = None,
         exclude_ids_val_from_file: str = None,
         exclude_ids_test_from_file: str = None,
+        cat_aware_split: bool = False,
+        chain_to_cat_path: Optional[str] = None,
     ) -> None:
         """Initialise DataSplitter object for splitting data based on arguments into train, val and test set.
 
@@ -362,11 +365,87 @@ class PDBDataSplitter:
         self.splits = ["train", "val", "test"]
         self.dfs_splits = None
         self.clusterid_to_seqid_mappings = None
+        # CAT-aware split: guarantee >=1 cluster per CAT in the train split.
+        self.cat_aware_split = cat_aware_split
+        self.chain_to_cat_path = chain_to_cat_path
+        self._chain_to_cat_split = None
 
     def _load_ids_from_file(self, path: str) -> set:
         """Load IDs from a text file (one per line)."""
         with open(path, "r") as f:
             return {line.strip() for line in f if line.strip()}
+
+    def _get_chain_to_cat_for_split(self) -> Dict[str, List[str]]:
+        if self._chain_to_cat_split is None:
+            if self.chain_to_cat_path is None:
+                raise ValueError("cat_aware_split=True requires chain_to_cat_path to be set")
+            with open(self.chain_to_cat_path, "rb") as fh:
+                self._chain_to_cat_split = pickle.load(fh)
+        return self._chain_to_cat_split
+
+    def _enforce_cat_coverage_in_train(
+        self,
+        rep_splits: Dict[str, pd.DataFrame],
+        clusterid_to_seqid_mapping: Dict[str, List[str]],
+        chain_to_cat: Dict[str, List[str]],
+    ) -> Tuple[Dict[str, pd.DataFrame], int]:
+        """Move clusters from val/test into train so every CAT has >=1 train cluster.
+
+        Deterministic: for each uncovered CAT (sorted), promote the largest carrying
+        cluster (tie-break by cluster name); one promotion can cover several CATs.
+        Operates on cluster REPS before expand_cluster_splits, reusing the same cluster
+        TSV + seed-42 rep split -> reproducible and identical across stages/methods that
+        set the same flag (shared-split leakage control).
+        """
+        def cats_of(members):
+            s = set()
+            for m in members:
+                for c in (chain_to_cat.get(m) or chain_to_cat.get(m.lower(), [])):
+                    s.add(c)
+            return s
+
+        train_reps = list(rep_splits["train"]["id"])
+        rep_to_split = {}
+        for sp in ("val", "test"):
+            for rep in rep_splits[sp]["id"]:
+                rep_to_split[rep] = sp
+        split_reps = set(train_reps) | set(rep_to_split.keys())
+        cluster_cats = {
+            rep: cats_of(clusterid_to_seqid_mapping[rep])
+            for rep in split_reps if rep in clusterid_to_seqid_mapping
+        }
+        covered = set()
+        for rep in train_reps:
+            covered |= cluster_cats.get(rep, set())
+        all_cats = set().union(*cluster_cats.values()) if cluster_cats else set()
+        missing = sorted(all_cats - covered)
+        if not missing:
+            return rep_splits, 0
+
+        moved = set()
+        for cat in missing:
+            if cat in covered:
+                continue
+            cands = [
+                rep for rep, cs in cluster_cats.items()
+                if cat in cs and rep in rep_to_split and rep not in moved
+            ]
+            if not cands:
+                continue
+            chosen = sorted(cands, key=lambda r: (-len(clusterid_to_seqid_mapping[r]), r))[0]
+            moved.add(chosen)
+            covered |= cluster_cats[chosen]
+
+        if not moved:
+            return rep_splits, 0
+        promoted_rows = []
+        for sp in ("val", "test"):
+            df = rep_splits[sp]
+            mask = df["id"].isin(moved)
+            promoted_rows.append(df[mask])
+            rep_splits[sp] = df[~mask]
+        rep_splits["train"] = pd.concat([rep_splits["train"], *promoted_rows], ignore_index=True)
+        return rep_splits, len(moved)
 
     def _derive_val_test_paths(self, base_path: str) -> Tuple[Optional[str], Optional[str]]:
         """Derive _val.txt and _test.txt paths from exclude_ids_from_file path."""
@@ -543,6 +622,14 @@ class PDBDataSplitter:
             splits = split_dataframe(
                 df_sequences_reps, self.splits, self.train_val_test
             )
+            if self.cat_aware_split:
+                splits, n_moved = self._enforce_cat_coverage_in_train(
+                    splits, clusterid_to_seqid_mapping, self._get_chain_to_cat_for_split()
+                )
+                rank_zero_info(
+                    f"CAT-aware split: promoted {n_moved} clusters from val/test into train "
+                    f"to guarantee >=1 cluster per CAT in the training split."
+                )
             # use cluster dict to extend splits from cluster representatives to all sequence ids included in these clusters
             self.dfs_splits, self.clusterid_to_seqid_mappings = expand_cluster_splits(
                 cluster_rep_splits=splits,
@@ -724,6 +811,19 @@ class PDBDataset(Dataset):
         debug = getattr(self, "_debug_data_loading", False)
         n = len(self)
 
+        # CATBalancedSampler(emit_topology=True) yields (idx, topology, crop_seed) tuples
+        # so DomainCropTransform can crop to the sampled domain with a reproducible,
+        # seeded random window. The int index drives the retry loop; topology may go
+        # stale on retry (different chain) -> the crop transform falls back to a
+        # whole-chain window. crop_seed is present for no-CAT draws too (topology None).
+        sampled_topology = None
+        crop_seed = None
+        if isinstance(idx, tuple):
+            if len(idx) == 3:
+                idx, sampled_topology, crop_seed = idx
+            else:
+                idx, sampled_topology = idx
+
         for attempt in range(self._MAX_GETITEM_RETRIES):
             cur = (idx + attempt) % n
 
@@ -829,6 +929,13 @@ class PDBDataset(Dataset):
 
             graph.coords = graph.coords[:, PDB_TO_OPENFOLD_INDEX_TENSOR, :]
             graph.coord_mask = graph.coord_mask[:, PDB_TO_OPENFOLD_INDEX_TENSOR]
+
+            # Pass the sampler-chosen topology + crop seed to DomainCropTransform (set
+            # only when present so non-crop runs never add these attrs to the batch).
+            if sampled_topology is not None:
+                graph.sampled_topology = sampled_topology
+            if crop_seed is not None:
+                graph.crop_seed = crop_seed
 
             if self.transform:
                 try:

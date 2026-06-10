@@ -9,6 +9,7 @@
 # its affiliates is strictly prohibited.
 
 import os
+import pickle
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, Iterable, List, Literal, Optional
 
@@ -19,7 +20,7 @@ from torch_geometric import transforms as T
 from torch_geometric.data import Dataset
 from torch_geometric.loader import DataLoader
 
-from proteinfoundation.utils.cluster_utils import ClusterSampler
+from proteinfoundation.utils.cluster_utils import ClusterSampler, CATBalancedSampler
 from proteinfoundation.utils.dense_padding_data_loader import DensePaddingDataLoader
 
 
@@ -29,7 +30,7 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
     def __init__(
         self,
         batch_padding: bool = True,
-        sampling_mode: Literal["random", "cluster-random", "cluster-reps"] = "random",
+        sampling_mode: Literal["random", "cluster-random", "cluster-reps", "cath-balanced"] = "random",
         transforms: Optional[List[Callable]] = None,
         pre_transforms: Optional[List[Callable]] = None,
         pre_filters: Optional[List[Callable]] = None,
@@ -42,6 +43,12 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         cath_dedupe_codes: bool = True,
         cluster_sampler_v2: bool = True,
         cluster_sampler_seed: int = 0,
+        chain_to_cat_path: Optional[str] = None,
+        cat_cluster_draw: Literal["random", "largest"] = "largest",
+        cath_balanced_member_mode: Literal["cluster-random", "cluster-reps"] = "cluster-random",
+        nocat_bucket: bool = True,
+        nocat_bucket_draws: int = 1,
+        cath_balanced_emit_topology: bool = False,
     ):
         """Initialising the base data module class.
 
@@ -95,6 +102,13 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         self.clusterid_to_seqid_mappings = None  # for cluster sampling
         self.cluster_sampler_v2 = cluster_sampler_v2
         self.cluster_sampler_seed = cluster_sampler_seed
+        self.chain_to_cat_path = chain_to_cat_path
+        self.cat_cluster_draw = cat_cluster_draw
+        self.cath_balanced_member_mode = cath_balanced_member_mode
+        self.nocat_bucket = nocat_bucket
+        self.nocat_bucket_draws = nocat_bucket_draws
+        self.cath_balanced_emit_topology = cath_balanced_emit_topology
+        self._chain_to_cat = None  # lazy cache for cath-balanced sampling
         # Last-built samplers kept on the datamodule so on_{train,validation}_epoch_start
         # can call set_epoch even on Lightning versions that don't auto-propagate.
         self._train_cluster_sampler: Optional[ClusterSampler] = None
@@ -141,6 +155,20 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
     def test_dataset(self) -> Dataset:
         return self._get_dataset("test")
 
+    def _get_chain_to_cat(self) -> Dict[str, List[str]]:
+        """Lazily load and cache the chain->[CAT] mapping for CAT-balanced sampling."""
+        if self._chain_to_cat is None:
+            if self.chain_to_cat_path is None:
+                raise ValueError(
+                    "sampling_mode='cath-balanced' requires chain_to_cat_path to be set"
+                )
+            with open(self.chain_to_cat_path, "rb") as fh:
+                self._chain_to_cat = pickle.load(fh)
+            logger.info(
+                f"Loaded chain_to_cat mapping: {len(self._chain_to_cat)} chains from {self.chain_to_cat_path}"
+            )
+        return self._chain_to_cat
+
     def _get_dataloader(
         self,
         dataset: Dataset,
@@ -161,7 +189,21 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             raise ValueError(
                 "Sampling mode not set, should be one of 'random', 'cluster-random' or 'cluster-reps'"
             )
-        if clusterid_to_seqid_mapping and self.sampling_mode != "random":
+        if clusterid_to_seqid_mapping and self.sampling_mode == "cath-balanced":
+            sampler = CATBalancedSampler(
+                dataset=dataset,
+                clusterid_to_seqid_mapping=clusterid_to_seqid_mapping,
+                chain_to_cat=self._get_chain_to_cat(),
+                cat_cluster_draw=self.cat_cluster_draw,
+                member_mode=self.cath_balanced_member_mode,
+                nocat_bucket=self.nocat_bucket,
+                nocat_bucket_draws=self.nocat_bucket_draws,
+                seed=self.cluster_sampler_seed,
+                v2=self.cluster_sampler_v2,
+                emit_topology=self.cath_balanced_emit_topology,
+            )
+            shuffle = False
+        elif clusterid_to_seqid_mapping and self.sampling_mode != "random":
             sampler = ClusterSampler(
                 dataset=dataset,
                 clusterid_to_seqid_mapping=clusterid_to_seqid_mapping,
@@ -257,7 +299,7 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             shuffle=shuffle,
             clusterid_to_seqid_mapping=clusterid_to_seqid_mapping,
         )
-        if isinstance(getattr(train_dl, "sampler", None), ClusterSampler):
+        if isinstance(getattr(train_dl, "sampler", None), (ClusterSampler, CATBalancedSampler)):
             self._train_cluster_sampler = train_dl.sampler
         return train_dl
 
@@ -285,7 +327,7 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             shuffle=shuffle,
             clusterid_to_seqid_mapping=clusterid_to_seqid_mapping,
         )
-        if isinstance(getattr(val_dl, "sampler", None), ClusterSampler):
+        if isinstance(getattr(val_dl, "sampler", None), (ClusterSampler, CATBalancedSampler)):
             self._val_cluster_sampler = val_dl.sampler
         return val_dl
 

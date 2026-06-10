@@ -75,7 +75,11 @@ def _graph_to_f2s_item(graph) -> Optional[Dict[str, torch.Tensor]]:
     x_f2s = coords[:, [0, 1, 2, 3, 4], :].clone()
 
     if coord_mask is not None:
-        mask = coord_mask[:, 1].bool()  # CA
+        # Gate on N, CA, C (OpenFold idx 0,1,2): the atoms the model actually uses
+        # (single-rep dihedrals N/CA/C; pair-rep N/CA/C/CB with CB reconstructed
+        # from N/CA/C). O is never read by the winner model (use_o_atom=false), so
+        # O/CB presence is irrelevant. Excludes only degenerate-backbone residues.
+        mask = (coord_mask[:, 0] & coord_mask[:, 1] & coord_mask[:, 2]).bool()  # N & CA & C
         cb_valid = coord_mask[:, 3].bool()  # CB in OpenFold
         missing_cb = ~cb_valid & mask
     else:

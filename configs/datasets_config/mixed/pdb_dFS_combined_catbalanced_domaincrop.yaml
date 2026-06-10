@@ -1,0 +1,70 @@
+# Combined PDB + AFDB d_FS CAT-balanced, DOMAIN-CROP pre-training variant (Phase 3, maxlen 320).
+# Same combined data_dir / joint cluster TSV / merged chain_to_cat as pdb_dFS_combined_catbalanced.yaml.
+# Differences:
+#   - sampling cath-balanced with cath_balanced_emit_topology=True: the sampler yields
+#     (idx, topology) so DomainCropTransform crops the drawn chain to the sampled domain.
+#   - DomainCropTransform (after the label transforms, before CATHToIndices) crops coords/
+#     contacts/dssp/ext_lig to the sampled domain's residue span (combined_domain_spans.pkl),
+#     narrows cath_code to that domain, and merges ext_lig toward PRESENT(1) for kept residues
+#     near cropped-out same-chain atoms. ChainBreakPerResidueTransform runs AFTER the crop so
+#     discontinuous-domain junctions are detected on the cropped structure.
+#   - PaddingTransform max_size 320 (domain length covers all train CATs by L=315).
+#   - datasplitter cat_aware_split=True: guarantees >=1 cluster per CAT in the train split
+#     (the CAT-blind seq-sim split drops 7 CATs from train). Same TSV + seed -> reproducible,
+#     shared across stages/methods for leakage control.
+# LAUNCH: set SKIP_CONFIND_PRECOMPUTE=1 (contacts pre-filled; the 14c82db guard else raises).
+datamodule:
+  _target_: "proteinfoundation.datasets.pdb_data.PDBLightningDataModule"
+  data_dir: ${oc.env:DATA_PATH}/pdb_dFS_combined/
+  in_memory: False
+  format: "pdb"
+  overwrite: False
+  regenerate_missing: False
+  cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/
+  multilabel_mode: "sample"
+  cath_dedupe_codes: True
+  batch_padding: True
+  sampling_mode: "cath-balanced"
+  chain_to_cat_path: ${oc.env:DATA_PATH}/pdb_dFS_combined/combined_chain_to_cat.pkl
+  cat_cluster_draw: "largest"
+  cath_balanced_member_mode: "cluster-random"
+  nocat_bucket: True
+  nocat_bucket_draws: 322
+  cath_balanced_emit_topology: True
+  cluster_sampler_seed: 42  # ties domain-crop random-window augmentation to the global seed (reproducible + resumable)
+  transforms:
+    - _target_: "proteinfoundation.datasets.transforms.GlobalRotationTransform"
+    - _target_: "proteinfoundation.datasets.transforms.CATHLabelTransform"
+      root_dir: ${oc.env:DATA_PATH}/cathdata/
+    - _target_: "proteinfoundation.datasets.transforms.TEDLabelTransform"
+      file_path: ${oc.env:DATA_PATH}/d_FS/ted_365m.domain_summary.cath.globularity.taxid.tsv
+      pkl_path: ${oc.env:DATA_PATH}/d_FS/afdb_to_cath_ted.pkl
+    - _target_: "proteinfoundation.datasets.transforms.DomainCropTransform"
+      spans_path: ${oc.env:DATA_PATH}/pdb_dFS_combined/combined_domain_spans.pkl
+      ext_lig_cutoff: 8.0
+      crop_size: 320
+      random_crop_over_length: true
+    - _target_: "proteinfoundation.datasets.transforms.CATHToIndicesTransform"
+      cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/
+    - _target_: "proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform"
+    - _target_: "proteinfoundation.datasets.transforms.DSSPTargetTransform"
+    - _target_: "proteinfoundation.datasets.transforms.ContactMapTransform"
+      contact_method: confind
+      confind_rotamer_lib: ${oc.env:DATA_PATH}/rotlibs
+      confind_contact_threshold: 0.01
+    - _target_: "proteinfoundation.datasets.transforms.PaddingTransform"
+      max_size: 320
+  batch_size: 8
+  num_workers: 8
+  pin_memory: True
+  prefetch_factor: 2
+
+  datasplitter:
+    _target_: "proteinfoundation.datasets.pdb_data.PDBDataSplitter"
+    data_dir: ${oc.env:DATA_PATH}/pdb_dFS_combined/
+    train_val_test: [0.98, 0.019, 0.001]
+    split_type: "sequence_similarity"
+    split_sequence_similarity: 0.25
+    overwrite_sequence_clusters: False
+    cat_aware_split: True
+    chain_to_cat_path: ${oc.env:DATA_PATH}/pdb_dFS_combined/combined_chain_to_cat.pkl
