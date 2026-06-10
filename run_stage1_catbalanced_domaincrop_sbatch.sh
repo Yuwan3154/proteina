@@ -54,11 +54,16 @@ echo "[$(date)] Launching $RUN on $(hostname) GPUs $(nvidia-smi --query-gpu=inde
 # making hydra raise MissingConfigException for a config that IS present. Force a
 # fresh dir lookup (revalidates after the TTL) until the config is readable, so
 # the torchrun workers on this node see it.
-CFG=/orcd/pool/006/chenxiou/proteina/configs/experiment_config/$RUN.yaml
+CFGDIR=/orcd/pool/006/chenxiou/proteina/configs/experiment_config
+CFG=$CFGDIR/$RUN.yaml
 for a in $(seq 1 18); do
-  ls -la /orcd/pool/006/chenxiou/proteina/configs/experiment_config/ >/dev/null 2>&1
+  # Bust a frozen stale dir-cache: git rewriting the config inodes can leave compute
+  # nodes with a stale readdir that hides the config indefinitely. Creating+removing a
+  # file bumps the dir mtime, forcing this node to re-read the directory.
+  touch "$CFGDIR/.fswarm_${SLURM_JOB_ID:-$$}" 2>/dev/null; rm -f "$CFGDIR/.fswarm_${SLURM_JOB_ID:-$$}" 2>/dev/null
+  ls -la "$CFGDIR/" >/dev/null 2>&1
   if [ -r "$CFG" ]; then echo "[$(date)] [fswarm] config visible (attempt $a)"; cat "$CFG" >/dev/null 2>&1; break; fi
-  echo "[$(date)] [fswarm] config not visible on $(hostname) yet (attempt $a); FS settling..."; sleep 10
+  echo "[$(date)] [fswarm] config not visible on $(hostname) yet (attempt $a); bumped dir, retrying..."; sleep 10
 done
 
 CKPT=$REPO/store/$RUN/checkpoints/last.ckpt
