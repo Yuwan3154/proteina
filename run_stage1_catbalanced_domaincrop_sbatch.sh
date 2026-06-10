@@ -13,7 +13,7 @@
 
 # CATH-balanced domain-crop Stage-1, combined PDB+AFDB, on mit_normal_gpu (2-GPU
 # per-user cap, non-preemptable, 6h job limit). Effective batch = 2 GPU * 4 micro
-# * 16 accum = 128. Runs from /home/chenxiou/proteina (configs there); imports
+# * 32 accum = 128 (batch 4 OOMs on 2-GPU L40S; batch 2 fits). Runs from /home/chenxiou/proteina (configs there); imports
 # resolve to the pip -e merged-main at /orcd/pool. Running from the pip -e source
 # ROOT under srun breaks hydra's relative config_path -- /home avoids that.
 #
@@ -41,6 +41,7 @@ export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TORCHINDUCTOR_CACHE_DIR=/orcd/compute/so3/001/chenxi/torchinductor_cache
 export TRITON_CACHE_DIR=/orcd/compute/so3/001/chenxi/triton_cache
 mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
@@ -59,8 +60,8 @@ if torchrun --standalone --nnodes=1 --nproc_per_node=2 proteinfoundation/train.p
     --config_name "$RUN" \
     --ngpus_per_node 2 \
     --nnodes 1 \
-    --batch_size 4 \
-    --accumulate_grad_batches 16 \
+    --batch_size 2 \
+    --accumulate_grad_batches 32 \
     --resume_option allow \
     af2_ipa_weights_path=/orcd/pool/006/chenxiou/params/params_model_1_ptm.npz; then
   RC=0

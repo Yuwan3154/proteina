@@ -11,7 +11,7 @@ hardware:
   ncpus_per_task_train_: 16
   ncpus_per_task_prepro_: 16
   accelerator: gpu
-  ngpus_per_node_: 2  # STAGE 1 on mit_normal_gpu (per-user 2-GPU cap). Effective batch = 2 GPU * 4 micro * 16 accum = 128.
+  ngpus_per_node_: 2  # STAGE 1 on mit_normal_gpu (per-user 2-GPU cap). Effective batch = 2 GPU * 2 micro * 32 accum = 128.
   nnodes_: 1
 
 loss:
@@ -134,8 +134,8 @@ opt:
   # annealer's horizon; max_steps is the hard stop.
   max_epochs: 2500
   max_steps: 150000
-  batch_size: 4  # per-GPU micro-batch (lowered 8->4 per user 2026-05-30)
-  accumulate_grad_batches: 16  # effective = 2 GPU * 4 micro * 16 accum = 128 (2-GPU mit_normal_gpu)
+  batch_size: 2  # per-GPU micro-batch (batch 4 OOMs on 2-GPU L40S at L=320; 2 fits)
+  accumulate_grad_batches: 32  # effective = 2 GPU * 2 micro * 32 accum = 128 (2-GPU mit_normal_gpu)
   optimizer: muon
   val_check_interval_optim_steps: 500  # 300 val cycles over 150K steps. Val-traj at chunk=8 is sampling-heavy, so leaner cadence saves compute.
   skip_nan_grad: False
