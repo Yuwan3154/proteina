@@ -746,6 +746,9 @@ if __name__ == "__main__":
         precision=precision,
         gradient_clip_algorithm="norm",
         gradient_clip_val=1.0,
+        # Debug-only: LIMIT_TRAIN_BATCHES shortens epochs to force many epoch
+        # boundaries fast (worker-recreation leak hunt). Default 1.0 = all batches.
+        limit_train_batches=(int(os.environ["LIMIT_TRAIN_BATCHES"]) if os.environ.get("LIMIT_TRAIN_BATCHES") else 1.0),
     )
     trainer.fit(
         model, datamodule, ckpt_path=last_ckpt_path
