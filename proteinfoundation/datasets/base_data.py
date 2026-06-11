@@ -8,6 +8,7 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+import gc
 import os
 import pickle
 from abc import ABC, abstractmethod
@@ -22,6 +23,15 @@ from torch_geometric.loader import DataLoader
 
 from proteinfoundation.utils.cluster_utils import ClusterSampler, CATBalancedSampler
 from proteinfoundation.utils.dense_padding_data_loader import DensePaddingDataLoader
+
+
+def _gc_freeze_worker_init(worker_id: int) -> None:
+    # Host-RAM CoW leak mitigation (pytorch#13246): freeze the objects this worker
+    # inherited via fork into a permanent GC generation, so periodic GC traversal never
+    # writes to their headers -- which would copy-on-write the big dataset/transform
+    # dicts (TEDLabel 656k, DomainCrop spans, file_names, sampler state) into each worker
+    # and grow host RAM unboundedly across iterations.
+    gc.freeze()
 
 
 class BaseLightningDataModule(L.LightningDataModule, ABC):
@@ -271,6 +281,11 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             prefetch_factor=self.prefetch_factor,
             timeout=dl_timeout,
         )
+        if self.num_workers > 0:
+            # Fork workers ONCE (no per-epoch re-accumulation) + gc.freeze() their
+            # inherited objects -- the two cheap CoW-leak mitigations (pytorch#13246).
+            kwargs["persistent_workers"] = True
+            kwargs["worker_init_fn"] = _gc_freeze_worker_init
         if dataloader_class is DensePaddingDataLoader:
             kwargs["rank_for_logging"] = rank_for_logging
             kwargs["debug_data_loading"] = debug_data_loading

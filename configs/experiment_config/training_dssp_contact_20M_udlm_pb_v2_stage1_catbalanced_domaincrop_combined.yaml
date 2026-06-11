@@ -8,7 +8,7 @@ freeze_ipa: true
 pretrain_ckpt_path: null
 
 hardware:
-  ncpus_per_task_train_: 16
+  ncpus_per_task_train_: 4  # = dataloader workers/rank; lowered from 16 to cut CoW-leak copies (pytorch#13246). GPUs are compute-bound (~0.9s/minibatch) so 4 workers x prefetch keep up.
   ncpus_per_task_prepro_: 16
   accelerator: gpu
   ngpus_per_node_: 2  # STAGE 1 on mit_normal_gpu (per-user 2-GPU cap). Effective batch = 2 GPU * 2 micro * 32 accum = 128.
