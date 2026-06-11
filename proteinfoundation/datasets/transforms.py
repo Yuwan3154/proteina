@@ -34,6 +34,7 @@ from torch_geometric.data import Data
 from proteinfoundation.datasets.cath_utils import load_cath_mapping, parse_cath_codes_to_indices
 from proteinfoundation.utils.ff_utils.pdb_utils import extract_cath_code_by_level
 from proteinfoundation.utils.dense_padding_data_loader import FLOAT_PADDING_VALUE
+from proteinfoundation.utils.frozen_str_map import FrozenStrMap
 
 
 def sample_uniform_rotation(shape=(), dtype=None, device=None) -> torch.Tensor:
@@ -300,9 +301,10 @@ class CATHLabelTransform(T.BaseTransform):
             wget.download(self.cath_id_cath_code_url, out=str(self.root_dir))
 
         rank_zero_info("Processing Uniprot/PDB CATH map...")
-        self.pdbchain_to_cathid_mapping = self._parse_cath_id()
+        self.pdbchain_to_cathid_mapping = FrozenStrMap(self._parse_cath_id())  # refcount-free (per-getitem worker CoW)
         rank_zero_info("Processing CATH ID to CATH code map...")
         self.cathid_to_cathcode_mapping, self.cathid_to_segment_mapping = self._parse_cath_code()
+        self.cathid_to_cathcode_mapping = FrozenStrMap(self.cathid_to_cathcode_mapping)  # refcount-free; segment_mapping isn't read at runtime
 
     def forward(self, graph: Data) -> Data:
         """Map each PDB chain to its CATH ID and CATH code.
@@ -528,7 +530,7 @@ class DomainCropTransform(T.BaseTransform):
         self.random_crop_over_length = bool(random_crop_over_length)
         self.on_missing = on_missing
         with open(spans_path, "rb") as fh:
-            self.spans = pickle.load(fh)
+            self.spans = FrozenStrMap(pickle.load(fh))  # refcount-free: no per-getitem worker CoW (pytorch#13246)
         rank_zero_info(
             f"DomainCropTransform: loaded spans for {len(self.spans)} chains from {spans_path}"
         )
@@ -902,6 +904,10 @@ class TEDLabelTransform(T.BaseTransform):
         self.chunk_size = chunk_size
         self.sample_to_cath = {}
         self._process_file()
+        # Wrap AFTER build/load (the build path mutates + pickles the plain dict): the
+        # 656k-entry map is touched per __getitem__ in workers -> refcount/GC CoW. Store
+        # it refcount-free so host RAM stays flat (pytorch#13246).
+        self.sample_to_cath = FrozenStrMap(self.sample_to_cath)
 
     # ------------------------------------------------------------------
     # Path helpers
