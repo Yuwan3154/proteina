@@ -570,6 +570,12 @@ if __name__ == "__main__":
     )
     callbacks.append(ClusterSamplerAuditCallback())
 
+    # Debug-only host-RAM leak tracker (off unless MEM_DEBUG=1 in the env).
+    if os.environ.get("MEM_DEBUG"):
+        from proteinfoundation.utils.mem_tracker_callback import MemTracker
+        callbacks.append(MemTracker(every_n_steps=int(os.environ.get("MEM_DEBUG_EVERY", "50"))))
+        log_info("MEM_DEBUG: MemTracker callback enabled")
+
     # Set checkpointing
     if cfg_exp.log.checkpoint and not args.nolog:
         # last_ckpt_every_n_steps: default 1000 when omitted (only-save-last mode)
