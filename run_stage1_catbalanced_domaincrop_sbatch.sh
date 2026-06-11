@@ -5,7 +5,10 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:l40s:2
 #SBATCH --cpus-per-task=32
-#SBATCH --mem=200G
+# 400G (was 200G): host RAM grew past 200G by ~step 777/5h45m (8 dataloader workers/rank
+# accumulating) -> OUT_OF_MEMORY near the 6h mark, and a same-node resubmit then hung at
+# startup. Nodes have ~1TB; 400G clears a full 6h job with ~2x headroom.
+#SBATCH --mem=400G
 #SBATCH --time=06:00:00
 #SBATCH --signal=B:USR1@120
 #SBATCH --output=/home/chenxiou/proteina/store/dssp_contact_20M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined/slurm/%x-%j.out
