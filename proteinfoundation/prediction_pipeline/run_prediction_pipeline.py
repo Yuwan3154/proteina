@@ -113,10 +113,13 @@ def _inference_base(inference_config):
     written by parallel_proteina_inference.py's --conditioning_mode flag:
         PROTEINA_CONDITIONING_MODE=seq      -> inference/{config}/seq_cond/
         PROTEINA_CONDITIONING_MODE=seq_cath -> inference/{config}/seq_cath_cond/
+        PROTEINA_CONDITIONING_MODE=legacy   -> inference/{config}/legacy/
         (unset / other)                     -> inference/{config}/
     """
     parts = [PROTEINA_BASE_DIR, "inference", inference_config]
-    label = {"seq": "seq_cond", "seq_cath": "seq_cath_cond"}.get(
+    # "legacy" mirrors parallel_proteina_inference._conditioning_label(None) so the
+    # analysis can read the un-namespaced legacy layout when inference wrote there.
+    label = {"seq": "seq_cond", "seq_cath": "seq_cath_cond", "legacy": "legacy"}.get(
         os.environ.get("PROTEINA_CONDITIONING_MODE", ""), ""
     )
     # Segment (joint-discontinuous) runs sample DIFFERENT PDBs than whole-chain for
