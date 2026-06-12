@@ -4,7 +4,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:l40s:2
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=16  # 2 ranks x (4 dataloader workers + main) ~= 12 CPUs; 16 fits the 32-CPU/user mit_normal_gpu QOS cap even alongside another small job (was 32, overkill since ncpus_per_task_train_ dropped to 4)
 # 200G: the host-RAM dataloader-worker CoW leak that pushed this past 200G near the 6h
 # mark is fixed (persistent_workers + gc.freeze + FrozenStrMap refcount-free dicts +
 # ncpus_per_task_train_ 4); real-run peak is now ~25G, so 200G has ample margin.
