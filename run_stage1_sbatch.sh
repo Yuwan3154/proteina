@@ -22,7 +22,37 @@
 # same wandb run.
 
 set -euo pipefail
-trap 'echo "[$(date)] Received SIGUSR1 (preempt warning); checkpoint should land on next step. Letting job continue until SIGTERM."' USR1
+# USR1 kept as a no-op so an early-warning signal (if ever delivered) doesn't
+# kill the job. On this cluster USR1 is in fact never delivered, so the real
+# time-limit handling is the SIGTERM trap below.
+trap 'echo "[$(date)] USR1 received (no-op)"' USR1
+
+# Resubmit machinery + time-limit survival. --requeue covers preemption and
+# node-failure but NOT the time limit -- a job that reaches its wall-clock limit
+# just TIMEOUTs and is gone. SLURM does send SIGTERM at the limit, so catch it and
+# resubmit a fresh job, but ONLY when near the limit (bash $SECONDS). An earlier
+# SIGTERM is a preemption: re-raise it so SLURM's --requeue handles it (no double
+# submit). RESUBMITTED guards against firing twice.
+TIME_LIMIT_SECONDS=172800   # keep in sync with --time=2-00:00:00
+RESUBMITTED=0
+resubmit_fresh() {
+  if [ "$RESUBMITTED" -eq 0 ]; then
+    RESUBMITTED=1
+    echo "[$(date)] resubmitting fresh stage-1 job"
+    (cd /home/chenxiou/proteina && sbatch run_stage1_sbatch.sh)
+  fi
+}
+on_term() {
+  if [ "$SECONDS" -ge "$((TIME_LIMIT_SECONDS - 300))" ]; then
+    echo "[$(date)] SIGTERM near time limit (SECONDS=$SECONDS); resubmitting fresh job"
+    resubmit_fresh
+    exit 0
+  fi
+  echo "[$(date)] SIGTERM at SECONDS=$SECONDS (preemption); re-raising for --requeue"
+  trap - TERM
+  kill -TERM "$$"
+}
+trap on_term TERM
 
 mkdir -p /home/chenxiou/proteina/store/dssp_contact_20M_udlm_pb_v2_stage1/slurm
 
@@ -76,10 +106,10 @@ fi
 echo "[$(date)] srun exited rc=$RC"
 
 END_MTIME=$(stat -c %Y "$CKPT_FILE" 2>/dev/null || echo 0)
-if [ "$RC" -ne 0 ] && [ "$END_MTIME" -gt "$START_MTIME" ]; then
+if [ "$RESUBMITTED" -eq 0 ] && [ "$RC" -ne 0 ] && [ "$END_MTIME" -gt "$START_MTIME" ]; then
   echo "[$(date)] app crash after checkpoint progress; auto-resubmitting fresh job"
-  cd /home/chenxiou/proteina && sbatch run_stage1_sbatch.sh
-elif [ "$RC" -ne 0 ]; then
+  resubmit_fresh
+elif [ "$RESUBMITTED" -eq 0 ] && [ "$RC" -ne 0 ]; then
   echo "[$(date)] app crash with NO new checkpoint (loop-guard: not resubmitting). Investigate."
 fi
 exit $RC
