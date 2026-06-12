@@ -32,7 +32,12 @@
 set -euo pipefail
 RUN=dssp_contact_20M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined
 REPO=/home/chenxiou/proteina  # NOT the pip -e source root (avoids srun+hydra relative-config-path failure); imports still resolve to pip -e merged-main
-trap 'echo "[$(date)] SIGUSR1 (time-limit warning); checkpoint should land soon."' USR1
+# torchrun runs in the BACKGROUND below so this trap can fire: a bash trap is DEFERRED
+# while waiting on a FOREGROUND child, so the previous foreground torchrun made SIGUSR1
+# (sent 120s before the 6h limit by --signal=B:USR1@120) never run -> SLURM's SIGKILL
+# bypassed the resubmit logic -> the chain died at the first clean 6h timeout. Here we
+# SIGTERM torchrun for a graceful stop so the resubmit logic below runs within the 120s.
+trap 'echo "[$(date)] SIGUSR1: 120s to time limit; SIGTERM torchrun so the resubmit fires."; kill -TERM ${TORCH_PID:-0} 2>/dev/null || true' USR1
 
 mkdir -p "$REPO/store/$RUN/slurm"
 
@@ -60,18 +65,21 @@ START_MTIME=$(stat -c %Y "$CKPT" 2>/dev/null || echo 0)
 
 # torchrun spawns the 2 GPU workers as plain python processes and sets
 # RANK/WORLD_SIZE/LOCAL_RANK, which train.py reads for the manual NCCL init.
-if torchrun --standalone --nnodes=1 --nproc_per_node=2 proteinfoundation/train.py \
+torchrun --standalone --nnodes=1 --nproc_per_node=2 proteinfoundation/train.py \
     --config_name "training_$RUN" \
     --ngpus_per_node 2 \
     --nnodes 1 \
     --batch_size 2 \
     --accumulate_grad_batches 32 \
     --resume_option allow \
-    af2_ipa_weights_path=/orcd/pool/006/chenxiou/params/params_model_1_ptm.npz; then
-  RC=0
-else
-  RC=$?
-fi
+    af2_ipa_weights_path=/orcd/pool/006/chenxiou/params/params_model_1_ptm.npz &
+TORCH_PID=$!
+# Wait for torchrun, RE-WAITING if the SIGUSR1 trap interrupts the wait, until it truly
+# exits. RC = torchrun's real exit code (set -e safe via the || guard).
+RC=0
+while kill -0 "$TORCH_PID" 2>/dev/null; do
+  wait "$TORCH_PID" && RC=0 || RC=$?
+done
 echo "[$(date)] torchrun exited rc=$RC"
 
 END_MTIME=$(stat -c %Y "$CKPT" 2>/dev/null || echo 0)
