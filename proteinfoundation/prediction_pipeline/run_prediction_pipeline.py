@@ -72,6 +72,7 @@ from proteinfoundation.prediction_pipeline.protein_tar_utils import (
     restore_selected_protein_dirs,
 )
 from proteinfoundation.prediction_pipeline.input_parser import build_discontinuous_pt, build_segment_pt_worker, create_pt_files, create_working_csv, parse_input
+from proteinfoundation.prediction_pipeline.conditioning_paths import inference_base_dir, conditioning_mode_from_env
 from proteinfoundation.prediction_pipeline.cif_to_pt_converter import convert_from_csv, sequence_to_pt_data
 
 logging.basicConfig(
@@ -108,27 +109,9 @@ def _split_shard_args(shard_args: list | None) -> tuple[int | None, int | None, 
 
 
 def _inference_base(inference_config):
-    """Build the inference base dir, optionally appending a conditioning-mode
-    subdir from the PROTEINA_CONDITIONING_MODE env var. Mirrors the layout
-    written by parallel_proteina_inference.py's --conditioning_mode flag:
-        PROTEINA_CONDITIONING_MODE=seq      -> inference/{config}/seq_cond/
-        PROTEINA_CONDITIONING_MODE=seq_cath -> inference/{config}/seq_cath_cond/
-        PROTEINA_CONDITIONING_MODE=legacy   -> inference/{config}/legacy/
-        (unset / other)                     -> inference/{config}/
-    """
-    parts = [PROTEINA_BASE_DIR, "inference", inference_config]
-    # "legacy" mirrors parallel_proteina_inference._conditioning_label(None) so the
-    # analysis can read the un-namespaced legacy layout when inference wrote there.
-    label = {"seq": "seq_cond", "seq_cath": "seq_cath_cond", "legacy": "legacy"}.get(
-        os.environ.get("PROTEINA_CONDITIONING_MODE", ""), ""
-    )
-    # Segment (joint-discontinuous) runs sample DIFFERENT PDBs than whole-chain for
-    # the same conditioning, so they live under a distinct <mode_base> subdir.
-    if label == "seq_cond" and os.environ.get("PROTEINA_SEGMENT_MODE", "") == "joint":
-        label = "seq_cond_segment"
-    if label:
-        parts.append(label)
-    return os.path.join(*parts)
+    """Inference base dir for the analysis/scoring steps. Conditioning mode is
+    REQUIRED via PROTEINA_CONDITIONING_MODE (no silent fallback). See conditioning_paths."""
+    return inference_base_dir(PROTEINA_BASE_DIR, inference_config, conditioning_mode_from_env())
 
 
 def _available_gpu_count(default: int = 1) -> int:
