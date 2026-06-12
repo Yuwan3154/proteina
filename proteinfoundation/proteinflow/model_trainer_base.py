@@ -1606,7 +1606,16 @@ class ModelTrainerBase(L.LightningModule):
                         and getattr(self, "contact_map_mode", False)
                         and self.cfg_exp.model.nn.get("predict_structure_from_distogram", False)
                     ),
-                    x_noised=x_t_local[:1] if isinstance(x_t_local, torch.Tensor) and x_t_local.numel() > 0 else None,
+                    # In contact_map_mode the structure is NOT diffused -- x_t is a zeros
+                    # placeholder (see training_step), so a "noised structure" is meaningless;
+                    # don't log it for contact+dssp runs.
+                    x_noised=(
+                        x_t_local[:1]
+                        if isinstance(x_t_local, torch.Tensor)
+                        and x_t_local.numel() > 0
+                        and not getattr(self, "contact_map_mode", False)
+                        else None
+                    ),
                     contact_map_noised=contact_map_noised_viz,
                     dssp_noised=dssp_t_local[0] if isinstance(dssp_t_local, torch.Tensor) and dssp_t_local.numel() > 0 else None,
                     dssp_pred=dssp_logits_local[0] if isinstance(dssp_logits_local, torch.Tensor) else None,
