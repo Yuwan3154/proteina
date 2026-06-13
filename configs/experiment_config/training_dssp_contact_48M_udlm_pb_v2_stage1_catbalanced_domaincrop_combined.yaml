@@ -1,4 +1,4 @@
-run_name_: dssp_contact_xM_udlm_pb_v2_stage1_catbalanced_domaincrop_combined
+run_name_: dssp_contact_48M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined
 
 # Initialize IPA from AF2 model 1 ptm at epoch 0
 af2_ipa_weights_path: /home/ubuntu/params/params_model_1_ptm.npz
@@ -33,7 +33,7 @@ loss:
 
 defaults:
   - model: contactflow_discrete_uniform
-  - override model/nn: contact_af3_xM_tri_individual-embed_coor_ipa-coord_dssp
+  - override model/nn: contact_af3_48M_tri_individual-embed_coor_ipa-coord_dssp
   - _self_
 
 model:
