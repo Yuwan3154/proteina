@@ -103,6 +103,36 @@ def tmscore(x, y, tmscore_exe="USalign", env=None):
     return o
 
 
+def usalign_files(mobile_pdb, ref_pdb, tmscore_exe="USalign", env=None):
+    """TM-score + RMSD between two structure FILES via USalign with default structural
+    superposition (sequence-independent), TM normalized by the reference (2nd arg).
+
+    Used for ref-vs-template metrics so the CA-only proteina sample is compared as its
+    full cg2all all-atom reconstruction (the file path) against the native — the coord-array
+    path (tmscore()) was producing TM=0 / huge RMSD for CA-only vs all-atom inputs.
+    Returns {"tms", "rms"}.
+    """
+    subprocess_env = os.environ.copy()
+    if env is not None:
+        subprocess_env.update(env)
+    exe = None
+    for cand in [tmscore_exe, os.path.expanduser("~/.local/bin/USalign"), "USalign"]:
+        if os.path.exists(cand) or os.system(f"which {cand} > /dev/null 2>&1") == 0:
+            exe = cand
+            break
+    if exe is None:
+        return {"tms": 0.0, "rms": float("nan")}
+    out = subprocess.run([exe, mobile_pdb, ref_pdb], capture_output=True, text=True,
+                         env=subprocess_env).stdout
+    tms, rms = 0.0, float("nan")
+    for line in out.splitlines():
+        if line.startswith("TM-score=") and "Structure_2" in line:
+            tms = float(line.split("=", 1)[1].split("(", 1)[0].strip())
+        elif "RMSD=" in line:
+            rms = float(line.split("RMSD=", 1)[1].strip().split(",")[0].split()[0])
+    return {"tms": tms, "rms": rms}
+
+
 def _save_openfold_prediction_pdb(reference_sequence: str, out: dict, output_pdb: str) -> None:
     atom37 = out["final_atom_positions"].detach().cpu().numpy()
     atom37_mask = out["final_atom_mask"].detach().cpu().numpy() if "final_atom_mask" in out else None
@@ -759,6 +789,7 @@ class OpenFoldAF2Rank:
         # Extract reference sequence and coordinates
         self.reference_sequence = get_sequence_from_structure(reference_pdb, detected_chain)
         self.reference_coords = get_ca_coords_from_structure(reference_pdb, detected_chain)
+        self.reference_pdb = reference_pdb  # file path, for all-atom USalign ref-vs-template
 
         logger.info(f"Reference sequence length: {len(self.reference_sequence)}")
         logger.info(f"Reference coords shape: {self.reference_coords.shape}")
@@ -827,6 +858,7 @@ class OpenFoldAF2Rank:
 
         self.reference_sequence = get_sequence_from_structure(reference_pdb, detected_chain)
         self.reference_coords = get_ca_coords_from_structure(reference_pdb, detected_chain)
+        self.reference_pdb = reference_pdb
         self._residue_type = torch.tensor(
             [[rc.restype_order.get(aa, rc.restype_num) for aa in self.reference_sequence]],
             dtype=torch.long,
@@ -957,7 +989,10 @@ class OpenFoldAF2Rank:
         # TM + RMSD: reference vs template/prediction, template vs prediction.
         # tmscore() returns both {"tms", "rms"} from one USalign call — record both.
         if not self.skip_ref_metrics:
-            _r = tmscore(self.reference_coords, template_coords, env=_USALIGN_PARALLEL_ENV)
+            # Compare the full all-atom template FILE (cg2all reconstruction in the normal
+            # flow) vs the native via USalign default superposition. The previous coord-array
+            # path compared CA-only ALA traces and yielded TM=0 / RMSD 14-178 A (no alignment).
+            _r = usalign_files(decoy_pdb, self.reference_pdb, env=_USALIGN_PARALLEL_ENV)
             scores["tm_ref_template"] = _r.get("tms", 0.0)
             scores["rmsd_ref_template"] = _r.get("rms", float("nan"))
         if "final_atom_positions" in out:
