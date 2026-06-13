@@ -11,7 +11,7 @@ hardware:
   ncpus_per_task_train_: 4  # = dataloader workers/rank; lowered from 16 to cut CoW-leak copies (pytorch#13246). GPUs are compute-bound (~0.9s/minibatch) so 4 workers x prefetch keep up.
   ncpus_per_task_prepro_: 16
   accelerator: gpu
-  ngpus_per_node_: 2  # STAGE 1 on mit_normal_gpu (per-user 2-GPU cap). Effective batch = 2 GPU * 2 micro * 32 accum = 128.
+  ngpus_per_node_: 4  # STAGE 1 on mit_preemptable (per-user 4-GPU cap, 2-day, preemptable). Effective batch = 4 GPU * 2 micro * 16 accum = 128.
   nnodes_: 1
 
 loss:
@@ -85,7 +85,7 @@ dataset_config_subdir: mixed
 # Overrides datamodule.in_memory in the dataset YAML.
 datamodule:
   in_memory: False  # AFDB: 1.05M chains; CAT-balanced ~1176/epoch -> per-batch disk read (avoid OOM)
-  nocat_bucket_draws: 644  # 2-GPU ~50:50 labeled:unlabeled (2 ranks * 644 ≈ 1289 labeled topologies)
+  nocat_bucket_draws: 322  # 4-GPU ~50:50 labeled:unlabeled (4 ranks * 322 ≈ 1289 labeled topologies)
 
 force_precision_f32: False
 
@@ -101,7 +101,7 @@ training:
   position_bias:
     enabled: true
     mode: sigmoid
-    k: 3.0  # tightness (sweep 2026-06-13): softer than 10 so off-diagonal contacts still get noised; near>off bias kept
+    k: 5.0  # tightness (sweep 2026-06-13; user pick): off-diagonal still noised, near>off curriculum bias kept; softer than original 10
     decouple_loss: true  # bias shapes forward noising only; loss uses the unbiased global schedule (position-uniform)
   mask_T_prob: 0.5
   mask_A_prob: 0.5
@@ -135,8 +135,8 @@ opt:
   # annealer's horizon; max_steps is the hard stop.
   max_epochs: 2500
   max_steps: 150000
-  batch_size: 2  # per-GPU micro-batch (batch 4 OOMs on 2-GPU L40S at L=320; 2 fits)
-  accumulate_grad_batches: 32  # effective = 2 GPU * 2 micro * 32 accum = 128 (2-GPU mit_normal_gpu)
+  batch_size: 2  # per-GPU micro-batch. 48M @ L=320: batch 1 fits L40S 44G; batch 2 fits H100 80G (~50G); batch 4 OOMs H100. Monitor.
+  accumulate_grad_batches: 16  # effective = 4 GPU * 2 micro * 16 accum = 128 (4-GPU mit_preemptable)
   optimizer: muon
   val_check_interval_optim_steps: 500  # 300 val cycles over 150K steps. Val-traj at chunk=8 is sampling-heavy, so leaner cadence saves compute.
   skip_nan_grad: False
