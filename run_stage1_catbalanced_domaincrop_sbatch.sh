@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:h100:4
 #SBATCH --cpus-per-task=48  # 1 task (torchrun) spawns 4 GPU procs; 4 ranks x (4 dataloader workers + main) ~= 24 CPUs, 48 leaves prefetch headroom
 #SBATCH --mem=400G          # in_memory=False (per-batch disk read); 4 ranks of dataloader workers peak ~50G, 400G ample on the TB-RAM preemptable nodes
-#SBATCH --time=2-00:00:00
+#SBATCH --time=1-00:00:00   # TEMP 24h: mapo-2026 maintenance (Jun 15 05:00 - Jun 18 21:00) blocks 2-day jobs now; restore 2-00:00:00 after Jun 18
 #SBATCH --requeue
 #SBATCH --signal=B:USR1@60
 #SBATCH --output=/home/chenxiou/proteina/store/dssp_contact_48M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined/slurm/%x-%j.out
@@ -35,7 +35,7 @@
 set -euo pipefail
 RUN=dssp_contact_48M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined
 REPO=/home/chenxiou/proteina  # NOT the pip -e source root; imports resolve to pip -e at /orcd/pool
-TIME_LIMIT_SECONDS=172800     # keep in sync with --time=2-00:00:00
+TIME_LIMIT_SECONDS=86400      # keep in sync with --time=1-00:00:00 (TEMP 24h; restore to 172800 / 2-00:00:00 after the Jun 15-18 mapo-2026 maintenance)
 RESUBMITTED=0
 TORCH_PID=0
 
