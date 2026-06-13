@@ -53,7 +53,6 @@ num_buckets_predict_pair: 39  # 38 bins between 3.25Å-50.75Å + 1 overflow (Alp
 
 # Contact map diffusion mode
 contact_map_mode: True
-contact_map_embed_dim: 64
 contact_map_input_dim: 3  # contact, non-contact, mask (discrete absorbing)
 predict_coords: "ipa"  # Whether to predict coordinates (for FAPE loss, logging)
 non_contact_value: -1  # 0 -> contacts in {0,1} (sigmoid); -1 -> contacts in {-1,1} (tanh)
@@ -63,4 +62,3 @@ dssp_diffusion_mode: True
 dssp_num_classes: 3  # loop, helix, strand
 dssp_input_dim: 4    # 3 classes + 1 mask token (absorbing mode)
 # DSSP self-conditioning feature
-dssp_sc_embed_dim: 64

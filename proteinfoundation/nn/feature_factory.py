@@ -544,84 +544,41 @@ class XscPairwiseDistancesPairFeat(Feature):
 
 
 class ContactMapScPairFeat(Feature):
-    """Embeds self-conditioned contact map prediction as a pair feature.
+    """Self-conditioned contact map as a pass-through pair feature, shape [b, n, n, 1].
 
-    Takes the self-conditioning contact map from batch["contact_map_sc"] and projects it.
+    Mirrors XscSeqFeat: returns the raw self-conditioning contact map; the
+    FeatureFactory projects it to the pair representation dim. Formulated identically
+    to x_sc / dssp_sc (no internal embedding Linear, no *_embed_dim knob).
     """
 
-    def __init__(
-        self,
-        contact_map_sc_embed_dim: int = 64,
-        **kwargs
-    ):
-        """Initialize the self-conditioning contact map pair feature.
-
-        Args:
-            contact_map_sc_embed_dim: Output dimension for the embedding.
-        """
-        super().__init__(dim=contact_map_sc_embed_dim)
-        self.contact_map_sc_embed_dim = contact_map_sc_embed_dim
-        self.linear_embed = torch.nn.Linear(1, contact_map_sc_embed_dim, bias=False)
+    def __init__(self, **kwargs):
+        super().__init__(dim=1)
 
     def forward(self, batch):
-        """Extract and embed the self-conditioning contact map.
-
-        Args:
-            batch: Dictionary containing "contact_map_sc" of shape [b, n, n]
-                   and "x_t" for shape/device inference.
-
-        Returns:
-            Embedded contact map of shape [b, n, n, dim]
-        """
         if "contact_map_sc" in batch:
-            contact_map_sc = batch["contact_map_sc"]  # [b, n, n]
-            contact_map_expanded = contact_map_sc.unsqueeze(-1)  # [b, n, n, 1]
-            return self.linear_embed(contact_map_expanded)  # [b, n, n, dim]
+            return batch["contact_map_sc"].unsqueeze(-1)  # [b, n, n, 1]
         else:
             # If no self-conditioning, return zeros
             x_t = batch["x_t"]  # [b, n, 3]
             b, n = x_t.shape[0], x_t.shape[1]
-            return torch.zeros(b, n, n, self.dim, device=x_t.device, dtype=x_t.dtype)
+            return torch.zeros(b, n, n, 1, device=x_t.device, dtype=x_t.dtype)
 
 
 class DsspScSeqFeat(Feature):
-    """Embeds self-conditioned DSSP prediction as a sequence feature.
+    """Self-conditioned DSSP as a pass-through seq feature, shape [b, n, dssp_num_classes].
 
-    Takes the self-conditioning DSSP probabilities from batch["dssp_sc"]
-    (shape [b, n, num_dssp_classes]) and projects them to the sequence
-    representation dimension.
+    Mirrors XscSeqFeat: returns the raw self-conditioning DSSP probabilities; the
+    FeatureFactory projects them to the sequence representation dim. Formulated
+    identically to x_sc / contact_map_sc (no internal embedding Linear).
     """
 
-    def __init__(
-        self,
-        dssp_sc_embed_dim: int = 64,
-        dssp_num_classes: int = 3,
-        **kwargs
-    ):
-        """Initialize the self-conditioning DSSP sequence feature.
-
-        Args:
-            dssp_sc_embed_dim: Output dimension for the embedding.
-            dssp_num_classes: Number of DSSP classes (default 3: loop, helix, strand).
-        """
-        super().__init__(dim=dssp_sc_embed_dim)
-        self.dssp_sc_embed_dim = dssp_sc_embed_dim
+    def __init__(self, dssp_num_classes: int = 3, **kwargs):
+        super().__init__(dim=dssp_num_classes)
         self.dssp_num_classes = dssp_num_classes
-        self.linear_embed = torch.nn.Linear(dssp_num_classes, dssp_sc_embed_dim, bias=False)
 
     def forward(self, batch):
-        """Extract and embed the self-conditioning DSSP prediction.
-
-        Args:
-            batch: Dictionary containing "dssp_sc" of shape [b, n, num_dssp_classes]
-                   and "x_t" for shape/device inference.
-
-        Returns:
-            Embedded DSSP SC of shape [b, n, dim]
-        """
         if "dssp_sc" in batch:
-            dssp_sc = batch["dssp_sc"]  # [b, n, num_dssp_classes]
-            return self.linear_embed(dssp_sc)  # [b, n, dim]
+            return batch["dssp_sc"]  # [b, n, dssp_num_classes]
         else:
             # If no self-conditioning, return zeros
             x_t = batch["x_t"]  # [b, n, 3]
