@@ -470,6 +470,11 @@ class UDLMDiscreteDiffusion(nn.Module):
         self.position_bias_w_min = float(self.position_bias.get("w_min", 0.2))
         self.position_bias_w_max = float(self.position_bias.get("w_max", 5.0))
         self.position_bias_k = float(self.position_bias.get("k", 30.0))
+        # When True, the position bias shapes ONLY the forward noising; the loss is
+        # scored against the unbiased (global cosine) schedule so per-element loss
+        # weighting is position-uniform (the model learns regional denoising from the
+        # corrupted data it sees, not from a position-skewed objective).
+        self.position_bias_decouple_loss = bool(self.position_bias.get("decouple_loss", False))
         self.noise_schedule = MaskingSchedule(
             schedule_fn_type=noise_schedule_type, eps=eps
         )
@@ -494,15 +499,23 @@ class UDLMDiscreteDiffusion(nn.Module):
 
     def _alpha_and_dalpha(
         self, t: Tensor, x_shape: tuple, device: torch.device, dtype: torch.dtype,
-        pair_mask: Optional[Tensor] = None,
+        pair_mask: Optional[Tensor] = None, for_loss: bool = False,
     ) -> tuple[Tensor, Tensor]:
-        """Return (alpha_t, dalpha_t) with proper broadcasting to data shape."""
+        """Return (alpha_t, dalpha_t) with proper broadcasting to data shape.
+
+        for_loss=True together with position_bias_decouple_loss returns the
+        UNBIASED global schedule so the loss is position-uniform (forward noising
+        still uses the position-biased schedule).
+        """
         alpha_cos = self.noise_schedule.alpha(t)
         dalpha_cos = self.noise_schedule.dalpha(t)
         alpha_cos = _reverse_broadcast(alpha_cos, len(x_shape))
         dalpha_cos = _reverse_broadcast(dalpha_cos, len(x_shape))
 
         if not self.position_bias_enabled:
+            return alpha_cos, dalpha_cos
+
+        if for_loss and self.position_bias_decouple_loss:
             return alpha_cos, dalpha_cos
 
         if self.position_bias_mode != "sigmoid":
@@ -601,9 +614,9 @@ class UDLMDiscreteDiffusion(nn.Module):
         N = self.vocab_size
         eps = 1e-8  # numerical stability
 
-        # -- noise schedule values --
+        # -- noise schedule values (unbiased when decouple_loss; see _alpha_and_dalpha) --
         alpha_t, dalpha_t = self._alpha_and_dalpha(
-            t, x.shape, x.device, x.dtype, pair_mask=pair_mask,
+            t, x.shape, x.device, x.dtype, pair_mask=pair_mask, for_loss=True,
         )
 
         # -- model prediction as probability distribution --

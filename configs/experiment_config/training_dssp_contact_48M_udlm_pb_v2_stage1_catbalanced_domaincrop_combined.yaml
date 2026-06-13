@@ -101,7 +101,8 @@ training:
   position_bias:
     enabled: true
     mode: sigmoid
-    k: 10.0
+    k: 3.0  # tightness (sweep 2026-06-13): softer than 10 so off-diagonal contacts still get noised; near>off bias kept
+    decouple_loss: true  # bias shapes forward noising only; loss uses the unbiased global schedule (position-uniform)
   mask_T_prob: 0.5
   mask_A_prob: 0.5
   mask_C_prob: 0.5
