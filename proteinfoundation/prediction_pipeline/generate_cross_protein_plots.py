@@ -958,6 +958,10 @@ def load_proteinebm_summary_data(summary_files: List[str], dataset_file: str, id
 
     df = pd.DataFrame(data)
     logger.info(f"Loaded {len(df)} proteins from ProteinEBM summary files (filtered by dataset)")
+    if df.empty:
+        # Summaries carried no AF2Rank-style TM metrics; return empty so the caller
+        # can skip gracefully instead of KeyError-ing on the protein_id merge below.
+        return df
 
     df = df.merge(dataset_df[[id_col, tms_col, "in_train", "length"]], left_on="protein_id", right_on=id_col, how="left")
     df.drop(columns=[id_col], inplace=True)
@@ -1929,6 +1933,15 @@ def main():
                 logger.error("No ProteinEBM summary files found")
                 sys.exit(1)
             df = load_proteinebm_summary_data(summary_files, args.dataset_file, args.id_col, args.tms_col)
+            if df.empty:
+                # ProteinEBM summaries lack AF2Rank-style TM metrics here; skip the
+                # primary TM plots cleanly (exit 0) so the orchestrator still proceeds
+                # to the af2rank_on_proteinebm_topk plots that write the summary CSV.
+                logger.warning(
+                    "ProteinEBM summaries contain no AF2Rank-style TM metrics "
+                    "(e.g. max_tm_ref_template); skipping primary ProteinEBM TM plots."
+                )
+                sys.exit(0)
         else:
             score_files = find_proteinebm_score_files(args.inference_dir, args.proteinebm_analysis_subdir)
             if not score_files:
