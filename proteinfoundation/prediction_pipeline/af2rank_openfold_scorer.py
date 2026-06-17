@@ -77,12 +77,15 @@ def tmscore(x, y, tmscore_exe="USalign", env=None):
             used_exe = exe
             break
     else:
-        x_np = x if isinstance(x, np.ndarray) else x.detach().cpu().numpy()
-        y_np = y if isinstance(y, np.ndarray) else y.detach().cpu().numpy()
-        rmsd = np.sqrt(np.mean(np.sum((x_np - y_np) ** 2, axis=-1)))
         os.unlink(f1.name)
         os.unlink(f2.name)
-        return {"rms": float(rmsd), "tms": 0.0, "gdt": 0.0}
+        # Fail loudly: a silent tms=0.0 fallback here once produced an entire run of
+        # 0.0 TM-scores because USalign was simply not on PATH.
+        raise RuntimeError(
+            "tmscore(): no USalign/TMscore executable found on PATH (tried "
+            f"{[tmscore_exe, './TMscore', 'TMscore', '/usr/local/bin/TMscore']}). "
+            "Install USalign or add its directory to PATH; refusing to return tms=0.0."
+        )
 
     os.unlink(f1.name)
     os.unlink(f2.name)
