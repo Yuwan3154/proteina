@@ -139,7 +139,10 @@ def extract_chain(cif_path, chain_letter, out_pdb):
     if chain_letter not in {c.id for c in model.get_chains()}:
         return False
     io = PDBIO()
-    io.set_structure(structure)
+    # First model only: saving the whole structure emits every NMR model, which
+    # foldseek then indexes as separate entries. Model 1 matches the single-model
+    # native used for the TM-based y-axis.
+    io.set_structure(model)
     io.save(str(out_pdb), _ChainSelect(chain_letter))
     with open(out_pdb) as f:
         has_atoms = any(line.startswith("ATOM") for line in f)
