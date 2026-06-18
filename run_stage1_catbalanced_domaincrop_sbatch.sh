@@ -4,8 +4,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:h100:4
-#SBATCH --cpus-per-task=56  # 4 ranks x 12 workers = 48 + 4 main = 52; 56 leaves the 64-CPU node 8 free (easier to schedule than requesting all 64)
-#SBATCH --mem=1000G         # in_memory=False; bumped 400->1000G for 12 workers/rank x prefetch 4 (node = 2TB; RAM is not the constraint)
+#SBATCH --cpus-per-task=40  # 4 ranks x 8 workers = 32 + 4 main = 36; 40 fits a 4-free-H100 node with >=40 free CPU (H100 nodes are CPU-shared, so don't over-request or it won't schedule)
+#SBATCH --mem=400G          # in_memory=False; 8 workers/rank x prefetch 4 peak well under this (FrozenStrMap). Keep modest so free-mem doesn't block scheduling on shared nodes
 #SBATCH --time=2-00:00:00
 #SBATCH --requeue
 #SBATCH --signal=B:USR1@60

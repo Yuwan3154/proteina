@@ -21,6 +21,7 @@ CKPT="$RUNDIR/checkpoints/last.ckpt"
 mkdir -p "$MON"
 echo $$ > "$MON/poller.pid"   # launcher checks this (kill -0) instead of pgrep, to avoid self-match
 nojob=0
+pending=0
 echo "[$(date '+%F %T')] poller START pid=$$ run=$RUN job=$JOBNAME interval=${INTERVAL}s" >> "$MON/poller.log"
 while true; do
   ts=$(date '+%F %T'); now=$(date +%s)
@@ -42,7 +43,13 @@ while true; do
     else flag="transient-no-job(${nojob})"; fi
   else
     nojob=0
-    if [ "$state" = RUNNING ] && [ "$age" -gt "$STALL_SECS" ]; then flag=ALERT; alert="STALL: $jid RUNNING (rt=$rtime) but last.ckpt ${age}s stale, step=$step"; fi
+    if [ "$state" = RUNNING ]; then
+      pending=0
+      [ "$age" -gt "$STALL_SECS" ] && { flag=ALERT; alert="STALL: $jid RUNNING (rt=$rtime) but last.ckpt ${age}s stale, step=$step"; }
+    else
+      pending=$((pending+1))
+      [ "$pending" -ge 2 ] && { flag=ALERT; alert="STUCK-PENDING: $jid state=$state for ${pending} polls (idle, not training); step=$step < $MAX_STEPS"; }
+    fi
   fi
   if [ "$oom" -gt 0 ] 2>/dev/null; then flag=ALERT; alert="OOM/ERROR markers in $(basename "$log")"; fi
   status="[$ts] job=${jid:-none} state=${state:-NONE} step=$step/$MAX_STEPS ckpt=${cknice}(${age}s) oom=$oom -> $flag"

@@ -8,7 +8,7 @@ freeze_ipa: true
 pretrain_ckpt_path: null
 
 hardware:
-  ncpus_per_task_train_: 12  # = dataloader num_workers/rank (train.py:351 overwrites the dataset cfg). Bumped 4->12 to feed the GPUs (CoW leak fixed via FrozenStrMap; node = 64 CPU / 2TB). Tune via DIAG_DATALOADER wait_frac.
+  ncpus_per_task_train_: 8  # = dataloader num_workers/rank (train.py:351 overwrites the dataset cfg). Bumped 4->8 (2x); capped at 8 because mit_preemptable H100 nodes are CPU-shared by co-tenants -> 12 workers (56 CPU) couldn't co-locate with 4 free H100. Tune via DIAG_DATALOADER wait_frac.
   ncpus_per_task_prepro_: 16
   accelerator: gpu
   ngpus_per_node_: 4  # STAGE 1 on mit_preemptable (per-user 4-GPU cap, 2-day, preemptable). Effective batch = 4 GPU * 2 micro * 16 accum = 128.
