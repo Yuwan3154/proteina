@@ -136,8 +136,8 @@ opt:
   # annealer's horizon; max_steps is the hard stop.
   max_epochs: 2500
   max_steps: 150000
-  batch_size: 2  # per-GPU micro-batch. 48M @ L=320: batch 1 fits L40S 44G; batch 2 fits H100 80G (~50G); batch 4 OOMs H100. Monitor.
-  accumulate_grad_batches: 16  # effective = 4 GPU * 2 micro * 16 accum = 128 (4-GPU mit_preemptable)
+  batch_size: 1  # per-GPU micro-batch. On L40S 44G (current target): batch 1 fits, batch 2 OOMs. (H100 80G fit batch 2 ~50G -> use batch 2/accum 16 when reverting to H100.)
+  accumulate_grad_batches: 32  # effective = 4 GPU * 1 micro * 32 accum = 128 (4xL40S). NOTE: launcher torchrun CLI also passes --batch_size/--accumulate_grad_batches and OVERRIDES these; keep them in sync.
   optimizer: muon
   val_check_interval_optim_steps: 500  # 300 val cycles over 150K steps. Val-traj at chunk=8 is sampling-heavy, so leaner cadence saves compute.
   skip_nan_grad: False

@@ -3,7 +3,7 @@
 #SBATCH --partition=mit_preemptable
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:h100:4
+#SBATCH --gres=gpu:l40s:4  # L40S (not H100): the 4-free-H100 pool is empty + 391 jobs outrank me, but mit_preemptable has a LARGE idle l40s:4 pool -> runs now. 48M @ L=320 fits L40S 44G only at batch 1 (batch 2 OOMs); ~3-8x slower/step than H100 but no waiting. Revert to gpu:h100:4 + batch 2/accum 16 when fair-share recovers.
 #SBATCH --cpus-per-task=20  # 4 ranks x 4 workers = 16 + 4 main = 20. Training reads PRE-processed .pt (no preprocessing on the GPU path) and is COMPUTE-bound at batch 2 (~88% util) -> the dataloader is not the bottleneck, so 4 workers/rank keep the pipe full. Lean CPU = fits more 4-free-H100 backfill windows on the CPU-shared nodes (= the morning-good 16058272 profile).
 #SBATCH --mem=200G          # in_memory=False; FrozenStrMap + persistent_workers keep real peak ~27G. 200G is generous; small request widens scheduling on shared nodes
 #SBATCH --time=0-06:00:00   # SHORT 6h for BACKFILL: a low-priority preemptable job only schedules in a gap before higher-priority reservations; a 2-day job rarely fits one on the contended H100 nodes. Autoresume handles the 6h boundaries; bump back to 2-00:00:00 once it's running steadily + fair-share recovers.
@@ -13,9 +13,9 @@
 #SBATCH --error=/home/chenxiou/proteina/store/dssp_contact_48M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined/slurm/%x-%j.err
 
 # CATH-balanced domain-crop Stage-1 (48M), combined PDB+AFDB, on mit_preemptable
-# (4-GPU/user cap, PREEMPTABLE, 2-day limit). Effective batch = 4 GPU * 2 micro
-# * 16 accum = 128. H100 80G fits 48M at L=320 batch 2 (~50G); L40S 44G would OOM
-# at batch 2, so H100 is requested. config_name carries the training_ prefix; the
+# (PREEMPTABLE). Effective batch = 4 GPU * 1 micro * 32 accum = 128 (was 4*2*16 on
+# H100). Running on the abundant idle L40S pool at batch 1 (L40S 44G OOMs at batch 2);
+# H100 80G fit batch 2 (~50G) but the 4-H100 pool is contended. config_name carries the training_ prefix; the
 # config path resolves via the pip -e proteinfoundation __file__ at /orcd/pool,
 # independent of REPO/CWD.
 #
@@ -100,8 +100,8 @@ torchrun --nnodes=1 --nproc_per_node=4 --rdzv-backend=c10d --rdzv-endpoint="127.
     --config_name "training_$RUN" \
     --ngpus_per_node 4 \
     --nnodes 1 \
-    --batch_size 2 \
-    --accumulate_grad_batches 16 \
+    --batch_size 1 \
+    --accumulate_grad_batches 32 \
     --resume_option allow \
     af2_ipa_weights_path=/orcd/pool/006/chenxiou/params/params_model_1_ptm.npz &
 TORCH_PID=$!
