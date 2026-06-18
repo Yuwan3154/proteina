@@ -576,6 +576,12 @@ if __name__ == "__main__":
         callbacks.append(MemTracker(every_n_steps=int(os.environ.get("MEM_DEBUG_EVERY", "50"))))
         log_info("MEM_DEBUG: MemTracker callback enabled")
 
+    # Dataloader-timing diagnostic (off unless DIAG_DATALOADER=1): logs wait vs compute.
+    if os.environ.get("DIAG_DATALOADER"):
+        from proteinfoundation.utils.dataloader_timer_callback import DataloaderTimer
+        callbacks.append(DataloaderTimer(every_n_steps=int(os.environ.get("DIAG_DATALOADER_EVERY", "100"))))
+        log_info("DIAG_DATALOADER: DataloaderTimer callback enabled")
+
     # Set checkpointing
     if cfg_exp.log.checkpoint and not args.nolog:
         # last_ckpt_every_n_steps: default 1000 when omitted (only-save-last mode)

@@ -8,7 +8,7 @@ freeze_ipa: true
 pretrain_ckpt_path: null
 
 hardware:
-  ncpus_per_task_train_: 4  # = dataloader workers/rank; lowered from 16 to cut CoW-leak copies (pytorch#13246). GPUs are compute-bound (~0.9s/minibatch) so 4 workers x prefetch keep up.
+  ncpus_per_task_train_: 12  # = dataloader num_workers/rank (train.py:351 overwrites the dataset cfg). Bumped 4->12 to feed the GPUs (CoW leak fixed via FrozenStrMap; node = 64 CPU / 2TB). Tune via DIAG_DATALOADER wait_frac.
   ncpus_per_task_prepro_: 16
   accelerator: gpu
   ngpus_per_node_: 4  # STAGE 1 on mit_preemptable (per-user 4-GPU cap, 2-day, preemptable). Effective batch = 4 GPU * 2 micro * 16 accum = 128.
@@ -86,6 +86,7 @@ dataset_config_subdir: mixed
 datamodule:
   in_memory: False  # AFDB: 1.05M chains; CAT-balanced ~1176/epoch -> per-batch disk read (avoid OOM)
   nocat_bucket_draws: 322  # 4-GPU ~50:50 labeled:unlabeled (4 ranks * 322 ≈ 1289 labeled topologies)
+  prefetch_factor: 4  # bump dataloader prefetch 2->4 (merges over the dataset cfg; pin_memory already True)
 
 force_precision_f32: False
 

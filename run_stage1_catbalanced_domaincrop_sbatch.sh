@@ -4,8 +4,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:h100:4
-#SBATCH --cpus-per-task=48  # 1 task (torchrun) spawns 4 GPU procs; 4 ranks x (4 dataloader workers + main) ~= 24 CPUs, 48 leaves prefetch headroom
-#SBATCH --mem=400G          # in_memory=False (per-batch disk read); 4 ranks of dataloader workers peak ~50G, 400G ample on the TB-RAM preemptable nodes
+#SBATCH --cpus-per-task=56  # 4 ranks x 12 workers = 48 + 4 main = 52; 56 leaves the 64-CPU node 8 free (easier to schedule than requesting all 64)
+#SBATCH --mem=1000G         # in_memory=False; bumped 400->1000G for 12 workers/rank x prefetch 4 (node = 2TB; RAM is not the constraint)
 #SBATCH --time=2-00:00:00
 #SBATCH --requeue
 #SBATCH --signal=B:USR1@60
@@ -77,6 +77,7 @@ export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export DIAG_DATALOADER=1   # dataloader-timing diagnostic: logs [DLTIMER] wait vs compute (low overhead)
 export TORCHINDUCTOR_CACHE_DIR=/orcd/compute/so3/001/chenxi/torchinductor_cache
 export TRITON_CACHE_DIR=/orcd/compute/so3/001/chenxi/triton_cache
 mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
