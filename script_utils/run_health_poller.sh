@@ -19,6 +19,7 @@ RUNDIR="/home/chenxiou/proteina/store/$RUN"
 MON="$RUNDIR/monitor"
 CKPT="$RUNDIR/checkpoints/last.ckpt"
 mkdir -p "$MON"
+echo $$ > "$MON/poller.pid"   # launcher checks this (kill -0) instead of pgrep, to avoid self-match
 nojob=0
 echo "[$(date '+%F %T')] poller START pid=$$ run=$RUN job=$JOBNAME interval=${INTERVAL}s" >> "$MON/poller.log"
 while true; do
