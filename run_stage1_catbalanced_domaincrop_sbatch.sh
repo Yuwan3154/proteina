@@ -4,8 +4,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:h100:4
-#SBATCH --cpus-per-task=40  # 4 ranks x 8 workers = 32 + 4 main = 36; 40 fits a 4-free-H100 node with >=40 free CPU (H100 nodes are CPU-shared, so don't over-request or it won't schedule)
-#SBATCH --mem=400G          # in_memory=False; 8 workers/rank x prefetch 4 peak well under this (FrozenStrMap). Keep modest so free-mem doesn't block scheduling on shared nodes
+#SBATCH --cpus-per-task=20  # 4 ranks x 4 workers = 16 + 4 main = 20. Training reads PRE-processed .pt (no preprocessing on the GPU path) and is COMPUTE-bound at batch 2 (~88% util) -> the dataloader is not the bottleneck, so 4 workers/rank keep the pipe full. Lean CPU = fits more 4-free-H100 backfill windows on the CPU-shared nodes (= the morning-good 16058272 profile).
+#SBATCH --mem=200G          # in_memory=False; FrozenStrMap + persistent_workers keep real peak ~27G. 200G is generous; small request widens scheduling on shared nodes
 #SBATCH --time=0-06:00:00   # SHORT 6h for BACKFILL: a low-priority preemptable job only schedules in a gap before higher-priority reservations; a 2-day job rarely fits one on the contended H100 nodes. Autoresume handles the 6h boundaries; bump back to 2-00:00:00 once it's running steadily + fair-share recovers.
 #SBATCH --requeue
 #SBATCH --signal=B:USR1@60
