@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:h100:4
 #SBATCH --cpus-per-task=40  # 4 ranks x 8 workers = 32 + 4 main = 36; 40 fits a 4-free-H100 node with >=40 free CPU (H100 nodes are CPU-shared, so don't over-request or it won't schedule)
 #SBATCH --mem=400G          # in_memory=False; 8 workers/rank x prefetch 4 peak well under this (FrozenStrMap). Keep modest so free-mem doesn't block scheduling on shared nodes
-#SBATCH --time=2-00:00:00
+#SBATCH --time=0-06:00:00   # SHORT 6h for BACKFILL: a low-priority preemptable job only schedules in a gap before higher-priority reservations; a 2-day job rarely fits one on the contended H100 nodes. Autoresume handles the 6h boundaries; bump back to 2-00:00:00 once it's running steadily + fair-share recovers.
 #SBATCH --requeue
 #SBATCH --signal=B:USR1@60
 #SBATCH --output=/home/chenxiou/proteina/store/dssp_contact_48M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined/slurm/%x-%j.out
@@ -35,7 +35,7 @@
 set -euo pipefail
 RUN=dssp_contact_48M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined
 REPO=/home/chenxiou/proteina  # NOT the pip -e source root; imports resolve to pip -e at /orcd/pool
-TIME_LIMIT_SECONDS=172800     # keep in sync with --time=2-00:00:00
+TIME_LIMIT_SECONDS=21600      # keep in sync with --time=0-06:00:00 (SHORT for backfill; restore to 172800 / 2-00:00:00 when fair-share recovers)
 RESUBMITTED=0
 TORCH_PID=0
 
