@@ -29,6 +29,7 @@ the per-chain PDBs plus the DB. Point ``--work_dir`` at a filesystem with room
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import shutil
@@ -49,6 +50,7 @@ if str(_PROTEINA_ROOT) not in sys.path:
 from scripts.analysis.mark_in_train import load_train_ids, normalize_pdb_chain  # noqa: E402
 from scripts.analysis.audit_broken_chains import _write_example_pdb  # noqa: E402
 from scripts.foldseek_cath_batch import extract_chain  # noqa: E402
+from proteinfoundation.datasets.pdb_data import _processed_path_sharded  # noqa: E402
 
 log = logging.getLogger("train_closeness")
 
@@ -94,11 +96,15 @@ def _pdb_worker(args: tuple[str, str, str]) -> tuple[str, bool, str]:
         return train_id, False, repr(e)[:200]
 
 
-def _build_chunk_pdbs(chunk_ids: list[str], processed_dir: Path, out_dir: Path, n_workers: int) -> int:
+def _build_chunk_pdbs(chunk_ids: list[str], processed_dir: Path, out_dir: Path, n_workers: int,
+                      manifest: Optional[dict] = None) -> int:
     if out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    jobs = [(tid, str(processed_dir / f"{tid}.pt"), str(out_dir / f"{tid}.pdb")) for tid in chunk_ids]
+    # Resolve each .pt via the dataset's canonical shard scheme (mid2/mid3/hash);
+    # flat layout falls through to processed_dir/{stem}.pt when manifest is None.
+    jobs = [(tid, str(_processed_path_sharded(processed_dir, tid, manifest)), str(out_dir / f"{tid}.pdb"))
+            for tid in chunk_ids]
     n_ok = 0
     with ProcessPoolExecutor(max_workers=n_workers) as ex:
         for _tid, ok, _err in ex.map(_pdb_worker, jobs):
@@ -134,7 +140,7 @@ def _mv_prefix(src: str, dst: str) -> None:
 
 def build_db_chunked(foldseek: str, train_ids: list[str], processed_dir: Path, db_path: Path,
                      tmp_dir: Path, chunk_size: int, n_workers: int, rebuild: bool,
-                     min_free_gb: float = 3.0) -> None:
+                     manifest: Optional[dict] = None, min_free_gb: float = 3.0) -> None:
     sentinel = db_path.parent / "db.done"
     if sentinel.exists() and not rebuild:
         log.info("foldseek DB present (%s); skipping build", db_path)
@@ -154,7 +160,7 @@ def build_db_chunked(foldseek: str, train_ids: list[str], processed_dir: Path, d
         if free_gb < min_free_gb:
             raise SystemExit(f"Aborting: only {free_gb:.1f} GB free (< {min_free_gb}); DB build would risk filling the disk.")
         chunk = train_ids[ci * chunk_size:(ci + 1) * chunk_size]
-        n_ok = _build_chunk_pdbs(chunk, processed_dir, chunk_pdb, n_workers)
+        n_ok = _build_chunk_pdbs(chunk, processed_dir, chunk_pdb, n_workers, manifest)
         _rm_prefix(chunk_db)
         Path(chunk_db).parent.mkdir(parents=True, exist_ok=True)
         _run([foldseek, "createdb", str(chunk_pdb), chunk_db], tmp_dir)
@@ -383,11 +389,19 @@ def main() -> None:
         train_ids = train_ids[: args.smoke_db_size]
         log.info("SMOKE: restricting DB to first %d train chains", len(train_ids))
 
+    # Shard manifest (sibling of processed/): enables mid2/mid3/hash bucket resolution.
+    manifest_path = processed_dir.parent / "shard_manifest.json"
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else None
+    if manifest:
+        log.info("Loaded shard manifest %s (%d buckets)", manifest_path, len(manifest.get("depth_table", {})))
+    else:
+        log.info("No shard manifest at %s; assuming flat processed/ layout", manifest_path)
+
     # Stage 2+3: chunked foldseek DB build (low peak disk; persistent + reusable)
     db_path = work_dir / ("db_smoke" if args.smoke_db_size else "db") / "trainDB"
     tmp_dir = work_dir / "fs_tmp"
     build_db_chunked(foldseek, train_ids, processed_dir, db_path, tmp_dir,
-                     args.chunk_size, args.n_workers, args.rebuild_db)
+                     args.chunk_size, args.n_workers, args.rebuild_db, manifest=manifest)
 
     # Stage 4: query native PDBs
     ids = pd.read_csv(args.ids_csv, dtype={args.id_col: str}, keep_default_na=False)[args.id_col].astype(str).tolist()
