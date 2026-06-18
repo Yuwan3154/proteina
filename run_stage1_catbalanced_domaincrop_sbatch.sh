@@ -90,7 +90,13 @@ START_MTIME=$(stat -c %Y "$CKPT" 2>/dev/null || echo 0)
 
 # torchrun spawns the 4 GPU workers as plain python processes and sets
 # RANK/WORLD_SIZE/LOCAL_RANK, which train.py reads for the manual NCCL init.
-torchrun --standalone --nnodes=1 --nproc_per_node=4 proteinfoundation/train.py \
+# Use a RANDOM rendezvous port instead of torchrun --standalone's fixed port: on a
+# SHARED mit_preemptable node a co-tenant torchrun on the same port collides -> the
+# process group fails to form -> silent rc=1 ~30s after dist-init (seen 2x on node2901,
+# while node2435/2501 were fine). A unique port + rdzv-id avoids the collision.
+RDZV_PORT=$(( 20000 + (RANDOM % 40000) ))
+echo "[$(date)] torchrun rendezvous 127.0.0.1:$RDZV_PORT"
+torchrun --nnodes=1 --nproc_per_node=4 --rdzv-backend=c10d --rdzv-endpoint="127.0.0.1:$RDZV_PORT" --rdzv-id="${SLURM_JOB_ID:-$$}" proteinfoundation/train.py \
     --config_name "training_$RUN" \
     --ngpus_per_node 4 \
     --nnodes 1 \
