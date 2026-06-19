@@ -3,19 +3,19 @@
 #SBATCH --partition=mit_preemptable
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:l40s:4  # L40S (not H100): the 4-free-H100 pool is empty + 391 jobs outrank me, but mit_preemptable has a LARGE idle l40s:4 pool -> runs now. 48M @ L=320 fits L40S 44G only at batch 1 (batch 2 OOMs); ~3-8x slower/step than H100 but no waiting. Revert to gpu:h100:4 + batch 2/accum 16 when fair-share recovers.
+#SBATCH --gres=gpu:h200:4  # H200 (141G): fastest GPU here AND most available on mit_preemptable (multiple free h200:8 nodes vs scarce H100/contended). ~3x faster/step than L40S. 48M @ L=320 batch 4 ~90G fits 141G with wide margin (H100 80G measured batch2=70G -> batch4 mathematically <=~110G). Fallbacks: gpu:h100:4 + batch 2/accum 16 (80G); gpu:l40s:4 + batch 1/accum 32 (44G).
 #SBATCH --cpus-per-task=20  # 4 ranks x 4 workers = 16 + 4 main = 20. Training reads PRE-processed .pt (no preprocessing on the GPU path) and is COMPUTE-bound at batch 2 (~88% util) -> the dataloader is not the bottleneck, so 4 workers/rank keep the pipe full. Lean CPU = fits more 4-free-H100 backfill windows on the CPU-shared nodes (= the morning-good 16058272 profile).
 #SBATCH --mem=200G          # in_memory=False; FrozenStrMap + persistent_workers keep real peak ~27G. 200G is generous; small request widens scheduling on shared nodes
-#SBATCH --time=0-06:00:00   # SHORT 6h for BACKFILL: a low-priority preemptable job only schedules in a gap before higher-priority reservations; a 2-day job rarely fits one on the contended H100 nodes. Autoresume handles the 6h boundaries; bump back to 2-00:00:00 once it's running steadily + fair-share recovers.
+#SBATCH --time=2-00:00:00   # 2-day MAX (mit_preemptable cap=48h): maximize walltime to MINIMIZE resubmit count + progress lost at boundaries. H200 is abundant so a 2-day job schedules fine (no backfill-fit constraint). Preemption is handled by --requeue; the SIGTERM trap handles the 2-day limit.
 #SBATCH --requeue
 #SBATCH --signal=B:USR1@60
 #SBATCH --output=/home/chenxiou/proteina/store/dssp_contact_48M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined/slurm/%x-%j.out
 #SBATCH --error=/home/chenxiou/proteina/store/dssp_contact_48M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined/slurm/%x-%j.err
 
 # CATH-balanced domain-crop Stage-1 (48M), combined PDB+AFDB, on mit_preemptable
-# (PREEMPTABLE). Effective batch = 4 GPU * 1 micro * 32 accum = 128 (was 4*2*16 on
-# H100). Running on the abundant idle L40S pool at batch 1 (L40S 44G OOMs at batch 2);
-# H100 80G fit batch 2 (~50G) but the 4-H100 pool is contended. config_name carries the training_ prefix; the
+# (PREEMPTABLE). Effective batch = 4 GPU * 4 micro * 8 accum = 128 on H200 (141G).
+# (H100 80G -> batch 2/accum 16; L40S 44G -> batch 1/accum 32 -- same eff 128.)
+# config_name carries the training_ prefix; the
 # config path resolves via the pip -e proteinfoundation __file__ at /orcd/pool,
 # independent of REPO/CWD.
 #
@@ -35,7 +35,7 @@
 set -euo pipefail
 RUN=dssp_contact_48M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined
 REPO=/home/chenxiou/proteina  # NOT the pip -e source root; imports resolve to pip -e at /orcd/pool
-TIME_LIMIT_SECONDS=21600      # keep in sync with --time=0-06:00:00 (SHORT for backfill; restore to 172800 / 2-00:00:00 when fair-share recovers)
+TIME_LIMIT_SECONDS=172800     # keep in sync with --time=2-00:00:00 (2-day MAX on mit_preemptable)
 RESUBMITTED=0
 TORCH_PID=0
 
@@ -100,8 +100,8 @@ torchrun --nnodes=1 --nproc_per_node=4 --rdzv-backend=c10d --rdzv-endpoint="127.
     --config_name "training_$RUN" \
     --ngpus_per_node 4 \
     --nnodes 1 \
-    --batch_size 1 \
-    --accumulate_grad_batches 32 \
+    --batch_size 4 \
+    --accumulate_grad_batches 8 \
     --resume_option allow \
     af2_ipa_weights_path=/orcd/pool/006/chenxiou/params/params_model_1_ptm.npz &
 TORCH_PID=$!
