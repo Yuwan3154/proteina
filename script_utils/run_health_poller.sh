@@ -1,6 +1,9 @@
 #!/bin/bash
 # Detached on-box health poller for the per-round 48M stage-1 run on Engaging.
-# DETECTION ONLY: writes STATUS + ALERTS files. No cron, no scancel, no sbatch/resubmit.
+# Writes STATUS + ALERTS AND auto-resubmits the chain on a GENUINE chain-down (bash submit_tiered.sh).
+# sbatch ONLY -- NEVER scancel. Defers to the launcher's no-progress cap: if the launcher DELIBERATELY
+# stopped (.noprogress_streak >= MAX_NOPROGRESS = deterministic bug / 3 distinct bad nodes), it does NOT
+# resubmit, only ALERTs (human needed). No agent cron.
 # Survives SSH/ControlMaster drops and terminal close (launch under setsid+nohup).
 #
 # Launch (from a login node):
@@ -19,11 +22,14 @@ INTERVAL="${POLL_INTERVAL:-600}"    # 10 min between polls (a full stop surfaces
 STALL_SECS="${STALL_SECS:-5400}"    # RUNNING + last.ckpt this stale => stall (covers compile + val)
 PENDING_POLLS="${PENDING_POLLS:-6}" # PENDING this many polls (~1h) => alert (pending is NORMAL in per-round escalation)
 MAX_STEPS="${MAX_STEPS:-150000}"
+REPO="${REPO:-/home/chenxiou/proteina}"
+MAX_NOPROGRESS="${MAX_NOPROGRESS:-3}"   # = launcher cap; if .noprogress_streak >= this, the stop was DELIBERATE -> do NOT resubmit
+MAX_PRESUB="${MAX_PRESUB:-3}"           # cap consecutive poller auto-resubmits that fail to produce a lasting job -> then give up + alert
 RUNDIR="/home/chenxiou/proteina/store/$RUN"
 MON="$RUNDIR/monitor"; CKPT="$RUNDIR/checkpoints/last.ckpt"
 mkdir -p "$MON"
 echo $$ > "$MON/poller.pid"
-nojob=0; pending=0
+nojob=0; pending=0; presub=0
 echo "[$(date '+%F %T')] poller START pid=$$ run=$RUN prefix=$JOBPREFIX interval=${INTERVAL}s (detection-only)" >> "$MON/poller.log"
 while true; do
   [ -f "$MON/STOP" ] && { echo "[$(date '+%F %T')] STOP file present; poller exiting." >> "$MON/poller.log"; rm -f "$MON/STOP"; break; }
@@ -43,11 +49,22 @@ while true; do
   flag=OK; alert=""
   if [ -z "$jid" ]; then
     nojob=$((nojob+1)); pending=0
+    streak=$(cat "$RUNDIR/.noprogress_streak" 2>/dev/null || echo 0)
     if [ "$step" -ge "$MAX_STEPS" ]; then flag=DONE
-    elif [ "$nojob" -ge 2 ]; then flag=ALERT; alert="CHAIN-DOWN: NO cb_dc_s1_48m* job for ${nojob} polls and step=$step < $MAX_STEPS -> training STOPPED (resubmit: bash submit_tiered.sh)"
-    else flag="transient-no-job(${nojob})"; fi
+    elif [ "$nojob" -lt 2 ]; then flag="transient-no-job(${nojob})"
+    elif [ "${streak:-0}" -ge "$MAX_NOPROGRESS" ]; then
+      flag=ALERT; alert="CHAIN-DOWN + launcher hit no-progress cap (streak=$streak): DELIBERATE stop (deterministic bug / bad nodes) -> NOT auto-resubmitting; HUMAN needed (read newest slurm .err)."
+    elif [ "$presub" -ge "$MAX_PRESUB" ]; then
+      flag=ALERT; alert="CHAIN-DOWN: poller already auto-resubmitted $presub times with no lasting job -> giving up; HUMAN needed."
+    else
+      presub=$((presub+1))
+      echo "[$ts] AUTO-RESUBMIT #$presub via submit_tiered.sh:" >> "$MON/poller.log"
+      ( bash "$REPO/submit_tiered.sh" ) >> "$MON/poller.log" 2>&1
+      nojob=0
+      flag=ALERT; alert="CHAIN-DOWN -> AUTO-RESUBMITTED via submit_tiered.sh (poller resubmit #$presub/$MAX_PRESUB, sbatch only, no scancel); re-checking next poll."
+    fi
   else
-    nojob=0
+    nojob=0; presub=0   # a job exists again -> chain alive -> reset the poller-resubmit counter
     if [ "$state" = RUNNING ]; then
       pending=0
       [ "$age" -gt "$STALL_SECS" ] && { flag=ALERT; alert="STALL: $jid RUNNING (rt=$rtime) but last.ckpt ${age}s stale, step=$step"; }
