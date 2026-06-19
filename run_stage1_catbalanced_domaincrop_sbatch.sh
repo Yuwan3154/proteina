@@ -32,6 +32,7 @@ REPO=/home/chenxiou/proteina       # NOT the pip -e source; imports resolve to p
 LAUNCHER=run_stage1_catbalanced_domaincrop_sbatch.sh
 TIME_LIMIT_SECONDS=172800          # keep in sync with --time=2-00:00:00
 STREAK_FILE="$REPO/store/$RUN/.noprogress_streak"
+EXCLUDE_FILE="$REPO/store/$RUN/.exclude_nodes"  # nodes that crashed this job with NO progress (bad GPU / CUDA invalid device ordinal); escalate AVOIDS them. Cleared on any real progress.
 MAX_NOPROGRESS=3
 
 # --- tier from the SLURM-set job name (cb_dc_s1_48m_<tier>) -> gres for resubmit targeting ---
@@ -51,8 +52,10 @@ _submit_tier() {  # $1=tier  $2=gres  $3=begin ; anti-dup: skip if ANOTHER job o
   if [ -n "$existing" ]; then
     echo "[$(date)] escalate: tier $1 already queued ($existing) -> skip"; return 0
   fi
-  echo "[$(date)] escalate: submit tier $1 (gres $2 begin $3)"
-  (cd "$REPO" && sbatch --job-name="cb_dc_s1_48m_$1" --gres="$2" --begin="$3" --export=ALL "$LAUNCHER") || true
+  local exarg=""
+  [ -s "$EXCLUDE_FILE" ] && exarg="--exclude=$(sort -u "$EXCLUDE_FILE" | paste -sd, -)"
+  echo "[$(date)] escalate: submit tier $1 (gres $2 begin $3) ${exarg}"
+  (cd "$REPO" && sbatch --job-name="cb_dc_s1_48m_$1" --gres="$2" --begin="$3" ${exarg} --export=ALL "$LAUNCHER") || true
 }
 # ESCALATE = start a fresh round: H200 now, H100 +8h, L40S +24h (--begin gates the broadening)
 escalate() {
@@ -66,6 +69,7 @@ TORCH_PID=0
 on_term() {  # SIGTERM = preemption OR time-limit -> treat BOTH as a round-end: escalate + exit
   echo "[$(date)] SIGTERM (preemption or time-limit) -> round-end: escalate fresh set + exit 0."
   kill -TERM "${TORCH_PID:-0}" 2>/dev/null || true
+  rm -f "$STREAK_FILE" "$EXCLUDE_FILE"   # the job RAN (preemption/time-limit, not a startup fault) -> reset no-progress state
   if [ "$ESCALATED" -eq 0 ]; then ESCALATED=1; escalate; fi
   exit 0
 }
@@ -130,24 +134,26 @@ done
 echo "[$(date)] torchrun exited rc=$RC (tier $TIER)"
 
 END_MTIME=$(stat -c %Y "$CKPT" 2>/dev/null || echo 0)
+NODE="${SLURMD_NODENAME:-$(hostname -s)}"; NODE="${NODE%%.*}"
 
 if [ "$ESCALATED" -ne 0 ]; then
   echo "[$(date)] already escalated by the SIGTERM trap."
 elif [ "$RC" -eq 0 ]; then
   echo "[$(date)] clean finish (max_steps) on tier $TIER -> cancel ALL pending tiers; chain done."
-  rm -f "$STREAK_FILE"
+  rm -f "$STREAK_FILE" "$EXCLUDE_FILE"
   done_ids=$(squeue -u "$USER" -h -t PENDING -o "%i %j" 2>/dev/null | awk '$2 ~ /^cb_dc_s1_48m/ {print $1}' || true)
   [ -n "$done_ids" ] && scancel $done_ids 2>/dev/null || true
 elif [ "$END_MTIME" -gt "$START_MTIME" ]; then
-  echo "[$(date)] non-zero exit AFTER checkpoint progress -> escalate (reset no-progress streak)."
-  rm -f "$STREAK_FILE"
+  echo "[$(date)] non-zero exit AFTER checkpoint progress -> escalate (reset streak + excludes)."
+  rm -f "$STREAK_FILE" "$EXCLUDE_FILE"
   escalate
 else
   STREAK=$(cat "$STREAK_FILE" 2>/dev/null || echo 0); STREAK=$((STREAK + 1)); echo "$STREAK" > "$STREAK_FILE"
+  echo "$NODE" >> "$EXCLUDE_FILE"   # startup fault, NO progress -> AVOID this node on the next escalate (bad GPU / CUDA invalid device ordinal, e.g. node3101)
   if [ "$STREAK" -ge "$MAX_NOPROGRESS" ]; then
-    echo "[$(date)] NO-progress crash #$STREAK (>= $MAX_NOPROGRESS) -> likely a deterministic bug. STOPPING (no escalate). Investigate, then resubmit by hand (bash submit_tiered.sh)."
+    echo "[$(date)] NO-progress crash #$STREAK (>= $MAX_NOPROGRESS) on $NODE -> likely persistent. STOPPING. Bad nodes: $(sort -u "$EXCLUDE_FILE" | paste -sd, -). Investigate, then resubmit by hand (bash submit_tiered.sh)."
   else
-    echo "[$(date)] NO-progress crash #$STREAK -> escalate."
+    echo "[$(date)] NO-progress crash #$STREAK on $NODE -> escalate (excluding crashed nodes)."
     escalate
   fi
 fi
