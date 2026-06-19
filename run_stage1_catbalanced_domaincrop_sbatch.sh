@@ -1,63 +1,85 @@
 #!/bin/bash
-#SBATCH --job-name=cb_dc_s1_48m
+#SBATCH --job-name=cb_dc_s1_48m_h200   # DEFAULT = H200 tier; the per-tier submits OVERRIDE --job-name/--gres on the CLI
 #SBATCH --partition=mit_preemptable
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:h200:4  # H200 (141G): fastest GPU here AND most available on mit_preemptable (multiple free h200:8 nodes vs scarce H100/contended). ~3x faster/step than L40S. 48M @ L=320 batch 4 ~90G fits 141G with wide margin (H100 80G measured batch2=70G -> batch4 mathematically <=~110G). Fallbacks: gpu:h100:4 + batch 2/accum 16 (80G); gpu:l40s:4 + batch 1/accum 32 (44G).
-#SBATCH --cpus-per-task=20  # 4 ranks x 4 workers = 16 + 4 main = 20. Training reads PRE-processed .pt (no preprocessing on the GPU path) and is COMPUTE-bound at batch 2 (~88% util) -> the dataloader is not the bottleneck, so 4 workers/rank keep the pipe full. Lean CPU = fits more 4-free-H100 backfill windows on the CPU-shared nodes (= the morning-good 16058272 profile).
-#SBATCH --mem=200G          # in_memory=False; FrozenStrMap + persistent_workers keep real peak ~27G. 200G is generous; small request widens scheduling on shared nodes
-#SBATCH --time=2-00:00:00   # 2-day MAX (mit_preemptable cap=48h): maximize walltime to MINIMIZE resubmit count + progress lost at boundaries. H200 is abundant so a 2-day job schedules fine (no backfill-fit constraint). Preemption is handled by --requeue; the SIGTERM trap handles the 2-day limit.
+#SBATCH --gres=gpu:h200:4              # DEFAULT = H200; overridden per-tier (h100:4 / l40s:4) on the sbatch CLI
+#SBATCH --cpus-per-task=20             # 4 ranks x 4 workers + 4 main; lean (training reads pre-processed .pt, compute-bound)
+#SBATCH --mem=200G
+#SBATCH --time=2-00:00:00              # 2-day MAX (mit_preemptable cap=48h): maximize walltime -> minimize resubmits/lost progress
 #SBATCH --requeue
 #SBATCH --signal=B:USR1@60
 #SBATCH --output=/home/chenxiou/proteina/store/dssp_contact_48M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined/slurm/%x-%j.out
 #SBATCH --error=/home/chenxiou/proteina/store/dssp_contact_48M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined/slurm/%x-%j.err
 
-# CATH-balanced domain-crop Stage-1 (48M), combined PDB+AFDB, on mit_preemptable
-# (PREEMPTABLE). Effective batch = 4 GPU * 4 micro * 8 accum = 128 on H200 (141G).
-# (H100 80G -> batch 2/accum 16; L40S 44G -> batch 1/accum 32 -- same eff 128.)
-# config_name carries the training_ prefix; the
-# config path resolves via the pip -e proteinfoundation __file__ at /orcd/pool,
-# independent of REPO/CWD.
+# TIERED GPU-escalation Stage-1 (48M), combined PDB+AFDB, on mit_preemptable.
+# THREE tier-jobs (H200/H100/L40S) are queued, each requesting 4 GPU. The per-USER
+# QOS cap is gres/gpu=4 TOTAL (untyped, verified) -> at most ONE runs at a time ->
+# NO checkpoint contention (the cap is a free mutex). Escalation is SLURM-native via
+# --begin (H200 now, H100 +8h, L40S +24h): later tiers sit in BeginTime until their
+# time, then compete; whichever lands first trains from last.ckpt. Effective batch is
+# always 128 (4 GPU x batch x accum): H200 4x8, H100 2x16, L40S 1x32. Changing
+# batch/accum across a resume is safe (ckpt stores weights/opt/step/epoch, not batch).
 #
-# FOUR death-mode protections (runs to max_steps=150000 unattended):
-#  1. Preemption / node-failure -> SBATCH --requeue (same job id; --resume_option=allow
-#     resumes from last.ckpt). The common case on mit_preemptable.
-#  2. App crash (NCCL timeout, OOM, any non-zero torchrun exit) -> self-resubmit chain:
-#     resubmit fresh if a checkpoint advanced this run; else exclude the node + cap
-#     consecutive no-progress retries at MAX_NOPROGRESS so a deterministic bug can't loop.
-#  3. Wall-clock time limit -> SIGTERM trap. --requeue does NOT cover the time limit (a
-#     job that reaches --time just TIMEOUTs and is gone). SLURM sends SIGTERM at the limit,
-#     so on_term resubmits fresh if near the limit, else re-raises for --requeue (preemption).
-#  4. Clean finish at max_steps -> exit 0; neither chain nor trap fires.
-# torchrun runs in the BACKGROUND so the trap is not deferred behind a foreground child
-# (a foreground child made the previous SIGUSR1 trap miss -> the 6h chain once died clean).
+# TIER is read from the env (--export=ALL,TIER=...). DEFAULT h200 so a bare
+# `sbatch run_..._sbatch.sh` is the H200 tier (lets the old single-tier chain adopt
+# this launcher on its next resubmit with no edit).
+#
+# Death-mode protections (per tier; runs to max_steps=150000 unattended):
+#  1. Preemption/node-failure -> --requeue (same job id, resumes last.ckpt). Common on mit_preemptable.
+#  2. App crash -> self-resubmit chain: resubmit THIS tier if a ckpt advanced; else exclude the node,
+#     cap consecutive no-progress retries at MAX_NOPROGRESS (deterministic-bug guard). Per-tier files.
+#  3. Wall-clock limit -> SIGTERM trap resubmits THIS tier (--requeue does NOT cover the time limit).
+#  4. Clean finish at max_steps -> exit 0 + CANCEL the other two tiers (training done; no orphans).
+# Resubmits are anti-duplicate-guarded (skip if a job of this tier is already queued) and use
+# --begin=now (escalation offsets apply only to the initial submit). torchrun runs in the BACKGROUND
+# so the SIGTERM trap is not deferred behind a foreground child.
 
 set -euo pipefail
 RUN=dssp_contact_48M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined
-REPO=/home/chenxiou/proteina  # NOT the pip -e source root; imports resolve to pip -e at /orcd/pool
-TIME_LIMIT_SECONDS=172800     # keep in sync with --time=2-00:00:00 (2-day MAX on mit_preemptable)
+REPO=/home/chenxiou/proteina       # NOT the pip -e source; imports resolve to pip -e at /orcd/pool
+LAUNCHER=run_stage1_catbalanced_domaincrop_sbatch.sh
+TIME_LIMIT_SECONDS=172800          # keep in sync with --time=2-00:00:00
+
+# --- TIER -> GPU type + per-GPU batch/accum (eff batch = 4 GPU * batch * accum = 128) ---
+TIER="${TIER:-h200}"
+case "$TIER" in
+  h200) GRES=gpu:h200:4; BATCH=4; ACCUM=8  ;;  # 141 GB: batch 4 ~90 GB
+  h100) GRES=gpu:h100:4; BATCH=2; ACCUM=16 ;;  # 80 GB:  batch 2 ~70 GB
+  l40s) GRES=gpu:l40s:4; BATCH=1; ACCUM=32 ;;  # 44 GB:  batch 1 ~32 GB
+  *) echo "[$(date)] FATAL: unknown TIER=$TIER (expected h200|h100|l40s)"; exit 1 ;;
+esac
+JOBNAME="cb_dc_s1_48m_${TIER}"
+ALL_TIERS="h200 h100 l40s"
+STREAK_FILE="$REPO/store/$RUN/.noprogress_streak_$TIER"  # per-tier (a tier's bad node doesn't exclude another tier)
+EXCLUDE_FILE="$REPO/store/$RUN/.exclude_nodes_$TIER"
+MAX_NOPROGRESS=3
 RESUBMITTED=0
 TORCH_PID=0
 
-resubmit_fresh() {
-  if [ "$RESUBMITTED" -eq 0 ]; then
-    RESUBMITTED=1
-    echo "[$(date)] resubmitting fresh job"
-    (cd "$REPO" && sbatch run_stage1_catbalanced_domaincrop_sbatch.sh)
+# Resubmit THIS tier (begin=now), ONLY if no other job of this tier is already queued (anti-duplicate).
+resubmit_tier() {
+  local extra="${1:-}"
+  local existing
+  existing=$(squeue -u "$USER" -h -o "%i %j" 2>/dev/null | awk -v n="$JOBNAME" -v self="${SLURM_JOB_ID:-0}" '$2==n && $1!=self {print $1}')
+  if [ -n "$existing" ]; then
+    echo "[$(date)] anti-dup: a $JOBNAME job is already queued ($existing); NOT resubmitting tier $TIER."
+    return
   fi
+  echo "[$(date)] resubmitting tier $TIER (begin=now) ${extra}"
+  (cd "$REPO" && sbatch --job-name="$JOBNAME" --gres="$GRES" --begin=now --export=ALL,TIER="$TIER" ${extra} "$LAUNCHER")
 }
-# USR1 (sent 60s before the limit) is unreliable on Engaging -> no-op. The SIGTERM
-# trap (delivered at the limit AND on preemption) does the real time-limit work.
-trap 'echo "[$(date)] USR1 (no-op)"' USR1
+
+trap 'echo "[$(date)] USR1 (no-op; SIGTERM does the time-limit work)"' USR1
 on_term() {
   echo "[$(date)] SIGTERM at SECONDS=$SECONDS; SIGTERM torchrun so it stops cleanly."
   kill -TERM "${TORCH_PID:-0}" 2>/dev/null || true
   if [ "$SECONDS" -ge "$((TIME_LIMIT_SECONDS - 300))" ]; then
-    echo "[$(date)] near time limit -> resubmitting fresh and exiting 0."
-    resubmit_fresh
+    echo "[$(date)] near time limit -> resubmit tier $TIER and exit 0."
+    if [ "$RESUBMITTED" -eq 0 ]; then RESUBMITTED=1; resubmit_tier; fi
     exit 0
   fi
-  echo "[$(date)] early SIGTERM (preemption) -> re-raising for --requeue."
+  echo "[$(date)] early SIGTERM (preemption) -> re-raise for --requeue."
   trap - TERM
   kill -TERM "$$"
 }
@@ -77,69 +99,60 @@ export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export DIAG_DATALOADER=1   # dataloader-timing diagnostic: logs [DLTIMER] wait vs compute (low overhead)
+export DIAG_DATALOADER=1
 export TORCHINDUCTOR_CACHE_DIR=/orcd/compute/so3/001/chenxi/torchinductor_cache
 export TRITON_CACHE_DIR=/orcd/compute/so3/001/chenxi/triton_cache
 mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
 
 cd "$REPO"
-echo "[$(date)] Launching $RUN on $(hostname) GPUs $(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | tr '\n' ',' | sed s/,$//) jobid=${SLURM_JOB_ID:-?} restart=${SLURM_RESTART_COUNT:-0}"
+echo "[$(date)] Launching $RUN TIER=$TIER (batch $BATCH accum $ACCUM, eff 128) on $(hostname) GPUs $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1) jobid=${SLURM_JOB_ID:-?} restart=${SLURM_RESTART_COUNT:-0}"
 
 CKPT=$REPO/store/$RUN/checkpoints/last.ckpt
 START_MTIME=$(stat -c %Y "$CKPT" 2>/dev/null || echo 0)
 
-# torchrun spawns the 4 GPU workers as plain python processes and sets
-# RANK/WORLD_SIZE/LOCAL_RANK, which train.py reads for the manual NCCL init.
-# Use a RANDOM rendezvous port instead of torchrun --standalone's fixed port: on a
-# SHARED mit_preemptable node a co-tenant torchrun on the same port collides -> the
-# process group fails to form -> silent rc=1 ~30s after dist-init (seen 2x on node2901,
-# while node2435/2501 were fine). A unique port + rdzv-id avoids the collision.
+# Random rendezvous port (avoid torchrun --standalone fixed-port collision with co-tenants on shared nodes).
 RDZV_PORT=$(( 20000 + (RANDOM % 40000) ))
 echo "[$(date)] torchrun rendezvous 127.0.0.1:$RDZV_PORT"
 torchrun --nnodes=1 --nproc_per_node=4 --rdzv-backend=c10d --rdzv-endpoint="127.0.0.1:$RDZV_PORT" --rdzv-id="${SLURM_JOB_ID:-$$}" proteinfoundation/train.py \
     --config_name "training_$RUN" \
     --ngpus_per_node 4 \
     --nnodes 1 \
-    --batch_size 4 \
-    --accumulate_grad_batches 8 \
+    --batch_size "$BATCH" \
+    --accumulate_grad_batches "$ACCUM" \
     --resume_option allow \
     af2_ipa_weights_path=/orcd/pool/006/chenxiou/params/params_model_1_ptm.npz &
 TORCH_PID=$!
-# Wait for torchrun, RE-WAITING if a trap interrupts the wait, until it truly exits.
 RC=0
 while kill -0 "$TORCH_PID" 2>/dev/null; do
   wait "$TORCH_PID" && RC=0 || RC=$?
 done
-echo "[$(date)] torchrun exited rc=$RC"
+echo "[$(date)] torchrun exited rc=$RC (tier $TIER)"
 
 END_MTIME=$(stat -c %Y "$CKPT" 2>/dev/null || echo 0)
-STREAK_FILE="$REPO/store/$RUN/.noprogress_streak"   # consecutive no-progress crashes
-EXCLUDE_FILE="$REPO/store/$RUN/.exclude_nodes"       # nodes that crashed with no progress
-MAX_NOPROGRESS=3                                      # give up after this many consecutive no-progress crashes
 NODE="${SLURMD_NODENAME:-$(hostname -s)}"; NODE="${NODE%%.*}"
 
 if [ "$RESUBMITTED" -ne 0 ]; then
   echo "[$(date)] already resubmitted by the SIGTERM trap; not resubmitting again."
 elif [ "$RC" -eq 0 ]; then
-  echo "[$(date)] clean exit (max_steps reached / fit complete); chain terminates."
+  echo "[$(date)] clean exit (max_steps / fit complete) on tier $TIER; CANCEL the other tiers + terminate."
   rm -f "$STREAK_FILE" "$EXCLUDE_FILE"
+  for t in $ALL_TIERS; do
+    [ "$t" = "$TIER" ] && continue
+    scancel -u "$USER" --partition=mit_preemptable --name="cb_dc_s1_48m_$t" 2>/dev/null && echo "[$(date)] cancelled tier $t (training complete)"
+  done
 elif [ "$END_MTIME" -gt "$START_MTIME" ]; then
-  # Progress this run (a crash after a checkpoint): node is fine and last.ckpt is fresh
-  # -> reset the no-progress streak/excludes, resubmit on all nodes.
-  echo "[$(date)] non-zero exit AFTER checkpoint progress; resubmitting fresh (reset streak/excludes)."
+  echo "[$(date)] non-zero exit AFTER checkpoint progress; resubmit tier $TIER (reset streak/excludes)."
   rm -f "$STREAK_FILE" "$EXCLUDE_FILE"
-  cd "$REPO" && sbatch run_stage1_catbalanced_domaincrop_sbatch.sh
+  resubmit_tier
 else
-  # NO progress this run: a startup fault (bad GPU/ECC, NCCL, node) or a deterministic
-  # bug. Exclude this node and resubmit, capping consecutive no-progress retries.
   STREAK=$(cat "$STREAK_FILE" 2>/dev/null || echo 0); STREAK=$((STREAK + 1)); echo "$STREAK" > "$STREAK_FILE"
   echo "$NODE" >> "$EXCLUDE_FILE"
   EXCLUDES=$(sort -u "$EXCLUDE_FILE" | paste -sd, -)
   if [ "$STREAK" -ge "$MAX_NOPROGRESS" ]; then
-    echo "[$(date)] NO-progress crash #$STREAK on $NODE (>= $MAX_NOPROGRESS consecutive) -> likely a deterministic bug, not transient node faults. STOPPING. Crashed nodes: $EXCLUDES. Investigate, then resubmit by hand."
+    echo "[$(date)] NO-progress crash #$STREAK on $NODE (>= $MAX_NOPROGRESS) for tier $TIER -> STOPPING this tier (other tiers continue). Crashed nodes: $EXCLUDES."
   else
-    echo "[$(date)] NO-progress crash #$STREAK on $NODE; resubmitting with --exclude=$EXCLUDES."
-    cd "$REPO" && sbatch --exclude="$EXCLUDES" run_stage1_catbalanced_domaincrop_sbatch.sh
+    echo "[$(date)] NO-progress crash #$STREAK on $NODE; resubmit tier $TIER with --exclude=$EXCLUDES."
+    resubmit_tier "--exclude=$EXCLUDES"
   fi
 fi
 exit $RC
