@@ -16,7 +16,8 @@ submit_tier() {  # $1=tier  $2=gres  $3=begin
     return
   fi
   echo "tier $1: submitting (gres $2, begin $3)"
-  sbatch --job-name="cb_dc_s1_48m_$1" --gres="$2" --begin="$3" --export=ALL,TIER="$1" "$L"
+  # the launcher derives the tier from --job-name (cb_dc_s1_48m_<tier>); --export=ALL just carries the env.
+  sbatch --job-name="cb_dc_s1_48m_$1" --gres="$2" --begin="$3" --export=ALL "$L"
 }
 
 submit_tier h200 gpu:h200:4 now

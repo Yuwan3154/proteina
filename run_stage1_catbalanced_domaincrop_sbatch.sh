@@ -41,15 +41,17 @@ REPO=/home/chenxiou/proteina       # NOT the pip -e source; imports resolve to p
 LAUNCHER=run_stage1_catbalanced_domaincrop_sbatch.sh
 TIME_LIMIT_SECONDS=172800          # keep in sync with --time=2-00:00:00
 
-# --- TIER -> GPU type + per-GPU batch/accum (eff batch = 4 GPU * batch * accum = 128) ---
-TIER="${TIER:-h200}"
+# --- TIER from the SLURM-set job name (cb_dc_s1_48m_<tier>) -> robust, NO --export dependency ---
+JOBNAME="${SLURM_JOB_NAME:-cb_dc_s1_48m_h200}"
+TIER="${JOBNAME##*_}"
 case "$TIER" in
-  h200) GRES=gpu:h200:4; BATCH=4; ACCUM=8  ;;  # 141 GB: batch 4 ~90 GB
-  h100) GRES=gpu:h100:4; BATCH=2; ACCUM=16 ;;  # 80 GB:  batch 2 ~70 GB
-  l40s) GRES=gpu:l40s:4; BATCH=1; ACCUM=32 ;;  # 44 GB:  batch 1 ~32 GB
-  *) echo "[$(date)] FATAL: unknown TIER=$TIER (expected h200|h100|l40s)"; exit 1 ;;
+  h200) GRES=gpu:h200:4 ;;
+  h100) GRES=gpu:h100:4 ;;
+  l40s) GRES=gpu:l40s:4 ;;
+  *) echo "[$(date)] WARN: job-name '$JOBNAME' has no known tier suffix -> default h200"; TIER=h200; JOBNAME=cb_dc_s1_48m_h200; GRES=gpu:h200:4 ;;
 esac
-JOBNAME="cb_dc_s1_48m_${TIER}"
+# batch/accum are set from the ACTUAL GPU at runtime (below, after the alloc) -> OOM-safe regardless of how
+# TIER/gres were requested; eff batch always 4*batch*accum = 128. TIER/GRES only target WHERE to resubmit.
 ALL_TIERS="h200 h100 l40s"
 STREAK_FILE="$REPO/store/$RUN/.noprogress_streak_$TIER"  # per-tier (a tier's bad node doesn't exclude another tier)
 EXCLUDE_FILE="$REPO/store/$RUN/.exclude_nodes_$TIER"
@@ -67,7 +69,8 @@ resubmit_tier() {
     return
   fi
   echo "[$(date)] resubmitting tier $TIER (begin=now) ${extra}"
-  (cd "$REPO" && sbatch --job-name="$JOBNAME" --gres="$GRES" --begin=now --export=ALL,TIER="$TIER" ${extra} "$LAUNCHER")
+  # --job-name encodes the tier (the new job re-derives TIER from it); --export=ALL just carries the env.
+  (cd "$REPO" && sbatch --job-name="$JOBNAME" --gres="$GRES" --begin=now --export=ALL ${extra} "$LAUNCHER")
 }
 
 trap 'echo "[$(date)] USR1 (no-op; SIGTERM does the time-limit work)"' USR1
@@ -105,7 +108,15 @@ export TRITON_CACHE_DIR=/orcd/compute/so3/001/chenxi/triton_cache
 mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
 
 cd "$REPO"
-echo "[$(date)] Launching $RUN TIER=$TIER (batch $BATCH accum $ACCUM, eff 128) on $(hostname) GPUs $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1) jobid=${SLURM_JOB_ID:-?} restart=${SLURM_RESTART_COUNT:-0}"
+# batch/accum from the ACTUAL allocated GPU (OOM-safe; eff batch always 4*batch*accum = 128)
+GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+case "$GPU_NAME" in
+  *H200*) BATCH=4; ACCUM=8  ;;  # 141 GB: batch 4 ~90 GB
+  *H100*) BATCH=2; ACCUM=16 ;;  # 80 GB:  batch 2 ~70 GB
+  *L40S*|*L40*) BATCH=1; ACCUM=32 ;;  # 44 GB:  batch 1 ~32 GB
+  *) echo "[$(date)] WARN: unrecognized GPU '$GPU_NAME' -> safe default batch 1/accum 32"; BATCH=1; ACCUM=32 ;;
+esac
+echo "[$(date)] Launching $RUN TIER=$TIER GPU='$GPU_NAME' -> batch $BATCH accum $ACCUM (eff 128) on $(hostname) jobid=${SLURM_JOB_ID:-?} restart=${SLURM_RESTART_COUNT:-0}"
 
 CKPT=$REPO/store/$RUN/checkpoints/last.ckpt
 START_MTIME=$(stat -c %Y "$CKPT" 2>/dev/null || echo 0)
