@@ -320,9 +320,22 @@ def compose_inference_cfg(args):
         if args.max_nsamples is not None:
             cfg = OmegaConf.merge(cfg, {"max_nsamples": args.max_nsamples})
             logger.info(f"Overriding max_nsamples to {args.max_nsamples}")
-        if args.nsamples_per_protein is not None:
-            cfg = OmegaConf.merge(cfg, {"nsamples_per_len": args.nsamples_per_protein})
-            logger.info(f"Overriding nsamples_per_len to {args.nsamples_per_protein}")
+        nsp = args.nsamples_per_protein
+        if nsp is None and os.getenv("PROTEINA_NSAMPLES_PER_PROTEIN"):
+            nsp = int(os.getenv("PROTEINA_NSAMPLES_PER_PROTEIN"))
+        if nsp is not None:
+            cfg = OmegaConf.merge(cfg, {"nsamples_per_len": nsp})
+            logger.info(f"Overriding nsamples_per_len to {nsp}")
+
+        # Inference precision + checkpoint_mode (CLI override > env > cfg/default).
+        prec = getattr(args, "precision", None) or os.getenv("PROTEINA_INFERENCE_PRECISION")
+        if prec:
+            cfg = OmegaConf.merge(cfg, {"inference_precision": prec})
+            logger.info(f"Inference precision: {prec}")
+        ckpt_mode = getattr(args, "checkpoint_mode", None) or os.getenv("PROTEINA_CHECKPOINT_MODE")
+        if ckpt_mode:
+            cfg = OmegaConf.merge(cfg, {"checkpoint_mode": ckpt_mode})
+            logger.info(f"Checkpoint mode override: {ckpt_mode}")
 
         # Conditioning-mode override: drives cfg.fold_cond and the per-protein cath_codes.
         cath_codes_override = None
@@ -363,24 +376,30 @@ def _resolve_checkpoint(cfg):
     if not run_name_:
         raise ValueError("No run_name_ found in config. Cannot automatically resolve checkpoint without run_name_.")
     ckpt_dir = os.path.join(".", "store", run_name_, "checkpoints")
-    if checkpoint_mode == "last":
-        from proteinfoundation.utils.fetch_last_ckpt import fetch_last_ckpt
-        last_ckpt_name = fetch_last_ckpt(ckpt_dir)
-        if last_ckpt_name is None:
+    from proteinfoundation.utils.fetch_last_ckpt import fetch_best_ckpt, fetch_last_ckpt
+    want_ema = checkpoint_mode.endswith("_EMA")  # best_EMA / last_EMA -> load the '-EMA' companion
+    base_mode = checkpoint_mode[:-4] if want_ema else checkpoint_mode  # 'best' | 'last'
+    if base_mode == "last":
+        name = fetch_last_ckpt(ckpt_dir)
+        if name is None:
             raise FileNotFoundError(f"No last checkpoint found in {ckpt_dir}")
-        ckpt_file = os.path.join(ckpt_dir, last_ckpt_name)
-    else:  # "best"
-        from proteinfoundation.utils.fetch_last_ckpt import fetch_best_ckpt
-        best_ckpt_name = fetch_best_ckpt(ckpt_dir)
-        if best_ckpt_name is None:
-            logger.warning(f"No best checkpoint found in {ckpt_dir}, falling back to last checkpoint")
-            from proteinfoundation.utils.fetch_last_ckpt import fetch_last_ckpt
-            last_ckpt_name = fetch_last_ckpt(ckpt_dir)
-            if last_ckpt_name is None:
+    else:  # 'best'
+        name = fetch_best_ckpt(ckpt_dir)
+        if name is None:
+            logger.warning(f"No best checkpoint found in {ckpt_dir}, falling back to last")
+            name = fetch_last_ckpt(ckpt_dir)
+            if name is None:
                 raise FileNotFoundError(f"No checkpoint found in {ckpt_dir}")
-            ckpt_file = os.path.join(ckpt_dir, last_ckpt_name)
-        else:
-            ckpt_file = os.path.join(ckpt_dir, best_ckpt_name)
+    if want_ema:
+        ema_name = (name[: -len(".ckpt")] + "-EMA.ckpt") if name.endswith(".ckpt") else name + "-EMA.ckpt"
+        ckpt_file = os.path.join(ckpt_dir, ema_name)
+        if not os.path.exists(os.path.expanduser(ckpt_file)):
+            raise FileNotFoundError(
+                f"checkpoint_mode='{checkpoint_mode}' but the EMA companion was not found: {ckpt_file}. "
+                f"(Base '{name}' exists; its '-EMA' companion may have been deleted by top-k rotation.)"
+            )
+    else:
+        ckpt_file = os.path.join(ckpt_dir, name)
     ckpt_file = os.path.expanduser(ckpt_file)
     logger.info(f"Using auto-resolved checkpoint {ckpt_file} (mode: {checkpoint_mode})")
     return ckpt_file
@@ -431,7 +450,14 @@ def load_model_for_worker(cfg, *, force_compile, dynamic_shapes=True, verbose=Fa
     if hasattr(model, "nn") and model.nn is not None:
         model.nn._compile_dynamic = bool(dynamic_shapes)
 
-    trainer = L.Trainer(accelerator="gpu", devices=1)
+    _prec_map = {"fp32": "32-true", "fp16": "16-mixed", "bf16": "bf16-mixed"}
+    _prec = cfg.get("inference_precision", None)
+    _trainer_prec = _prec_map.get(_prec) if _prec else None
+    if _trainer_prec:
+        trainer = L.Trainer(accelerator="gpu", devices=1, precision=_trainer_prec)
+        logger.info(f"Trainer precision={_trainer_prec} (inference_precision={_prec})")
+    else:
+        trainer = L.Trainer(accelerator="gpu", devices=1)
     logger.info(f"Loaded model on worker (force_compile={force_compile}, dynamic_shapes={dynamic_shapes})")
     return model, nn_ag, trainer
 
@@ -826,6 +852,22 @@ def main():
         help="Pass dynamic=True to torch.compile so a single compiled graph handles all "
              "protein lengths (no per-length recompile). --no-dynamic_shapes restores static-shape "
              "compilation.",
+    )
+    parser.add_argument(
+        "--precision",
+        type=str,
+        default=None,
+        choices=["fp32", "fp16", "bf16"],
+        help="Inference Trainer precision: fp32=32-true (default), fp16=16-mixed, bf16=bf16-mixed. "
+             "Falls back to env PROTEINA_INFERENCE_PRECISION when omitted.",
+    )
+    parser.add_argument(
+        "--checkpoint_mode",
+        type=str,
+        default=None,
+        choices=["best", "last", "best_EMA", "last_EMA"],
+        help="Which checkpoint to load. best/last = non-EMA; best_EMA/last_EMA = the '-EMA' companion. "
+             "Falls back to env PROTEINA_CHECKPOINT_MODE, then cfg.checkpoint_mode, then 'best'.",
     )
 
     args = parser.parse_args()
