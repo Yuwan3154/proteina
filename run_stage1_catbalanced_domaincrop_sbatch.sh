@@ -118,6 +118,19 @@ case "$GPU_NAME" in
 esac
 echo "[$(date)] Launching $RUN TIER=$TIER GPU='$GPU_NAME' -> batch $BATCH accum $ACCUM (eff 128) on $(hostname) jobid=${SLURM_JOB_ID:-?} restart=${SLURM_RESTART_COUNT:-0}"
 
+# PATCH (user 2026-06-19): the moment a FAST tier (H200/H100) secures a node, purge any pending L40S
+# backup. Else, after this fast job ends, the ABUNDANT L40S would almost certainly grab the freed cap
+# before H200/H100 re-compete -> silently drop to 4x-slower L40S. L40S thus runs ONLY while fast cards
+# are stuck (cold start, the +24h fallback); once a fast card is secured we commit to fast-or-wait.
+# Guarded (|| true) so a squeue/scancel hiccup never aborts training. Re-add L40S via submit_tiered.sh.
+if [ "$TIER" != "l40s" ]; then
+  pend_l40s=$(squeue -u "$USER" -h -t PENDING --name=cb_dc_s1_48m_l40s -o "%i" 2>/dev/null || true)
+  if [ -n "$pend_l40s" ]; then
+    echo "[$(date)] tier $TIER secured a node -> purging pending L40S backup: $(echo $pend_l40s | tr '\n' ' ')"
+    scancel -t PENDING -u "$USER" --partition=mit_preemptable --name=cb_dc_s1_48m_l40s 2>/dev/null || true
+  fi
+fi
+
 CKPT=$REPO/store/$RUN/checkpoints/last.ckpt
 START_MTIME=$(stat -c %Y "$CKPT" 2>/dev/null || echo 0)
 
