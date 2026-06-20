@@ -70,6 +70,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 AF2RANK_TOPK_SUBDIR = "af2rank_on_proteinebm_top_k"
+AF2RANK_ORACLE_SUBDIR = "af2rank_on_oracle_top_k"
 M1_SUBDIR = "af2rank_analysis"
 M2_SUBDIR = "af2rank_analysis_model_2_ptm"
 PREDICTED_SUBDIR = "predicted_structures"
@@ -124,7 +125,7 @@ def _read_energy_df(
 
 
 def _read_af2rank_scores(
-    inference_dir: Path, protein_id: str
+    inference_dir: Path, protein_id: str, af2rank_subdir: str = AF2RANK_TOPK_SUBDIR
 ) -> Optional[pd.DataFrame]:
     """Read m1+m2 AF2Rank score CSVs from tar/loose dir; inner-join; compute min_*.
 
@@ -132,8 +133,8 @@ def _read_af2rank_scores(
     ``ptm_m1, ptm_m2, min_ptm, composite_m1, composite_m2, min_composite,
     plddt_m1, plddt_m2, tm_ref_pred_m1, tm_ref_pred_m2, min_tm_ref_pred``.
     """
-    m1_rel = Path(AF2RANK_TOPK_SUBDIR) / M1_SUBDIR / f"af2rank_scores_{protein_id}.csv"
-    m2_rel = Path(AF2RANK_TOPK_SUBDIR) / M2_SUBDIR / f"af2rank_scores_{protein_id}.csv"
+    m1_rel = Path(af2rank_subdir) / M1_SUBDIR / f"af2rank_scores_{protein_id}.csv"
+    m2_rel = Path(af2rank_subdir) / M2_SUBDIR / f"af2rank_scores_{protein_id}.csv"
     m1_text = read_protein_text(inference_dir, protein_id, m1_rel)
     m2_text = read_protein_text(inference_dir, protein_id, m2_rel)
     if m1_text is None or m2_text is None:
@@ -218,6 +219,9 @@ def _analyze_protein_readonly(
     protein_id: str,
     proteinebm_subdir: str,
     cutoffs: List[int],
+    ranking_mode: str = "energy",
+    top_k: int = 1,
+    af2rank_subdir: str = AF2RANK_TOPK_SUBDIR,
 ) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]], Optional[str]]:
     """Read-only analysis for one protein.
 
@@ -231,7 +235,10 @@ def _analyze_protein_readonly(
     if energy_df is None or energy_df.empty:
         return None, [], "missing_or_empty_energy_csv"
 
-    af2_df = _read_af2rank_scores(inference_dir, protein_id)
+    if ranking_mode == "oracle" and "tm_ref_template" not in energy_df.columns:
+        return None, [], "missing_tm_ref_template_for_oracle"
+
+    af2_df = _read_af2rank_scores(inference_dir, protein_id, af2rank_subdir)
     scored_files = set()
     if af2_df is not None:
         scored_files = set(af2_df["structure_file"].astype(str))
@@ -261,6 +268,27 @@ def _analyze_protein_readonly(
             assert af2_df is not None
             sub_scores = af2_df[af2_df["structure_file"].astype(str).isin(scored_in_subset)]
             _fill_max_metrics(result, sub_scores)
+        elif ranking_mode == "oracle":
+            # Oracle: pick the top-k samples by true GT TM (tm_ref_template) within
+            # this window and queue them all for AF2Rank scoring (separate subdir).
+            cand = subset.copy()
+            cand["tm_ref_template"] = pd.to_numeric(cand["tm_ref_template"], errors="coerce")
+            cand = cand.dropna(subset=["tm_ref_template"]).sort_values(
+                "tm_ref_template", ascending=False
+            ).head(int(top_k))
+            if len(cand):
+                result["fallback_used"] = True
+                result["fallback_sample_index"] = int(cand.iloc[0]["sample_index"])
+                result["fallback_energy"] = float(cand.iloc[0]["energy"])
+                for _, row in cand.iterrows():
+                    fallback_items.append({
+                        "protein_id": protein_id,
+                        "structure_file": str(row["structure_file"]),
+                        "structure_path": str(row["structure_path"]),
+                        "sample_index": int(row["sample_index"]),
+                        "energy": float(row["energy"]),
+                        "cutoff": int(N),
+                    })
         else:
             min_row = subset.sort_values("energy", ascending=True).iloc[0]
             result["fallback_used"] = True
@@ -361,6 +389,7 @@ def _run_fallback_scoring(
     use_cuequivariance_attention: bool,
     use_cuequivariance_multiplicative_update: bool,
     tar_protein_dirs: bool = True,
+    af2rank_subdir: str = AF2RANK_TOPK_SUBDIR,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
     """Run AF2Rank (m1 + m2) on fallback templates.
 
@@ -472,7 +501,7 @@ def _run_fallback_scoring(
         out: Dict[str, set] = {}
         for cfg in protein_configs:
             pid = cfg["protein_id"]
-            scores_csv = inference_dir / pid / AF2RANK_TOPK_SUBDIR / out_subdir / f"af2rank_scores_{pid}.csv"
+            scores_csv = inference_dir / pid / af2rank_subdir / out_subdir / f"af2rank_scores_{pid}.csv"
             if scores_csv.exists():
                 try:
                     df = pd.read_csv(scores_csv)
@@ -518,7 +547,7 @@ def _run_fallback_scoring(
                     except Exception as e:
                         logger.error("%s: reset_reference failed: %s; skipping", pid, e)
                         continue
-                out_dir = inference_dir / pid / AF2RANK_TOPK_SUBDIR / out_subdir
+                out_dir = inference_dir / pid / af2rank_subdir / out_subdir
                 predicted_dir = out_dir / PREDICTED_SUBDIR
                 predicted_dir.mkdir(parents=True, exist_ok=True)
                 scores_csv = out_dir / f"af2rank_scores_{pid}.csv"
@@ -576,12 +605,13 @@ def _run_fallback_scoring(
 # Per-protein cache JSON (lives inside the protein dir)
 # ---------------------------------------------------------------------------
 
-def _per_protein_cache_rel_path() -> Path:
-    return Path(PER_PROTEIN_CACHE_NAME)
+def _per_protein_cache_rel_path(cache_name: str = PER_PROTEIN_CACHE_NAME) -> Path:
+    return Path(cache_name)
 
 
-def _read_per_protein_cache(inference_dir: Path, protein_id: str) -> Optional[Dict[str, Any]]:
-    text = read_protein_text(inference_dir, protein_id, _per_protein_cache_rel_path())
+def _read_per_protein_cache(inference_dir: Path, protein_id: str,
+                            cache_name: str = PER_PROTEIN_CACHE_NAME) -> Optional[Dict[str, Any]]:
+    text = read_protein_text(inference_dir, protein_id, _per_protein_cache_rel_path(cache_name))
     if text is None:
         return None
     try:
@@ -590,13 +620,14 @@ def _read_per_protein_cache(inference_dir: Path, protein_id: str) -> Optional[Di
         return None
 
 
-def _write_per_protein_cache(inference_dir: Path, protein_id: str, cache: Dict[str, Any]) -> None:
+def _write_per_protein_cache(inference_dir: Path, protein_id: str, cache: Dict[str, Any],
+                             cache_name: str = PER_PROTEIN_CACHE_NAME) -> None:
     """Write the cache JSON into the (already-extracted) protein dir."""
     protein_dir = inference_dir / protein_id
     if not protein_dir.is_dir():
         logger.warning("%s: cannot write per-protein cache; dir not extracted", protein_id)
         return
-    (protein_dir / PER_PROTEIN_CACHE_NAME).write_text(json.dumps(cache, indent=2))
+    (protein_dir / cache_name).write_text(json.dumps(cache, indent=2))
 
 
 def _cache_matches(cache: Optional[Dict[str, Any]], cutoffs: List[int]) -> bool:
@@ -922,6 +953,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Output directory for aggregate CSVs/JSON/plots.")
     p.add_argument("--af2rank_top_k", "--top_k", dest="af2rank_top_k", type=int, default=5,
                    help="Top-k size used during original prediction pipeline run (default: 5).")
+    p.add_argument("--ranking_mode", choices=["energy", "oracle"], default="energy",
+                   help="Selection criterion. 'energy' (default) = ProteinEBM min-energy, reads/writes "
+                        "af2rank_on_proteinebm_top_k (the canonical EBM run). 'oracle' = top-k by "
+                        "tm_ref_template (true GT TM), reads/writes a SEPARATE af2rank_on_oracle_top_k "
+                        "(never touches the EBM subdir). Oracle requires --cif_dir + enriched "
+                        "proteinebm_scores containing tm_ref_template.")
     p.add_argument("--recycles", type=int, default=3,
                    help="AF2Rank recycles for fallback scoring (default: 3).")
     p.add_argument("--ptm_cutoff", type=float, default=0.7,
@@ -962,8 +999,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     cif_dir = args.cif_dir.strip() if args.cif_dir else None
     has_gt_mode = bool(cif_dir)
     cutoffs = _parse_cutoffs(args.cutoffs)
-    logger.info("Cutoffs: %s; mode: %s",
-                cutoffs, "evaluation (with GT)" if has_gt_mode else "prediction-only")
+    ranking_mode = args.ranking_mode
+    if ranking_mode == "oracle":
+        if not has_gt_mode:
+            raise SystemExit("--ranking_mode oracle requires --cif_dir (GT needed for "
+                             "tm_ref_template ranking + tm_ref_pred metric)")
+        af2rank_subdir = AF2RANK_ORACLE_SUBDIR
+        ranking_top_k = int(args.af2rank_top_k)
+        cache_name = "sampling_convergence_oracle_summary.json"
+    else:
+        af2rank_subdir = AF2RANK_TOPK_SUBDIR
+        ranking_top_k = 1  # energy fallback selects the single min-energy template
+        cache_name = PER_PROTEIN_CACHE_NAME
+    logger.info("Cutoffs: %s; mode: %s; ranking=%s (af2rank_subdir=%s, top_k=%d, cache=%s)",
+                cutoffs, "evaluation (with GT)" if has_gt_mode else "prediction-only",
+                ranking_mode, af2rank_subdir, ranking_top_k, cache_name)
 
     global_protein_ids = _load_protein_ids(args.csv_file, args.id_col)
     logger.info("Loaded %d protein IDs from %s", len(global_protein_ids), args.csv_file)
@@ -985,7 +1035,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     def _is_complete(pid: str) -> bool:
         if not args.filter_existing:
             return False
-        cache = _read_per_protein_cache(inference_dir, pid)
+        cache = _read_per_protein_cache(inference_dir, pid, cache_name)
         if not _cache_matches(cache, cutoffs):
             return False
         if not _cache_has_no_pending_fallbacks(cache, cutoffs):
@@ -1011,6 +1061,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     for pid in needing:
         cache, fb, status = _analyze_protein_readonly(
             inference_dir, pid, args.proteinebm_analysis_subdir, cutoffs,
+            ranking_mode=ranking_mode, top_k=ranking_top_k, af2rank_subdir=af2rank_subdir,
         )
         if status is not None:
             skipped[pid] = status
@@ -1026,11 +1077,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Load cached results for proteins we already considered complete
     for pid in done:
-        cache = _read_per_protein_cache(inference_dir, pid)
+        cache = _read_per_protein_cache(inference_dir, pid, cache_name)
         if cache is None:
             logger.warning("%s: marked complete but cache read returned None; re-analyzing", pid)
             cache, fb, status = _analyze_protein_readonly(
                 inference_dir, pid, args.proteinebm_analysis_subdir, cutoffs,
+                ranking_mode=ranking_mode, top_k=ranking_top_k, af2rank_subdir=af2rank_subdir,
             )
             if status is not None:
                 skipped[pid] = status
@@ -1052,6 +1104,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             use_cuequivariance_attention=args.use_cuequivariance_attention,
             use_cuequivariance_multiplicative_update=args.use_cuequivariance_multiplicative_update,
             tar_protein_dirs=args.tar_protein_dirs,
+            af2rank_subdir=af2rank_subdir,
         )
         # After scoring, re-read AF2Rank CSVs and recompute the max metrics
         # for EVERY cutoff (not just the fallback ones).  A fallback template
@@ -1065,7 +1118,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             if cache is None:
                 continue
             energy_df = _read_energy_df(inference_dir, pid, args.proteinebm_analysis_subdir)
-            af2_df = _read_af2rank_scores(inference_dir, pid)
+            af2_df = _read_af2rank_scores(inference_dir, pid, af2rank_subdir)
             if energy_df is None or af2_df is None:
                 continue
             scored_files = set(af2_df["structure_file"].astype(str))
@@ -1074,7 +1127,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                 subset = energy_df[energy_df["sample_index"] < N]
                 if subset.empty:
                     continue
-                scored_in_subset = set(subset["structure_file"].astype(str)) & scored_files
+                if ranking_mode == "oracle":
+                    # Restrict to exactly this window's top-k by GT TM (mirrors the
+                    # Case-B selection) so the oracle line = max af2rank over the
+                    # top-k-by-tm_ref_template within N, not over all scored samples.
+                    cand = subset.copy()
+                    cand["tm_ref_template"] = pd.to_numeric(cand["tm_ref_template"], errors="coerce")
+                    cand = cand.dropna(subset=["tm_ref_template"]).sort_values(
+                        "tm_ref_template", ascending=False
+                    ).head(int(ranking_top_k))
+                    scored_in_subset = set(cand["structure_file"].astype(str)) & scored_files
+                else:
+                    scored_in_subset = set(subset["structure_file"].astype(str)) & scored_files
                 if not scored_in_subset:
                     # Still no cached templates within this cutoff — fallback
                     # for this cutoff must have failed; leave the record as-is.
@@ -1096,7 +1160,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "min_tm_ref_pred" in af2_df.columns
                 and pd.to_numeric(af2_df["min_tm_ref_pred"], errors="coerce").notna().any()
             )
-            _write_per_protein_cache(inference_dir, pid, cache)
+            _write_per_protein_cache(inference_dir, pid, cache, cache_name)
         # Re-tar the protein dirs we restored for fallback scoring
         if args.tar_protein_dirs:
             scored_pids = sorted(fallback_by_protein.keys())
@@ -1109,14 +1173,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             stats = restore_selected_protein_dirs(inference_dir, cache_to_persist)
             logger.info("tar_restore sampling_convergence (cache-only): %s", stats)
             for pid in cache_to_persist:
-                _write_per_protein_cache(inference_dir, pid, per_protein_caches[pid])
+                _write_per_protein_cache(inference_dir, pid, per_protein_caches[pid], cache_name)
             stats = pack_protein_dirs(inference_dir, cache_to_persist, delete_after=True)
             logger.info("tar_pack sampling_convergence (cache-only): %s", stats)
         elif cache_to_persist:
             # Loose layout — write only into dirs that exist on disk.
             for pid in cache_to_persist:
                 if (inference_dir / pid).is_dir():
-                    _write_per_protein_cache(inference_dir, pid, per_protein_caches[pid])
+                    _write_per_protein_cache(inference_dir, pid, per_protein_caches[pid], cache_name)
 
     # ── Phase 4: assemble long rows for this shard's proteins ───────────────
     for pid, cache in per_protein_caches.items():
