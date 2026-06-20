@@ -261,21 +261,44 @@ def _analyze_protein_readonly(
             cutoff_results[N] = result
             continue
 
-        scored_in_subset = set(subset["structure_file"].astype(str)) & scored_files
+        # Candidate set for this window. Energy: all samples (Case A picks the
+        # globally-scored top-k that fall inside; Case B fallback = min-energy).
+        # Oracle: exactly this window's top-k by GT TM (tm_ref_template), used for
+        # BOTH the cache-hit (Case A) and fallback paths so the re-run is strict.
+        if ranking_mode == "oracle":
+            cand = subset.copy()
+            cand["tm_ref_template"] = pd.to_numeric(cand["tm_ref_template"], errors="coerce")
+            cand = cand.dropna(subset=["tm_ref_template"]).sort_values(
+                "tm_ref_template", ascending=False
+            ).head(int(top_k))
+            window_files = set(cand["structure_file"].astype(str))
+        else:
+            cand = None
+            window_files = set(subset["structure_file"].astype(str))
+
+        scored_in_subset = window_files & scored_files
         result["n_scored_in_cutoff"] = len(scored_in_subset)
 
         if scored_in_subset:
             assert af2_df is not None
             sub_scores = af2_df[af2_df["structure_file"].astype(str).isin(scored_in_subset)]
             _fill_max_metrics(result, sub_scores)
+            # Oracle cache-miss safety: queue any window top-k not yet scored.
+            if ranking_mode == "oracle" and cand is not None:
+                unscored = cand[~cand["structure_file"].astype(str).isin(scored_files)]
+                if len(unscored):
+                    result["fallback_used"] = True
+                    for _, row in unscored.iterrows():
+                        fallback_items.append({
+                            "protein_id": protein_id,
+                            "structure_file": str(row["structure_file"]),
+                            "structure_path": str(row["structure_path"]),
+                            "sample_index": int(row["sample_index"]),
+                            "energy": float(row["energy"]),
+                            "cutoff": int(N),
+                        })
         elif ranking_mode == "oracle":
-            # Oracle: pick the top-k samples by true GT TM (tm_ref_template) within
-            # this window and queue them all for AF2Rank scoring (separate subdir).
-            cand = subset.copy()
-            cand["tm_ref_template"] = pd.to_numeric(cand["tm_ref_template"], errors="coerce")
-            cand = cand.dropna(subset=["tm_ref_template"]).sort_values(
-                "tm_ref_template", ascending=False
-            ).head(int(top_k))
+            # Oracle, none of this window's top-k scored yet: queue them all.
             if len(cand):
                 result["fallback_used"] = True
                 result["fallback_sample_index"] = int(cand.iloc[0]["sample_index"])
