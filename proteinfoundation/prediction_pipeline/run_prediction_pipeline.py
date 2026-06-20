@@ -55,6 +55,7 @@ import pandas as pd
 import torch
 
 from proteinfoundation.prediction_pipeline.pipeline_cli_utils import parallel_incremental_filter_args
+from proteinfoundation.prediction_pipeline.usalign_tabular import resolve_usalign_exe
 from proteinfoundation.prediction_pipeline.sharding_utils import (
     add_shard_args,
     build_shard_cli_args,
@@ -384,6 +385,7 @@ def step_af2rank_scoring(
     tar_protein_dirs: bool = True,
     dynamic_resharding: bool = True,
     progress_check_workers: int | None = None,
+    usalign_path: str | None = None,
 ) -> bool:
     """Run AF2Rank scoring (parallel_af2rank_scoring.py). Requires --cif_dir
     because AF2Rank always needs a reference structure for scoring."""
@@ -399,6 +401,8 @@ def step_af2rank_scoring(
         *parallel_incremental_filter_args(not rerun),
         "--af2rank_backend", backend,
     ]
+    if usalign_path:
+        cmd.extend(["--usalign_path", usalign_path])
     if regenerate_plots:
         cmd.append("--regenerate_plots")
     if backend == "openfold":
@@ -442,6 +446,7 @@ def step_af2rank_topk(
     segment_min_len: int = 50,
     mask_inter_segment: bool = True,
     af2rank_subdir: str = "af2rank_on_proteinebm_top_k",
+    usalign_path: str | None = None,
 ) -> bool:
     """Run AF2Rank on ProteinEBM top-k templates.
 
@@ -463,6 +468,8 @@ def step_af2rank_topk(
         "--proteinebm_analysis_subdir", proteinebm_analysis_subdir,
         "--af2rank_subdir", af2rank_subdir,
     ]
+    if usalign_path:
+        cmd.extend(["--usalign_path", usalign_path])
     if segment_mode == "joint":
         cmd.extend(["--segment_mode", "joint", "--segments_col", segments_col,
                     "--segment_min_len", str(segment_min_len)])
@@ -562,6 +569,7 @@ def step_central_analysis(
     dynamic_resharding: bool = True,
     progress_check_workers: int | None = None,
     af2rank_subdir: str = "af2rank_on_proteinebm_top_k",
+    usalign_path: str | None = None,
 ) -> bool:
     """Run centralized TM analysis after scorer outputs and prediction PDBs exist.
     When cif_dir is provided, GT TM-score columns are added to the per-protein
@@ -581,6 +589,8 @@ def step_central_analysis(
         "--af2rank_subdir",
         af2rank_subdir,
     ]
+    if usalign_path:
+        cmd.extend(["--usalign_path", usalign_path])
     if cif_dir:
         cmd.extend(["--cif_dir", cif_dir])
     if num_workers is not None:
@@ -1378,6 +1388,24 @@ def main(argv: list[str] | None = None):
     logger.info(f"num_workers (CPU, analysis etc.): {resolve_num_workers(args.num_workers)}")
     skip_analysis = args.skip_analysis
 
+    # Resolve USalign ONCE up front and export it so every child step/subprocess
+    # (af2rank scoring, top-k refinement, central analysis — all of which inherit
+    # os.environ) uses the explicit path rather than only searching PATH. Fail
+    # loudly here instead of per-template deep in scoring. USalign is needed for
+    # GT TM-score columns (scoring/analysis with a reference) and for AF2Rank.
+    needs_usalign = bool(
+        has_gt
+        and not (args.skip_scoring and skip_analysis and int(args.af2rank_top_k) == 0)
+    )
+    resolved_usalign = resolve_usalign_exe(args.usalign_path, required=needs_usalign)
+    if resolved_usalign:
+        os.environ["USALIGN_PATH"] = resolved_usalign
+        logger.info(f"USalign resolved: {resolved_usalign}")
+    elif needs_usalign:
+        # resolve_usalign_exe(required=True) would have raised; defensive only.
+        logger.error("USalign required but not resolved; aborting.")
+        sys.exit(1)
+
     # ── Step 1: Resolve working CSV (parse --input or use --dataset_file directly) ──
     if input_mode == "input":
         logger.info("\n" + "=" * 60)
@@ -1517,6 +1545,7 @@ def main(argv: list[str] | None = None):
                     tar_protein_dirs=args.tar_protein_dirs,
                     dynamic_resharding=args.dynamic_resharding,
                     progress_check_workers=args.progress_check_workers,
+                    usalign_path=args.usalign_path,
                 )
                 if not scoring_ok:
                     logger.error("AF2Rank scoring failed")
@@ -1593,6 +1622,7 @@ def main(argv: list[str] | None = None):
             segment_min_len=args.segment_min_len,
             mask_inter_segment=args.mask_inter_segment,
             af2rank_subdir=af2rank_subdir,
+            usalign_path=args.usalign_path,
         ):
             logger.error("AF2Rank top-k step failed")
             success = False
@@ -1627,6 +1657,7 @@ def main(argv: list[str] | None = None):
                 dynamic_resharding=args.dynamic_resharding,
                 progress_check_workers=args.progress_check_workers,
                 af2rank_subdir=af2rank_subdir,
+                usalign_path=args.usalign_path,
             ):
                 logger.error("Central analysis failed")
                 success = False

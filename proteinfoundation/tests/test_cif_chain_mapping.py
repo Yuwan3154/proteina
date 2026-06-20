@@ -108,7 +108,7 @@ def test_reference_dir2_resolves_reference_chain_only(tmp_path, monkeypatch):
 
     calls = []
 
-    def fake_run_dir2_rows(chain1_path, folder2, names2, env=None, chain1=None, chain2=None):
+    def fake_run_dir2_rows(chain1_path, folder2, names2, env=None, chain1=None, chain2=None, usalign_path=None):
         calls.append((chain1_path, folder2, names2, chain1, chain2))
         return [
             {

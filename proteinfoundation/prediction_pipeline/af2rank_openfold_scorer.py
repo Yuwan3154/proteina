@@ -34,7 +34,7 @@ from openfold.utils.loss import compute_tm
 from proteinfoundation.utils.openfold_inference import OpenFoldTemplateInference
 from proteinfoundation.utils.ff_utils.pdb_utils import write_prot_to_pdb
 from proteinfoundation.prediction_pipeline.cif_chain_mapping import resolve_biopython_chain_for_structure
-from proteinfoundation.prediction_pipeline.usalign_tabular import parse_usalign_pair_outfmt2
+from proteinfoundation.prediction_pipeline.usalign_tabular import parse_usalign_pair_outfmt2, resolve_usalign_exe
 from scipy.stats import spearmanr
 
 
@@ -52,8 +52,15 @@ _USALIGN_PARALLEL_ENV = {
 # Utility functions (self-contained, no ColabDesign/JAX dependency)
 # ---------------------------------------------------------------------------
 
-def tmscore(x, y, tmscore_exe="USalign", env=None):
-    """Calculate TMscore between two coordinate arrays (CA atoms)."""
+def tmscore(x, y, tmscore_exe=None, env=None):
+    """Calculate TMscore between two coordinate arrays (CA atoms).
+
+    tmscore_exe: explicit USalign/TMscore path. When None it is resolved from
+    $USALIGN_PATH / PATH via resolve_usalign_exe (fails loudly if unresolvable).
+    """
+    # Resolve up-front so a missing executable fails before we write temp files.
+    used_exe = resolve_usalign_exe(tmscore_exe, required=True)
+
     with tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False) as f1, \
          tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False) as f2:
         for f, z in zip([f1, f2], [x, y]):
@@ -63,29 +70,13 @@ def tmscore(x, y, tmscore_exe="USalign", env=None):
                         % (k + 1, "CA", "ALA", "A", k + 1, c[0], c[1], c[2], 1, 0))
             f.flush()
 
-    output_text = None
-    used_exe = None
-    for exe in [tmscore_exe, "./TMscore", "TMscore", "/usr/local/bin/TMscore"]:
-        if os.path.exists(exe) or os.system(f"which {exe} > /dev/null 2>&1") == 0:
-            cmd = [exe, f1.name, f2.name]
-            if os.path.basename(exe) == "USalign":
-                cmd += ["-TMscore", "5", "-outfmt", "2"]
-            subprocess_env = os.environ.copy()
-            if env is not None:
-                subprocess_env.update(env)
-            output_text = subprocess.check_output(cmd, text=True, env=subprocess_env)
-            used_exe = exe
-            break
-    else:
-        os.unlink(f1.name)
-        os.unlink(f2.name)
-        # Fail loudly: a silent tms=0.0 fallback here once produced an entire run of
-        # 0.0 TM-scores because USalign was simply not on PATH.
-        raise RuntimeError(
-            "tmscore(): no USalign/TMscore executable found on PATH (tried "
-            f"{[tmscore_exe, './TMscore', 'TMscore', '/usr/local/bin/TMscore']}). "
-            "Install USalign or add its directory to PATH; refusing to return tms=0.0."
-        )
+    cmd = [used_exe, f1.name, f2.name]
+    if os.path.basename(used_exe) == "USalign":
+        cmd += ["-TMscore", "5", "-outfmt", "2"]
+    subprocess_env = os.environ.copy()
+    if env is not None:
+        subprocess_env.update(env)
+    output_text = subprocess.check_output(cmd, text=True, env=subprocess_env)
 
     os.unlink(f1.name)
     os.unlink(f2.name)
@@ -106,7 +97,7 @@ def tmscore(x, y, tmscore_exe="USalign", env=None):
     return o
 
 
-def usalign_files(mobile_pdb, ref_pdb, tmscore_exe="USalign", env=None):
+def usalign_files(mobile_pdb, ref_pdb, tmscore_exe=None, env=None):
     """TM-score + RMSD between two structure FILES via USalign with default structural
     superposition (sequence-independent), TM normalized by the reference (2nd arg).
 
@@ -114,17 +105,14 @@ def usalign_files(mobile_pdb, ref_pdb, tmscore_exe="USalign", env=None):
     full cg2all all-atom reconstruction (the file path) against the native — the coord-array
     path (tmscore()) was producing TM=0 / huge RMSD for CA-only vs all-atom inputs.
     Returns {"tms", "rms"}.
+
+    tmscore_exe: explicit USalign path; None -> resolved from $USALIGN_PATH / PATH
+    (fails loudly if unresolvable, rather than silently returning tms=0.0).
     """
     subprocess_env = os.environ.copy()
     if env is not None:
         subprocess_env.update(env)
-    exe = None
-    for cand in [tmscore_exe, os.path.expanduser("~/.local/bin/USalign"), "USalign"]:
-        if os.path.exists(cand) or os.system(f"which {cand} > /dev/null 2>&1") == 0:
-            exe = cand
-            break
-    if exe is None:
-        return {"tms": 0.0, "rms": float("nan")}
+    exe = resolve_usalign_exe(tmscore_exe, required=True)
     out = subprocess.run([exe, mobile_pdb, ref_pdb], capture_output=True, text=True,
                          env=subprocess_env).stdout
     tms, rms = 0.0, float("nan")
@@ -771,6 +759,7 @@ class OpenFoldAF2Rank:
         compile_strategy: str = "per_block",
         use_cueq_triangle_mul: bool = False,
         mask_inter_segment: bool = True,
+        usalign_path: Optional[str] = None,
     ):
         if chain is None:
             chain = "A"
@@ -781,6 +770,10 @@ class OpenFoldAF2Rank:
         self.skip_ref_metrics = skip_ref_metrics
         self._segments = None
         self._mask_inter_segment = mask_inter_segment
+        # Resolve USalign once at construction so a missing executable fails loudly
+        # here rather than per-template deep inside score_structure(). Required even
+        # when skip_ref_metrics, because tm_template_pred still calls tmscore().
+        self.usalign_exe = resolve_usalign_exe(usalign_path, required=True)
 
         # Detect correct chain in reference CIF
         is_cif = reference_pdb.lower().endswith('.cif')
@@ -995,16 +988,16 @@ class OpenFoldAF2Rank:
             # Compare the full all-atom template FILE (cg2all reconstruction in the normal
             # flow) vs the native via USalign default superposition. The previous coord-array
             # path compared CA-only ALA traces and yielded TM=0 / RMSD 14-178 A (no alignment).
-            _r = usalign_files(decoy_pdb, self.reference_pdb, env=_USALIGN_PARALLEL_ENV)
+            _r = usalign_files(decoy_pdb, self.reference_pdb, tmscore_exe=self.usalign_exe, env=_USALIGN_PARALLEL_ENV)
             scores["tm_ref_template"] = _r.get("tms", 0.0)
             scores["rmsd_ref_template"] = _r.get("rms", float("nan"))
         if "final_atom_positions" in out:
             pred_ca = out["final_atom_positions"][:, 1, :].detach().cpu().numpy()
             if not self.skip_ref_metrics:
-                _rp = tmscore(self.reference_coords, pred_ca, env=_USALIGN_PARALLEL_ENV)
+                _rp = tmscore(self.reference_coords, pred_ca, tmscore_exe=self.usalign_exe, env=_USALIGN_PARALLEL_ENV)
                 scores["tm_ref_pred"] = _rp.get("tms", 0.0)
                 scores["rmsd_ref_pred"] = _rp.get("rms", float("nan"))
-            _tp = tmscore(template_coords, pred_ca, env=_USALIGN_PARALLEL_ENV)
+            _tp = tmscore(template_coords, pred_ca, tmscore_exe=self.usalign_exe, env=_USALIGN_PARALLEL_ENV)
             scores["tm_template_pred"] = _tp.get("tms", 0.0)
             scores["rmsd_template_pred"] = _tp.get("rms", float("nan"))
 
@@ -1215,19 +1208,19 @@ def score_proteina_structures_openfold(
                 # TM + RMSD: reference vs template/prediction, template vs prediction.
                 # tmscore() returns both {"tms", "rms"} from one USalign call — record both.
                 _r = tmscore(
-                    scorer.reference_coords, template_coords, env=_USALIGN_PARALLEL_ENV
+                    scorer.reference_coords, template_coords, tmscore_exe=scorer.usalign_exe, env=_USALIGN_PARALLEL_ENV
                 )
                 structure_scores["tm_ref_template"] = _r.get("tms", 0.0)
                 structure_scores["rmsd_ref_template"] = _r.get("rms", float("nan"))
                 if "final_atom_positions" in out:
                     pred_ca = out["final_atom_positions"][:, 1, :].detach().cpu().numpy()
                     _rp = tmscore(
-                        scorer.reference_coords, pred_ca, env=_USALIGN_PARALLEL_ENV
+                        scorer.reference_coords, pred_ca, tmscore_exe=scorer.usalign_exe, env=_USALIGN_PARALLEL_ENV
                     )
                     structure_scores["tm_ref_pred"] = _rp.get("tms", 0.0)
                     structure_scores["rmsd_ref_pred"] = _rp.get("rms", float("nan"))
                     _tp = tmscore(
-                        template_coords, pred_ca, env=_USALIGN_PARALLEL_ENV
+                        template_coords, pred_ca, tmscore_exe=scorer.usalign_exe, env=_USALIGN_PARALLEL_ENV
                     )
                     structure_scores["tm_template_pred"] = _tp.get("tms", 0.0)
                     structure_scores["rmsd_template_pred"] = _tp.get("rms", float("nan"))

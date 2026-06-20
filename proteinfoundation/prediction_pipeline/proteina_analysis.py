@@ -22,7 +22,6 @@ import glob
 import json
 import logging
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -59,6 +58,7 @@ from proteinfoundation.prediction_pipeline.usalign_tabular import (
     normalize_usalign_structure_name,
     parse_usalign_outfmt2_named_rows,
     parse_usalign_pair_outfmt2,
+    resolve_usalign_exe,
 )
 
 logger = logging.getLogger(__name__)
@@ -146,11 +146,9 @@ def run_pairwise_tm(
     env: Optional[Dict[str, str]] = None,
     chain1: Optional[str] = None,
     chain2: Optional[str] = None,
-    tmscore_exe: str = "USalign",
+    tmscore_exe: Optional[str] = None,
 ) -> Dict[str, float]:
-    exe = shutil.which(tmscore_exe) or shutil.which("USalign") or shutil.which("TMscore")
-    if exe is None:
-        raise FileNotFoundError("Neither USalign nor TMscore found in PATH")
+    exe = resolve_usalign_exe(tmscore_exe, required=True)
 
     cmd = [exe, path_a, path_b]
     if os.path.basename(exe) == "USalign":
@@ -175,10 +173,9 @@ def run_template_template_dir(
     protein_dir: str,
     basenames: Sequence[str],
     env: Optional[Dict[str, str]] = None,
+    usalign_path: Optional[str] = None,
 ) -> List[Dict[str, object]]:
-    exe = shutil.which("USalign")
-    if exe is None:
-        raise FileNotFoundError("USalign not found in PATH")
+    exe = resolve_usalign_exe(usalign_path, required=True)
 
     list_path = _write_list_file(basenames)
     try:
@@ -214,10 +211,9 @@ def run_dir2_rows(
     env: Optional[Dict[str, str]] = None,
     chain1: Optional[str] = None,
     chain2: Optional[str] = None,
+    usalign_path: Optional[str] = None,
 ) -> List[Dict[str, object]]:
-    exe = shutil.which("USalign")
-    if exe is None:
-        raise FileNotFoundError("USalign not found in PATH")
+    exe = resolve_usalign_exe(usalign_path, required=True)
 
     list2 = _write_list_file(names2)
     try:
@@ -252,6 +248,7 @@ def run_reference_vs_paths_dir2(
     env: Optional[Dict[str, str]] = None,
     chain1: Optional[str] = None,
     chain2: Optional[str] = None,
+    usalign_path: Optional[str] = None,
 ) -> Dict[str, Dict[str, float]]:
     reference_abs = os.path.abspath(reference_path)
     reference_name = os.path.basename(reference_abs)
@@ -273,6 +270,7 @@ def run_reference_vs_paths_dir2(
             env=env,
             chain1=resolved_chain1,
             chain2=chain2,
+            usalign_path=usalign_path,
         )
         for row in rows:
             name1 = str(row["structure_1_name"])
@@ -379,7 +377,7 @@ def _compute_pairwise_template_metrics(
     basenames = [os.path.basename(path) for path in template_paths]
     tm_values: List[float] = []
     pairwise_mode = "per_pair"
-    if use_usalign_dir and shutil.which("USalign"):
+    if use_usalign_dir and resolve_usalign_exe(required=False):
         rows = run_template_template_dir(protein_dir, basenames, env=None)
         tm_values = [float(row["tms"]) for row in rows]
         pairwise_mode = "usalign_dir"
@@ -977,6 +975,7 @@ def enrich_proteinebm_outputs(
     reference_cif: Optional[str],
     reference_chain: Optional[str],
     proteinebm_analysis_subdir: str = "proteinebm_v2_cathmd_analysis",
+    usalign_path: Optional[str] = None,
 ) -> Optional[Dict[str, object]]:
     output_dir = Path(protein_dir) / proteinebm_analysis_subdir
     scores_csv = output_dir / f"proteinebm_scores_{protein_id}.csv"
@@ -994,6 +993,7 @@ def enrich_proteinebm_outputs(
             target_paths=[str(path) for path in scores_df["structure_path"].astype(str).tolist()],
             env=None,
             chain1=reference_chain,
+            usalign_path=usalign_path,
         )
 
     scores_df["tm_ref_template"] = scores_df["structure_file"].astype(str).apply(
@@ -1030,6 +1030,7 @@ def enrich_af2rank_output_dir(
     output_dir: str,
     reference_cif: Optional[str],
     reference_chain: Optional[str],
+    usalign_path: Optional[str] = None,
 ) -> Optional[Dict[str, object]]:
     scores_csv = Path(output_dir) / f"af2rank_scores_{protein_id}.csv"
     if not scores_csv.exists():
@@ -1046,6 +1047,7 @@ def enrich_af2rank_output_dir(
             target_paths=[str(path) for path in scores_df["structure_path"].astype(str).tolist()],
             env=None,
             chain1=reference_chain,
+            usalign_path=usalign_path,
         )
         prediction_paths = [str(path) for path in scores_df["predicted_structure_path"].astype(str).tolist() if Path(path).exists()]
         if prediction_paths:
@@ -1054,6 +1056,7 @@ def enrich_af2rank_output_dir(
                 target_paths=prediction_paths,
                 env=None,
                 chain1=reference_chain,
+                usalign_path=usalign_path,
             )
 
     matched_pairs = [
@@ -1416,6 +1419,9 @@ def main() -> None:
     parser.add_argument("--rerun", action="store_true", help="Recompute even if analysis summary exists")
     parser.add_argument("--num_workers", type=int, default=None, help="Max one-process-per-protein worker count")
     parser.add_argument("--no_usalign_dir", action="store_true", help="Disable USalign -dir for template all-to-all")
+    parser.add_argument("--usalign_path", default=None,
+                        help="Explicit path to the USalign executable. Used when USalign is not on PATH "
+                             "(e.g. installed at ~/.local/bin on SLURM compute nodes).")
     parser.add_argument("--skip_diversity", action="store_true", help="Skip pairwise template-to-template diversity computation")
     parser.add_argument(
         "--tar_protein_dirs",
@@ -1437,6 +1443,14 @@ def main() -> None:
     TOPK_SUBDIR = args.af2rank_subdir
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+    # Resolve USalign once at startup and export it so every worker/subprocess
+    # (and resolve_usalign_exe deep in scoring) uses the explicit path instead of
+    # only searching PATH. Required when a reference CIF is given (GT TM columns).
+    resolved_usalign = resolve_usalign_exe(args.usalign_path, required=bool(args.cif_dir.strip()))
+    if resolved_usalign:
+        os.environ["USALIGN_PATH"] = resolved_usalign
+        logger.info("USalign resolved: %s", resolved_usalign)
 
     if args.protein_ids:
         protein_ids = args.protein_ids

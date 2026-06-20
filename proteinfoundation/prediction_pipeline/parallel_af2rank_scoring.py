@@ -34,6 +34,7 @@ from sharding_utils import (
     shard_proteins,
 )
 from protein_tar_utils import list_protein_members, pack_protein_dirs, read_protein_text, restore_protein_dirs
+from usalign_tabular import resolve_usalign_exe
 
 try:
     from dotenv import load_dotenv
@@ -636,18 +637,27 @@ def main():
                         help='Drop ordered segments shorter than this (segment_mode=joint, default 50).')
     parser.add_argument('--mask_inter_segment', action=argparse.BooleanOptionalAction, default=True,
                         help='Mask cross-segment template pairs in AF2Rank (segment_mode=joint, default True).')
+    parser.add_argument('--usalign_path', default=None,
+                        help='Explicit path to the USalign executable (used when USalign is not on PATH, '
+                             'e.g. installed at ~/.local/bin on SLURM compute nodes).')
     add_shard_args(parser)
 
     args = parser.parse_args()
-    
+
     # Validate inputs
     if not os.path.exists(args.csv_file):
         logger.error(f"CSV file not found: {args.csv_file}")
         sys.exit(1)
-    
+
     if not os.path.exists(args.cif_dir):
         logger.error(f"CIF directory not found: {args.cif_dir}")
         sys.exit(1)
+
+    # AF2Rank always scores against a reference, so USalign is required. Resolve it
+    # loudly here and export USALIGN_PATH so the per-protein scoring subprocesses
+    # (which inherit os.environ) use the explicit path instead of only PATH.
+    os.environ["USALIGN_PATH"] = resolve_usalign_exe(args.usalign_path, required=True)
+    logger.info(f"USalign resolved: {os.environ['USALIGN_PATH']}")
     
     global_protein_names = get_protein_names(args.csv_file, args.csv_col)
     protein_names = list(global_protein_names)

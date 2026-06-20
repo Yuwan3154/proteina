@@ -43,7 +43,6 @@ from colabdesign.af import prep
 from colabdesign.af.contrib import predict
 from colabdesign.af.prep import prep_pdb
 from colabdesign.shared import protein
-from colabdesign.shared.protein import _np_rmsd
 from colabdesign.shared.utils import copy_dict
 from colabdesign.af.alphafold.common import residue_constants
 from loguru import logger
@@ -346,9 +345,17 @@ def tmscore(x, y, tmscore_exe="USalign", env=None):
                           % (k+1, "CA", "ALA", "A", k+1, c[0], c[1], c[2], 1, 0))
             f.flush()
 
+    # Candidate order: explicit arg, $USALIGN_PATH (set by the pipeline from
+    # --usalign_path), then PATH / per-user / standard locations. ~/.local/bin is
+    # the per-user install used on SLURM compute nodes whose non-login PATH omits it.
+    candidates = [tmscore_exe, os.environ.get("USALIGN_PATH"),
+                  "USalign", os.path.expanduser("~/.local/bin/USalign"),
+                  "./TMscore", "TMscore", "/usr/local/bin/TMscore"]
     output_text = None
     used_exe = None
-    for exe in [tmscore_exe, "./TMscore", "TMscore", "/usr/local/bin/TMscore"]:
+    for exe in candidates:
+        if not exe:
+            continue
         if os.path.exists(exe) or os.system(f"which {exe} > /dev/null 2>&1") == 0:
             cmd = [exe, f1.name, f2.name]
             if os.path.basename(exe) == "USalign":
@@ -360,11 +367,16 @@ def tmscore(x, y, tmscore_exe="USalign", env=None):
             used_exe = exe
             break
     else:
-        print("Warning: TMscore executable not found. Using RMSD calculation.")
-        rmsd = _np_rmsd(x, y, use_jax=False)
         for temp_file in [f1.name, f2.name]:
             os.unlink(temp_file)
-        return {"rms": rmsd, "tms": 0.0, "gdt": 0.0}
+        # Fail loudly: a silent tms=0.0 fallback once produced an entire run of
+        # 0.0 TM-scores because USalign was simply not on PATH.
+        raise RuntimeError(
+            "tmscore(): no USalign/TMscore executable found. Tried "
+            f"explicit={tmscore_exe!r}, $USALIGN_PATH={os.environ.get('USALIGN_PATH')!r}, "
+            "and PATH/~/.local/bin/standard locations. Pass --usalign_path or add "
+            "USalign to PATH; refusing to return tms=0.0."
+        )
 
     for temp_file in [f1.name, f2.name]:
         os.unlink(temp_file)

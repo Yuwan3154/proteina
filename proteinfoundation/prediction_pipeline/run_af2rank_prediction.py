@@ -38,6 +38,7 @@ import json
 import pandas as pd
 import torch
 
+from proteinfoundation.prediction_pipeline.usalign_tabular import resolve_usalign_exe
 from proteinfoundation.prediction_pipeline.sharding_utils import (
     add_shard_args,
     default_progress_check_workers,
@@ -434,12 +435,22 @@ def main() -> None:
                         help='Per-protein AF2Rank-on-top-k output subdir name. Use a distinct name '
                              '(e.g. af2rank_on_proteinebm_top_k_mask) so mask vs nomask runs coexist '
                              'under the same shared inference dir without overwriting.')
+    parser.add_argument('--usalign_path', default=None,
+                        help='Explicit path to the USalign executable (used when USalign is not on PATH, '
+                             'e.g. installed at ~/.local/bin on SLURM compute nodes).')
     add_shard_args(parser)
 
     args = parser.parse_args()
 
     inference_base = Path(args.inference_dir)
     cif_dir = args.cif_dir.strip() or None
+
+    # Resolve USalign loudly at startup and export USALIGN_PATH so the scorer's
+    # tmscore() calls use the explicit path instead of only searching PATH.
+    # Required only when scoring against a reference (cif_dir => GT TM columns);
+    # tm_template_pred always needs it too, so require whenever we will score.
+    os.environ["USALIGN_PATH"] = resolve_usalign_exe(args.usalign_path, required=True)
+    logger.info(f"USalign resolved: {os.environ['USALIGN_PATH']}")
 
     global TOPK_SUBDIR
     TOPK_SUBDIR = args.af2rank_subdir
