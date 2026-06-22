@@ -4,11 +4,11 @@
 # sbatch ONLY -- NEVER scancel. Defers to the launcher's no-progress cap: if the launcher DELIBERATELY
 # stopped (.noprogress_streak >= MAX_NOPROGRESS = deterministic bug / 3 distinct bad nodes), it does NOT
 # resubmit, only ALERTs (human needed). No agent cron.
-# Survives SSH/ControlMaster drops and terminal close (launch under setsid+nohup).
-#
-# Launch (from a login node):
-#   ssh -n Engaging 'cd ~/proteina && setsid nohup bash script_utils/run_health_poller.sh \
-#       >/dev/null 2>&1 </dev/null & echo started'
+# This is the POLL LOOP. The DURABLE way to run it is the SLURM wrapper run_health_poller.sbatch
+# (a tiny mit_normal CPU job that self-resubmits at its 12h limit) -- a login setsid/nohup process gets
+# REAPED after a few days on the shared login node. Durable launch:  cd ~/proteina && sbatch run_health_poller.sbatch
+# Quick/temporary login launch (NOT durable):
+#   ssh -n Engaging 'cd ~/proteina && setsid nohup bash script_utils/run_health_poller.sh >/dev/null 2>&1 </dev/null & echo started'
 #
 # Every INTERVAL it inspects squeue (any cb_dc_s1_48m* tier) + last.ckpt + the newest slurm logs and writes
 #   $RUNDIR/monitor/STATUS    (latest one-liner, overwritten)
@@ -44,7 +44,7 @@ while true; do
   step=0; oom=0
   if [ -n "$errs" ]; then
     s=$(grep -hoE 'step=[0-9]+' $errs 2>/dev/null | grep -oE '[0-9]+' | sort -n | tail -1); step="${s:-0}"
-    oom=$(grep -icE 'out of memory|cuda error|invalid device ordinal|Traceback' $errs 2>/dev/null | paste -sd+ - | bc 2>/dev/null); oom="${oom:-0}"
+    oom=$(grep -ihE 'out of memory|cuda error|invalid device ordinal|Traceback' $errs 2>/dev/null | wc -l); oom="${oom:-0}"
   fi
   flag=OK; alert=""
   if [ -z "$jid" ]; then
