@@ -39,12 +39,16 @@ while true; do
   jid=$(awk '{print $1}' <<<"$line"); state=$(awk '{print $3}' <<<"$line"); rtime=$(awk '{print $4}' <<<"$line")
   ckmt=$(stat -c %Y "$CKPT" 2>/dev/null || echo 0); age=$(( now - ${ckmt:-0} ))
   cknice=$(date -d "@${ckmt:-0}" '+%m-%d_%H:%M' 2>/dev/null || echo none)
-  # latest training step + error markers from the newest 3 slurm .err logs (diag step= lives in stderr)
-  errs=$(ls -t "$RUNDIR"/slurm/*.err 2>/dev/null | head -3)
+  # step + GPU-error markers from the CURRENT job's .err ONLY. (Grepping the newest-3 caused FALSE oom alerts:
+  # old logs legitimately hold a timed-out job's SIGTERM traceback + historical node3101 CUDA errors.)
+  # No running/pending job -> step from the newest log (for the done-check) and oom=0 (ignore historical errors).
+  if [ -n "$jid" ]; then cerr=$(ls -t "$RUNDIR"/slurm/*-"$jid".err 2>/dev/null | head -1)
+  else cerr=$(ls -t "$RUNDIR"/slurm/*.err 2>/dev/null | head -1); fi
   step=0; oom=0
-  if [ -n "$errs" ]; then
-    s=$(grep -hoE 'step=[0-9]+' $errs 2>/dev/null | grep -oE '[0-9]+' | sort -n | tail -1); step="${s:-0}"
-    oom=$(grep -ihE 'out of memory|cuda error|invalid device ordinal|Traceback' $errs 2>/dev/null | wc -l); oom="${oom:-0}"
+  if [ -n "$cerr" ]; then
+    s=$(grep -hoE 'step=[0-9]+' "$cerr" 2>/dev/null | grep -oE '[0-9]+' | sort -n | tail -1); step="${s:-0}"
+    [ -n "$jid" ] && oom=$(grep -ihE 'out of memory|cuda error|invalid device ordinal' "$cerr" 2>/dev/null | wc -l)
+    oom="${oom:-0}"
   fi
   flag=OK; alert=""
   if [ -z "$jid" ]; then
