@@ -243,6 +243,20 @@ def pack_protein_dir(inference_dir: str | Path, protein_id: str, delete_after: b
         raise RuntimeError(
             f"Tar validation failed for {protein_id}: missing={missing}, extra={extra}"
         )
+    # Regression guard: never overwrite a populated tar with a smaller one. A
+    # time-limit-killed pack (or two jobs racing on the same shared dir) can
+    # leave a partially-rmtree'd loose dir (crash stub); trusting + re-tarring
+    # it silently dropped 8192 samples (run 4964053). Refuse the shrink so the
+    # good tar is preserved; the stub must be reconciled against the tar first.
+    if tar_path.exists():
+        dropped = _tar_file_members(tar_path, protein_id) - packed_members
+        if dropped:
+            tmp_path.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"Refusing to re-tar {protein_id}: would drop {len(dropped)} "
+                f"member(s) already in {tar_path.name} (e.g. {sorted(dropped)[:5]}). "
+                f"Loose dir is likely a crash stub; restore from the tar first."
+            )
     os.replace(tmp_path, tar_path)
     if delete_after:
         shutil.rmtree(protein_dir)

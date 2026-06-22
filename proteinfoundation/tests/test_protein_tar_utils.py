@@ -88,6 +88,30 @@ def test_pack_dirs_migrates_complete_loose_dir(tmp_path):
     assert read_protein_text(tmp_path, protein_id, "done.txt") == "complete\n"
 
 
+def test_pack_refuses_to_shrink_tar_from_crash_stub(tmp_path):
+    # Regression (run 4964053): a partially-rmtree'd crash-stub loose dir must
+    # NOT silently overwrite a populated tar with fewer members.
+    protein_id = "protein_A"
+    protein_dir = tmp_path / protein_id
+    protein_dir.mkdir()
+    for i in range(8):
+        (protein_dir / f"{protein_id}_{i}.pdb").write_text("ATOM\n")
+    assert pack_protein_dir(tmp_path, protein_id, delete_after=True)
+    tar_path = protein_tar_path(tmp_path, protein_id)
+    before = tar_path.read_bytes()
+
+    # Crash stub: dir reappears holding only 1 of the 8 members.
+    protein_dir.mkdir()
+    (protein_dir / f"{protein_id}_0.pdb").write_text("ATOM\n")
+    with pytest.raises(RuntimeError, match="would drop"):
+        pack_protein_dir(tmp_path, protein_id, delete_after=False)
+
+    # The good tar is preserved byte-identical (all 8 members intact).
+    assert tar_path.read_bytes() == before
+    with tarfile.open(tar_path, "r:") as tf:
+        assert sum(n.endswith(".pdb") for n in tf.getnames()) == 8
+
+
 def test_path_exists_loose_or_tar(tmp_path):
     protein_id = "protein_A"
     protein_dir = tmp_path / protein_id
