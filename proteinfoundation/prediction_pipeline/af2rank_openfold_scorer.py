@@ -760,6 +760,9 @@ class OpenFoldAF2Rank:
         use_cueq_triangle_mul: bool = False,
         mask_inter_segment: bool = True,
         usalign_path: Optional[str] = None,
+        slim_ckpt_path: Optional[str] = None,
+        evoformer_keep_block_indices: Optional[str] = None,
+        use_ema: bool = True,
     ):
         if chain is None:
             chain = "A"
@@ -799,7 +802,7 @@ class OpenFoldAF2Rank:
 
         # Load OpenFold model
         jax_params_path = os.path.join(DEFAULT_PARAMS_DIR, f"params_{model_name}.npz")
-        if not os.path.exists(jax_params_path):
+        if slim_ckpt_path is None and not os.path.exists(jax_params_path):
             raise FileNotFoundError(f"Weight file not found: {jax_params_path}")
 
         # The compile inference path is mutually exclusive with the
@@ -820,6 +823,9 @@ class OpenFoldAF2Rank:
         self.model = OpenFoldTemplateInference(
             model_name=model_name,
             jax_params_path=jax_params_path,
+            slim_ckpt_path=slim_ckpt_path,
+            evoformer_keep_block_indices=evoformer_keep_block_indices,
+            use_ema=use_ema,
             skip_template_alignment=True,  # No alignment needed (sequences match)
             max_recycling_iters=recycles,
             use_deepspeed_evoformer_attention=use_deepspeed_evoformer_attention,

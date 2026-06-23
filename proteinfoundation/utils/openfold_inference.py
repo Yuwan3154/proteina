@@ -45,6 +45,9 @@ class OpenFoldTemplateInference(nn.Module):
         *,
         model_name: str = "model_1_ptm",
         jax_params_path: str = None,
+        slim_ckpt_path: Optional[str] = None,
+        evoformer_keep_block_indices: Optional[str] = None,
+        use_ema: bool = True,
         device: Optional[torch.device] = None,
         skip_template_alignment: bool = False,
         max_recycling_iters: Optional[int] = None,
@@ -94,7 +97,30 @@ class OpenFoldTemplateInference(nn.Module):
 
         self.model = AlphaFold(self.cfg)
         self.model.eval()
-        import_jax_weights_(self.model, jax_params_path, version=model_name.replace("model_", ""))
+        if slim_ckpt_path is not None:
+            if evoformer_keep_block_indices is None:
+                raise ValueError("slim_ckpt_path set but evoformer_keep_block_indices is None")
+            keep = [int(x) for x in str(evoformer_keep_block_indices).split(",")]
+            self.model.evoformer.blocks = nn.ModuleList(
+                [self.model.evoformer.blocks[i] for i in keep]
+            )
+            ck = torch.load(slim_ckpt_path, map_location="cpu", weights_only=False)
+            if use_ema and "ema" in ck:
+                sd = ck["ema"]["params"]
+            else:
+                sd = {k[len("model."):]: v for k, v in ck["state_dict"].items() if k.startswith("model.")}
+            if len(set(sd.keys()) & set(self.model.state_dict().keys())) == 0:
+                raise RuntimeError(
+                    f"slim ckpt {slim_ckpt_path}: 0 keys matched the sliced model "
+                    f"(use_ema={use_ema}, keep={len(keep)} blocks) -- wrong format or KEEP indices"
+                )
+            miss, unexp = self.model.load_state_dict(sd, strict=False)
+            logger.info(
+                f"[slim] loaded {slim_ckpt_path} (ema={use_ema}, keep={len(keep)} blocks) "
+                f"| missing={len(miss)} unexpected={len(unexp)}"
+            )
+        else:
+            import_jax_weights_(self.model, jax_params_path, version=model_name.replace("model_", ""))
 
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
