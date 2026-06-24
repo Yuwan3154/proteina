@@ -31,6 +31,16 @@ mkdir -p "$MON"
 echo $$ > "$MON/poller.pid"
 nojob=0; pending=0; presub=0
 echo "[$(date '+%F %T')] poller START pid=$$ run=$RUN prefix=$JOBPREFIX interval=${INTERVAL}s (detection-only)" >> "$MON/poller.log"
+rt2s() {  # slurm elapsed D-HH:MM:SS / HH:MM:SS / MM:SS -> seconds
+  local t="$1" d=0
+  case "$t" in *-*) d="${t%%-*}"; t="${t#*-}";; esac
+  local IFS=:; set -- $t
+  case $# in
+    3) echo $(( d*86400 + 10#$1*3600 + 10#$2*60 + 10#$3 )) ;;
+    2) echo $(( d*86400 + 10#$1*60 + 10#$2 )) ;;
+    *) echo $(( d*86400 + 10#${1:-0} )) ;;
+  esac
+}
 while true; do
   [ -f "$MON/STOP" ] && { echo "[$(date '+%F %T')] STOP file present; poller exiting." >> "$MON/poller.log"; rm -f "$MON/STOP"; break; }
   ts=$(date '+%F %T'); now=$(date +%s)
@@ -71,7 +81,10 @@ while true; do
     nojob=0; presub=0   # a job exists again -> chain alive -> reset the poller-resubmit counter
     if [ "$state" = RUNNING ]; then
       pending=0
-      [ "$age" -gt "$STALL_SECS" ] && { flag=ALERT; alert="STALL: $jid RUNNING (rt=$rtime) but last.ckpt ${age}s stale, step=$step"; }
+      # gate on the job's OWN runtime: a fresh resume inherits an OLD last.ckpt + needs ~30min compile before its
+      # first ckpt -> only flag STALL once the job itself has run > STALL_SECS yet STILL hasn't checkpointed.
+      rt_secs=$(rt2s "$rtime")
+      { [ "$rt_secs" -gt "$STALL_SECS" ] && [ "$age" -gt "$STALL_SECS" ]; } && { flag=ALERT; alert="STALL: $jid RUNNING (rt=$rtime/${rt_secs}s) but last.ckpt ${age}s stale, step=$step"; }
     else
       pending=$((pending+1))
       [ "$pending" -ge "$PENDING_POLLS" ] && { flag=ALERT; alert="STUCK-PENDING: $jid state=$state for ${pending} polls (~$((pending*INTERVAL/60))min, no GPU); step=$step < $MAX_STEPS"; }
