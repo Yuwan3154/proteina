@@ -142,8 +142,18 @@ def extract_chain(cif_path, chain_letter, out_pdb):
     # First model only: saving the whole structure emits every NMR model, which
     # foldseek then indexes as separate entries. Model 1 matches the single-model
     # native used for the TM-based y-axis.
-    io.set_structure(model)
-    io.save(str(out_pdb), _ChainSelect(chain_letter))
+    if len(chain_letter) > 1:
+        # PDB format caps chain IDs at one char; multi-char auth IDs (complex
+        # chains, e.g. "C5") crash PDBIO -> isolate + rename to "A" (foldseek
+        # keys on the filename, not the internal chain ID).
+        chain = next(c for c in model.get_chains() if c.id == chain_letter)
+        chain.detach_parent()
+        chain.id = "A"
+        io.set_structure(chain)
+        io.save(str(out_pdb), _ChainSelect("A"))
+    else:
+        io.set_structure(model)
+        io.save(str(out_pdb), _ChainSelect(chain_letter))
     with open(out_pdb) as f:
         has_atoms = any(line.startswith("ATOM") for line in f)
     return has_atoms
