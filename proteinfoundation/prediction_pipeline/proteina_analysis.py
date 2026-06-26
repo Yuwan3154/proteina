@@ -99,15 +99,17 @@ def _default_chain(protein_id: str) -> Optional[str]:
 def _find_reference_cif(protein_id: str, cif_dir: Optional[str]) -> Optional[str]:
     if not cif_dir:
         return None
-    pdb_id = protein_id.split("_")[0]
     base = Path(cif_dir)
-    direct = base / f"{pdb_id}.cif"
-    if direct.exists():
-        return str(direct)
-    for child in sorted(base.iterdir()):
-        candidate = child / f"{pdb_id}.cif"
-        if candidate.exists():
-            return str(candidate)
+    # prefer a per-chain native named by the full protein_id (e.g. 8GZU_42.cif);
+    # needed when several targets share a PDB (complex chains) — pdb_id alone collides
+    for stem in (protein_id, protein_id.split("_")[0]):
+        direct = base / f"{stem}.cif"
+        if direct.exists():
+            return str(direct)
+        for child in sorted(base.iterdir()):
+            candidate = child / f"{stem}.cif"
+            if candidate.exists():
+                return str(candidate)
     return None
 
 
