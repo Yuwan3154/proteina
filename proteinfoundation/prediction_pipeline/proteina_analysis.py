@@ -681,7 +681,7 @@ def _plot_metric(
     labels = {
         "ptm": "Predicted TM-score (pTM)",
         "plddt": "Predicted LDDT (pLDDT)",
-        "composite": "AF2Rank Score (pTM x pLDDT)",
+        "composite": "AF2Rank Score (pTM x pLDDT x tm_io)",
         "pae_mean": "Predicted Aligned Error",
         "tm_ref_template": "TM-score (Reference vs Template)",
         "tm_ref_pred": "TM-score (Reference vs Prediction)",
