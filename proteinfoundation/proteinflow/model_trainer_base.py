@@ -167,8 +167,16 @@ class ModelTrainerBase(L.LightningModule):
             # Calculate total training steps dynamically from max_epochs and dataloader
             total_steps = None
             if scheduler_type in ["linear_decay", "cosine"]:
-                # Try to get dataloader length and max_epochs
-                if hasattr(self, 'trainer') and self.trainer is not None:
+                # Opt-in: pin the LR-anneal horizon to max_steps (the hard stop) so LR reaches 0 exactly at
+                # training end. Avoids the max_epochs * len(dataloader) estimate below, which over-counts
+                # steps/epoch (len(dataloader) != actual iterated batches) and mis-sizes the horizon.
+                if self.cfg_exp.opt.get("lr_horizon_from_max_steps", False):
+                    ms = getattr(self.trainer, "max_steps", -1) if (hasattr(self, 'trainer') and self.trainer is not None) else -1
+                    if ms and ms > 0:
+                        total_steps = int(ms)
+                        logger.info(f"LR horizon total_training_steps = {total_steps} (pinned to max_steps; lr_horizon_from_max_steps=True)")
+                # Try to get dataloader length and max_epochs (fallback when not pinned to max_steps)
+                if total_steps is None and hasattr(self, 'trainer') and self.trainer is not None:
                     if hasattr(self.trainer, 'datamodule') and self.trainer.datamodule is not None:
                         train_dataloader = self.trainer.datamodule.train_dataloader()
                         steps_per_epoch = len(train_dataloader)

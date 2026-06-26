@@ -132,9 +132,13 @@ lora:
 opt:
   lr: 0.0001
   # STAGE 1: backbone pretraining. Targets 150K optim steps (~19M samples at
-  # effective batch 128). max_epochs is a loose upper-bound for the cosine
-  # annealer's horizon; max_steps is the hard stop.
-  max_epochs: 2500
+  # effective batch 128). max_steps is the hard stop. max_epochs is set NON-BINDING
+  # so the epoch loop never gates before 150K steps (~21 actual optim-steps/epoch *
+  # ~7150 epochs ~= 150K; 100000 is comfortably non-binding). The cosine LR horizon
+  # is pinned to max_steps via lr_horizon_from_max_steps below (NOT the old
+  # max_epochs * len(dataloader) estimate, which mis-sized it to 125625 and the
+  # epoch cap then stopped the run at step 52499 / ~35%).
+  max_epochs: 100000
   max_steps: 150000
   batch_size: 4  # per-GPU micro-batch. On H200 141G (current target): batch 4 ~90G fits with wide margin. (H100 80G -> batch 2; L40S 44G -> batch 1.)
   accumulate_grad_batches: 8  # effective = 4 GPU * 4 micro * 8 accum = 128 (4xH200). NOTE: launcher torchrun CLI also passes --batch_size/--accumulate_grad_batches and OVERRIDES these; keep them in sync.
@@ -156,6 +160,9 @@ opt:
   warmup_steps: 3000
   warmup_start_lr_ratio: 0.0
   lr_scheduler_type: cosine
+  # Pin the cosine LR-anneal horizon to max_steps (hard stop) instead of the
+  # max_epochs * len(dataloader) estimate. Opt-in so other runs are unchanged.
+  lr_horizon_from_max_steps: True
   use_cueq: False
 
 log:
