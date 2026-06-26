@@ -47,6 +47,12 @@ _USALIGN_PARALLEL_ENV = {
     "OPENBLAS_NUM_THREADS": "1",
 }
 
+# UNGROUNDED default (user-chosen 2026-06-25): a valid ~500-res USalign pair finishes
+# in <1s; NaN/degenerate coords make the iterative superposition never converge and
+# spin at 100% CPU forever. 120s is ~100x real runtime → no false positives, aborts a
+# NaN-spin in 2 min. Not derived from any paper/our runs.
+USALIGN_TIMEOUT_S = 120
+
 
 # ---------------------------------------------------------------------------
 # Utility functions (self-contained, no ColabDesign/JAX dependency)
@@ -76,7 +82,16 @@ def tmscore(x, y, tmscore_exe=None, env=None):
     subprocess_env = os.environ.copy()
     if env is not None:
         subprocess_env.update(env)
-    output_text = subprocess.check_output(cmd, text=True, env=subprocess_env)
+    try:
+        output_text = subprocess.check_output(
+            cmd, text=True, env=subprocess_env, timeout=USALIGN_TIMEOUT_S
+        )
+    except subprocess.TimeoutExpired:
+        # Degenerate/NaN coords make USalign's superposition never converge.
+        logger.warning("USalign timed out after %ds (likely NaN coords); returning sentinel", USALIGN_TIMEOUT_S)
+        os.unlink(f1.name)
+        os.unlink(f2.name)
+        return {"tms": 0.0, "rms": float("nan")}
 
     os.unlink(f1.name)
     os.unlink(f2.name)
@@ -113,8 +128,12 @@ def usalign_files(mobile_pdb, ref_pdb, tmscore_exe=None, env=None):
     if env is not None:
         subprocess_env.update(env)
     exe = resolve_usalign_exe(tmscore_exe, required=True)
-    out = subprocess.run([exe, mobile_pdb, ref_pdb], capture_output=True, text=True,
-                         env=subprocess_env).stdout
+    try:
+        out = subprocess.run([exe, mobile_pdb, ref_pdb], capture_output=True, text=True,
+                             env=subprocess_env, timeout=USALIGN_TIMEOUT_S).stdout
+    except subprocess.TimeoutExpired:
+        logger.warning("USalign timed out after %ds (likely NaN coords); returning sentinel", USALIGN_TIMEOUT_S)
+        return {"tms": 0.0, "rms": float("nan")}
     tms, rms = 0.0, float("nan")
     for line in out.splitlines():
         if line.startswith("TM-score=") and "Structure_2" in line:
@@ -126,6 +145,8 @@ def usalign_files(mobile_pdb, ref_pdb, tmscore_exe=None, env=None):
 
 def _save_openfold_prediction_pdb(reference_sequence: str, out: dict, output_pdb: str) -> None:
     atom37 = out["final_atom_positions"].detach().cpu().numpy()
+    if np.isnan(atom37).any():
+        raise ValueError("Refusing to write prediction PDB: final_atom_positions contains NaN")
     atom37_mask = out["final_atom_mask"].detach().cpu().numpy() if "final_atom_mask" in out else None
     aatype = np.array([rc.restype_order.get(aa, rc.restype_num) for aa in reference_sequence], dtype=np.int32)
     residue_index = np.arange(atom37.shape[0], dtype=np.int32) + 1
@@ -982,6 +1003,13 @@ class OpenFoldAF2Rank:
             else:
                 out = self.model.model(batch)
 
+        # A numerically-unstable forward (e.g. cueq kernels on V100) can yield all-NaN
+        # positions; feeding those to USalign hangs it forever. Fail fast instead.
+        if "final_atom_positions" in out and torch.isnan(out["final_atom_positions"]).any():
+            logger.warning("Skipping %s: OpenFold forward produced NaN final_atom_positions",
+                           os.path.basename(decoy_pdb))
+            return _invalid_template_scores("nan_final_atom_positions")
+
         scores = self._extract_scores(out, seg_ids)
         if output_pdb is not None:
             _save_openfold_prediction_pdb(self.reference_sequence, out, output_pdb)
@@ -1205,34 +1233,40 @@ def score_proteina_structures_openfold(
                 with torch.no_grad():
                     out = scorer.model.model(batch)
 
-                structure_scores = scorer._extract_scores(out, seg_ids)
-                if output_pdb is not None:
-                    _save_openfold_prediction_pdb(scorer.reference_sequence, out, output_pdb)
-                    structure_scores["predicted_structure_path"] = output_pdb
-                    structure_scores["predicted_structure_file"] = os.path.basename(output_pdb)
+                # A numerically-unstable forward (e.g. cueq kernels on V100) can yield
+                # all-NaN positions; feeding those to USalign hangs it forever. Fail fast.
+                if "final_atom_positions" in out and torch.isnan(out["final_atom_positions"]).any():
+                    logger.warning("Skipping %s: OpenFold forward produced NaN final_atom_positions", pdb_filename)
+                    structure_scores = _invalid_template_scores("nan_final_atom_positions")
+                else:
+                    structure_scores = scorer._extract_scores(out, seg_ids)
+                    if output_pdb is not None:
+                        _save_openfold_prediction_pdb(scorer.reference_sequence, out, output_pdb)
+                        structure_scores["predicted_structure_path"] = output_pdb
+                        structure_scores["predicted_structure_file"] = os.path.basename(output_pdb)
 
-                # TM + RMSD: reference vs template/prediction, template vs prediction.
-                # tmscore() returns both {"tms", "rms"} from one USalign call — record both.
-                _r = tmscore(
-                    scorer.reference_coords, template_coords, tmscore_exe=scorer.usalign_exe, env=_USALIGN_PARALLEL_ENV
-                )
-                structure_scores["tm_ref_template"] = _r.get("tms", 0.0)
-                structure_scores["rmsd_ref_template"] = _r.get("rms", float("nan"))
-                if "final_atom_positions" in out:
-                    pred_ca = out["final_atom_positions"][:, 1, :].detach().cpu().numpy()
-                    _rp = tmscore(
-                        scorer.reference_coords, pred_ca, tmscore_exe=scorer.usalign_exe, env=_USALIGN_PARALLEL_ENV
+                    # TM + RMSD: reference vs template/prediction, template vs prediction.
+                    # tmscore() returns both {"tms", "rms"} from one USalign call — record both.
+                    _r = tmscore(
+                        scorer.reference_coords, template_coords, tmscore_exe=scorer.usalign_exe, env=_USALIGN_PARALLEL_ENV
                     )
-                    structure_scores["tm_ref_pred"] = _rp.get("tms", 0.0)
-                    structure_scores["rmsd_ref_pred"] = _rp.get("rms", float("nan"))
-                    _tp = tmscore(
-                        template_coords, pred_ca, tmscore_exe=scorer.usalign_exe, env=_USALIGN_PARALLEL_ENV
-                    )
-                    structure_scores["tm_template_pred"] = _tp.get("tms", 0.0)
-                    structure_scores["rmsd_template_pred"] = _tp.get("rms", float("nan"))
+                    structure_scores["tm_ref_template"] = _r.get("tms", 0.0)
+                    structure_scores["rmsd_ref_template"] = _r.get("rms", float("nan"))
+                    if "final_atom_positions" in out:
+                        pred_ca = out["final_atom_positions"][:, 1, :].detach().cpu().numpy()
+                        _rp = tmscore(
+                            scorer.reference_coords, pred_ca, tmscore_exe=scorer.usalign_exe, env=_USALIGN_PARALLEL_ENV
+                        )
+                        structure_scores["tm_ref_pred"] = _rp.get("tms", 0.0)
+                        structure_scores["rmsd_ref_pred"] = _rp.get("rms", float("nan"))
+                        _tp = tmscore(
+                            template_coords, pred_ca, tmscore_exe=scorer.usalign_exe, env=_USALIGN_PARALLEL_ENV
+                        )
+                        structure_scores["tm_template_pred"] = _tp.get("tms", 0.0)
+                        structure_scores["rmsd_template_pred"] = _tp.get("rms", float("nan"))
 
-                gc.collect()
-                torch.cuda.empty_cache()
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
                 structure_scores.update({
                     "protein_id": protein_id,
