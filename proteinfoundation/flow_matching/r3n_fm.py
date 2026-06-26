@@ -10,6 +10,7 @@
 
 
 import math
+import os
 from typing import Callable, Dict, List, Literal, Optional, Tuple
 
 import torch
@@ -512,11 +513,22 @@ class _CoordinateFlowMatcher:
             x = self.sample_reference(
                 n, shape=(nsamples,), device=device, mask=mask, dtype=dtype
             )  # [nsamples, n, 3]
-            
+
+            # --- speedup Step C hook: env-gated x0/x_t capture + fork-resume (additive, default OFF) ---
+            _sc_dump = os.environ.get("PROTEINA_TRAJ_DUMP")
+            _sc_fork = os.environ.get("PROTEINA_FORK_FROM")
+            _sc_fork_idx = os.environ.get("PROTEINA_FORK_T_IDX")
+            _sc_x0_list, _sc_xt_list, _sc_t_list = [], [], []
+            _sc_start = 0
+            if _sc_fork and _sc_fork_idx is not None:
+                _sc_start = int(_sc_fork_idx)
+                x = torch.load(_sc_fork, weights_only=False)["x_t"].to(device=x.device, dtype=x.dtype)
+            # --- end speedup hook ---
+
             if fixed_sequence_mask is not None:
                 x_motif = (x_motif - mean_w_mask(x_motif, fixed_sequence_mask, keepdim=True)) * fixed_sequence_mask[..., None]
                 
-            for step in tqdm(range(nsteps), disable=not verbose):
+            for step in tqdm(range(_sc_start, nsteps), disable=not verbose):
                 t = ts[step] * torch.ones(nsamples, device=device)  # [nsamples]
                 dt = ts[step + 1] - ts[step]  # float
                 gt_step = gt[step]  # float
@@ -554,6 +566,10 @@ class _CoordinateFlowMatcher:
                 result = predict_clean_n_v(nn_in)
                 x_1_pred = result["coords"]
                 v = result["v"]
+                if _sc_dump is not None:
+                    _sc_t_list.append(float(ts[step]))
+                    _sc_x0_list.append(x_1_pred.detach().to("cpu", torch.float32))
+                    _sc_xt_list.append(x.detach().to("cpu", torch.float32))
 
                 # Accomodate last few steps
                 if ts[step] > 0.99:
@@ -573,6 +589,10 @@ class _CoordinateFlowMatcher:
                     sc_scale_score=sc_scale_score,
                     mask=mask,
                 )
+            if _sc_dump is not None:
+                torch.save({"t": _sc_t_list, "x0_pred": _sc_x0_list, "x_t": _sc_xt_list,
+                            "x_final": x.detach().to("cpu", torch.float32),
+                            "schedule_ts": ts.detach().to("cpu")}, _sc_dump)
             return x
 
     def get_gt(
