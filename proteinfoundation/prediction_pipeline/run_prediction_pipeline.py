@@ -373,7 +373,7 @@ def step_af2rank_scoring(
     cif_dir: str,
     inference_config: str,
     num_gpus: int,
-    recycles: int = 3,
+    recycles: int = 1,  # AF2Rank protocol default (total iters = recycles+1); was 3
     regenerate_plots: bool = False,
     backend: str = "colabdesign",
     use_deepspeed_evoformer_attention: bool = True,
@@ -1192,7 +1192,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Use cuEquivariance attention kernels (openfold backend, default: False)")
     parser.add_argument("--use_cuequivariance_multiplicative_update", action=argparse.BooleanOptionalAction, default=False,
                         help="Use cuEquivariance multiplicative update (openfold backend, default: False)")
-    parser.add_argument("--recycles", type=int, default=3, help="AF2 recycles for AF2Rank (default: 3)")
+    parser.add_argument("--recycles", type=int, default=1, help="AF2 recycles for AF2Rank (AF2Rank protocol default: 1)")
     parser.add_argument("--proteinebm_config", default="/home/ubuntu/ProteinEBM/protein_ebm/config/pae_config.yaml",
                         help="Path to ProteinEBM config YAML (default: pae_config.yaml — adds PAE head for pTM/mean_pae)")
     parser.add_argument("--proteinebm_checkpoint", default="/home/ubuntu/ProteinEBM/weights/pae.ckpt",
