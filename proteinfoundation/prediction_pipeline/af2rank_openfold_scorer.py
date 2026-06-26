@@ -784,6 +784,7 @@ class OpenFoldAF2Rank:
         slim_ckpt_path: Optional[str] = None,
         evoformer_keep_block_indices: Optional[str] = None,
         use_ema: bool = True,
+        use_mlm: bool = False,  # AF2Rank protocol: leave masked_msa at the config default (~0.15, training distribution); False forces 0 (proteina deterministic inference)
     ):
         if chain is None:
             chain = "A"
@@ -847,6 +848,7 @@ class OpenFoldAF2Rank:
             slim_ckpt_path=slim_ckpt_path,
             evoformer_keep_block_indices=evoformer_keep_block_indices,
             use_ema=use_ema,
+            use_mlm=use_mlm,
             skip_template_alignment=True,  # No alignment needed (sequences match)
             max_recycling_iters=recycles,
             use_deepspeed_evoformer_attention=use_deepspeed_evoformer_attention,

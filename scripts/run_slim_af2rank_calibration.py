@@ -56,6 +56,7 @@ def build_scorer(mode, ref_pdb, chain, args):
         recycles=args.recycles,
         skip_ref_metrics=False,
         usalign_path=args.usalign_path,
+        use_mlm=args.use_mlm,
     )
     if mode == "slim":
         kw.update(
@@ -115,6 +116,7 @@ def main():
     ap.add_argument("--keep", default="0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38,40,42,44,47")
     ap.add_argument("--use_ema", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--recycles", type=int, default=1)  # AF2Rank protocol (total iters = recycles+1)
+    ap.add_argument("--use_mlm", action=argparse.BooleanOptionalAction, default=False)  # AF2Rank: masked_msa at config default (~0.15); False = forced 0
     ap.add_argument("--chain", default="A")
     ap.add_argument("--max_decoys", type=int, default=0, help="0 = all")
     ap.add_argument("--modes", default="slim,stock", help="comma list: slim,stock")
