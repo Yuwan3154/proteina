@@ -717,8 +717,8 @@ class ModernAF2Rank:
                     os.unlink(temp_pdb_file)
         
     def score_structure(self, decoy_pdb, decoy_chain=None,
-                rm_seq=True, rm_sc=False, rm_ic=False,
-                      recycles=3, seed=0,
+                rm_seq=True, rm_sc=True, rm_ic=False,  # AF2Rank: rm_seq=gap template seq, rm_sc=mask sidechains (backbone+CB)
+                      recycles=1, seed=0,  # AF2Rank protocol (total iters = recycles+1)
                       output_pdb=None, verbose=False,
                       _allatom_pdb=None, _original_pdb=None):
         """Score a single structure using AF2Rank protocol following predict.ipynb exactly.
@@ -850,7 +850,7 @@ def score_proteina_structures(
     reference_cif: str,
     inference_output_dir: str,
     chain: str = "A",
-    recycles: int = 3,
+    recycles: int = 1,
     verbose: bool = False,
     predicted_structure_dir: Optional[str] = None,
 ) -> List[Dict]:
@@ -956,7 +956,7 @@ def score_proteina_structures(
 
 
 def run_af2rank_analysis(protein_id: str, reference_cif: str, inference_output_dir: str,
-                        output_dir: str, chain: str = "A", recycles: int = 3, 
+                        output_dir: str, chain: str = "A", recycles: int = 1, 
                         verbose: bool = False, regenerate_summary: bool = False) -> str:
     """
     Run complete AF2Rank analysis including scoring and visualization.
@@ -1191,7 +1191,7 @@ def load_af2rank_scores_from_csv(csv_path: str) -> List[Dict]:
 
 
 def run_af2rank_plot_only(protein_id: str, reference_cif: str, inference_output_dir: str,
-                          output_dir: str, chain: str = "A", recycles: int = 3, 
+                          output_dir: str, chain: str = "A", recycles: int = 1, 
                           regenerate_summary: bool = True) -> str:
     """
     Generate only AF2Rank plots (no scoring) from existing CSV data.
