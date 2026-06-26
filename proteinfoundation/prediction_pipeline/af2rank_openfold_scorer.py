@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 import torch
 from Bio.PDB import MMCIFParser, PDBIO, PDBParser, Select
+from Bio.PDB.Atom import Atom
 import matplotlib.pyplot as plt
 from loguru import logger
 from tqdm import tqdm
@@ -302,6 +303,45 @@ def reconstruct_all_atom(pdb_file):
     except Exception as e:
         logger.warning(f"cg2all reconstruction failed for {pdb_file}: {e}")
         return None
+
+
+_BACKBONE_CB = ("N", "CA", "C", "O", "CB")
+
+
+def _project_cb(n, ca, c):
+    """Virtual CB from backbone atoms (AF2Rank `extend`), for adding CB to glycines."""
+    norm = lambda x: x / (np.sqrt(np.square(x).sum()) + 1e-8)
+    bc = norm(n - ca)
+    nn = norm(np.cross(n - c, bc))
+    m = np.array([bc, np.cross(nn, bc), nn])
+    d = np.array([
+        1.522 * np.cos(1.927),
+        1.522 * np.sin(1.927) * np.cos(-2.143),
+        -1.522 * np.sin(1.927) * np.sin(-2.143),
+    ])
+    return ca + d @ m
+
+
+def _strip_to_backbone_cb(pdb_file, out_file):
+    """AF2Rank mask_sidechains_add_cb: keep N/CA/C/O/CB only and project a CB onto
+    glycines, so the decoy's sidechain geometry cannot leak the native sequence
+    (which otherwise makes AlphaFold overconfident in the decoy)."""
+    s = PDBParser(QUIET=True).get_structure("x", pdb_file)
+    for res in list(s.get_residues()):
+        names = {a.get_name(): a for a in res}
+        for a in list(res):
+            if a.get_name() not in _BACKBONE_CB:
+                res.detach_child(a.get_id())
+        if "CB" not in names and all(k in names for k in ("N", "CA", "C")):
+            cb = _project_cb(
+                names["N"].coord.astype(float),
+                names["CA"].coord.astype(float),
+                names["C"].coord.astype(float),
+            )
+            res.add(Atom("CB", cb.astype("f4"), 0.0, 1.0, " ", " CB ", 0, "C"))
+    io = PDBIO()
+    io.set_structure(s)
+    io.save(out_file)
 
 
 def convert_pdb_to_cif(pdb_file, chain_id=None):
@@ -785,6 +825,7 @@ class OpenFoldAF2Rank:
         evoformer_keep_block_indices: Optional[str] = None,
         use_ema: bool = True,
         use_mlm: bool = False,  # AF2Rank protocol: leave masked_msa at the config default (~0.15, training distribution); False forces 0 (proteina deterministic inference)
+        mask_sidechains: bool = True,  # AF2Rank protocol: mask decoy template sidechains to backbone+CB (+Gly CB) so they don't leak the native sequence
     ):
         if chain is None:
             chain = "A"
@@ -792,6 +833,7 @@ class OpenFoldAF2Rank:
         self.model_name = model_name
         self.debug = debug
         self.recycles = recycles
+        self.mask_sidechains = mask_sidechains
         self.skip_ref_metrics = skip_ref_metrics
         self._segments = None
         self._mask_inter_segment = mask_inter_segment
@@ -929,6 +971,11 @@ class OpenFoldAF2Rank:
             pdb_for_template = decoy_pdb
 
         seg_ids = seg_mask = None
+        stripped_pdb = None
+        if self.mask_sidechains:
+            stripped_pdb = tempfile.NamedTemporaryFile(suffix=".pdb", delete=False).name
+            _strip_to_backbone_cb(pdb_for_template, stripped_pdb)
+            pdb_for_template = stripped_pdb
         if self._segments is not None:
             temp_cif, seg_ids, seg_mask = composite_from_joint(
                 self.reference_sequence, self._segments, pdb_for_template, chain_id=decoy_chain
@@ -960,6 +1007,8 @@ class OpenFoldAF2Rank:
                 os.unlink(temp_cif)
             if allatom_pdb and os.path.exists(allatom_pdb):
                 os.unlink(allatom_pdb)
+            if stripped_pdb and os.path.exists(stripped_pdb):
+                os.unlink(stripped_pdb)
 
         return batch, template_coords, seg_ids
 
