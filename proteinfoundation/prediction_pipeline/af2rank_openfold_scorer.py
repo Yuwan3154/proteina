@@ -768,7 +768,7 @@ class OpenFoldAF2Rank:
         reference_pdb: str,
         chain: Optional[str] = None,
         model_name: str = "model_1_ptm",
-        recycles: int = 3,
+        recycles: int = 1,  # AF2Rank protocol default (total iters = recycles+1); was 3
         debug: bool = False,
         chunk_size: Optional[int] = None,
         use_deepspeed_evoformer_attention: bool = False,
@@ -1034,6 +1034,11 @@ class OpenFoldAF2Rank:
             _tp = tmscore(template_coords, pred_ca, tmscore_exe=self.usalign_exe, env=_USALIGN_PARALLEL_ENV)
             scores["tm_template_pred"] = _tp.get("tms", 0.0)
             scores["rmsd_template_pred"] = _tp.get("rms", float("nan"))
+            # AF2Rank composite (ColabDesign canonical af2rank._get_score): ptm * plddt * tm_io,
+            # where tm_io = TM(input decoy/template, AF2 output) = tm_template_pred. The previous
+            # composite omitted tm_io (the dominant ranking signal, ~= decoy TM-to-native since
+            # output~=native) which under-ranked decoys (stock 0.69 vs paper ~0.92).
+            scores["composite"] = scores["ptm"] * scores["plddt"] * scores["tm_template_pred"]
 
         gc.collect()
         torch.cuda.empty_cache()

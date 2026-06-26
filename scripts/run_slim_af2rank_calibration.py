@@ -88,6 +88,7 @@ def run_mode(mode, targets, args):
                 "pae_mean": s.get("pae_mean"),
                 "tm_ref_template": s.get("tm_ref_template"),
                 "tm_ref_pred": s.get("tm_ref_pred"),
+                "tm_io": s.get("tm_template_pred"),  # TM(decoy, output) — the AF2Rank composite's 3rd factor
             })
         print(f"[{mode}] {ti + 1}/{len(targets)} {tid}: {len(decoys)} decoys", flush=True)
     del scorer
@@ -113,7 +114,7 @@ def main():
     ap.add_argument("--slim_ckpt_path", default=None)
     ap.add_argument("--keep", default="0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38,40,42,44,47")
     ap.add_argument("--use_ema", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--recycles", type=int, default=3)
+    ap.add_argument("--recycles", type=int, default=1)  # AF2Rank protocol (total iters = recycles+1)
     ap.add_argument("--chain", default="A")
     ap.add_argument("--max_decoys", type=int, default=0, help="0 = all")
     ap.add_argument("--modes", default="slim,stock", help="comma list: slim,stock")
