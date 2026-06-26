@@ -13,7 +13,7 @@ US=/home/jupyter-chenxi/USalign/USalign
 T=/home/jupyter-chenxi/data/af2rank_rosetta/targets.txt
 OUT=/home/jupyter-chenxi/runs/ws1_af2rank
 MAXD=${MAXD:-50}
-RECYCLES=${RECYCLES:-3}
+RECYCLES=${RECYCLES:-1}  # AF2Rank protocol (total iters = recycles+1)
 rm -rf "$OUT"; mkdir -p "$OUT"
 split -n l/4 -d "$T" "$OUT/targets_part_"
 for i in 0 1 2 3; do
