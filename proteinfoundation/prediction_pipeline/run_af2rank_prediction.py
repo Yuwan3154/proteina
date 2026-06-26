@@ -361,8 +361,8 @@ def main() -> None:
                         help="Column name in --csv_file for protein IDs (default: id)")
     parser.add_argument("--top_k", type=int, default=5,
                         help="Number of top ProteinEBM templates per protein (default: 5)")
-    parser.add_argument("--recycles", type=int, default=3,
-                        help="AF2 recycling iterations (default: 3)")
+    parser.add_argument("--recycles", type=int, default=1,
+                        help="AF2 recycling iterations (AF2Rank protocol default: 1)")
     parser.add_argument("--proteinebm_analysis_subdir", default="proteinebm_v2_cathmd_analysis",
                         help="Per-protein subdir containing ProteinEBM scores (default: proteinebm_v2_cathmd_analysis)")
     parser.add_argument("--cif_dir", default="",

@@ -982,8 +982,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "tm_ref_template (true GT TM), reads/writes a SEPARATE af2rank_on_oracle_top_k "
                         "(never touches the EBM subdir). Oracle requires --cif_dir + enriched "
                         "proteinebm_scores containing tm_ref_template.")
-    p.add_argument("--recycles", type=int, default=3,
-                   help="AF2Rank recycles for fallback scoring (default: 3).")
+    p.add_argument("--recycles", type=int, default=1,
+                   help="AF2Rank recycles for fallback scoring (AF2Rank protocol default: 1).")
     p.add_argument("--ptm_cutoff", type=float, default=0.7,
                    help="pTM threshold for 'fraction passing' plot (default: 0.7).")
     p.add_argument("--tm_cutoff", type=float, default=0.5,

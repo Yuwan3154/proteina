@@ -241,7 +241,7 @@ def run_af2rank_scoring(
     protein_name,
     reference_cif,
     inference_output_dir,
-    recycles=3,
+    recycles=1,
     backend="colabdesign",
     use_deepspeed_evoformer_attention=True,
     use_cuequivariance_attention=True,
@@ -348,7 +348,7 @@ def run_af2rank_plot_only(
     protein_name,
     reference_cif,
     inference_output_dir,
-    recycles=3,
+    recycles=1,
     backend="colabdesign",
     use_deepspeed_evoformer_attention=True,
     use_cuequivariance_attention=True,
@@ -600,7 +600,7 @@ def main():
     parser.add_argument('--cif_dir', required=True, help='Directory containing reference CIF files')
     parser.add_argument('--inference_config', required=True, help='Inference configuration name')
     parser.add_argument('--num_gpus', type=int, default=1, help='Number of GPUs to use')
-    parser.add_argument('--recycles', type=int, default=3, help='Number of AF2 recycles')
+    parser.add_argument('--recycles', type=int, default=1, help='Number of AF2 recycles (AF2Rank protocol: 1)')
     parser.add_argument('--filter_existing', action='store_true', 
                        help='Only process proteins that have completed inference')
     parser.add_argument('--regenerate_plots', action='store_true',
