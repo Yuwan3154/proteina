@@ -1096,6 +1096,10 @@ def enrich_af2rank_output_dir(
     scores_df["gdt_template_pred"] = scores_df["structure_file"].astype(str).apply(
         lambda name: template_prediction_metrics[name]["gdt"] if name in template_prediction_metrics else float("nan")
     )
+    # AF2Rank composite = pTM * pLDDT * tm_io, tm_io = TM(decoy template, AF2 output) = tm_template_pred.
+    # Recompute post-enrichment so the JAX/ColabDesign backend (whose scorer writes pTM*pLDDT only) matches
+    # the canonical definition; idempotent for the OpenFold port (its scorer already includes tm_io).
+    scores_df["composite"] = scores_df["ptm"] * scores_df["plddt"] * scores_df["tm_template_pred"]
     scores_df.to_csv(scores_csv, index=False)
 
     summary_path = Path(output_dir) / f"af2rank_summary_{protein_id}.json"
