@@ -22,6 +22,7 @@ Distilled do/don't + key-file map. Not a log. Motivations/understanding live in 
 ## DON'T
 - ⚠️⚠️ Don't trust ANY af2rank gate number (ref_pred_tm / composite) produced before the 2026-06-26 AF2Rank protocol fix — see PLAN top block + TaskCreate #1. CORRECT protocol: composite = pTM×pLDDT×**tm_io** (all three; tm_io dominant), **mask_sidechains_add_cb** (N/CA/C/O/CB + virtual CB on Gly), **recycles=1** (not 3/6), gap-token template seq, full decoy set, per-target Spearman→mean. Core fixes on origin/main (`97ca393` rec1, `d6e3ccf` mask-sc, `67cc19d`/`aafa509` composite); final tweaks uncommitted → confirm the deployed git state before re-scoring. ALL major analyses must be re-scored (reuse tars, `--rerun_af2rank_on_top_k`, rec1; do NOT regenerate). UNAFFECTED: ProteinEBM `tm_ref_template` (raw-selection / Q4 relaxation).
 - Don't invent step counts, schedules, cutoffs, or hyperparameters — ask if unspecified.
+- ProteinEBM relaxation gotchas: (a) load `pae.ckpt` via `ProteinRegressionTrainer.load_from_checkpoint(...).ebm` (bare `ProteinEBM` keys are unprefixed → loads nothing); (b) `compute_score`=∇ₓE builds the backward graph (~3× a forward) → OOM at big batch; use tiny relax batch (N=78→12, N=192→2), while `score_decoys`'s forward-only `compute_energy` fits at 256; (c) after a convergence run the sample PDB dirs are TARRED (`conv_sc8.sh --tar_protein_dirs`) → read PDBs + the proteinebm_scores CSV from `<pid>.tar`, not disk.
 - Don't assume pure-ODE sampling: Proteina's **default is the stochastic SDE** (`sampling_mode="sc"`). Switching to ODE ("vf") is a decision (Q4), not a default.
 - Don't expect the coordinate flow loop to save/resume intermediates — it doesn't; a small hook in `r3n_fm.py` is required for approach #3.
 - Don't score CA-only output directly where all-atom is needed — reconstruct atom37 first.
@@ -54,7 +55,9 @@ Distilled do/don't + key-file map. Not a log. Motivations/understanding live in 
 - `proteinfoundation/metrics/metric_factory.py` — FID/IS/fJSD via GearNet :34-194.
 - `proteinfoundation/proteinflow/proteina.py` — CA→atom37 reconstruction :794-842.
 - `docs/inference-speedup-PLAN.md` — the live plan (protocol, status, all motivations).
+- `docs/inference-speedup-PLAN-RAW-ARCHIVE.md` — dated blow-by-blow (campaign log + autonomous decisions log); audit trail only, PLAN is authoritative.
 - `docs/inference-speedup-litsearch-raw.json` — full lit-search synthesis (final recommendation, gaps, verified-paper verdicts).
+- **`~/proteina_speedup/scripts/` (SuperCloud, NOT in repo — operational):** `scaling_run_sc8.sh`/`scaling_run_seqcond8.sh` (8192 gen seq_cath/seq_cond), `conv_sc8.sh <energy|oracle> <cfg> <cond>` (scaling8-matched convergence), `conv_summary.py` (parse summary.json). Q4 relaxation: `make_decoys.py` (tar→decoy.pt; reuses `residues_to_features`, bakes tmscore, atom37_mask=ones[B,N]), `relax_decoys_fix.py`/`score_decoys_fix.py` (forked ProteinEBM scripts loading pae.ckpt via `ProteinRegressionTrainer→.ebm`), `relax_full.sh <pid> <t_max> <tag>` (convert→raw-score→relax→relaxed-score, energy+pTM), `compare_relax.py` (ρ raw-vs-relaxed). Untracked sweep configs backed up at `~/proteina_speedup/sweep_configs_backup.tar.gz`.
 
 ## DATA PATHS
 - `$DATA_PATH/metric_factory/model_weights/gearnet_ca.pth`; `$DATA_PATH/cath_shared/{cath_label_mapping.pt, pdb_chain_to_cat.pkl, cat_recovery/reps}`.
