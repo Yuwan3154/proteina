@@ -729,6 +729,7 @@ class PDBDataset(Dataset):
         self.packed = pack_path is not None
         self._pack_path = pack_path
         self._mm = None
+        self._mm_file = None
         self._pack_index = None
         if self.packed:
             idx_path = pack_path + ".idx.npz"
@@ -818,8 +819,10 @@ class PDBDataset(Dataset):
         """Lazily mmap the pack blob once per process (fork-safe: each worker opens
         its own read-only map; the node's OS page cache is shared across workers)."""
         if self._mm is None:
-            f = open(self._pack_path, "rb")
-            self._mm = mmap.mmap(f.fileno(), 0, prot=mmap.PROT_READ)
+            # keep the file handle alive on self: closing it would invalidate the fd
+            # before/under the mmap (CPython would GC a bare open() -> Bad file descriptor)
+            self._mm_file = open(self._pack_path, "rb")
+            self._mm = mmap.mmap(self._mm_file.fileno(), 0, prot=mmap.PROT_READ)
         return self._mm
 
     def __len__(self):
