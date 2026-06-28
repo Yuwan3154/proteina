@@ -9,6 +9,8 @@
 # its affiliates is strictly prohibited.
 
 import os
+import io
+import mmap
 import pathlib
 import pickle
 import random
@@ -671,6 +673,7 @@ class PDBDataset(Dataset):
         transform: Optional[Callable] = None,
         format: Literal["mmtf", "pdb", "cif", "ent"] = "cif",
         in_memory: bool = False,
+        pack_path: Optional[str] = None,
         file_names: Optional[List[str]] = None,
         num_workers: int = 64,
         min_length: Optional[int] = None,
@@ -718,7 +721,28 @@ class PDBDataset(Dataset):
         self._rank_for_logging = -1
         self._debug_data_loading = os.environ.get("DATA_LOADING_DEBUG", "0") == "1"
 
-        if self.in_memory:
+        # Packed-mmap mode: all processed graphs concatenated into one blob file
+        # (pack_path) + a sidecar index (pack_path + ".idx.npz": stems/offsets/lengths).
+        # __getitem__ reads each graph's byte range from a single mmap -> fork-safe
+        # (read-only, OS-page-cache resident across workers) and fast to warm. Takes
+        # precedence over in_memory (they are mutually exclusive).
+        self.packed = pack_path is not None
+        self._pack_path = pack_path
+        self._mm = None
+        self._pack_index = None
+        if self.packed:
+            idx_path = pack_path + ".idx.npz"
+            rank_zero_info(f"Packed-mmap dataset: loading index {idx_path}")
+            _z = np.load(idx_path, allow_pickle=True)
+            self._pack_index = {
+                str(s): (int(o), int(l))
+                for s, o, l in zip(_z["stems"], _z["offsets"], _z["lengths"])
+            }
+            rank_zero_info(
+                f"Packed-mmap index: {len(self._pack_index)} entries; pack={pack_path}"
+            )
+
+        if self.in_memory and not self.packed:
             rank_zero_info("Reading data into memory")
             # map_location="cpu" defends against .pt files whose tensors were
             # saved with a CUDA device (e.g. d_FS files written by
@@ -790,6 +814,14 @@ class PDBDataset(Dataset):
                 return self.processed_dir / bucket / fname_with_pt
         return self.processed_dir / fname_with_pt
 
+    def _pack_mmap(self):
+        """Lazily mmap the pack blob once per process (fork-safe: each worker opens
+        its own read-only map; the node's OS page cache is shared across workers)."""
+        if self._mm is None:
+            f = open(self._pack_path, "rb")
+            self._mm = mmap.mmap(f.fileno(), 0, prot=mmap.PROT_READ)
+        return self._mm
+
     def __len__(self):
         return len(self.file_names)
 
@@ -839,8 +871,18 @@ class PDBDataset(Dataset):
                 else:
                     fname = f"{self.pdb_codes[cur]}.pt"
 
-                # Sharded-aware path: works for flat (degenerates) and bucketed layouts.
-                path = self._processed_path_for(fname)
+                # Resolve the load source: packed mmap (stem -> byte range in one blob)
+                # OR the sharded on-disk path. Both feed the SAME corrupt-skip try below.
+                pack_ent = None
+                if self.packed:
+                    pack_ent = self._pack_index.get(fname[:-3])
+                    src_missing = pack_ent is None
+                    src_repr = f"pack[{fname}]"
+                else:
+                    # Sharded-aware path: works for flat (degenerates) and bucketed layouts.
+                    path = self._processed_path_for(fname)
+                    src_missing = not path.exists()
+                    src_repr = str(path)
 
                 if debug:
                     logger.info(
@@ -848,7 +890,7 @@ class PDBDataset(Dataset):
                         f"fname={fname} attempt={attempt + 1}/{self._MAX_GETITEM_RETRIES}"
                     )
 
-                if not path.exists():
+                if src_missing:
                     if debug:
                         logger.warning(
                             f"{self._data_load_log_prefix()} skip fname={fname} reason=missing_file"
@@ -861,7 +903,15 @@ class PDBDataset(Dataset):
                 if debug:
                     logger.info(f"{self._data_load_log_prefix()} loading fname={fname} ...")
                 try:
-                    graph = torch.load(path, map_location="cpu", weights_only=False)
+                    if self.packed:
+                        _off, _len = pack_ent
+                        graph = torch.load(
+                            io.BytesIO(self._pack_mmap()[_off:_off + _len]),
+                            map_location="cpu",
+                            weights_only=False,
+                        )
+                    else:
+                        graph = torch.load(path, map_location="cpu", weights_only=False)
                 except Exception as e:
                     elapsed = time.perf_counter() - t0
                     err_msg = str(e).lower()
@@ -970,6 +1020,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
         dataselector: Optional[PDBDataSelector] = None,
         datasplitter: Optional[PDBDataSplitter] = None,
         in_memory: bool = False,
+        pack_path: Optional[str] = None,
         format: Literal["mmtf", "pdb", "cif", "ent"] = "cif",
         overwrite: bool = False,
         regenerate_missing: bool = False,
@@ -1073,6 +1124,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
         self.overwrite = overwrite
         self.regenerate_missing = regenerate_missing
         self.in_memory = in_memory
+        self.pack_path = pack_path
         self.store_het = store_het
         self.store_bfactor = store_bfactor
         self.use_multiprocessing = use_multiprocessing
@@ -1974,6 +2026,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
             transform=self.transform,
             format=self.format,
             in_memory=self.in_memory,
+            pack_path=self.pack_path,
             file_names=file_names,
             num_workers=self.num_workers,
             min_length=self.dataselector.min_length if self.dataselector else None,

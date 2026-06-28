@@ -84,7 +84,11 @@ dataset_config_subdir: mixed
 # Load processed .pt files into RAM at training start (policy switch 2026-05-26).
 # Overrides datamodule.in_memory in the dataset YAML.
 datamodule:
-  in_memory: False  # AFDB: 1.05M chains; CAT-balanced ~1176/epoch -> per-batch disk read (avoid OOM)
+  in_memory: False  # superseded by pack_path; kept False so the per-file disk fallback still works when PACK_PATH is unset
+  # Packed-mmap in-RAM mode (2026-06-27): all processed graphs concatenated into ONE mmap'd blob on the
+  # data disk (fork-safe, OS-page-cache resident). Env-gated -> null when PACK_PATH unset = a no-op for
+  # any other run/dataset; this run's launcher exports PACK_PATH to enable it.
+  pack_path: ${oc.env:PACK_PATH,null}
   nocat_bucket_draws: 322  # 4-GPU ~50:50 labeled:unlabeled (4 ranks * 322 ≈ 1289 labeled topologies)
   prefetch_factor: 4  # bump dataloader prefetch 2->4 (merges over the dataset cfg; pin_memory already True)
 
