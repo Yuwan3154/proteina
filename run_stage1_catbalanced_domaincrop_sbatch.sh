@@ -5,7 +5,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:h200:4              # DEFAULT = H200; overridden per-tier on the sbatch CLI
 #SBATCH --cpus-per-task=20             # 4 ranks x 4 workers + 4 main; lean (training reads pre-processed .pt)
-#SBATCH --mem=200G
+#SBATCH --mem=768G                     # packed in-RAM mode: holds the 505G mmap pack resident + ~per-rank anon (validated on 2TB H200; mmap is RECLAIMABLE so lower would not OOM, just fault more -- prefetch-hidden). Restricts to big-RAM nodes; revisit per-tier if scheduling tightens.
 #SBATCH --time=2-00:00:00              # 2-day MAX (mit_preemptable cap=48h)
 #SBATCH --output=/home/chenxiou/proteina/store/dssp_contact_48M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined/slurm/%x-%j.out
 #SBATCH --error=/home/chenxiou/proteina/store/dssp_contact_48M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined/slurm/%x-%j.err
@@ -93,6 +93,9 @@ export DIAG_DATALOADER=1
 export TORCHINDUCTOR_CACHE_DIR=/orcd/compute/so3/001/chenxi/torchinductor_cache
 export TRITON_CACHE_DIR=/orcd/compute/so3/001/chenxi/triton_cache
 mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
+# >>> in-RAM packed dataset (2026-06-27): mmap the single blob on the data disk (roundtrip-validated,
+# fork-safe). Unsetting PACK_PATH reverts to per-file disk mode via the (re-pointed) symlinks.
+export PACK_PATH=/orcd/data/so3/001/chenxi/pdb_dFS_combined_pack/combined.pack
 
 cd "$REPO"
 # batch/accum from the ACTUAL allocated GPU (OOM-safe; eff batch always 4*batch*accum = 128)
