@@ -13,6 +13,7 @@ import gc
 import glob
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -39,7 +40,7 @@ from proteinfoundation.prediction_pipeline.usalign_tabular import parse_usalign_
 from scipy.stats import spearmanr
 
 
-KALIGN_BINARY_PATH = "/usr/bin/kalign"
+KALIGN_BINARY_PATH = shutil.which("kalign") or "/usr/bin/kalign"
 DEFAULT_PARAMS_DIR = os.path.expanduser("~/openfold/openfold/resources/params")
 
 _USALIGN_PARALLEL_ENV = {
