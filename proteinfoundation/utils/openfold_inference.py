@@ -810,6 +810,7 @@ class OpenFoldTemplateInference(nn.Module):
         segment_ids=None,
         segment_mask=None,
         seed: Optional[int] = None,
+        skip_template_alignment: Optional[bool] = None,
     ):
         """
         Build a feature dict for a single sample.
@@ -897,7 +898,7 @@ class OpenFoldTemplateInference(nn.Module):
                     chain_id=template_chain_id,
                     kalign_binary_path=kalign_binary_path,
                     rm_template_sequence=False,
-                    skip_alignment=self.skip_template_alignment,
+                    skip_alignment=(self.skip_template_alignment if skip_template_alignment is None else skip_template_alignment),
                 )
             else:
                 raw = self._make_template_stub_features(
@@ -921,7 +922,7 @@ class OpenFoldTemplateInference(nn.Module):
                 chain_id=template_chain_id,
                 kalign_binary_path=kalign_binary_path,
                 rm_template_sequence=False,
-                skip_alignment=self.skip_template_alignment,
+                skip_alignment=(self.skip_template_alignment if skip_template_alignment is None else skip_template_alignment),
             )
         else:
             raise ValueError(

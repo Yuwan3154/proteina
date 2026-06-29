@@ -852,7 +852,8 @@ def _run_model_pass(
                 allatom_map=allatom_map,
             )
         except Exception as e:
-            logger.error(f"  {protein_id} ({model_name}): scoring failed: {e}")
+            import traceback as _tb
+            logger.error(f"  {protein_id} ({model_name}): scoring failed: {e}\n{_tb.format_exc()}")
 
 
 if __name__ == "__main__":

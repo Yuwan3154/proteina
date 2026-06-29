@@ -1001,6 +1001,14 @@ class OpenFoldAF2Rank:
                 mask_template_aatype=True,  # AF2Rank: mask template sequence to all-X post-pipeline
                 segment_mask=seg_mask,
                 segment_ids=(seg_ids if self._mask_inter_segment else None),
+                # skip_template_alignment (1:1 decoy->query) is valid only when the decoy
+                # length matches the reference/query length. For decoys shorter than the
+                # reference (e.g. modeled-region decoy vs full-chain native), fall back to
+                # kalign alignment to avoid an out-of-range mapping in template featurization.
+                skip_template_alignment=(
+                    self.model.skip_template_alignment
+                    and int(template_coords.shape[0]) == len(self.reference_sequence)
+                ),
             )
         finally:
             if os.path.exists(temp_cif):
