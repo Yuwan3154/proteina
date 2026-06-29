@@ -445,6 +445,7 @@ def step_af2rank_topk(
     segments_col: str = "ordered_segments",
     segment_min_len: int = 50,
     mask_inter_segment: bool = True,
+    mask_sidechains: bool = True,
     af2rank_subdir: str = "af2rank_on_proteinebm_top_k",
     usalign_path: str | None = None,
 ) -> bool:
@@ -468,6 +469,7 @@ def step_af2rank_topk(
         "--proteinebm_analysis_subdir", proteinebm_analysis_subdir,
         "--af2rank_subdir", af2rank_subdir,
     ]
+    cmd.append("--mask_sidechains" if mask_sidechains else "--no-mask_sidechains")
     if usalign_path:
         cmd.extend(["--usalign_path", usalign_path])
     if segment_mode == "joint":
@@ -1292,6 +1294,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help='Drop ordered segments shorter than this (segment_mode=joint, default 50).')
     parser.add_argument('--mask_inter_segment', action=argparse.BooleanOptionalAction, default=True,
                         help='Mask cross-segment template pairs in AF2Rank (segment_mode=joint, default True).')
+    parser.add_argument('--mask_sidechains', action=argparse.BooleanOptionalAction, default=True,
+                        help='AF2Rank mask_sidechains_add_cb: strip decoy template to backbone+CB (default True). --no-mask_sidechains disables.')
     parser.add_argument('--af2rank_subdir', default=None,
                         help='Per-protein AF2Rank-on-top-k output subdir name. Default: auto '
                              '(af2rank_on_proteinebm_top_k for whole-chain; ..._mask / ..._nomask for '
@@ -1621,6 +1625,7 @@ def main(argv: list[str] | None = None):
             segments_col=args.segments_col,
             segment_min_len=args.segment_min_len,
             mask_inter_segment=args.mask_inter_segment,
+            mask_sidechains=args.mask_sidechains,
             af2rank_subdir=af2rank_subdir,
             usalign_path=args.usalign_path,
         ):

@@ -431,6 +431,8 @@ def main() -> None:
                         help='Drop ordered segments shorter than this (segment_mode=joint, default 50).')
     parser.add_argument('--mask_inter_segment', action=argparse.BooleanOptionalAction, default=True,
                         help='Mask cross-segment template pairs in AF2Rank (segment_mode=joint, default True).')
+    parser.add_argument('--mask_sidechains', action=argparse.BooleanOptionalAction, default=True,
+                        help='AF2Rank mask_sidechains_add_cb: strip decoy template to backbone+CB (default True). --no-mask_sidechains disables.')
     parser.add_argument('--af2rank_subdir', default='af2rank_on_proteinebm_top_k',
                         help='Per-protein AF2Rank-on-top-k output subdir name. Use a distinct name '
                              '(e.g. af2rank_on_proteinebm_top_k_mask) so mask vs nomask runs coexist '
@@ -617,6 +619,7 @@ def main() -> None:
             out_dir_key="out_dir_m1",
             seg_by_protein=seg_by_protein,
             mask_inter_segment=args.mask_inter_segment,
+            mask_sidechains=args.mask_sidechains,
             recycles=args.recycles,
             filter_existing=args.filter_existing,
             use_deepspeed_evoformer_attention=args.use_deepspeed_evoformer_attention,
@@ -638,6 +641,7 @@ def main() -> None:
             out_dir_key="out_dir_m2",
             seg_by_protein=seg_by_protein,
             mask_inter_segment=args.mask_inter_segment,
+            mask_sidechains=args.mask_sidechains,
             recycles=args.recycles,
             filter_existing=args.filter_existing,
             use_deepspeed_evoformer_attention=args.use_deepspeed_evoformer_attention,
@@ -791,6 +795,7 @@ def _run_model_pass(
     use_cueq_triangle_mul: bool = False,
     seg_by_protein: Dict = None,
     mask_inter_segment: bool = True,
+    mask_sidechains: bool = True,
 ) -> None:
     """Load model_name ONCE, then iterate over all proteins.
 
@@ -816,6 +821,7 @@ def _run_model_pass(
         inference_attn_kernel=inference_attn_kernel,
         compile_strategy=compile_strategy,
         use_cueq_triangle_mul=use_cueq_triangle_mul,
+        mask_sidechains=mask_sidechains,
     )
     logger.info(f"{model_name} loaded. Scoring {len(protein_configs)} proteins ...")
 
