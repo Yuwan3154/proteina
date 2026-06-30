@@ -523,6 +523,10 @@ class _CoordinateFlowMatcher:
             if _sc_fork and _sc_fork_idx is not None:
                 _sc_start = int(_sc_fork_idx)
                 x = torch.load(_sc_fork, weights_only=False)["x_t"].to(device=x.device, dtype=x.dtype)
+            # speedup HYBRID sampler (env-gated, default OFF): SDE (sc) for high-noise t<thresh,
+            # ODE (vf) for the rest. gt is always computed above so sc steps work on any config.
+            _sde_until = os.environ.get("PROTEINA_SDE_UNTIL_T")
+            _sde_until = float(_sde_until) if _sde_until else None
             # --- end speedup hook ---
 
             if fixed_sequence_mask is not None:
@@ -571,12 +575,16 @@ class _CoordinateFlowMatcher:
                     _sc_x0_list.append(x_1_pred.detach().to("cpu", torch.float32))
                     _sc_xt_list.append(x.detach().to("cpu", torch.float32))
 
-                # Accomodate last few steps
+                # per-step mode: hybrid (SDE high-noise -> ODE) if _sde_until set, else config mode
+                if _sde_until is not None:
+                    step_mode = "sc" if ts[step] < _sde_until else "vf"
+                else:
+                    step_mode = sampling_mode
+                # Accomodate last few steps (always force ODE near data)
                 if ts[step] > 0.99:
-                    sampling_mode = "vf"
-                if schedule_mode in ["cos_sch_v_snr", "edm"]:
-                    if ts[step] > 0.985:
-                        sampling_mode = "vf"
+                    step_mode = "vf"
+                if schedule_mode in ["cos_sch_v_snr", "edm"] and ts[step] > 0.985:
+                    step_mode = "vf"
 
                 x, _ = self.simulation_step(
                     x_t=x,
@@ -584,7 +592,7 @@ class _CoordinateFlowMatcher:
                     t=t,
                     dt=dt,
                     gt=gt_step,
-                    sampling_mode=sampling_mode,
+                    sampling_mode=step_mode,
                     sc_scale_noise=sc_scale_noise,
                     sc_scale_score=sc_scale_score,
                     mask=mask,
