@@ -187,11 +187,42 @@ def safe_extract_protein_tar(inference_dir: str | Path, protein_id: str) -> bool
     return True
 
 
+def extract_missing_protein_members(inference_dir: str | Path, protein_id: str) -> int:
+    """Backfill tar members absent from an existing (partial) loose dir.
+
+    Existence of the loose dir is not completeness: an interrupted extraction
+    can leave it short of the tar (e.g. 131 of 1024 decoy PDBs), and a later
+    top-k read then crashes FileNotFoundError. Returns the count extracted;
+    0 means the dir was already complete (fast path, no second tar open).
+    """
+    inference_path = Path(inference_dir)
+    protein_dir = inference_path / protein_id
+    tar_path = protein_tar_path(inference_path, protein_id)
+    if not protein_dir.is_dir() or not tar_path.exists():
+        return 0
+    missing_rel = _tar_file_members(tar_path, protein_id) - _loose_file_members(protein_dir)
+    if not missing_rel:
+        return 0
+    to_extract: list[tarfile.TarInfo] = []
+    with tarfile.open(tar_path, "r:") as tf:
+        for member in tf.getmembers():
+            _validate_member_name(member.name, protein_id)
+            if member.issym() or member.islnk():
+                continue
+            rel_name = _strip_protein_prefix(member.name, protein_id)
+            if rel_name and rel_name in missing_rel:
+                to_extract.append(member)
+        if to_extract:
+            tf.extractall(inference_path, members=to_extract)
+    return len(to_extract)
+
+
 def restore_protein_dirs(inference_dir: str | Path, protein_ids: Iterable[str]) -> dict[str, float | int]:
     start = time.perf_counter()
     initialized = 0
     extracted = 0
     already_present = 0
+    repaired = 0
     empty_or_missing = 0
     inference_path = Path(inference_dir)
     for protein_id in protein_ids:
@@ -201,7 +232,12 @@ def restore_protein_dirs(inference_dir: str | Path, protein_ids: Iterable[str]) 
         ensure_protein_tar(inference_path, protein_id)
         protein_dir = inference_path / protein_id
         if protein_dir.exists():
-            already_present += 1
+            # Existence != completeness: backfill any members missing from an
+            # interrupted/partial extraction so a later top-k read cannot miss one.
+            if extract_missing_protein_members(inference_path, protein_id):
+                repaired += 1
+            else:
+                already_present += 1
         elif safe_extract_protein_tar(inference_path, protein_id):
             extracted += 1
         else:
@@ -210,6 +246,7 @@ def restore_protein_dirs(inference_dir: str | Path, protein_ids: Iterable[str]) 
         "initialized": initialized,
         "extracted": extracted,
         "already_present": already_present,
+        "repaired": repaired,
         "empty_or_missing": empty_or_missing,
         "elapsed_seconds": time.perf_counter() - start,
     }
