@@ -128,7 +128,7 @@ torchrun --nnodes=1 --nproc_per_node=4 --rdzv-backend=c10d --rdzv-endpoint="127.
     --batch_size "$BATCH" \
     --accumulate_grad_batches "$ACCUM" \
     --resume_option allow \
-    af2_ipa_weights_path=/orcd/pool/006/chenxiou/params/params_model_1_ptm.npz &
+    af2_ipa_weights_path=/orcd/scratch/orcd/011/chenxiou/params/params_model_1_ptm.npz &
 TORCH_PID=$!
 RC=0
 while kill -0 "$TORCH_PID" 2>/dev/null; do
