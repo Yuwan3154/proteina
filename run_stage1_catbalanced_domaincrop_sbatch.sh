@@ -5,7 +5,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:h200:4              # DEFAULT = H200; overridden per-tier on the sbatch CLI
 #SBATCH --cpus-per-task=20             # 4 ranks x 4 workers + 4 main; lean (training reads pre-processed .pt)
-#SBATCH --mem=768G                     # packed in-RAM mode: holds the 505G mmap pack resident + ~per-rank anon (validated on 2TB H200; mmap is RECLAIMABLE so lower would not OOM, just fault more -- prefetch-hidden). Restricts to big-RAM nodes; revisit per-tier if scheduling tightens.
+#SBATCH --mem=400G                     # h200 default (overridden per-tier in _submit_tier/submit_tiered.sh: h100/l40s=300G). mmap is RECLAIMABLE; non-mmap working set ~50GB; 300-400G gives ample page-cache headroom. Was 768G but blocked scheduling on mix nodes (node5105 H200 has only 747GB total).
 #SBATCH --time=2-00:00:00              # 2-day MAX (mit_preemptable cap=48h)
 #SBATCH --output=/home/chenxiou/proteina/store/dssp_contact_48M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined/slurm/%x-%j.out
 #SBATCH --error=/home/chenxiou/proteina/store/dssp_contact_48M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined/slurm/%x-%j.err
@@ -54,8 +54,9 @@ _submit_tier() {  # $1=tier  $2=gres  $3=begin ; anti-dup: skip if ANOTHER job o
   fi
   local exarg=""
   [ -s "$EXCLUDE_FILE" ] && exarg="--exclude=$(sort -u "$EXCLUDE_FILE" | paste -sd, -)"
-  echo "[$(date)] escalate: submit tier $1 (gres $2 begin $3) ${exarg}"
-  (cd "$REPO" && sbatch --job-name="cb_dc_s1_48m_$1" --gres="$2" --begin="$3" ${exarg} --export=ALL "$LAUNCHER") || true
+  local TIER_MEM; case "$1" in h200) TIER_MEM=400G ;; *) TIER_MEM=300G ;; esac
+  echo "[$(date)] escalate: submit tier $1 (gres $2 begin $3 mem $TIER_MEM) ${exarg}"
+  (cd "$REPO" && sbatch --job-name="cb_dc_s1_48m_$1" --gres="$2" --begin="$3" --mem="$TIER_MEM" ${exarg} --export=ALL "$LAUNCHER") || true
 }
 # ESCALATE = start a fresh round: H200 now, H100 +6h, L40S +24h (--begin gates the broadening)
 escalate() {

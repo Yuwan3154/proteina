@@ -18,9 +18,10 @@ submit_tier() {  # $1=tier  $2=gres  $3=begin
     echo "tier $1: cb_dc_s1_48m_$1 already queued -> skip (no duplicate)."
     return
   fi
-  echo "tier $1: submitting (gres $2, begin $3)"
+  local MEM; case "$1" in h200) MEM=400G ;; *) MEM=300G ;; esac
+  echo "tier $1: submitting (gres $2, begin $3, mem $MEM)"
   # the launcher derives the tier from --job-name (cb_dc_s1_48m_<tier>); --export=ALL just carries the env.
-  sbatch --job-name="cb_dc_s1_48m_$1" --gres="$2" --begin="$3" --export=ALL "$L"
+  sbatch --job-name="cb_dc_s1_48m_$1" --gres="$2" --begin="$3" --mem="$MEM" --export=ALL "$L"
 }
 
 submit_tier h200 gpu:h200:4 now
