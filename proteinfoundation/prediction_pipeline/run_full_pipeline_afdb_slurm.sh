@@ -27,7 +27,7 @@ cd /home/gridsan/cou/proteina
 # of proteins sorted by length for balanced workload.
 # OOM errors automatically halve max_nsamples and retry.
 python proteinfoundation/prediction_pipeline/run_prediction_pipeline.py \
-    --dataset_file ~/data/bad_afdb/pdb_70_cluster_reps_aligned_confidence_aggregate_monomer_tm-05_coverage-08_identity-07_length_50-512.csv \
+    --dataset_file ~/data/bad_afdb/pdb_70_cluster_reps_aligned_confidence_aggregate_monomer_tm-05_pdbLength_50-512_coverage-08_identity-07.csv \
     --id_col pdb \
     --tms_col tm_score \
     --cif_dir ~/data/bad_afdb/pdb \
@@ -51,7 +51,7 @@ python proteinfoundation/prediction_pipeline/run_prediction_pipeline.py \
     --rerun_score
 
 python proteinfoundation/prediction_pipeline/run_prediction_pipeline.py \
-    --dataset_file ~/data/bad_afdb/pdb_70_cluster_reps_aligned_confidence_aggregate_monomer_tm-05_coverage-08_identity-07_length_50-512.csv \
+    --dataset_file ~/data/bad_afdb/pdb_70_cluster_reps_aligned_confidence_aggregate_monomer_tm-05_pdbLength_50-512_coverage-08_identity-07.csv \
     --id_col pdb \
     --tms_col tm_score \
     --cif_dir ~/data/bad_afdb/pdb \
