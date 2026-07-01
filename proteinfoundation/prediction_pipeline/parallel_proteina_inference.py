@@ -350,8 +350,12 @@ def process_single_protein(args):
         dynamic_shapes = True
 
     try:
-        # Set GPU for this process
-        os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+        # Set GPU for this process. gpu_id is a local worker index; if the caller already
+        # restricted CUDA_VISIBLE_DEVICES to specific physical ids (shared, non-SLURM host),
+        # index into that list instead of clobbering it with a raw 0-based id.
+        _inherited_cvd = os.environ.get('CUDA_VISIBLE_DEVICES')
+        _phys_gpus = _inherited_cvd.split(',') if _inherited_cvd else None
+        os.environ['CUDA_VISIBLE_DEVICES'] = _phys_gpus[gpu_id] if _phys_gpus and gpu_id < len(_phys_gpus) else str(gpu_id)
 
         logger.info(f"[GPU {gpu_id}] Starting processing for {protein_name}")
 
@@ -480,7 +484,9 @@ def worker_init_proteina(counter, lock, num_gpus):
         counter.value += 1
     
     gpu_id = worker_id % num_gpus
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+    _inherited_cvd = os.environ.get('CUDA_VISIBLE_DEVICES')
+    _phys_gpus = _inherited_cvd.split(',') if _inherited_cvd else None
+    os.environ['CUDA_VISIBLE_DEVICES'] = _phys_gpus[gpu_id] if _phys_gpus and gpu_id < len(_phys_gpus) else str(gpu_id)
     # Store GPU ID in a process-local variable
     builtins._worker_gpu_id = gpu_id
     logger.info(f"Proteina Worker {worker_id} initialized with GPU {gpu_id}")

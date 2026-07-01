@@ -292,7 +292,11 @@ def run_gpu_worker_subprocess(
         cmd.append("--no-proteinebm_template_self_condition")
 
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    # gpu_id is a local worker index; if the caller already restricted CUDA_VISIBLE_DEVICES to
+    # specific physical ids (shared, non-SLURM host), index into that list instead of clobbering it.
+    _inherited_cvd = env.get("CUDA_VISIBLE_DEVICES")
+    _phys_gpus = _inherited_cvd.split(",") if _inherited_cvd else None
+    env["CUDA_VISIBLE_DEVICES"] = _phys_gpus[gpu_id] if _phys_gpus and gpu_id < len(_phys_gpus) else str(gpu_id)
     try:
         result = subprocess.run(
             cmd,
@@ -499,7 +503,9 @@ def main():
             cmd.append("--no-proteinebm_template_self_condition")
 
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        _inherited_cvd = env.get("CUDA_VISIBLE_DEVICES")
+        _phys_gpus = _inherited_cvd.split(",") if _inherited_cvd else None
+        env["CUDA_VISIBLE_DEVICES"] = _phys_gpus[gpu_id] if _phys_gpus and gpu_id < len(_phys_gpus) else str(gpu_id)
         proc = subprocess.Popen(
             cmd,
             cwd=_SCRIPT_DIR,

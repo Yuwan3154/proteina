@@ -527,7 +527,13 @@ def step_af2rank_topk(
     procs: list[tuple[int, subprocess.Popen]] = []
     for gpu_id, sub_cmd in sub_cmds:
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        # gpu_id is a local worker index (0..effective_num_gpus-1), assumed == physical GPU id
+        # (true on a SLURM-allocated node owning GPUs 0..N-1). If CUDA_VISIBLE_DEVICES was
+        # already restricted to specific physical ids by the caller (shared, non-SLURM host),
+        # index into that list instead of clobbering it.
+        _inherited_cvd = env.get("CUDA_VISIBLE_DEVICES")
+        _phys_gpus = _inherited_cvd.split(",") if _inherited_cvd else None
+        env["CUDA_VISIBLE_DEVICES"] = _phys_gpus[gpu_id] if _phys_gpus and gpu_id < len(_phys_gpus) else str(gpu_id)
         if effective_num_gpus > 1 or ext_idx is not None:
             logger.info(
                 f"GPU {gpu_id}: launching AF2Rank top-k worker "
