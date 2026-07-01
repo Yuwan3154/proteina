@@ -28,7 +28,11 @@ import torch
 torch.set_float32_matmul_precision("medium")
 # Match train.py: raise the Dynamo recompile limit so dynamic-shape eval
 # (many sampling lengths) doesn't evict cached graphs (default 8).
-torch._dynamo.config.recompile_limit = 32
+# Attribute was renamed cache_size_limit -> recompile_limit between torch 2.4 and 2.7.
+if hasattr(torch._dynamo.config, "recompile_limit"):
+    torch._dynamo.config.recompile_limit = 32
+else:
+    torch._dynamo.config.cache_size_limit = 32
 from dotenv import load_dotenv
 from loguru import logger
 from omegaconf import OmegaConf
