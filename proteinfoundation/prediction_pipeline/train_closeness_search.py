@@ -192,15 +192,17 @@ def _find_reference_cif(protein_id: str, cif_dir: Path) -> Optional[Path]:
     """Resolve {cif_dir}/{pdb}.cif, directly or one level down (sharded layout).
 
     Mirrors proteina_analysis._find_reference_cif so natives resolve identically.
+    Prefers the full protein_id (e.g. 9EVD_6.cif) over the bare pdb_id, since
+    several targets can share a PDB (complex chains) — pdb_id alone collides.
     """
-    pdb_id = protein_id.split("_")[0]
-    direct = cif_dir / f"{pdb_id}.cif"
-    if direct.exists():
-        return direct
-    for child in sorted(p for p in cif_dir.iterdir() if p.is_dir()):
-        cand = child / f"{pdb_id}.cif"
-        if cand.exists():
-            return cand
+    for stem in (protein_id, protein_id.split("_")[0]):
+        direct = cif_dir / f"{stem}.cif"
+        if direct.exists():
+            return direct
+        for child in sorted(p for p in cif_dir.iterdir() if p.is_dir()):
+            cand = child / f"{stem}.cif"
+            if cand.exists():
+                return cand
     return None
 
 
