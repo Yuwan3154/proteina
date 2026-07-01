@@ -240,8 +240,9 @@ def run_proteina_inference(protein_name, inference_config, force_compile: bool =
         '--pt', protein_name,
         '--config_name', inference_config,
     ]
-    if force_compile:
-        cmd.append('--force_compile')
+    # inference.py's own --force_compile defaults to True (BooleanOptionalAction), so omitting
+    # the flag here does NOT disable it there -- must pass --no-force_compile explicitly.
+    cmd.append('--force_compile' if force_compile else '--no-force_compile')
     if max_nsamples is not None:
         cmd.extend(['--max_nsamples', str(max_nsamples)])
     if conditioning_mode is not None:
