@@ -9,7 +9,10 @@
 #SBATCH --time=2-00:00:00              # 2-day MAX (mit_preemptable cap=48h)
 #SBATCH --output=/home/chenxiou/proteina/store/dssp_contact_48M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined/slurm/%x-%j.out
 #SBATCH --error=/home/chenxiou/proteina/store/dssp_contact_48M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined/slurm/%x-%j.err
-# NO --requeue: a preemption is treated as a round-end -> RE-ESCALATE (per design), not requeue.
+#SBATCH --no-requeue                   # mit_preemptable auto-requeues preempted jobs by default (Requeue=1); without
+                                        # this flag, SLURM's auto-requeue AND this script's own on_term trap BOTH fire
+                                        # on preemption -> two concurrent DDP training processes on the SAME checkpoint.
+                                        # A preemption is treated as a round-end -> RE-ESCALATE (per design), not requeue.
 
 # PER-ROUND GPU-escalation Stage-1 (48M), combined PDB+AFDB, on mit_preemptable.
 # The escalating queue is rebuilt EACH ROUND (a round begins when the previous job ends):
