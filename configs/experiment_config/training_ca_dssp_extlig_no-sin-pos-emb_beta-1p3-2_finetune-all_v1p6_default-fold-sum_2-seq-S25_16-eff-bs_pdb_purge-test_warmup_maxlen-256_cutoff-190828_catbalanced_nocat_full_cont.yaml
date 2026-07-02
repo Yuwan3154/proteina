@@ -60,7 +60,10 @@ training:
   mask_C_prob: 0.5
   fold_label_sample_ratio: [0.67, 0.13, 0.2, 0.0] # Pretain: [0.5, 0.1, 0.15, 0.25], Finetune (no H, scale up by 4/3): [0.67, 0.13, 0.2, 0.0]
   mask_seq_proportion: 0.15
-  mask_extlig_proportion: 0.3
+  mask_extlig_proportion: 0.3  # inert while ext_lig_smart_unknown_augment=True below (kept as the documented fallback value)
+  ext_lig_smart_unknown_augment: True  # block-shaped, per-chain-diverse-fraction augmentation (real empirical stats), replaces the fixed-0.3 i.i.d. scatter above
+  ext_lig_frac_present_stats_path: ${oc.env:DATA_PATH}/ext_lig_stats/frac_present.npy
+  ext_lig_runlen_stats_path: ${oc.env:DATA_PATH}/ext_lig_stats/runlen_buckets.npz
   finetune_seq_cond_lora_only: False
   self_cond_use_copy: True
   self_cond_copy_update_every: 10

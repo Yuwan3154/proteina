@@ -43,6 +43,7 @@ from proteinfoundation.datasets.cath_utils import (
     load_cath_mapping,
 )
 from proteinfoundation.utils.ff_utils.pdb_utils import (
+    mask_ext_lig_blocky,
     mask_seq,
     write_prot_to_pdb,
 )
@@ -73,6 +74,10 @@ class ModelTrainerBase(L.LightningModule):
         self.nflops = 0
         self.nparams = None
         self.nsamples_processed = 0
+
+        # Lazy cache for the ext_lig "smart unknown" augmentation stats (see
+        # _get_ext_lig_augment_stats / mask_ext_lig_blocky)
+        self._ext_lig_augment_stats = None
 
         # Attributes re-written by classes that inherit from this one
         self.nn = None
@@ -1063,6 +1068,53 @@ class ModelTrainerBase(L.LightningModule):
                 f"Sampling mode for t {self.cfg_exp.loss.t_distribution.name} not implemented"
             )
 
+    def _get_ext_lig_augment_stats(self) -> dict:
+        """Lazily load and cache the ext_lig 'smart unknown' augmentation artifacts
+        (script_utils/precompute_ext_lig_augment_stats.py) -- real per-chain frac_present
+        pool + adaptive by-residue-weighted run-length buckets."""
+        if self._ext_lig_augment_stats is None:
+            frac_path = self.cfg_exp.training.ext_lig_frac_present_stats_path
+            runlen_path = self.cfg_exp.training.ext_lig_runlen_stats_path
+            frac_present_pool = np.load(frac_path)
+            runlen = np.load(runlen_path)
+            self._ext_lig_augment_stats = {
+                "frac_present_pool": frac_present_pool,
+                "runlen_bucket_lo": runlen["bucket_lo"],
+                "runlen_bucket_hi": runlen["bucket_hi"],
+                "runlen_bucket_weight": runlen["bucket_weight"],
+            }
+            logger.info(
+                f"Loaded ext_lig smart-augment stats: {len(frac_present_pool)} chains from "
+                f"{frac_path}, {len(runlen['bucket_lo'])} runlen buckets from {runlen_path}"
+            )
+        return self._ext_lig_augment_stats
+
+    def _log_ext_lig_augment_monitoring(
+        self, before: Tensor, after: Tensor, mask: Tensor, augment_stats: dict
+    ) -> None:
+        """Before/after ext_lig label distribution + sampled block stats, so a
+        misbehaving augmentation (wrong fraction, degenerate all-singleton blocks, etc.)
+        is visible in wandb rather than silently degrading training."""
+        valid = mask.bool()
+
+        def frac(labels, value):
+            return (labels[valid] == value).float().mean()
+
+        log_kwargs = dict(on_step=True, on_epoch=False, prog_bar=False, logger=True,
+                           batch_size=mask.shape[0], sync_dist=True)
+        for name, value in [
+            ("present_before", frac(before, 1)),
+            ("absent_before", frac(before, 0)),
+            ("unknown_before", frac(before, 2)),
+            ("present_after", frac(after, 1)),
+            ("absent_after", frac(after, 0)),
+            ("unknown_after", frac(after, 2)),
+            ("sampled_fraction", augment_stats["mean_fraction"]),
+            ("n_pieces", augment_stats["mean_n_pieces"]),
+            ("piece_length", augment_stats["mean_piece_length"]),
+        ]:
+            self.log(f"ext_lig_augment/{name}", value, **log_kwargs)
+
     def training_step(self, batch, batch_idx):
         """
         Computes training loss for batch of samples.
@@ -1247,8 +1299,23 @@ class ModelTrainerBase(L.LightningModule):
 
         # ext_lig masking (when model uses ext_lig embeddings)
         mask_extlig = self.cfg_exp.training.get("mask_extlig_proportion", 0.0)
-        if mask_extlig > 0 and "ext_lig" in batch and getattr(self.cfg_exp.model.nn, "ext_lig_emb_dim", None):
-            batch["ext_lig"] = mask_seq(batch["ext_lig"], mask, mask_extlig, mask_value=2)
+        smart_extlig_augment = self.cfg_exp.training.get("ext_lig_smart_unknown_augment", False)
+        if "ext_lig" in batch and getattr(self.cfg_exp.model.nn, "ext_lig_emb_dim", None):
+            if smart_extlig_augment:
+                ext_lig_before = batch["ext_lig"]
+                stats = self._get_ext_lig_augment_stats()
+                batch["ext_lig"], augment_stats = mask_ext_lig_blocky(
+                    ext_lig_before,
+                    mask,
+                    stats["frac_present_pool"],
+                    stats["runlen_bucket_lo"],
+                    stats["runlen_bucket_hi"],
+                    stats["runlen_bucket_weight"],
+                    mask_value=2,
+                )
+                self._log_ext_lig_augment_monitoring(ext_lig_before, batch["ext_lig"], mask, augment_stats)
+            elif mask_extlig > 0:
+                batch["ext_lig"] = mask_seq(batch["ext_lig"], mask, mask_extlig, mask_value=2)
 
         # Zero out sinusoidal positional embedding (for fine-tuning without position info)
         if self.cfg_exp.training.get("zero_sin_pos_emb", False):

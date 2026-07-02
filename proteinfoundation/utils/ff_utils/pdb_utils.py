@@ -438,9 +438,134 @@ def mask_seq(
             
         seq_len = mask_np.sum()
         num_mask = int(seq_len * mask_seq_proportion)
-        
+
         if num_mask > 0:
             mask_idx = np.random.choice(range(int(seq_len)), size=num_mask, replace=False)
             seq[mask_idx] = mask_value
 
     return seq
+
+
+def _sample_run_length(bucket_lo: np.ndarray, bucket_hi: np.ndarray, bucket_p: np.ndarray) -> int:
+    """Draw one run length: pick a bucket by its (precomputed, normalized) by-residue
+    weight, then uniformly within [lo, hi]. See script_utils/precompute_ext_lig_augment_stats.py
+    for how the buckets are built (single-length bins where data is dense, wider merged
+    bins in the sparse tail -- avoids resampling raw finite-sample noise in rare lengths)."""
+    bucket_idx = np.random.choice(len(bucket_p), p=bucket_p)
+    lo, hi = int(bucket_lo[bucket_idx]), int(bucket_hi[bucket_idx])
+    return int(np.random.randint(lo, hi + 1))
+
+
+def _draw_ext_lig_piece_multiset(
+    target_count: int, bucket_lo: np.ndarray, bucket_hi: np.ndarray, bucket_p: np.ndarray
+) -> List[int]:
+    """Repeatedly draw a run length and subtract it from the remaining mask budget; once
+    the next draw would overflow the remaining budget, treat the remainder as that many
+    length-1 singletons. Returns piece lengths summing to exactly target_count."""
+    pieces = []
+    remaining = target_count
+    while remaining > 0:
+        run_len = _sample_run_length(bucket_lo, bucket_hi, bucket_p)
+        if run_len > remaining:
+            pieces.extend([1] * remaining)
+            remaining = 0
+        else:
+            pieces.append(run_len)
+            remaining -= run_len
+    return pieces
+
+
+def _place_pieces_nonoverlapping(pieces: List[int], valid_length: int) -> np.ndarray:
+    """Place `pieces` (lengths summing to <= valid_length) as non-overlapping blocks at
+    random, non-adjacent-or-not positions within [0, valid_length). Exact, zero-rejection:
+    a random composition of the leftover gap space into len(pieces)+1 parts (stars-and-bars
+    via sorted uniform cut points), so this is O(k log k) with no retry loop. Returns a
+    boolean array, True at positions to mask."""
+    k = len(pieces)
+    selected = np.zeros(valid_length, dtype=bool)
+    if k == 0:
+        return selected
+    gap_budget = valid_length - sum(pieces)
+    cuts = np.sort(np.random.randint(0, gap_budget + 1, size=k))
+    gaps = np.diff(np.concatenate([[0], cuts, [gap_budget]]))
+    pos = 0
+    for gap, piece_len in zip(gaps, pieces):
+        pos += int(gap)
+        selected[pos : pos + piece_len] = True
+        pos += piece_len
+    return selected
+
+
+def mask_ext_lig_blocky(
+    seq: torch.Tensor,
+    mask: torch.Tensor,
+    frac_present_pool: np.ndarray,
+    runlen_bucket_lo: np.ndarray,
+    runlen_bucket_hi: np.ndarray,
+    runlen_bucket_weight: np.ndarray,
+    mask_value: int = 2,
+) -> "tuple[torch.Tensor, dict]":
+    """Block-shaped ext_lig 'unknown' training augmentation.
+
+    For each batch item, draws a per-item masking fraction from the REAL per-chain
+    frac_present empirical distribution (no parametric fit), then hides that many
+    residues as contiguous blocks sized like real present-patches (by-residue-weighted
+    run-length buckets, see _sample_run_length), placed at random positions -- placement
+    is INDEPENDENT of the item's own true ext_lig label, so being masked carries no
+    information about whether a position was really present (matching real inference-time
+    "unknown", which has no such correlation either). Unlike mask_seq's i.i.d. scattered
+    per-residue selection, this reproduces the real contiguous block pattern (empirically,
+    ~51% of present residues sit in patches longer than 10 residues).
+
+    Args:
+      seq: ext_lig labels, [B, N] or [N], long tensor with values {0,1,2}.
+      mask: validity mask, [B, N] or [N] (1 = real residue, 0 = padding).
+      frac_present_pool: float32[N_chains], real per-chain frac_present values.
+      runlen_bucket_lo, runlen_bucket_hi, runlen_bucket_weight: adaptive run-length
+        histogram from precompute_ext_lig_augment_stats.py.
+      mask_value: label written at masked positions (2 = unknown).
+
+    Returns:
+      (masked_seq, stats) where stats holds per-batch-mean sampled fraction / number of
+      pieces / piece length, for monitoring (see model_trainer_base.py call site).
+    """
+    is_1d = seq.dim() == 1
+    if is_1d:
+        seq = seq.unsqueeze(0)
+        mask = mask.unsqueeze(0)
+
+    device, dtype = seq.device, seq.dtype
+    lengths = mask.sum(dim=1).detach().cpu().numpy()
+    B = seq.shape[0]
+
+    bucket_p = runlen_bucket_weight / runlen_bucket_weight.sum()
+    fractions = frac_present_pool[np.random.randint(0, len(frac_present_pool), size=B)]
+
+    seq_out = seq.clone()
+    n_pieces_total, piece_len_sum, piece_len_count = 0, 0, 0
+    for i in range(B):
+        L = int(lengths[i])
+        if L == 0:
+            continue
+        target_count = int(round(L * fractions[i]))
+        if target_count == 0:
+            continue
+        pieces = _draw_ext_lig_piece_multiset(target_count, runlen_bucket_lo, runlen_bucket_hi, bucket_p)
+        selected = _place_pieces_nonoverlapping(pieces, L)
+        selected_t = torch.from_numpy(selected).to(device=device)
+        seq_out[i, :L] = torch.where(
+            selected_t, torch.tensor(mask_value, device=device, dtype=dtype), seq_out[i, :L]
+        )
+        n_pieces_total += len(pieces)
+        piece_len_sum += sum(pieces)
+        piece_len_count += len(pieces)
+
+    if is_1d:
+        seq_out = seq_out.squeeze(0)
+
+    stats = {
+        "mean_fraction": float(fractions.mean()),
+        "mean_n_pieces": n_pieces_total / max(B, 1),
+        "mean_piece_length": (piece_len_sum / piece_len_count) if piece_len_count else 0.0,
+    }
+    return seq_out, stats
