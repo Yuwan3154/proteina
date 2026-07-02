@@ -44,7 +44,7 @@ trap on_term TERM
 
 check_type() {  # $1=gpu type (h200|h100); prints "node type free" for nodes with free >= NEED
   local gtype="$1"
-  sinfo -p "$PART" -N -h -o '%N %t' 2>/dev/null | awk '$2 !~ /drain|resv|down|maint/ {print $1}' | while read -r n; do
+  sinfo -p "$PART" -N -h -o '%N %t' 2>/dev/null | awk '$2 !~ /drain|drng|resv|down|maint/ {print $1}' | while read -r n; do
     local show cfgline allocline cfg alloc free
     show=$(scontrol show node="$n" 2>/dev/null)
     cfgline=$(echo "$show" | grep 'CfgTRES=')
