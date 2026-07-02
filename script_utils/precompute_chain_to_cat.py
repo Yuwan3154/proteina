@@ -34,7 +34,10 @@ EXPECTED = {
 
 def build_chain_to_cat(cath_root):
     transform = CATHLabelTransform(root_dir=cath_root)
-    pdbchain_to_cathid = transform.pdbchain_to_cathid_mapping
+    # transform.pdbchain_to_cathid_mapping is a FrozenStrMap (refcount-free lookup-only
+    # structure for forked dataloader workers, see frozen_str_map.py) -- no .items(), so
+    # re-parse the raw dict directly instead (cheap: file is already downloaded/cached).
+    pdbchain_to_cathid = transform._parse_cath_id()
     cathid_to_code = transform.cathid_to_cathcode_mapping
     chain_to_cat = {}
     for chain_key, cath_ids in pdbchain_to_cathid.items():

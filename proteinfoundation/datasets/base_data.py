@@ -58,6 +58,7 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         cath_balanced_member_mode: Literal["cluster-random", "cluster-reps"] = "cluster-random",
         nocat_bucket: bool = True,
         nocat_bucket_draws: int = 1,
+        nocat_bucket_full_coverage: bool = False,
         cath_balanced_emit_topology: bool = False,
     ):
         """Initialising the base data module class.
@@ -117,6 +118,7 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         self.cath_balanced_member_mode = cath_balanced_member_mode
         self.nocat_bucket = nocat_bucket
         self.nocat_bucket_draws = nocat_bucket_draws
+        self.nocat_bucket_full_coverage = nocat_bucket_full_coverage
         self.cath_balanced_emit_topology = cath_balanced_emit_topology
         self._chain_to_cat = None  # lazy cache for cath-balanced sampling
         # Last-built samplers kept on the datamodule so on_{train,validation}_epoch_start
@@ -208,6 +210,7 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
                 member_mode=self.cath_balanced_member_mode,
                 nocat_bucket=self.nocat_bucket,
                 nocat_bucket_draws=self.nocat_bucket_draws,
+                nocat_bucket_full_coverage=self.nocat_bucket_full_coverage,
                 seed=self.cluster_sampler_seed,
                 v2=self.cluster_sampler_v2,
                 emit_topology=self.cath_balanced_emit_topology,

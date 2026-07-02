@@ -255,6 +255,7 @@ class CATBalancedSampler(Sampler):
         member_mode: Literal["cluster-random", "cluster-reps"] = "cluster-random",
         nocat_bucket: bool = True,
         nocat_bucket_draws: int = 1,
+        nocat_bucket_full_coverage: bool = False,
         shuffle: bool = True,
         drop_last: bool = False,
         seed: int = 0,
@@ -270,6 +271,10 @@ class CATBalancedSampler(Sampler):
         self.member_mode = member_mode
         self.nocat_bucket = bool(nocat_bucket)
         self.nocat_bucket_draws = int(nocat_bucket_draws)
+        # When True, every no-CAT cluster is drawn exactly once per epoch (split
+        # disjointly across ranks, not once per rank), instead of nocat_bucket_draws
+        # with-replacement draws. nocat_bucket_draws is ignored in this mode.
+        self.nocat_bucket_full_coverage = bool(nocat_bucket_full_coverage)
         if dataset.database == "pdb" or dataset.database == "scop":
             self.sequence_id_to_idx = {
                 fname.split(".")[0]: i for i, fname in enumerate(dataset.file_names)
@@ -336,11 +341,16 @@ class CATBalancedSampler(Sampler):
         self.topology_to_clusters = topology_to_clusters
         self.nocat_clusters = nocat_clusters
         self._topologies = sorted(topology_to_clusters.keys())
+        nocat_desc = (
+            "full_coverage=True (every no-CAT cluster used ~once/epoch, split across ranks)"
+            if self.nocat_bucket_full_coverage
+            else f"draws={self.nocat_bucket_draws}"
+        )
         log_info(
             f"CATBalancedSampler: {len(self._topologies)} CAT topologies, "
             f"{len(self.cluster_names)} clusters ({len(nocat_clusters)} no-CAT), "
             f"cat_cluster_draw={self.cat_cluster_draw}, member_mode={self.member_mode}, "
-            f"nocat_bucket={self.nocat_bucket} (draws={self.nocat_bucket_draws})"
+            f"nocat_bucket={self.nocat_bucket} ({nocat_desc})"
         )
 
     def set_epoch(self, epoch: int) -> None:
@@ -421,6 +431,48 @@ class CATBalancedSampler(Sampler):
             out.append((self.sequence_id_to_idx[seqid], None))
         return out
 
+    def _draw_nocat_full_coverage(self, gen) -> List[Tuple]:
+        """Exact-coverage variant of _draw_nocat: every no-CAT cluster is drawn exactly
+        once per epoch (no with-replacement duplicates), split disjointly across ranks
+        under DDP so the full set is covered once in total (not once per rank). Mirrors
+        the topology sampler's shuffle+pad+stride DDP split in __iter__ so every rank
+        yields an equal count (required -- unequal per-rank batch counts hang DDP
+        collectives); padding (only when the count isn't evenly divisible by world size)
+        repeats a few clusters rather than dropping any."""
+        if not self.nocat_clusters:
+            return []
+        m = len(self.nocat_clusters)
+        nocat_shuffle_gen = self._make_generator(4) if self.v2 else None
+        if self.v2:
+            nperm = torch.randperm(m, generator=nocat_shuffle_gen).tolist()
+        else:
+            nperm = torch.randperm(m).tolist()
+
+        if self.num_replicas is not None:
+            nocat_num_samples = math.ceil(m * 1.0 / self.num_replicas)
+            nocat_total_size = nocat_num_samples * self.num_replicas
+            padding_size = nocat_total_size - len(nperm)
+            if padding_size <= len(nperm):
+                nperm += nperm[:padding_size]
+            else:
+                nperm += (nperm * math.ceil(padding_size / len(nperm)))[:padding_size]
+            nperm = nperm[self.rank : nocat_total_size : self.num_replicas]
+
+        out: List[Tuple] = []
+        for j in nperm:
+            cluster_name = self.nocat_clusters[j]
+            if self.member_mode == "cluster-reps":
+                seqid = cluster_name
+            else:
+                members = self.clusterid_to_seqid_mapping[cluster_name]
+                if self.v2:
+                    k = torch.randint(0, len(members), (1,), generator=gen).item()
+                else:
+                    k = torch.randint(0, len(members), (1,)).item()
+                seqid = members[k]
+            out.append((self.sequence_id_to_idx[seqid], None))
+        return out
+
     def __iter__(self):
         self.log_first = True
         if torch.distributed.is_initialized():
@@ -466,7 +518,12 @@ class CATBalancedSampler(Sampler):
             idx, cat = self._draw_for_topology(self._topologies[i], draw_gen)
             pairs.append((idx, cat, self._derive_seed(2, i)))
         if self.nocat_bucket:
-            for j, (idx, cat) in enumerate(self._draw_nocat(draw_gen)):
+            nocat_pairs = (
+                self._draw_nocat_full_coverage(draw_gen)
+                if self.nocat_bucket_full_coverage
+                else self._draw_nocat(draw_gen)
+            )
+            for j, (idx, cat) in enumerate(nocat_pairs):
                 pairs.append((idx, cat, self._derive_seed(3, self.rank, j)))
         if self.emit_topology:
             return iter(pairs)
@@ -478,7 +535,15 @@ class CATBalancedSampler(Sampler):
         else:
             base = len(self._topologies)
         if self.nocat_bucket and self.nocat_clusters:
-            base += self.nocat_bucket_draws
+            if self.nocat_bucket_full_coverage:
+                m = len(self.nocat_clusters)
+                base += (
+                    math.ceil(m * 1.0 / self.num_replicas)
+                    if self.num_replicas is not None
+                    else m
+                )
+            else:
+                base += self.nocat_bucket_draws
         return base
 
 
