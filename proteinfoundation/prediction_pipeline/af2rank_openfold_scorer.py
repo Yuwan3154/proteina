@@ -166,6 +166,16 @@ def _save_openfold_prediction_pdb(reference_sequence: str, out: dict, output_pdb
     )
 
 
+def _round_up_to_multiple(n: int, multiple: int = 32) -> int:
+    """Round n up to the nearest multiple (e.g. 78 -> 96 for multiple=32).
+
+    Used to bucket compiled-model input lengths so torch.compile only ever
+    sees a handful of distinct shapes across a whole dataset's length range,
+    instead of recompiling for every distinct protein length.
+    """
+    return ((n + multiple - 1) // multiple) * multiple
+
+
 def _is_ca_only_pdb(pdb_file):
     """Check if a PDB file contains only CA atoms."""
     atom_names = set()
@@ -864,6 +874,10 @@ class OpenFoldAF2Rank:
             dtype=torch.long,
         )
         self._mask = torch.ones((1, len(self.reference_sequence)), dtype=torch.float32)
+        # Bucket the compiled-model input length to a multiple of 32 so torch.compile
+        # reuses one compiled kernel across every protein whose length rounds to the
+        # same bucket, instead of recompiling per distinct length (see compile_inference_path).
+        self._compile_pad_length = _round_up_to_multiple(len(self.reference_sequence), 32)
 
         # Load OpenFold model
         jax_params_path = os.path.join(DEFAULT_PARAMS_DIR, f"params_{model_name}.npz")
@@ -932,6 +946,7 @@ class OpenFoldAF2Rank:
             dtype=torch.long,
         )
         self._mask = torch.ones((1, len(self.reference_sequence)), dtype=torch.float32)
+        self._compile_pad_length = _round_up_to_multiple(len(self.reference_sequence), 32)
         logger.info(f"reset_reference: new sequence length {len(self.reference_sequence)}")
         self._segments = None
 
@@ -1010,6 +1025,11 @@ class OpenFoldAF2Rank:
                     self.model.skip_template_alignment
                     and int(template_coords.shape[0]) == len(self.reference_sequence)
                 ),
+                # Bucket to a multiple of 32 only when compiling: this makes torch.compile
+                # reuse one kernel per bucket across differently-sized proteins instead of
+                # recompiling per exact length. Eager mode gets no benefit from padding, so
+                # leave it unpadded (avoids wasting compute on masked-out positions).
+                _pad_to_length=(self._compile_pad_length if self.compile_inference_path else None),
             )
         finally:
             if os.path.exists(temp_cif):
@@ -1070,7 +1090,7 @@ class OpenFoldAF2Rank:
                            os.path.basename(decoy_pdb))
             return _invalid_template_scores("nan_final_atom_positions")
 
-        scores = self._extract_scores(out, seg_ids)
+        scores = self._extract_scores(out, seg_ids, true_length=len(self.reference_sequence))
         if output_pdb is not None:
             _save_openfold_prediction_pdb(self.reference_sequence, out, output_pdb)
             scores["predicted_structure_path"] = output_pdb
@@ -1138,28 +1158,49 @@ class OpenFoldAF2Rank:
                 os.unlink(temp_cif)
         with torch.no_grad():
             out = self.model.model(batch)
-        scores = self._extract_scores(out, seg_ids)
+        scores = self._extract_scores(out, seg_ids, true_length=len(self.reference_sequence))
         gc.collect()
         torch.cuda.empty_cache()
         return scores
 
-    def _extract_scores(self, out: dict, seg_ids=None) -> Dict:
-        """Extract AF2 confidence metrics from OpenFold output."""
+    def _extract_scores(self, out: dict, seg_ids=None, true_length: Optional[int] = None) -> Dict:
+        """Extract AF2 confidence metrics from OpenFold output.
+
+        Args:
+            true_length: if the batch was padded (e.g. bucketed for torch.compile,
+                see _compile_pad_length), pass the true (unpadded) residue count here.
+                OpenFold's AuxiliaryHeads.compute_tm/compute_plddt are NOT mask-aware
+                (openfold/model/heads.py: compute_tm defaults residue_weights to
+                ones over the FULL logits length, so d0 and the pLDDT/PAE means would
+                silently include padded positions and be wrong). When true_length is
+                given and shorter than the raw output, pTM is recomputed with a
+                residue_weights mask restricted to the real residues (mirrors the
+                existing per-segment compute_tm call below), and pLDDT/PAE means are
+                computed over the sliced [:true_length] region.
+        """
         scores = {}
+        n_out = int(out["plddt"].shape[0]) if "plddt" in out else None
+        padded = true_length is not None and n_out is not None and true_length < n_out
 
         # pTM score (0-1)
-        scores["ptm"] = float(out["ptm_score"].item()) if "ptm_score" in out else 0.0
+        if padded and "tm_logits" in out:
+            mask = out["tm_logits"].new_zeros(n_out)
+            mask[:true_length] = 1.0
+            scores["ptm"] = float(compute_tm(out["tm_logits"], residue_weights=mask).item())
+        else:
+            scores["ptm"] = float(out["ptm_score"].item()) if "ptm_score" in out else 0.0
 
         # pLDDT (OpenFold returns 0-100, normalize to 0-1 to match ColabDesign)
         if "plddt" in out:
-            plddt_per_res = out["plddt"]  # [N_res] in 0-100
+            plddt_per_res = out["plddt"][:true_length] if padded else out["plddt"]  # [N_res] in 0-100
             scores["plddt"] = float(plddt_per_res.mean().item()) / 100.0
         else:
             scores["plddt"] = 0.0
 
         # Predicted Aligned Error (mean, in Angstroms)
         if "predicted_aligned_error" in out:
-            scores["pae_mean"] = float(out["predicted_aligned_error"].mean().item())
+            pae = out["predicted_aligned_error"][:true_length, :true_length] if padded else out["predicted_aligned_error"]
+            scores["pae_mean"] = float(pae.mean().item())
         else:
             scores["pae_mean"] = 0.0
 
@@ -1304,7 +1345,7 @@ def score_proteina_structures_openfold(
                     logger.warning("Skipping %s: OpenFold forward produced NaN final_atom_positions", pdb_filename)
                     structure_scores = _invalid_template_scores("nan_final_atom_positions")
                 else:
-                    structure_scores = scorer._extract_scores(out, seg_ids)
+                    structure_scores = scorer._extract_scores(out, seg_ids, true_length=len(scorer.reference_sequence))
                     if output_pdb is not None:
                         _save_openfold_prediction_pdb(scorer.reference_sequence, out, output_pdb)
                         structure_scores["predicted_structure_path"] = output_pdb
