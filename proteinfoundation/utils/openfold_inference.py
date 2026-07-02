@@ -15,6 +15,7 @@ import openfold.np.residue_constants as rc
 from openfold.config import model_config
 from openfold.model.model import AlphaFold
 from openfold.utils.import_weights import import_jax_weights_
+from openfold.utils.precision_utils import wrap_for_precision
 from openfold.data.feature_pipeline import FeaturePipeline
 from openfold.data.data_pipeline import (
     make_dummy_msa_feats,
@@ -62,6 +63,7 @@ class OpenFoldTemplateInference(nn.Module):
         inference_attn_kernel: str = "sdpa",
         compile_strategy: str = "per_block",
         use_cueq_triangle_mul: bool = False,
+        precision: str = "tf32",
     ):
         super().__init__()
 
@@ -81,6 +83,7 @@ class OpenFoldTemplateInference(nn.Module):
             use_deepspeed_evoformer_attention=use_deepspeed_evoformer_attention,
             use_cuequivariance_attention=use_cuequivariance_attention,
             use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
+            precision=precision,
         )
         self.cfg.data.common.use_templates = True
         if max_recycling_iters is not None:
@@ -131,6 +134,11 @@ class OpenFoldTemplateInference(nn.Module):
             )
         self.device = device
         self.model = self.model.to(self.device)
+        # Mirrors openfold/utils/script_utils.py's _accelerate(): only evoformer +
+        # extra_msa_stack are cast; heads/structure module stay fp32 for numerical stability.
+        if self.cfg.precision in ("bf16", "fp16"):
+            self.model.evoformer = wrap_for_precision(self.model.evoformer, self.cfg.precision)
+            self.model.extra_msa_stack = wrap_for_precision(self.model.extra_msa_stack, self.cfg.precision)
         self.feature_pipeline = FeaturePipeline(self.cfg.data)
         self.skip_template_alignment = skip_template_alignment
         self._template_use_unit_vector_default = None

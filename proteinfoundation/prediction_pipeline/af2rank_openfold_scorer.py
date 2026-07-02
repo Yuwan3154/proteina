@@ -837,6 +837,7 @@ class OpenFoldAF2Rank:
         use_ema: bool = True,
         use_mlm: bool = False,  # AF2Rank protocol: leave masked_msa at the config default (~0.15, training distribution); False forces 0 (proteina deterministic inference)
         mask_sidechains: bool = True,  # AF2Rank protocol: mask decoy template sidechains to backbone+CB (+Gly CB) so they don't leak the native sequence
+        precision: str = "tf32",  # "tf32" (default), "bf16", or "fp16" -- see openfold.utils.precision_utils.wrap_for_precision
     ):
         if chain is None:
             chain = "A"
@@ -915,6 +916,7 @@ class OpenFoldAF2Rank:
             inference_attn_kernel=inference_attn_kernel,
             compile_strategy=compile_strategy,
             use_cueq_triangle_mul=use_cueq_triangle_mul,
+            precision=precision,
         )
         self.compile_inference_path = compile_inference_path
 
