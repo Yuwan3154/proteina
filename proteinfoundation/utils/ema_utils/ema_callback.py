@@ -378,14 +378,60 @@ class EMAOptimizer(torch.optim.Optimizer):
     def load_state_dict(self, state_dict):
         self.join()
 
-        self.optimizer.load_state_dict(state_dict["opt"])
+        opt_state = state_dict["opt"]
+        self._reset_mismatched_param_groups(opt_state)
+        self.optimizer.load_state_dict(opt_state)
         self.ema_params = tuple(
             param.to(self.device) for param in copy.deepcopy(state_dict["ema"])
         )
         self.current_step = state_dict["current_step"]
         self.decay = state_dict["decay"]
         self.every_n_steps = state_dict["every_n_steps"]
-        self.rebuild_ema_params = False
+        # If new trainable params were added since this checkpoint was saved (e.g. a newly
+        # wired feature-embedding gate), ema_params is now shorter than all_parameters() --
+        # let step()'s existing top-up logic (lines ~264-271) extend it with fresh
+        # (current-value) EMA entries for the new params, instead of assuming an exact match.
+        self.rebuild_ema_params = len(self.ema_params) != len(list(self.all_parameters()))
+
+    def _reset_mismatched_param_groups(self, opt_state):
+        """Architecture-migration guard for resuming after a wiring/param-count change.
+
+        If a param group's size no longer matches this (already correctly configured, live)
+        optimizer's groups, PyTorch's Optimizer.load_state_dict hard-crashes on the group-size
+        mismatch. For any group whose size changed, reset that group's state to fresh (zero)
+        Adam/Muon moments -- unaffected groups keep their saved momentum untouched
+        (position-based state restoration is only valid when a group's member order is
+        unchanged). Self-heals: once the next checkpoint is saved with the new param count,
+        later resumes match normally and this is a no-op.
+        """
+        saved_groups = opt_state["param_groups"]
+        current_groups = self.optimizer.param_groups
+        if len(saved_groups) != len(current_groups):
+            raise RuntimeError(
+                f"EMAOptimizer group COUNT changed ({len(saved_groups)} -> {len(current_groups)}) "
+                "on resume; no safe generic remap for this -- resolve manually."
+            )
+
+        state = dict(opt_state["state"])
+        next_id = max((max(g["params"], default=-1) for g in saved_groups), default=-1) + 1
+        changed = False
+        for i, (sg, cg) in enumerate(zip(saved_groups, current_groups)):
+            n_saved, n_current = len(sg["params"]), len(cg["params"])
+            if n_saved != n_current:
+                changed = True
+                rank_zero_info(
+                    f"EMAOptimizer group {i} trainable-param count changed on resume "
+                    f"({n_saved} -> {n_current}); resetting this group's optimizer state "
+                    "(fresh moments for ALL params in the group, not just the new ones)."
+                )
+                for old_id in sg["params"]:
+                    state.pop(old_id, None)
+                sg["params"] = list(range(next_id, next_id + n_current))
+                next_id += n_current
+
+        if changed:
+            opt_state["param_groups"] = saved_groups
+            opt_state["state"] = state
 
     def add_param_group(self, param_group):
         self.optimizer.add_param_group(param_group)
