@@ -6,6 +6,8 @@
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=1G
 #SBATCH --time=2-00:00:00
+#SBATCH --no-requeue                   # mit_preemptable auto-requeues preempted jobs by default; without this flag
+                                        # SLURM's auto-requeue AND our own on_term trap both resubmit -> duplicate job
 #SBATCH --output=/home/chenxiou/proteina/store/dssp_contact_48M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined/monitor/poller-slurm-%j.out
 #SBATCH --error=/home/chenxiou/proteina/store/dssp_contact_48M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined/monitor/poller-slurm-%j.out
 #

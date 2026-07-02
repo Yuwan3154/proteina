@@ -6,6 +6,9 @@
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=1G
 #SBATCH --time=2-00:00:00
+#SBATCH --no-requeue                   # mit_preemptable defaults to auto-requeue on preemption; without this, SLURM's
+                                        # auto-requeue AND our own on_term trap BOTH resubmit -> duplicate running jobs
+                                        # (hit 2026-07-01: 16964905 auto-requeued to node2902 while its trap spawned 16970787)
 #SBATCH --output=/home/chenxiou/proteina/store/dssp_contact_48M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined/slurm/free-node-monitor-%j.out
 # Polls every 30min for an H200/H100 node with >=4 GPUs of the SAME type idle (our --nodes=1 --gres=gpu:<type>:4
 # requirement). Gates on GPU count only (not mem) -- every node seen with >=4 free GPUs has had far more than the
