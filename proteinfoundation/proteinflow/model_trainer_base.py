@@ -1670,6 +1670,13 @@ class ModelTrainerBase(L.LightningModule):
                             sync_dist=False,
                             add_dataloader_idx=False,
                         )
+                # Shared payload: both calls below log panels for the SAME training
+                # example/step, so accumulate into one dict and send a single
+                # wandb.log() call (see `_log_structure_visualization` docstring) --
+                # otherwise each panel would land on a different wandb step, making
+                # the per-panel "Step" sliders in the WandB UI disagree even though
+                # they all depict the same example.
+                qual_viz_payload: Dict = {}
                 self._log_structure_visualization(
                     # Log only the first sample. Passing the full batch here makes
                     # `write_prot_to_pdb` treat batch dim as MODEL index, producing a
@@ -1699,6 +1706,7 @@ class ModelTrainerBase(L.LightningModule):
                     dssp_noised=dssp_t_local[0] if isinstance(dssp_t_local, torch.Tensor) and dssp_t_local.numel() > 0 else None,
                     dssp_pred=dssp_logits_local[0] if isinstance(dssp_logits_local, torch.Tensor) else None,
                     dssp_gt=dssp_target_local[0] if isinstance(dssp_target_local, torch.Tensor) and dssp_target_local.numel() > 0 else None,
+                    payload=qual_viz_payload,
                 )
                 gt_contact_map = (
                     self._contact_map_to_viz(c_1[0]) if c_1 is not None else None
@@ -1710,7 +1718,10 @@ class ModelTrainerBase(L.LightningModule):
                     log_prefix=log_prefix,
                     key_suffix="_gt",
                     residue_type=residue_type_first,
+                    payload=qual_viz_payload,
                 )
+                if len(qual_viz_payload) > 0:
+                    self.logger.experiment.log(qual_viz_payload)
 
         return train_loss
     
@@ -1852,11 +1863,18 @@ class ModelTrainerBase(L.LightningModule):
         dssp_noised: torch.Tensor = None,
         dssp_pred: torch.Tensor = None,
         dssp_gt: torch.Tensor = None,
+        payload: Optional[Dict] = None,
     ):
         """
         Logs predicted structure (as temporary PDB) and contact map visualizations.
         Expects x_1_pred coordinates in nm (training pipeline convention); samples_to_atom37
         converts nm -> Å for PDB output.
+
+        All panels for one call are accumulated into a single dict and sent via one
+        wandb.log() call, so they share the same wandb step (wandb auto-increments its
+        internal step on every separate .log() call, which previously caused the
+        structure/dssp/contact_map panels of the same training example to be spread
+        across several different wandb steps).
 
         Args:
             x_1_pred: Predicted coordinates in nm, shape [1, n, 3]
@@ -1865,6 +1883,11 @@ class ModelTrainerBase(L.LightningModule):
             residue_type: Residue type, shape [n]
             log_prefix: Prefix for log names ("train" or "validation_loss")
             key_suffix: Suffix appended to logged keys (e.g., "_gt")
+            payload: If given, accumulate entries into this dict instead of logging
+                immediately -- the caller is responsible for calling
+                self.logger.experiment.log(payload) once all panels are added, so
+                that panels from multiple calls (e.g. pred pass + "_gt" pass) that
+                belong to the same training example land on the same wandb step.
         """
         if (
             self.logger is None
@@ -1875,6 +1898,13 @@ class ModelTrainerBase(L.LightningModule):
 
         if hasattr(self.trainer, "is_global_zero") and not self.trainer.is_global_zero:
             return
+
+        # Accumulate all panels here and issue a single wandb.log() call at the end
+        # (unless the caller supplied its own payload dict to merge multiple calls
+        # into one log() -- see `payload` doc above).
+        own_payload = payload is None
+        if payload is None:
+            payload = {}
 
         mask = mask.bool()
 
@@ -1921,15 +1951,9 @@ class ModelTrainerBase(L.LightningModule):
                     overwrite=True,
                     no_indexing=True,
                 )
-                self.logger.experiment.log(
-                    {
-                        f"{log_prefix}/structure{key_suffix}": wandb.Molecule(
-                            temp_pdb_path
-                        ),
-                        "global_step": self.global_step,
-                        "epoch": self.current_epoch,
-                    }
-                )
+                payload[f"{log_prefix}/structure{key_suffix}"] = wandb.Molecule(temp_pdb_path)
+                payload["global_step"] = self.global_step
+                payload["epoch"] = self.current_epoch
             finally:
                 if os.path.exists(temp_pdb_path):
                     os.remove(temp_pdb_path)
@@ -1939,13 +1963,9 @@ class ModelTrainerBase(L.LightningModule):
             noised_pdb = self._coords_to_temp_pdb(x_noised, residue_type, mask)
             if noised_pdb is not None:
                 try:
-                    self.logger.experiment.log(
-                        {
-                            f"{log_prefix}/structure_noised{key_suffix}": wandb.Molecule(noised_pdb),
-                            "global_step": self.global_step,
-                            "epoch": self.current_epoch,
-                        }
-                    )
+                    payload[f"{log_prefix}/structure_noised{key_suffix}"] = wandb.Molecule(noised_pdb)
+                    payload["global_step"] = self.global_step
+                    payload["epoch"] = self.current_epoch
                 finally:
                     if os.path.exists(noised_pdb):
                         try:
@@ -1975,9 +1995,9 @@ class ModelTrainerBase(L.LightningModule):
             buf.seek(0)
             img = Image.open(buf)
             plt.close(fig)
-            self.logger.experiment.log(
-                {key: wandb.Image(img), "global_step": self.global_step, "epoch": self.current_epoch}
-            )
+            payload[key] = wandb.Image(img)
+            payload["global_step"] = self.global_step
+            payload["epoch"] = self.current_epoch
 
         if contact_map_pred is not None:
             _log_contact_image(
@@ -2029,9 +2049,9 @@ class ModelTrainerBase(L.LightningModule):
             buf.seek(0)
             img = Image.open(buf)
             plt.close(fig)
-            self.logger.experiment.log(
-                {key: wandb.Image(img), "global_step": self.global_step, "epoch": self.current_epoch}
-            )
+            payload[key] = wandb.Image(img)
+            payload["global_step"] = self.global_step
+            payload["epoch"] = self.current_epoch
 
         _log_dssp_strip(
             _dssp_to_arr(dssp_noised),
@@ -2048,6 +2068,12 @@ class ModelTrainerBase(L.LightningModule):
             f"{log_prefix}/dssp_gt{key_suffix}",
             f"DSSP (ground truth) - Step {self.global_step}",
         )
+
+        # Single wandb.log() call for all panels accumulated above -- keeps them
+        # on the same wandb step. Skipped when the caller passed its own `payload`
+        # (it will log once after merging in panels from other calls too).
+        if own_payload and len(payload) > 0:
+            self.logger.experiment.log(payload)
 
     @abstractmethod
     def compute_fm_loss(
