@@ -15,7 +15,7 @@ import openfold.np.residue_constants as rc
 from openfold.config import model_config
 from openfold.model.model import AlphaFold
 from openfold.utils.import_weights import import_jax_weights_
-from openfold.utils.precision_utils import wrap_for_precision
+from openfold.utils.precision_utils import wrap_for_precision, PrecisionWrapper
 from openfold.data.feature_pipeline import FeaturePipeline
 from openfold.data.data_pipeline import (
     make_dummy_msa_feats,
@@ -25,6 +25,14 @@ from openfold.data.data_pipeline import (
 from openfold.utils.tensor_utils import tensor_tree_map
 
 logger = logging.getLogger(__name__)
+
+
+def _unwrap_precision(module: nn.Module) -> nn.Module:
+    """Return the underlying module if wrapped by wrap_for_precision(), else module
+    unchanged. Needed because per-block compile patches .forward directly on the
+    blocks inside evoformer/extra_msa_stack, which PrecisionWrapper hides behind
+    a `.model` attribute rather than exposing them at the top level."""
+    return module.model if isinstance(module, PrecisionWrapper) else module
 
 
 class OpenFoldTemplateInference(nn.Module):
@@ -441,7 +449,7 @@ class OpenFoldTemplateInference(nn.Module):
 
         # Evoformer blocks (the main bottleneck: 48 blocks).
         wrap_evo = _make_l_axis_marker(evo_spec)
-        for i, block in enumerate(self.model.evoformer.blocks):
+        for i, block in enumerate(_unwrap_precision(self.model.evoformer).blocks):
             key = f"ip_evoformer_block_{i}"
             self._original_forwards[key] = block.forward
             block.forward = wrap_evo(torch.compile(block.forward, **compile_kwargs))
@@ -449,7 +457,7 @@ class OpenFoldTemplateInference(nn.Module):
         # Extra-MSA blocks.
         if hasattr(self.model, "extra_msa_stack"):
             wrap_extra = _make_l_axis_marker(extra_spec)
-            for i, block in enumerate(self.model.extra_msa_stack.blocks):
+            for i, block in enumerate(_unwrap_precision(self.model.extra_msa_stack).blocks):
                 key = f"ip_extra_msa_block_{i}"
                 self._original_forwards[key] = block.forward
                 block.forward = wrap_extra(torch.compile(block.forward, **compile_kwargs))
@@ -530,14 +538,14 @@ class OpenFoldTemplateInference(nn.Module):
         compile_kwargs = dict(fullgraph=False, dynamic=dynamic)
 
         # --- Evoformer blocks (48 blocks – main compute bottleneck) ---
-        for i, block in enumerate(self.model.evoformer.blocks):
+        for i, block in enumerate(_unwrap_precision(self.model.evoformer).blocks):
             key = f"evoformer_block_{i}"
             self._original_forwards[key] = block.forward
             block.forward = torch.compile(block.forward, **compile_kwargs)
 
         # --- Extra-MSA stack blocks ---
         if hasattr(self.model, "extra_msa_stack"):
-            for i, block in enumerate(self.model.extra_msa_stack.blocks):
+            for i, block in enumerate(_unwrap_precision(self.model.extra_msa_stack).blocks):
                 key = f"extra_msa_block_{i}"
                 self._original_forwards[key] = block.forward
                 block.forward = torch.compile(block.forward, **compile_kwargs)
@@ -573,13 +581,13 @@ class OpenFoldTemplateInference(nn.Module):
         if not self._compiled:
             return
 
-        for i, block in enumerate(self.model.evoformer.blocks):
+        for i, block in enumerate(_unwrap_precision(self.model.evoformer).blocks):
             key = f"evoformer_block_{i}"
             if key in self._original_forwards:
                 block.forward = self._original_forwards[key]
 
         if hasattr(self.model, "extra_msa_stack"):
-            for i, block in enumerate(self.model.extra_msa_stack.blocks):
+            for i, block in enumerate(_unwrap_precision(self.model.extra_msa_stack).blocks):
                 key = f"extra_msa_block_{i}"
                 if key in self._original_forwards:
                     block.forward = self._original_forwards[key]
@@ -620,7 +628,7 @@ class OpenFoldTemplateInference(nn.Module):
           Triangle mul update   → cuequivariance (if use_cuequivariance_multiplicative_update)
         """
         count = 0
-        for block in self.model.evoformer.blocks:
+        for block in _unwrap_precision(self.model.evoformer).blocks:
             if not hasattr(block, "pair_stack"):
                 continue
             orig = block.pair_stack.forward
