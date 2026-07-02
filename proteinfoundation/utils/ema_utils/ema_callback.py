@@ -379,21 +379,31 @@ class EMAOptimizer(torch.optim.Optimizer):
         self.join()
 
         opt_state = state_dict["opt"]
-        self._reset_mismatched_param_groups(opt_state)
+        param_count_changed = self._reset_mismatched_param_groups(opt_state)
         self.optimizer.load_state_dict(opt_state)
-        self.ema_params = tuple(
-            param.to(self.device) for param in copy.deepcopy(state_dict["ema"])
-        )
         self.current_step = state_dict["current_step"]
         self.decay = state_dict["decay"]
         self.every_n_steps = state_dict["every_n_steps"]
-        # If new trainable params were added since this checkpoint was saved (e.g. a newly
-        # wired feature-embedding gate), ema_params is now shorter than all_parameters() --
-        # let step()'s existing top-up logic (lines ~264-271) extend it with fresh
-        # (current-value) EMA entries for the new params, instead of assuming an exact match.
-        self.rebuild_ema_params = len(self.ema_params) != len(list(self.all_parameters()))
+        if param_count_changed:
+            # New params can be inserted ANYWHERE in registration order (e.g. a newly wired
+            # feature-embedding gate lands in the middle, not appended at the end), so a
+            # position-based top-up of the saved "ema" tuple would silently pair the WRONG
+            # tensors -- e.g. an old param's EMA shadow could end up tracking a completely
+            # different new param (mismatched shapes crash; matching shapes corrupt silently).
+            # Only safe option: discard EMA history entirely for ALL params and let the
+            # standard cold-start top-up below (rebuild_ema_params=True, same path used when
+            # ema_params starts empty on a fresh run) reinitialize every shadow from its
+            # current just-loaded value. Self-heals: the next checkpoint save captures the
+            # new param count/order, so later resumes match normally and this is a no-op.
+            self.ema_params = ()
+            self.rebuild_ema_params = True
+        else:
+            self.ema_params = tuple(
+                param.to(self.device) for param in copy.deepcopy(state_dict["ema"])
+            )
+            self.rebuild_ema_params = False
 
-    def _reset_mismatched_param_groups(self, opt_state):
+    def _reset_mismatched_param_groups(self, opt_state) -> bool:
         """Architecture-migration guard for resuming after a wiring/param-count change.
 
         If a param group's size no longer matches this (already correctly configured, live)
@@ -402,7 +412,7 @@ class EMAOptimizer(torch.optim.Optimizer):
         Adam/Muon moments -- unaffected groups keep their saved momentum untouched
         (position-based state restoration is only valid when a group's member order is
         unchanged). Self-heals: once the next checkpoint is saved with the new param count,
-        later resumes match normally and this is a no-op.
+        later resumes match normally and this is a no-op. Returns whether anything changed.
         """
         saved_groups = opt_state["param_groups"]
         current_groups = self.optimizer.param_groups
@@ -432,6 +442,7 @@ class EMAOptimizer(torch.optim.Optimizer):
         if changed:
             opt_state["param_groups"] = saved_groups
             opt_state["state"] = state
+        return changed
 
     def add_param_group(self, param_group):
         self.optimizer.add_param_group(param_group)
