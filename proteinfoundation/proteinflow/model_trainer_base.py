@@ -57,6 +57,10 @@ from proteinfoundation.openfold_stub.utils.rigid_utils import Rigid, Rotation
 class ModelTrainerBase(L.LightningModule):
     def __init__(self, cfg_exp, store_dir=None):
         super(ModelTrainerBase, self).__init__()
+        # Non-strict model-weight loading: lets a checkpoint resume even after new
+        # submodules are wired in (e.g. a previously-dead feature-embedding gate) --
+        # the new params get their fresh random init instead of crashing the resume.
+        self.strict_loading = False
         self.cfg_exp = cfg_exp
         self.inf_cfg = None  # Only used for inference runs
         self.validation_output_lens = {}
@@ -735,6 +739,68 @@ class ModelTrainerBase(L.LightningModule):
             logger.info("Failed to load nflops and nsamples_processed from checkpoint")
             self.nflops = 0
             self.nsamples_processed = 0
+        self._reset_optimizer_groups_on_param_count_change(checkpoint)
+
+    def _reset_optimizer_groups_on_param_count_change(self, checkpoint):
+        """Architecture-migration guard for resuming after a wiring/param-count change.
+
+        If the model's trainable params no longer match the checkpoint's saved optimizer
+        param-group sizes (e.g. a newly wired feature-embedding gate), PyTorch's
+        Optimizer.load_state_dict hard-crashes on the group-size mismatch. For any group
+        whose size changed, reset that group's state to fresh (zero) Adam/Muon moments --
+        unaffected groups keep their saved momentum untouched (position-based state
+        restoration is only valid when a group's member order is unchanged). Self-heals:
+        once the next checkpoint is saved with the new param count, later resumes match
+        normally and this is a no-op.
+        """
+        opt_states = checkpoint.get("optimizer_states")
+        if not opt_states:
+            return
+        saved_groups = opt_states[0]["param_groups"]
+
+        # Mirror configure_optimizers' requires_grad assignment (idempotent -- configure_optimizers
+        # will set the same values again later). Needed because this hook can run before Lightning
+        # calls configure_optimizers, so requires_grad may not yet reflect its final state.
+        if self.cfg_exp.training.finetune_seq_cond_lora_only:
+            for name, param in self.named_parameters():
+                param.requires_grad = "residue_type" in name or "lora" in name
+        else:
+            for name, param in self.named_parameters():
+                param.requires_grad = not name.startswith("nn_sc.")
+
+        if self.cfg_exp.opt.get("optimizer", "adam") == "muon" and not self.cfg_exp.training.finetune_seq_cond_lora_only:
+            from proteinfoundation.optim.param_groups import build_optimizer_param_groups
+            current_groups = build_optimizer_param_groups(self, self.cfg_exp.opt)
+        else:
+            trainable = [p for p in self.parameters() if p.requires_grad]
+            current_groups = [{"params": trainable}]
+
+        if len(saved_groups) != len(current_groups):
+            raise RuntimeError(
+                f"Optimizer group COUNT changed ({len(saved_groups)} -> {len(current_groups)}) "
+                "on resume; no safe generic remap for this -- resolve manually."
+            )
+
+        state = dict(opt_states[0]["state"])
+        next_id = max((max(g["params"], default=-1) for g in saved_groups), default=-1) + 1
+        changed = False
+        for i, (sg, cg) in enumerate(zip(saved_groups, current_groups)):
+            n_saved, n_current = len(sg["params"]), len(cg["params"])
+            if n_saved != n_current:
+                changed = True
+                logger.warning(
+                    f"Optimizer group {i} trainable-param count changed on resume "
+                    f"({n_saved} -> {n_current}); resetting this group's optimizer state "
+                    "(fresh moments for ALL params in the group, not just the new ones)."
+                )
+                for old_id in sg["params"]:
+                    state.pop(old_id, None)
+                sg["params"] = list(range(next_id, next_id + n_current))
+                next_id += n_current
+
+        if changed:
+            checkpoint["optimizer_states"][0]["param_groups"] = saved_groups
+            checkpoint["optimizer_states"][0]["state"] = state
 
     @abstractmethod
     def align_wrapper(self, x_0, x_1, mask):
