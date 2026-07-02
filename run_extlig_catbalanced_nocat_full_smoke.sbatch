@@ -50,8 +50,7 @@ torchrun --nnodes=1 --nproc_per_node=2 --rdzv-backend=c10d --rdzv-endpoint="127.
     --nnodes 1 \
     --batch_size 8 \
     --accumulate_grad_batches 1 \
-    --resume_option allow \
-    af2_ipa_weights_path=/orcd/pool/006/chenxiou/params/params_model_1_ptm.npz
+    --resume_option allow
 RC=$?
 echo "[$(date)] SMOKE TEST: torchrun exited rc=$RC"
 exit $RC
