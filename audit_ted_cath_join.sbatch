@@ -14,8 +14,8 @@
 # CPU-only, generous 8h wall as a safety margin, not expected to need it.
 set -uo pipefail
 mkdir -p /home/chenxiou/proteina/store/ted_audit
-source "$(conda info --base 2>/dev/null || echo /opt/conda)/etc/profile.d/conda.sh"
-module load miniforge 2>/dev/null
+module load miniforge
+source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate cue_openfold
 
 cd /orcd/scratch/orcd/011/chenxiou/proteina
