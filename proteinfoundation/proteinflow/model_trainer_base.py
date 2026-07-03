@@ -79,14 +79,15 @@ class ModelTrainerBase(L.LightningModule):
         # _get_ext_lig_augment_stats / mask_ext_lig_blocky)
         self._ext_lig_augment_stats = None
 
-        # Temp PDB files handed to wandb.Molecule() in _log_structure_visualization.
-        # wandb does NOT read the file synchronously at construction time -- it's
-        # consumed later (possibly by a background writer thread), so deleting it
-        # immediately after construction races wandb's own read and can crash
-        # training with a FileNotFoundError. Deletion is deferred to the START of
-        # the NEXT call to this function instead, giving wandb a full inter-call
-        # gap (at minimum log_structure_every_n_steps steps) to finish with it.
-        self._pending_temp_pdb_cleanup = []
+        # NOTE on temp PDB files handed to wandb.Molecule() in _log_structure_visualization:
+        # wandb does NOT read the file synchronously at construction time -- confirmed by two
+        # separate live crashes this session, one of which survived a "delete on the next call"
+        # deferral (i.e. even a full inter-call gap, >= log_structure_every_n_steps steps, wasn't
+        # always enough -- wandb's own internal copy can be delayed further than that, e.g. by
+        # its background queue). These temp files are therefore intentionally NEVER deleted by
+        # this code anymore (see _log_structure_visualization) -- correctness beats tidiness here;
+        # a handful of small PDB text files accumulating in node-local /tmp over a run is
+        # negligible and the directory is wiped when the SLURM job's node session ends anyway.
 
         # Attributes re-written by classes that inherit from this one
         self.nn = None
@@ -1908,17 +1909,6 @@ class ModelTrainerBase(L.LightningModule):
         if hasattr(self.trainer, "is_global_zero") and not self.trainer.is_global_zero:
             return
 
-        # Clean up temp PDBs from the PREVIOUS call now -- by this point wandb has had a
-        # full inter-call gap to finish reading them (see _pending_temp_pdb_cleanup doc
-        # in __init__). Do this before creating any new ones this call.
-        for _p in self._pending_temp_pdb_cleanup:
-            if os.path.exists(_p):
-                try:
-                    os.remove(_p)
-                except OSError:
-                    pass
-        self._pending_temp_pdb_cleanup = []
-
         # Accumulate all panels here and issue a single wandb.log() call at the end
         # (unless the caller supplied its own payload dict to merge multiple calls
         # into one log() -- see `payload` doc above).
@@ -1974,7 +1964,9 @@ class ModelTrainerBase(L.LightningModule):
                 payload[f"{log_prefix}/structure{key_suffix}"] = wandb.Molecule(temp_pdb_path)
                 payload["global_step"] = self.global_step
                 payload["epoch"] = self.current_epoch
-                self._pending_temp_pdb_cleanup.append(temp_pdb_path)
+                # Intentionally NOT deleted here -- see the temp-PDB-files note in __init__
+                # (wandb consumes this file at an unpredictable later time; deleting it here
+                # races that read).
             except Exception:
                 if os.path.exists(temp_pdb_path):
                     os.remove(temp_pdb_path)
@@ -1988,7 +1980,7 @@ class ModelTrainerBase(L.LightningModule):
                     payload[f"{log_prefix}/structure_noised{key_suffix}"] = wandb.Molecule(noised_pdb)
                     payload["global_step"] = self.global_step
                     payload["epoch"] = self.current_epoch
-                    self._pending_temp_pdb_cleanup.append(noised_pdb)
+                    # Intentionally not deleted -- see note above.
                 except Exception:
                     if os.path.exists(noised_pdb):
                         try:
