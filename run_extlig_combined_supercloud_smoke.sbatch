@@ -25,7 +25,7 @@ mkdir -p "$REPO/store/$RUN/checkpoints"
 source /etc/profile.d/modules.sh
 module load anaconda/2023a
 source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate cathfold
+conda activate cathfold_extlig
 
 echo "[$(date)] NODES: $SLURM_JOB_NODELIST"
 
