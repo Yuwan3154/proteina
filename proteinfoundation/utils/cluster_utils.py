@@ -16,7 +16,7 @@ import pathlib
 import shutil
 import subprocess
 from datetime import datetime
-from typing import Dict, List, Literal, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
 import pandas as pd
 import torch
@@ -256,6 +256,7 @@ class CATBalancedSampler(Sampler):
         nocat_bucket: bool = True,
         nocat_bucket_draws: int = 1,
         nocat_bucket_full_coverage: bool = False,
+        nocat_bucket_subsample_size: Optional[int] = None,
         shuffle: bool = True,
         drop_last: bool = False,
         seed: int = 0,
@@ -275,6 +276,14 @@ class CATBalancedSampler(Sampler):
         # disjointly across ranks, not once per rank), instead of nocat_bucket_draws
         # with-replacement draws. nocat_bucket_draws is ignored in this mode.
         self.nocat_bucket_full_coverage = bool(nocat_bucket_full_coverage)
+        # Without-replacement subsample of this many no-CAT clusters TOTAL per epoch
+        # (split disjointly across ranks, same DDP convention as full_coverage), for
+        # no-CAT populations too large for exact full coverage to be practical.
+        # Ignored when nocat_bucket_full_coverage=True (full coverage takes priority);
+        # falls back to nocat_bucket_draws (with-replacement) when None.
+        self.nocat_bucket_subsample_size = (
+            int(nocat_bucket_subsample_size) if nocat_bucket_subsample_size is not None else None
+        )
         if dataset.database == "pdb" or dataset.database == "scop":
             self.sequence_id_to_idx = {
                 fname.split(".")[0]: i for i, fname in enumerate(dataset.file_names)
@@ -341,11 +350,15 @@ class CATBalancedSampler(Sampler):
         self.topology_to_clusters = topology_to_clusters
         self.nocat_clusters = nocat_clusters
         self._topologies = sorted(topology_to_clusters.keys())
-        nocat_desc = (
-            "full_coverage=True (every no-CAT cluster used ~once/epoch, split across ranks)"
-            if self.nocat_bucket_full_coverage
-            else f"draws={self.nocat_bucket_draws}"
-        )
+        if self.nocat_bucket_full_coverage:
+            nocat_desc = "full_coverage=True (every no-CAT cluster used ~once/epoch, split across ranks)"
+        elif self.nocat_bucket_subsample_size is not None:
+            nocat_desc = (
+                f"subsample_size={self.nocat_bucket_subsample_size} "
+                "(without-replacement subsample/epoch, split across ranks)"
+            )
+        else:
+            nocat_desc = f"draws={self.nocat_bucket_draws}"
         log_info(
             f"CATBalancedSampler: {len(self._topologies)} CAT topologies, "
             f"{len(self.cluster_names)} clusters ({len(nocat_clusters)} no-CAT), "
@@ -431,12 +444,16 @@ class CATBalancedSampler(Sampler):
             out.append((self.sequence_id_to_idx[seqid], None))
         return out
 
-    def _draw_nocat_full_coverage(self, gen) -> List[Tuple]:
-        """Exact-coverage variant of _draw_nocat: every no-CAT cluster is drawn exactly
-        once per epoch (no with-replacement duplicates), split disjointly across ranks
-        under DDP so the full set is covered once in total (not once per rank). Mirrors
-        the topology sampler's shuffle+pad+stride DDP split in __iter__ so every rank
-        yields an equal count (required -- unequal per-rank batch counts hang DDP
+    def _draw_nocat_full_coverage(self, gen, target_total: Optional[int] = None) -> List[Tuple]:
+        """Exact-coverage (or without-replacement subsample) variant of _draw_nocat: no-CAT
+        clusters are drawn without repeats, split disjointly across ranks under DDP. With
+        target_total=None, every no-CAT cluster is drawn exactly once per epoch (the
+        original full-coverage behavior). With target_total=N < len(nocat_clusters), a
+        fresh-each-epoch uniformly random N-subset (without replacement) is drawn instead --
+        truncating a full random permutation to its first N entries is itself a uniform
+        random N-subset, so this reuses the exact same shuffle/pad/stride machinery.
+        Mirrors the topology sampler's shuffle+pad+stride DDP split in __iter__ so every
+        rank yields an equal count (required -- unequal per-rank batch counts hang DDP
         collectives); padding (only when the count isn't evenly divisible by world size)
         repeats a few clusters rather than dropping any."""
         if not self.nocat_clusters:
@@ -448,14 +465,18 @@ class CATBalancedSampler(Sampler):
         else:
             nperm = torch.randperm(m).tolist()
 
+        if target_total is not None:
+            nperm = nperm[: min(target_total, m)]
+
         if self.num_replicas is not None:
-            nocat_num_samples = math.ceil(m * 1.0 / self.num_replicas)
+            n = len(nperm)
+            nocat_num_samples = math.ceil(n * 1.0 / self.num_replicas)
             nocat_total_size = nocat_num_samples * self.num_replicas
-            padding_size = nocat_total_size - len(nperm)
-            if padding_size <= len(nperm):
+            padding_size = nocat_total_size - n
+            if padding_size <= n:
                 nperm += nperm[:padding_size]
             else:
-                nperm += (nperm * math.ceil(padding_size / len(nperm)))[:padding_size]
+                nperm += (nperm * math.ceil(padding_size / n))[:padding_size]
             nperm = nperm[self.rank : nocat_total_size : self.num_replicas]
 
         out: List[Tuple] = []
@@ -518,11 +539,14 @@ class CATBalancedSampler(Sampler):
             idx, cat = self._draw_for_topology(self._topologies[i], draw_gen)
             pairs.append((idx, cat, self._derive_seed(2, i)))
         if self.nocat_bucket:
-            nocat_pairs = (
-                self._draw_nocat_full_coverage(draw_gen)
-                if self.nocat_bucket_full_coverage
-                else self._draw_nocat(draw_gen)
-            )
+            if self.nocat_bucket_full_coverage:
+                nocat_pairs = self._draw_nocat_full_coverage(draw_gen)
+            elif self.nocat_bucket_subsample_size is not None:
+                nocat_pairs = self._draw_nocat_full_coverage(
+                    draw_gen, target_total=self.nocat_bucket_subsample_size
+                )
+            else:
+                nocat_pairs = self._draw_nocat(draw_gen)
             for j, (idx, cat) in enumerate(nocat_pairs):
                 pairs.append((idx, cat, self._derive_seed(3, self.rank, j)))
         if self.emit_topology:
@@ -537,6 +561,13 @@ class CATBalancedSampler(Sampler):
         if self.nocat_bucket and self.nocat_clusters:
             if self.nocat_bucket_full_coverage:
                 m = len(self.nocat_clusters)
+                base += (
+                    math.ceil(m * 1.0 / self.num_replicas)
+                    if self.num_replicas is not None
+                    else m
+                )
+            elif self.nocat_bucket_subsample_size is not None:
+                m = min(self.nocat_bucket_subsample_size, len(self.nocat_clusters))
                 base += (
                     math.ceil(m * 1.0 / self.num_replicas)
                     if self.num_replicas is not None
