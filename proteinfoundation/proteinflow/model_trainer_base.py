@@ -79,6 +79,15 @@ class ModelTrainerBase(L.LightningModule):
         # _get_ext_lig_augment_stats / mask_ext_lig_blocky)
         self._ext_lig_augment_stats = None
 
+        # Temp PDB files handed to wandb.Molecule() in _log_structure_visualization.
+        # wandb does NOT read the file synchronously at construction time -- it's
+        # consumed later (possibly by a background writer thread), so deleting it
+        # immediately after construction races wandb's own read and can crash
+        # training with a FileNotFoundError. Deletion is deferred to the START of
+        # the NEXT call to this function instead, giving wandb a full inter-call
+        # gap (at minimum log_structure_every_n_steps steps) to finish with it.
+        self._pending_temp_pdb_cleanup = []
+
         # Attributes re-written by classes that inherit from this one
         self.nn = None
         self.fm = None
@@ -1899,6 +1908,17 @@ class ModelTrainerBase(L.LightningModule):
         if hasattr(self.trainer, "is_global_zero") and not self.trainer.is_global_zero:
             return
 
+        # Clean up temp PDBs from the PREVIOUS call now -- by this point wandb has had a
+        # full inter-call gap to finish reading them (see _pending_temp_pdb_cleanup doc
+        # in __init__). Do this before creating any new ones this call.
+        for _p in self._pending_temp_pdb_cleanup:
+            if os.path.exists(_p):
+                try:
+                    os.remove(_p)
+                except OSError:
+                    pass
+        self._pending_temp_pdb_cleanup = []
+
         # Accumulate all panels here and issue a single wandb.log() call at the end
         # (unless the caller supplied its own payload dict to merge multiple calls
         # into one log() -- see `payload` doc above).
@@ -1954,9 +1974,11 @@ class ModelTrainerBase(L.LightningModule):
                 payload[f"{log_prefix}/structure{key_suffix}"] = wandb.Molecule(temp_pdb_path)
                 payload["global_step"] = self.global_step
                 payload["epoch"] = self.current_epoch
-            finally:
+                self._pending_temp_pdb_cleanup.append(temp_pdb_path)
+            except Exception:
                 if os.path.exists(temp_pdb_path):
                     os.remove(temp_pdb_path)
+                raise
 
         # Optional noised structure (Phase D — show what the model actually saw).
         if x_noised is not None and residue_type is not None:
@@ -1966,12 +1988,14 @@ class ModelTrainerBase(L.LightningModule):
                     payload[f"{log_prefix}/structure_noised{key_suffix}"] = wandb.Molecule(noised_pdb)
                     payload["global_step"] = self.global_step
                     payload["epoch"] = self.current_epoch
-                finally:
+                    self._pending_temp_pdb_cleanup.append(noised_pdb)
+                except Exception:
                     if os.path.exists(noised_pdb):
                         try:
                             os.remove(noised_pdb)
                         except OSError:
                             pass
+                    raise
 
         mask_np = mask.detach().cpu().numpy()
         pair_mask_np = mask_np[..., :, None] * mask_np[..., None, :]
