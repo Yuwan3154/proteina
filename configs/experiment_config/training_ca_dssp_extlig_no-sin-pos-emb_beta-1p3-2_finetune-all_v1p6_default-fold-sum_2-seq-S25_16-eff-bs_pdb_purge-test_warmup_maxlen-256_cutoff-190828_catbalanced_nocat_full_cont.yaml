@@ -101,7 +101,7 @@ log:
   log_every_n_steps: 1
   log_structure_every_n_steps: 50
   checkpoint: True
-  last_ckpt_every_n_steps: 20  # PLACEHOLDER -- to be recalibrated after the throughput smoke test on 2x L40S (target: checkpoint at least every 15 min)
+  last_ckpt_every_n_steps: 200  # calibrated from the 1-GPU smoke test (2026-07-02): 508 steps / 1063s = ~2.1 s/step -> 200 steps = ~7 min, safely under the 15-min mit_normal_gpu budget with margin. Matches the original single-GPU production run's own value (SuperCloud exp_config), not an arbitrary new number.
 
 validation_sampling:
   dt: 0.005
