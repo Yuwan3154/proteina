@@ -5,8 +5,13 @@
 #   - drops ContactMapTransform/confind (this model doesn't use contact maps) in favor of
 #     PurgeConfindTransform, matching the ext_lig finetune's own PDB-only dataset config
 #     (pdb_train_S25_max256_purge-test_cutoff-190828_catbalanced.yaml).
-#   - uses nocat_bucket_full_coverage (exact no-CAT coverage) instead of nocat_bucket_draws
-#     (with-replacement subsample), matching the ext_lig finetune's standing choice.
+#   - uses nocat_bucket_subsample_size (without-replacement subsample, fresh each epoch) instead
+#     of nocat_bucket_full_coverage (exact coverage) or nocat_bucket_draws (with-replacement) --
+#     the combined no-CAT population (735,471 clusters, vs 2,458 for the PDB-only finetune that
+#     nocat_bucket_full_coverage was built for) is far too large for exact per-epoch coverage to
+#     be practical. 1289 below is a PLACEHOLDER (roughly matching the 48M project's own combined
+#     dataset's ~50:50 labeled:unlabeled convention) for smoke-testing only -- pending a TED/CATH
+#     join audit + final user direction on the real value before the actual full launch.
 # pack_path (packed-mmap combined.pack) is set from the experiment config via ${oc.env:PACK_PATH}.
 datamodule:
   _target_: "proteinfoundation.datasets.pdb_data.PDBLightningDataModule"
@@ -24,7 +29,8 @@ datamodule:
   cat_cluster_draw: "largest"
   cath_balanced_member_mode: "cluster-random"
   nocat_bucket: True
-  nocat_bucket_full_coverage: True
+  nocat_bucket_full_coverage: False
+  nocat_bucket_subsample_size: 1289  # PLACEHOLDER for smoke test, see note above
   transforms:
     - _target_: "proteinfoundation.datasets.transforms.GlobalRotationTransform"
     - _target_: "proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform"
