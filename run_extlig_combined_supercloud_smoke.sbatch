@@ -31,6 +31,10 @@ echo "[$(date)] NODES: $SLURM_JOB_NODELIST"
 
 export DATA_PATH=/home/gridsan/cou/proteina/data
 export PACK_PATH=$DATA_PATH/pdb_dFS_combined_pack/combined.pack
+# SuperCloud compute nodes have no outbound internet (confirmed: curl to api.wandb.ai fails,
+# unlike Engaging) -- wandb.init() hangs retrying forever without this. Sync later from a node
+# with internet access via `wandb sync <run dir>` if the logs are wanted in the cloud dashboard.
+export WANDB_MODE=offline
 export SKIP_CONFIND_PRECOMPUTE=1
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
