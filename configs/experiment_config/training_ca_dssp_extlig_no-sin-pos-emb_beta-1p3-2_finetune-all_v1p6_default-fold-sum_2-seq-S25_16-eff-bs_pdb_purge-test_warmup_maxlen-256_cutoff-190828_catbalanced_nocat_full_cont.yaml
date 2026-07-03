@@ -88,7 +88,7 @@ opt:
   skip_nan_grad: False
   grad_and_weight_analysis: False
   dist_strategy: ddp
-  dist_backend: gloo
+  dist_backend: nccl  # TESTING 2026-07-03: was gloo (slower, host-memory-routed all-reduce); trying nccl for real DDP throughput on 2x L40S, per user direction. User has seen NCCL hang indefinitely before -- watch closely, revert to gloo if unresolved after 3 well-diagnosed attempts.
   use_lr_warmup: True
   warmup_steps: 3000
   warmup_start_lr_ratio: 0.0
