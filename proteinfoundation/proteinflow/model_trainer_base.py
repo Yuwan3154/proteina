@@ -2031,11 +2031,17 @@ class ModelTrainerBase(L.LightningModule):
                 return
             arr = arr.copy()
             mask_1d = mask_np if mask_np.ndim == 1 else mask_np.reshape(-1)
-            n_show = int(mask_1d.sum()) if mask_1d.size == arr.size else arr.size
-            if n_show <= 0:
+            if mask_1d.size == arr.size:
+                # Select the actual valid positions, not the first mask.sum() raw
+                # positions -- those differ whenever the mask has an INTERNAL gap
+                # (missing residue / chain break), not just right-side padding,
+                # which previously misaligned this strip against the structure and
+                # contact-map panels (both of which correctly skip only the gaps).
+                arr_show = arr[mask_1d.astype(bool)]
+            else:
+                arr_show = arr
+            if arr_show.size <= 0:
                 return
-            # Truncate to valid prefix only — padding on the right is uninformative.
-            arr_show = arr[:n_show]
             fig, ax = plt.subplots(figsize=(8, 1.0))
             cmap = plt.matplotlib.colors.ListedColormap(["black", "lightgray", "firebrick", "gold"])
             # remap: -1 -> 0 (black), 0/1/2 -> 1/2/3
