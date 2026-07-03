@@ -38,7 +38,7 @@ Usage:
         --processed_dir data/pdb_train/processed \
         --metadata_csv data/pdb_train/df_pdb_f1_....csv \
         --cutoff 4.0 --sample_size 10000 --resolution_good_cutoff 3.0 \
-        --frac_resolved_bad_cutoff 0.7 --top_k 30 \
+        --frac_resolved_bad_cutoff 0.7 --top_k 30 --workers 32 \
         --out_dir analysis_out/chain_quality_vs_resolution
 """
 
@@ -48,6 +48,7 @@ import argparse
 import pathlib
 import random
 import sys
+from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -61,6 +62,18 @@ if str(_THIS.parent) not in sys.path:
     sys.path.insert(0, str(_THIS.parent))
 
 from audit_broken_chains import _audit_one  # noqa: E402
+
+
+def _audit_one_or_none(args_tuple):
+    """Picklable top-level wrapper for ProcessPoolExecutor -- swallows per-file
+    load failures the same way the single-process loop does, instead of killing
+    the whole pool over one corrupt .pt."""
+    p, cutoff = args_tuple
+    try:
+        summary, _breaks = _audit_one(p, cutoff)
+    except Exception as e:
+        return (p.stem, None, repr(e))
+    return (p.stem, summary, None)
 
 
 def main():
@@ -79,6 +92,9 @@ def main():
     ap.add_argument("--frac_resolved_bad_cutoff", type=float, default=0.7,
                      help="Chains with frac_resolved below this are flagged as 'largely unresolved'.")
     ap.add_argument("--top_k", type=int, default=30)
+    ap.add_argument("--workers", type=int, default=1,
+                     help="Parallel worker processes for the .pt scan (I/O-bound; "
+                          "match to allocated CPUs for a full-corpus run).")
     ap.add_argument("--out_dir", type=pathlib.Path,
                      default=pathlib.Path("analysis_out/chain_quality_vs_resolution"))
     args = ap.parse_args()
@@ -99,20 +115,34 @@ def main():
         pt_files = rng.sample(pt_files, args.sample_size)
         print(f"[chain_quality] subsampled to {len(pt_files)}")
 
+    # Only load/scan files we can actually join against metadata -- skip the rest
+    # up front rather than wasting worker time on them.
+    scan_files = [p for p in pt_files if p.stem in meta.index]
+    n_no_metadata = len(pt_files) - len(scan_files)
+
+    summaries = {}
+    if args.workers > 1:
+        with ProcessPoolExecutor(max_workers=args.workers) as pool:
+            work = [(p, args.cutoff) for p in scan_files]
+            for chain_id, summary, err in tqdm(
+                pool.map(_audit_one_or_none, work, chunksize=32), total=len(work), desc="scanning"
+            ):
+                if err is not None:
+                    print(f"[chain_quality] {chain_id}: load failed {err}", file=sys.stderr)
+                    continue
+                if summary is not None:
+                    summaries[chain_id] = summary
+    else:
+        for p in tqdm(scan_files, desc="scanning"):
+            chain_id, summary, err = _audit_one_or_none((p, args.cutoff))
+            if err is not None:
+                print(f"[chain_quality] {chain_id}: load failed {err}", file=sys.stderr)
+                continue
+            if summary is not None:
+                summaries[chain_id] = summary
+
     rows = []
-    n_no_metadata = 0
-    for p in tqdm(pt_files, desc="scanning"):
-        chain_id = p.stem
-        if chain_id not in meta.index:
-            n_no_metadata += 1
-            continue
-        try:
-            summary, _breaks = _audit_one(p, args.cutoff)
-        except Exception as e:
-            print(f"[chain_quality] {chain_id}: load failed {e!r}", file=sys.stderr)
-            continue
-        if summary is None:
-            continue
+    for chain_id, summary in summaries.items():
         m = meta.loc[chain_id]
         length = m["length"]
         n_residues = summary["n_residues"]
