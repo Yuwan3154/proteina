@@ -77,14 +77,16 @@ def main():
     found_no_cath = []
     global_matched_with_cath = 0
     n_lines = 0
+    n_bytes = 0
     t_start = time.time()
     t_last_report = t_start
     with open_tsv(tsv_path) as fh:
         for line in fh:
             n_lines += 1
+            n_bytes += len(line)  # char count as a byte-count proxy (content is ~all ASCII); avoids a costly encode() per line
             now = time.time()
             if now - t_last_report >= 300:  # time-based, not line-count-based -- guarantees visibility
-                pos = fh.tell()
+                pos = n_bytes  # fh.tell() is disabled mid-iteration on a text-mode file (CPython quirk)
                 elapsed = now - t_start
                 rate_mb_s = pos / 1e6 / elapsed if elapsed > 0 else 0
                 print(f"  ...{elapsed/60:.1f} min elapsed, {pos/1e9:.2f} GB / "
