@@ -367,3 +367,48 @@ scaling8_nfe50    0.430600      8
 ```
 
 See PLAN finding #13 for the interpretation (NFE40≈NFE50 tie generalizes; 8TVL_A/8AUC_B are the weak points, matching the chain-break sanity check).
+
+## The missing SDE-200 comparison, found after user pushback (2026-07-03)
+
+User asked "How do they compare to SDE200, the baseline" after the campaign-complete report above -- the report had only compared NFE40 vs NFE50 to each other, never against the actual SDE-200 baseline. First search (grepping doc files + A6000 filesystem for "SDE-200"/"sde_200") came up short beyond the already-known 7AD5-only result. User: "They definitely exist. Check more carefully under more config names; this has happened before. CHECK CAREFULLY!"
+
+Re-grepped RAW-ARCHIVE's own older sections and found the lead: `..._unified_sderef8k` (line 8, "APPLES-TO-APPLES CAMPAIGN" section) -- checked on SuperCloud (`ssh SuperCloud`, not A6000 -- this data was from the original scaling8 apples-to-apples work which ran on SuperCloud/`cou` per §1.6), found the directory exists but contains ONLY 7AD5_A. This looked like it might be the full answer but was a decoy -- checking `ls ~/proteina/inference/` more broadly on SuperCloud revealed the BARE `..._unified` config (no suffix at all) actually contains raw samples + `proteinebm_v2_cathmd_analysis/proteinebm_scores_{pid}.csv` for essentially all 26 bad_afdb26 proteins. This is the true SDE-200 baseline (dt=0.005, schedule=log/2.0, sampling_mode=sc -- the actual production default) -- it was missed on the first pass because searching for "SDE"/"200" in directory names doesn't match a bare/unsuffixed config name.
+
+Sample counts are NOT matched: the 8 scaling8 proteins have N=8192 (an early apples-to-apples investment); the 18 bad_afdb26-only proteins only have N=512 (7ZK0_A at 1024) -- SDE-200 was never run to the full 8192 for those, likely because 200-step sampling is 4-5x the compute of the fast configs and the original scope only covered the 8 hard scaling8 targets at that depth.
+
+**Full comparison table** (best-of-NFE40/NFE50 vs SDE-200 oracle `tm_ref_template`, all NFE-side N=8192 except 7AD5 at N=2048 -- see campaign table above):
+
+```
+protein       nfe40    nfe50  best_nfe   sde200   sde_N  delta(nfe-sde)   winner
+8QXI_A          nan   0.5252    0.5252   0.5187    8192         +0.0065      NFE
+6ZYG_A       0.3744   0.4169    0.4169   0.4281    8192         -0.0112      SDE
+7AD5_A       0.6223   0.6235    0.6235   0.6499    8192         -0.0264      SDE
+6ZUS_A       0.3300   0.3232    0.3300   0.3283    8192         +0.0017      NFE
+8RJX_A       0.3925   0.3766    0.3925   0.4211    8192         -0.0286      SDE
+7KW9_A       0.4668   0.4776    0.4776   0.4894    8192         -0.0118      SDE
+6ZTG_A       0.2743   0.2884    0.2884   0.2857    8192         +0.0027      NFE
+8XHT_A       0.4115   0.4134    0.4134   0.4156    8192         -0.0022      SDE
+8AP5_A       0.3021   0.3055    0.3055   0.2534     512         +0.0521      NFE
+7ZK0_A       0.2246   0.2522    0.2522   0.5742    1024         -0.3220      SDE
+7MQQ_A       0.3038   0.3092    0.3092   0.4196     512         -0.1104      SDE
+8F3K_A       0.3853   0.3607    0.3853   0.3512     512         +0.0341      NFE
+7VZM_A       0.3603   0.3165    0.3603   0.3536     512         +0.0067      NFE
+6UF2_A       0.3302   0.3259    0.3302   0.4658     512         -0.1356      SDE
+7F7N_A       0.2680   0.2672    0.2680   0.2647     512         +0.0033      NFE
+8JB9_A       0.2642   0.3979    0.3979   0.2934     512         +0.1045      NFE
+7OIO_A       0.2839   0.3406    0.3406   0.3496     512         -0.0090      SDE
+7TXX_A       0.2649   0.3242    0.3242   0.3111     512         +0.0131      NFE
+7A2D_A       0.3825   0.2719    0.3825   0.3692     512         +0.0133      NFE
+8IN4_A       0.2703   0.2626    0.2703   0.2548     512         +0.0155      NFE
+6U1O_A       0.3405   0.2858    0.3405   0.3370     512         +0.0035      NFE
+7E7T_B       0.7308   0.8888    0.8888   0.8893     512         -0.0005      TIE
+6M5Y_A       0.3483   0.2661    0.3483   0.6543     512         -0.3060      SDE
+7DME_A       0.4202   0.2975    0.4202   0.4032     512         +0.0170      NFE
+8TVL_A       0.1901   0.1835    0.1901   0.1863     512         +0.0038      NFE
+8AUC_B       0.4021   0.3588    0.4021   0.3693     512         +0.0328      NFE
+
+scaling8 (N=8192 both sides, fair):     NFE-best mean=0.4334  SDE200 mean=0.4421  wins: NFE=3 SDE=5 tie=0
+new18 (SDE200 disadvantaged, N=512-1024 vs NFE's 8192): NFE-best mean=0.3620  SDE200 mean=0.3944  wins: NFE=12 SDE=5 tie=1
+```
+
+See PLAN finding #14 for the interpretation. Retrieval script: `~/scratchpad/sde200_oracle_summary.py` (stdlib-only, reads `proteinebm_scores_{pid}.csv` directly out of each protein's tar via Python's `tarfile` module, no venv/dependencies needed) run on SuperCloud against the bare `_unified` config's `seq_cath_cond` directory.
