@@ -271,3 +271,99 @@ Fix: a separate, additive script (`a6000_bad_afdb26_manual_driver.sh`), own PID 
 First launch attempt used `ssh -n ... < localfile` to transfer the script (avoiding fragile inline heredoc quoting) -- `-n` redirects the ssh session's stdin to /dev/null, which silently defeated the stdin-pipe transfer (0-byte file written). Fixed by dropping `-n` for that one transfer command (still fine since it's a one-shot non-interactive `cat >`, no hang risk). Verified via `md5sum` on both ends before executing. Launch itself printed `disown: not found` (remote non-interactive shell doesn't have the bash builtin available in that context) but the backgrounded process still detached correctly (`nohup` alone was sufficient) -- verified via `ps -p <pid> -o ppid` showing PPID=1. Multiple `parallel_proteina_inference.py` processes appeared per shard (3 each) which initially looked like a possible duplicate-launch repeat; cross-checked against the live driver's own long-running, healthy shard-1 process tree and found the identical 3-process-per-shard pattern there too (stable for 3.5h+) -- confirmed this is the pipeline's normal manager/worker/watchdog process shape, not a new incident.
 
 The first attempt to write this same script via a single `ssh 'cat > file << HEREDOC ... HEREDOC'` one-liner with nested quoting was blocked by Claude Code's auto-mode safety classifier ("preparing to launch a second, concurrent GPU driver... exact kind of unilateral, self-justified concurrent-launch decision that caused the earlier incident"). Correctly deferred to the user rather than working around it; user chose "fix the bug first [verify correctness], then authorize the second driver" -- script was rewritten locally, syntax-checked (`bash -n`) both locally and after transfer, checksummed for exact match, then launched only after that verification passed.
+
+## Campaign completion: full narrative + final results (2026-07-02 4:08 PM -> 2026-07-03 7:45 PM EDT, ~27.6h wall-clock)
+
+**Timeline.** Live driver `a6000_hybrid_campaign_driver.sh` (buggy stage 3/4, see above) finished cleanly at 5:50 PM 2026-07-02 -- its own stage 3 attempt hit a real but inconsequential GPU0 OOM (tried loading ProteinEBM while the manual driver's 8AUC_B sampling held 47.13/47.43 GiB of GPU0 -- the underlying data was already fully scored, so nothing was lost) and stage 4 succeeded; its own `oracle_summary.txt` failed with `python: command not found` (no venv activation in the top-level script, a pre-existing bug, same class as below). Manual driver `a6000_bad_afdb26_manual_driver.sh` detected the live driver's lock-PID exit and launched GPU1's shard at 5:51 PM as designed.
+
+nfe40 stage: GPU0/GPU2 shards (started 4:08 PM) ran the full 6-protein/7-protein lists; GPU1's shard (started 5:51 PM) ran 3 proteins. 8AUC_B (L=492, the campaign's known long-pole outlier) finished sampling at 12:30 AM 2026-07-03 in 8.36h -- faster than the 11-14h worst-case projection from the L²·log(L) cost-scaling extrapolation. `NFE40_ALL_SHARDS_DONE` printed 4:33 AM (12h25min total). One graceful mid-stage recovery: GPU0's ProteinEBM scoring of 8AUC_B hit a CUDA OOM at batch_size=16, auto-retried at batch_size=8, succeeded -- not a failure.
+
+User authorized a ~12h autonomous push (1:57 AM, deadline ~1:57 PM) to keep monitoring/pushing regardless of whether it finished in time. A sanity check at ~2:15 AM (see PLAN finding #12) verified pipeline/data integrity (correct 8192-sample counts, no NaN, no missing files for completed proteins) and separately found real chain-break degradation in raw structures for large/OOD proteins -- non-monotonic with length (8TVL_A at L=338 worse than 8AUC_B at L=492).
+
+nfe50 stage auto-started 4:33 AM on all 3 GPUs with the SAME shard assignment (LPT bin-packing is deterministic given identical cost inputs): GPU0=8AUC_B again, GPU1=8TVL_A again, GPU2=7DME_A first. GPU2's and GPU1's shards fully finished (TGT_EXIT=0) by 5:41 PM and 6:33 PM respectively. GPU0's shard finished sampling all 6 proteins by 6:50 PM (8AUC_B took 10.43h this time, matching the 50/40-scaled projection of ~10.5h almost exactly) then hit the SAME OOM-at-batch_size=16-retry-at-8 pattern during 8AUC_B's scoring, which again succeeded. The final step -- a USalign batch TM-score computation for all 8192 samples of 8AUC_B against the native structure -- ran at 99.9% CPU for ~19 minutes (the single most expensive step in the whole campaign, confirmed actively working via `ps`, not hung, before being reported as such). `NFE50_ALL_SHARDS_DONE` and `MANUAL_DRIVER_DONE` both printed 7:45:35 PM 2026-07-03.
+
+**The venv-activation bug (predicted, confirmed) recurred exactly as documented:** the manual driver's own final `python3 scripts/campaign_oracle_summary.py` call produced `oracle_summary_full.txt` containing only the one-line error `python: command not found` (79 bytes). Regenerated manually with the venv properly activated (`bash -c "cd $HOME/cue-openfold-env && source .venv/bin/activate && source ./activate.sh && cd $HOME/proteina_speedup && python3 scripts/campaign_oracle_summary.py"`, passed as ONE single-quoted ssh argument) to get the real table below.
+
+**Full final oracle table (`oracle_tm_ref_template`, N=8192 except 7AD5_A which is N=2048 from an earlier smoke test; 8QXI_A shows NaN at nfe40 in both scaling8 and bad_afdb26 stages -- a pre-existing 1-corrupted-sample artifact from the 2026-07-02 duplicate-driver incident, n_samples=8191 not 8192, unrelated to this campaign's own work):**
+
+```
+           stage    pdb  n_samples  oracle_tm_ref_template
+  scaling8_nfe40 8QXI_A       8191                     NaN
+  scaling8_nfe40 6ZYG_A       8192                  0.3744
+  scaling8_nfe40 7AD5_A       2048                  0.6223
+  scaling8_nfe40 6ZUS_A       8192                  0.3300
+  scaling8_nfe40 8RJX_A       8192                  0.3925
+  scaling8_nfe40 7KW9_A       8192                  0.4668
+  scaling8_nfe40 6ZTG_A       8192                  0.2743
+  scaling8_nfe40 8XHT_A       8192                  0.4115
+  scaling8_nfe50 8QXI_A       8192                  0.5252
+  scaling8_nfe50 6ZYG_A       8192                  0.4169
+  scaling8_nfe50 7AD5_A       2048                  0.6235
+  scaling8_nfe50 6ZUS_A       8192                  0.3232
+  scaling8_nfe50 8RJX_A       8192                  0.3766
+  scaling8_nfe50 7KW9_A       8192                  0.4776
+  scaling8_nfe50 6ZTG_A       8192                  0.2884
+  scaling8_nfe50 8XHT_A       8192                  0.4134
+bad_afdb26_nfe40 8AP5_A       8192                  0.3021
+bad_afdb26_nfe40 8QXI_A       8191                     NaN
+bad_afdb26_nfe40 7ZK0_A       8192                  0.2246
+bad_afdb26_nfe40 6ZYG_A       8192                  0.3744
+bad_afdb26_nfe40 7MQQ_A       8192                  0.3038
+bad_afdb26_nfe40 8F3K_A       8192                  0.3853
+bad_afdb26_nfe40 7VZM_A       8192                  0.3603
+bad_afdb26_nfe40 7AD5_A       2048                  0.6223
+bad_afdb26_nfe40 6UF2_A       8192                  0.3302
+bad_afdb26_nfe40 7F7N_A       8192                  0.2680
+bad_afdb26_nfe40 8JB9_A       8192                  0.2642
+bad_afdb26_nfe40 6ZUS_A       8192                  0.3300
+bad_afdb26_nfe40 7OIO_A       8192                  0.2839
+bad_afdb26_nfe40 7TXX_A       8192                  0.2649
+bad_afdb26_nfe40 7A2D_A       8192                  0.3825
+bad_afdb26_nfe40 8RJX_A       8192                  0.3925
+bad_afdb26_nfe40 7KW9_A       8192                  0.4668
+bad_afdb26_nfe40 6ZTG_A       8192                  0.2743
+bad_afdb26_nfe40 8IN4_A       8192                  0.2703
+bad_afdb26_nfe40 6U1O_A       8192                  0.3405
+bad_afdb26_nfe40 7E7T_B       8192                  0.7308
+bad_afdb26_nfe40 6M5Y_A       8192                  0.3483
+bad_afdb26_nfe40 8XHT_A       8192                  0.4115
+bad_afdb26_nfe40 7DME_A       8192                  0.4202
+bad_afdb26_nfe40 8TVL_A       8192                  0.1901
+bad_afdb26_nfe40 8AUC_B       8192                  0.4021
+bad_afdb26_nfe50 8AP5_A       8192                  0.3055
+bad_afdb26_nfe50 8QXI_A       8192                  0.5252
+bad_afdb26_nfe50 7ZK0_A       8192                  0.2522
+bad_afdb26_nfe50 6ZYG_A       8192                  0.4169
+bad_afdb26_nfe50 7MQQ_A       8192                  0.3092
+bad_afdb26_nfe50 8F3K_A       8192                  0.3607
+bad_afdb26_nfe50 7VZM_A       8192                  0.3165
+bad_afdb26_nfe50 7AD5_A       2048                  0.6235
+bad_afdb26_nfe50 6UF2_A       8192                  0.3259
+bad_afdb26_nfe50 7F7N_A       8192                  0.2672
+bad_afdb26_nfe50 8JB9_A       8192                  0.3979
+bad_afdb26_nfe50 6ZUS_A       8192                  0.3232
+bad_afdb26_nfe50 7OIO_A       8192                  0.3406
+bad_afdb26_nfe50 7TXX_A       8192                  0.3242
+bad_afdb26_nfe50 7A2D_A       8192                  0.2719
+bad_afdb26_nfe50 8RJX_A       8192                  0.3766
+bad_afdb26_nfe50 7KW9_A       8192                  0.4776
+bad_afdb26_nfe50 6ZTG_A       8192                  0.2884
+bad_afdb26_nfe50 8IN4_A       8192                  0.2626
+bad_afdb26_nfe50 6U1O_A       8192                  0.2858
+bad_afdb26_nfe50 7E7T_B       8192                  0.8888
+bad_afdb26_nfe50 6M5Y_A       8192                  0.2661
+bad_afdb26_nfe50 8XHT_A       8192                  0.4134
+bad_afdb26_nfe50 7DME_A       8192                  0.2975
+bad_afdb26_nfe50 8TVL_A       8192                  0.1835
+bad_afdb26_nfe50 8AUC_B       8192                  0.3588
+
+=== per-stage mean oracle (proteins with data only) ===
+                      mean  count
+stage
+bad_afdb26_nfe40  0.357756     25
+bad_afdb26_nfe50  0.363835     26
+scaling8_nfe40    0.410257      7
+scaling8_nfe50    0.430600      8
+```
+
+See PLAN finding #13 for the interpretation (NFE40≈NFE50 tie generalizes; 8TVL_A/8AUC_B are the weak points, matching the chain-break sanity check).
