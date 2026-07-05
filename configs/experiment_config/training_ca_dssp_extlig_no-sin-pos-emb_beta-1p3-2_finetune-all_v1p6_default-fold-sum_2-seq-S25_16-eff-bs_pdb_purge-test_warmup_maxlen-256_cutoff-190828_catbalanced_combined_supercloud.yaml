@@ -122,6 +122,11 @@ log:
   log_structure_every_n_steps: 50
   checkpoint: True
   last_ckpt_every_n_steps: 200  # calibrated from the smoke test's measured ~2.6-2.9s/step -> ~200 steps = ~9min
+  # Disabled (2026-07-05, after 2 crashes): the best-tmscore checkpoint's cross-rank file-existence
+  # broadcast hit a gloo TCP connection drop twice in a row on this cluster's network -- a
+  # non-essential bookkeeping feature (doesn't affect what's learned) crashing the whole job
+  # repeatedly isn't worth chasing further; last.ckpt (plain, no broadcast) is unaffected.
+  checkpoint_best_tmscore_median: False
 
 validation_sampling:
   dt: 0.005
