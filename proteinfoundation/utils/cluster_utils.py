@@ -16,7 +16,7 @@ import pathlib
 import shutil
 import subprocess
 from datetime import datetime
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import pandas as pd
 import torch
@@ -257,6 +257,8 @@ class CATBalancedSampler(Sampler):
         nocat_bucket_draws: int = 1,
         nocat_bucket_full_coverage: bool = False,
         nocat_bucket_subsample_size: Optional[int] = None,
+        nocat_bucket_inverse_freq: bool = False,
+        nocat_sample_counts_init: Optional[List[int]] = None,
         shuffle: bool = True,
         drop_last: bool = False,
         seed: int = 0,
@@ -284,6 +286,14 @@ class CATBalancedSampler(Sampler):
         self.nocat_bucket_subsample_size = (
             int(nocat_bucket_subsample_size) if nocat_bucket_subsample_size is not None else None
         )
+        # When True, draw len(self._topologies) no-CAT clusters per epoch (matching the CAT-labeled
+        # count 1:1) via inverse-frequency-weighted sampling WITHOUT replacement: weight = 1/(count+1)
+        # per no-CAT cluster, count = cumulative times drawn across the whole training run (persisted
+        # across checkpoints via nocat_sample_counts_init / the datamodule's state_dict hook). Takes
+        # priority over nocat_bucket_subsample_size when both are set; ignored if nocat_bucket_full_coverage.
+        self.nocat_bucket_inverse_freq = bool(nocat_bucket_inverse_freq)
+        self._nocat_sample_counts_init = nocat_sample_counts_init
+        self._nocat_sample_counts = None  # populated in _build_cat_index, once self.nocat_clusters exists
         if dataset.database == "pdb" or dataset.database == "scop":
             self.sequence_id_to_idx = {
                 fname.split(".")[0]: i for i, fname in enumerate(dataset.file_names)
@@ -350,8 +360,27 @@ class CATBalancedSampler(Sampler):
         self.topology_to_clusters = topology_to_clusters
         self.nocat_clusters = nocat_clusters
         self._topologies = sorted(topology_to_clusters.keys())
+        if self.nocat_bucket_inverse_freq:
+            m = len(nocat_clusters)
+            init = self._nocat_sample_counts_init
+            if init is not None and len(init) == m:
+                self._nocat_sample_counts = torch.tensor(init, dtype=torch.long)
+            else:
+                if init is not None:
+                    log_info(
+                        f"CATBalancedSampler: restored nocat_sample_counts has length {len(init)} "
+                        f"but current nocat_clusters count is {m} -- population changed since the "
+                        f"checkpoint was written, ignoring restored counts, starting fresh at zero."
+                    )
+                self._nocat_sample_counts = torch.zeros(m, dtype=torch.long)
         if self.nocat_bucket_full_coverage:
             nocat_desc = "full_coverage=True (every no-CAT cluster used ~once/epoch, split across ranks)"
+        elif self.nocat_bucket_inverse_freq:
+            n_never = int((self._nocat_sample_counts == 0).sum().item())
+            nocat_desc = (
+                f"inverse_freq=True (draw {len(self._topologies)}/epoch, 1:1 with CAT topologies, "
+                f"weight=1/(count+1), split across ranks; {n_never}/{len(nocat_clusters)} never yet sampled)"
+            )
         elif self.nocat_bucket_subsample_size is not None:
             nocat_desc = (
                 f"subsample_size={self.nocat_bucket_subsample_size} "
@@ -444,29 +473,51 @@ class CATBalancedSampler(Sampler):
             out.append((self.sequence_id_to_idx[seqid], None))
         return out
 
-    def _draw_nocat_full_coverage(self, gen, target_total: Optional[int] = None) -> List[Tuple]:
+    def _select_nocat_inverse_freq(self, target_total: int) -> List[int]:
+        """Pick `target_total` no-CAT cluster indices via inverse-frequency-weighted sampling
+        WITHOUT replacement: weight = 1/(count+1), count = cumulative times this cluster has
+        been drawn across the whole training run (persisted across checkpoints). Deterministic
+        given (seed, epoch, current counts) -- identical on every rank (no cross-rank sync
+        needed), same design as the other draw methods. Mutates self._nocat_sample_counts."""
+        m = len(self.nocat_clusters)
+        k = min(target_total, m)
+        weights = 1.0 / (self._nocat_sample_counts.to(torch.float64) + 1.0)
+        gen = self._make_generator(5) if self.v2 else None
+        if self.v2:
+            chosen = torch.multinomial(weights, k, replacement=False, generator=gen).tolist()
+        else:
+            chosen = torch.multinomial(weights, k, replacement=False).tolist()
+        self._nocat_sample_counts[chosen] += 1
+        return chosen
+
+    def _draw_nocat_full_coverage(
+        self, gen, target_total: Optional[int] = None, use_inverse_freq: bool = False
+    ) -> List[Tuple]:
         """Exact-coverage (or without-replacement subsample) variant of _draw_nocat: no-CAT
         clusters are drawn without repeats, split disjointly across ranks under DDP. With
         target_total=None, every no-CAT cluster is drawn exactly once per epoch (the
         original full-coverage behavior). With target_total=N < len(nocat_clusters), a
-        fresh-each-epoch uniformly random N-subset (without replacement) is drawn instead --
-        truncating a full random permutation to its first N entries is itself a uniform
-        random N-subset, so this reuses the exact same shuffle/pad/stride machinery.
-        Mirrors the topology sampler's shuffle+pad+stride DDP split in __iter__ so every
-        rank yields an equal count (required -- unequal per-rank batch counts hang DDP
-        collectives); padding (only when the count isn't evenly divisible by world size)
-        repeats a few clusters rather than dropping any."""
+        fresh-each-epoch N-subset (without replacement) is drawn instead: either uniformly
+        random (truncating a full random permutation to its first N entries is itself a
+        uniform random N-subset) or, when use_inverse_freq=True, weighted toward
+        under-sampled clusters via _select_nocat_inverse_freq. Either way this reuses the
+        same shuffle/pad/stride machinery. Mirrors the topology sampler's shuffle+pad+stride
+        DDP split in __iter__ so every rank yields an equal count (required -- unequal
+        per-rank batch counts hang DDP collectives); padding (only when the count isn't
+        evenly divisible by world size) repeats a few clusters rather than dropping any."""
         if not self.nocat_clusters:
             return []
         m = len(self.nocat_clusters)
-        nocat_shuffle_gen = self._make_generator(4) if self.v2 else None
-        if self.v2:
-            nperm = torch.randperm(m, generator=nocat_shuffle_gen).tolist()
+        if use_inverse_freq:
+            nperm = self._select_nocat_inverse_freq(target_total if target_total is not None else m)
         else:
-            nperm = torch.randperm(m).tolist()
-
-        if target_total is not None:
-            nperm = nperm[: min(target_total, m)]
+            nocat_shuffle_gen = self._make_generator(4) if self.v2 else None
+            if self.v2:
+                nperm = torch.randperm(m, generator=nocat_shuffle_gen).tolist()
+            else:
+                nperm = torch.randperm(m).tolist()
+            if target_total is not None:
+                nperm = nperm[: min(target_total, m)]
 
         if self.num_replicas is not None:
             n = len(nperm)
@@ -541,6 +592,10 @@ class CATBalancedSampler(Sampler):
         if self.nocat_bucket:
             if self.nocat_bucket_full_coverage:
                 nocat_pairs = self._draw_nocat_full_coverage(draw_gen)
+            elif self.nocat_bucket_inverse_freq:
+                nocat_pairs = self._draw_nocat_full_coverage(
+                    draw_gen, target_total=len(self._topologies), use_inverse_freq=True
+                )
             elif self.nocat_bucket_subsample_size is not None:
                 nocat_pairs = self._draw_nocat_full_coverage(
                     draw_gen, target_total=self.nocat_bucket_subsample_size
@@ -566,6 +621,13 @@ class CATBalancedSampler(Sampler):
                     if self.num_replicas is not None
                     else m
                 )
+            elif self.nocat_bucket_inverse_freq:
+                m = min(len(self._topologies), len(self.nocat_clusters))
+                base += (
+                    math.ceil(m * 1.0 / self.num_replicas)
+                    if self.num_replicas is not None
+                    else m
+                )
             elif self.nocat_bucket_subsample_size is not None:
                 m = min(self.nocat_bucket_subsample_size, len(self.nocat_clusters))
                 base += (
@@ -576,6 +638,17 @@ class CATBalancedSampler(Sampler):
             else:
                 base += self.nocat_bucket_draws
         return base
+
+    def state_dict(self) -> Dict[str, Any]:
+        """Persisted state for checkpoint round-trip: the per-cluster sample-count history
+        that drives inverse-frequency weighting. Empty dict when the mode is off (no-op).
+        Restoration is via the nocat_sample_counts_init constructor arg (see the datamodule's
+        own load_state_dict, which feeds this into the next sampler's constructor) -- a fresh
+        sampler is always built per-epoch-set via train_dataloader(), so there's no live
+        sampler instance to restore INTO after the fact."""
+        if self.nocat_bucket_inverse_freq and self._nocat_sample_counts is not None:
+            return {"nocat_sample_counts": self._nocat_sample_counts.tolist()}
+        return {}
 
 
 def split_dataframe(

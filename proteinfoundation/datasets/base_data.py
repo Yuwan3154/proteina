@@ -12,7 +12,7 @@ import gc
 import os
 import pickle
 from abc import ABC, abstractmethod
-from typing import Callable, Dict, Iterable, List, Literal, Optional
+from typing import Any, Callable, Dict, Iterable, List, Literal, Optional
 
 import lightning as L
 import torch
@@ -60,6 +60,7 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         nocat_bucket_draws: int = 1,
         nocat_bucket_full_coverage: bool = False,
         nocat_bucket_subsample_size: Optional[int] = None,
+        nocat_bucket_inverse_freq: bool = False,
         cath_balanced_emit_topology: bool = False,
     ):
         """Initialising the base data module class.
@@ -121,12 +122,17 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         self.nocat_bucket_draws = nocat_bucket_draws
         self.nocat_bucket_full_coverage = nocat_bucket_full_coverage
         self.nocat_bucket_subsample_size = nocat_bucket_subsample_size
+        self.nocat_bucket_inverse_freq = nocat_bucket_inverse_freq
         self.cath_balanced_emit_topology = cath_balanced_emit_topology
         self._chain_to_cat = None  # lazy cache for cath-balanced sampling
         # Last-built samplers kept on the datamodule so on_{train,validation}_epoch_start
         # can call set_epoch even on Lightning versions that don't auto-propagate.
         self._train_cluster_sampler: Optional[ClusterSampler] = None
         self._val_cluster_sampler: Optional[ClusterSampler] = None
+        # Restored via load_state_dict (Lightning calls this before dataloaders are built on
+        # resume) -- fed into the samplers' nocat_sample_counts_init at construction time.
+        self._train_nocat_sample_counts_restore: Optional[List[int]] = None
+        self._val_nocat_sample_counts_restore: Optional[List[int]] = None
 
     def setup(self, stage: Optional[str] = None):
         if stage == "fit" or stage is None:
@@ -135,6 +141,28 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             self.val_ds = self.val_dataset()
         elif stage == "test":
             self.test_ds = self.test_dataset()
+
+    def state_dict(self) -> Dict[str, Any]:
+        """Lightning calls this on checkpoint save; only the nocat_bucket_inverse_freq
+        per-cluster sample-count history needs persisting (empty/no-op otherwise)."""
+        out = {}
+        if self._train_cluster_sampler is not None:
+            train_state = self._train_cluster_sampler.state_dict()
+            if train_state:
+                out["train_nocat_sample_counts"] = train_state["nocat_sample_counts"]
+        if self._val_cluster_sampler is not None:
+            val_state = self._val_cluster_sampler.state_dict()
+            if val_state:
+                out["val_nocat_sample_counts"] = val_state["nocat_sample_counts"]
+        return out
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        """Lightning calls this on checkpoint resume, BEFORE dataloaders/samplers are built
+        (via restore_datamodule -> _restore_modules_and_callbacks, ahead of fit_loop.setup_data).
+        Stash the restored counts; train_dataloader/val_dataloader thread them into the fresh
+        sampler's nocat_sample_counts_init at construction time."""
+        self._train_nocat_sample_counts_restore = state_dict.get("train_nocat_sample_counts")
+        self._val_nocat_sample_counts_restore = state_dict.get("val_nocat_sample_counts")
 
     def _compose_transforms(self, transforms: Iterable[Callable]) -> T.Compose:
         try:
@@ -188,6 +216,7 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         dataset: Dataset,
         shuffle: bool = False,
         clusterid_to_seqid_mapping: Dict[str, List[str]] = None,
+        nocat_sample_counts_init: Optional[List[int]] = None,
     ) -> DataLoader:
         """Returns the dataloader for the corresponding dataset.
 
@@ -214,6 +243,8 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
                 nocat_bucket_draws=self.nocat_bucket_draws,
                 nocat_bucket_full_coverage=self.nocat_bucket_full_coverage,
                 nocat_bucket_subsample_size=self.nocat_bucket_subsample_size,
+                nocat_bucket_inverse_freq=self.nocat_bucket_inverse_freq,
+                nocat_sample_counts_init=nocat_sample_counts_init,
                 seed=self.cluster_sampler_seed,
                 v2=self.cluster_sampler_v2,
                 emit_topology=self.cath_balanced_emit_topology,
@@ -319,6 +350,7 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             dataset=self.train_ds,
             shuffle=shuffle,
             clusterid_to_seqid_mapping=clusterid_to_seqid_mapping,
+            nocat_sample_counts_init=self._train_nocat_sample_counts_restore,
         )
         if isinstance(getattr(train_dl, "sampler", None), (ClusterSampler, CATBalancedSampler)):
             self._train_cluster_sampler = train_dl.sampler
@@ -347,6 +379,7 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             dataset=self.val_ds,
             shuffle=shuffle,
             clusterid_to_seqid_mapping=clusterid_to_seqid_mapping,
+            nocat_sample_counts_init=self._val_nocat_sample_counts_restore,
         )
         if isinstance(getattr(val_dl, "sampler", None), (ClusterSampler, CATBalancedSampler)):
             self._val_cluster_sampler = val_dl.sampler
