@@ -48,9 +48,8 @@ model:
     ext_lig_emb_cond_seq: True
     ext_lig_emb_dim: 3
 
-# Dataset: combined PDB+AFDB, cath-balanced sampling w/ without-replacement no-CAT subsample
-# (see configs/datasets_config/mixed/pdb_dFS_combined_catbalanced_extlig.yaml -- nocat subsample
-# size there is a PLACEHOLDER pending the TED/CATH join audit).
+# Dataset: combined PDB+AFDB, cath-balanced sampling w/ checkpoint-persisted inverse-frequency
+# no-CAT sampling (see configs/datasets_config/mixed/pdb_dFS_combined_catbalanced_extlig.yaml).
 dataset: pdb_dFS_combined_catbalanced_extlig
 dataset_config_subdir: mixed
 
@@ -91,12 +90,15 @@ lora:
 opt:
   lr: 0.0001
   max_epochs: 100000  # non-binding; max_steps below is the real hard stop
-  # PLACEHOLDER for smoke-testing ONLY (checkpoint step 123200 + a small increment) -- the real
-  # target awaits the TED/CATH join audit + user's final training-duration direction. DO NOT use
-  # this value for the real full launch.
-  max_steps: 123700
+  # 200 additional epochs (user's standing duration target), recomputed with the corrected
+  # per-rank epoch length for THIS dataset/sampler/hardware: 1282 CAT topologies (train split,
+  # confirmed live via the smoke test's sampler construction log) + 1282 no-CAT draws (now
+  # 1:1 by the inverse-freq mode) = 2564 total/epoch, split across 8 ranks (4 nodes x 2 V100):
+  # ceil(1282/8)=161 CAT + ceil(1282/8)=161 no-CAT = 322 steps/epoch/rank. 200 epochs x 322 =
+  # 64400 additional steps. Target = checkpoint step 123200 + 64400 = 187600.
+  max_steps: 187600
   lr_horizon_from_max_steps: True
-  batch_size: 2  # PROVISIONAL/conservative starting point for 32GB V100 + fp32 (untested); retune from real OOM headroom observed during the smoke test
+  batch_size: 2  # confirmed safe (no OOM) on 32GB V100 + fp32 via the smoke test; not pushed higher (untested), fine per "training slower is fine"
   accumulate_grad_batches: 1  # 8 GPUs (4 nodes x 2) x batch 2 x accum 1 = eff batch 16, matching the original single-GPU run's effective batch size
   optimizer: muon
   val_check_interval_optim_steps: 1000
@@ -119,7 +121,7 @@ log:
   log_every_n_steps: 1
   log_structure_every_n_steps: 50
   checkpoint: True
-  last_ckpt_every_n_steps: 50  # PLACEHOLDER for smoke test; recalibrate from real measured throughput before the full launch
+  last_ckpt_every_n_steps: 200  # calibrated from the smoke test's measured ~2.6-2.9s/step -> ~200 steps = ~9min
 
 validation_sampling:
   dt: 0.005
