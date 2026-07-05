@@ -36,6 +36,9 @@ export PACK_PATH=$DATA_PATH/pdb_dFS_combined_pack/combined.pack
 # SuperCloud compute nodes have no outbound internet (confirmed via smoke test) -- wandb.init()
 # hangs retrying forever without this.
 export WANDB_MODE=offline
+# USalign (validation_sampling TM-score, feeds the best-tmscore ModelCheckpoint monitor) --
+# copied from Engaging's working binary to ~/.local/bin, not on PATH by default in this shell.
+export PATH="$HOME/.local/bin:$PATH"
 export SKIP_CONFIND_PRECOMPUTE=1
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1

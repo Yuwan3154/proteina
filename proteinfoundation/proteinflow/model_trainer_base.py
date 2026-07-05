@@ -1791,8 +1791,16 @@ class ModelTrainerBase(L.LightningModule):
         choose. Falls through gracefully if USalign isn't on PATH or the call
         fails — we never let logging break training.
         """
-        usalign_bin = shutil.which("USalign") or "/home/ubuntu/.local/bin/USalign"
+        usalign_bin = shutil.which("USalign") or os.path.expanduser("~/.local/bin/USalign")
         if not os.path.exists(usalign_bin):
+            if not getattr(self, "_usalign_missing_warned", False):
+                logger.warning(
+                    f"USalign not found (checked PATH and {usalign_bin}) -- "
+                    f"validation_sampling/tmscore_median will never be logged, which crashes "
+                    f"the best-tmscore ModelCheckpoint callback the first time it fires. "
+                    f"Install USalign or set log.checkpoint_best_tmscore_median=False."
+                )
+                self._usalign_missing_warned = True
             return None
         if x_pred is None or x_gt is None or residue_type is None or mask is None:
             return None
