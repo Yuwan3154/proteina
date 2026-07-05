@@ -17,8 +17,12 @@
 # PER-ROUND GPU-escalation Stage-1 (48M), combined PDB+AFDB, on mit_preemptable.
 # The escalating queue is rebuilt EACH ROUND (a round begins when the previous job ends):
 #   - On job END (preemption / time-limit / crash-with-progress): ESCALATE = submit a fresh set
-#       {H200 begin=now, H100 begin=+6h, L40S begin=+24h}. SLURM --begin does the timed broadening
-#       (try H200 hardest; add H100 after 6h unassigned; add L40S after 24h) with NO daemon.
+#       {H200 begin=now, H100 begin=+6h}. SLURM --begin does the timed broadening (try H200 hardest;
+#       add H100 after 6h unassigned) with NO daemon. L40S REMOVED from the escalation (2026-07-04,
+#       user directive: strictly H200/H100, no L40S fallback tier at all -- a full day idle is
+#       preferred over training on L40S). The l40s case in the tier-detection switch and the
+#       runtime batch/accum branch below are intentionally LEFT IN PLACE (not submitted anymore, but
+#       still correctly handle any already-running legacy L40S job through to its own completion).
 #   - On job START (this job got a node): PURGE all OTHER pending cb_dc_s1_48m* jobs (the escalation
 #       losers / any duplicate) -> "we got one, drop the rest."
 #   - On CLEAN finish (max_steps): cancel ALL tiers; done.
@@ -61,11 +65,10 @@ _submit_tier() {  # $1=tier  $2=gres  $3=begin ; anti-dup: skip if ANOTHER job o
   echo "[$(date)] escalate: submit tier $1 (gres $2 begin $3 mem $TIER_MEM) ${exarg}"
   (cd "$REPO" && sbatch --job-name="cb_dc_s1_48m_$1" --gres="$2" --begin="$3" --mem="$TIER_MEM" ${exarg} --export=ALL "$LAUNCHER") || true
 }
-# ESCALATE = start a fresh round: H200 now, H100 +6h, L40S +24h (--begin gates the broadening)
+# ESCALATE = start a fresh round: H200 now, H100 +6h (--begin gates the broadening). No L40S tier.
 escalate() {
   _submit_tier h200 gpu:h200:4 now
   _submit_tier h100 gpu:h100:4 now+6hours
-  _submit_tier l40s gpu:l40s:4 now+24hours
 }
 
 ESCALATED=0
