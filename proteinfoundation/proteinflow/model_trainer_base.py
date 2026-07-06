@@ -2562,36 +2562,46 @@ class ModelTrainerBase(L.LightningModule):
         # with discrete diffusion). Mean over the per-sample dicts (gathered
         # across ranks above). Each metric key is logged independently so a
         # sample missing one metric (e.g. no long-range pairs at all) doesn't
-        # poison the rest.
-        if contact_results and self.logger is not None and hasattr(self.logger, "experiment"):
-            if not (hasattr(self.trainer, "is_global_zero") and not self.trainer.is_global_zero):
-                # Collect all metric keys across the samples (some are optional).
-                all_keys = set()
-                for r in contact_results:
-                    all_keys.update(r.keys())
-                payload_c: Dict[str, float] = {
-                    "global_step": self.global_step,
-                    "epoch": self.current_epoch,
-                }
-                for k in sorted(all_keys):
-                    vals = [r[k] for r in contact_results if k in r]
-                    if not vals:
-                        continue
-                    arr = np.array(vals, dtype=np.float64)
-                    payload_c[f"validation_sampling/{k}_mean"] = float(arr.mean())
-                    payload_c[f"validation_sampling/{k}_median"] = float(np.median(arr))
-                payload_c["validation_sampling/contact_n_samples"] = int(len(contact_results))
+        # poison the rest. Same fix as the tmscore block above: contact_results is
+        # already identical on every rank (all_gather_object earlier in this
+        # function), so the metric computation + self.log() run on EVERY rank, not
+        # just rank 0 -- otherwise a ModelCheckpoint monitor keyed on any of these
+        # values would crash on every non-zero rank the same way the tmscore one did
+        # (see that block's comment for the full story). Only the direct wandb
+        # dict-log stays rank-0-gated (needs a real wandb experiment object).
+        if contact_results:
+            # Collect all metric keys across the samples (some are optional).
+            all_keys = set()
+            for r in contact_results:
+                all_keys.update(r.keys())
+            payload_c: Dict[str, float] = {
+                "global_step": self.global_step,
+                "epoch": self.current_epoch,
+            }
+            for k in sorted(all_keys):
+                vals = [r[k] for r in contact_results if k in r]
+                if not vals:
+                    continue
+                arr = np.array(vals, dtype=np.float64)
+                payload_c[f"validation_sampling/{k}_mean"] = float(arr.mean())
+                payload_c[f"validation_sampling/{k}_median"] = float(np.median(arr))
+            payload_c["validation_sampling/contact_n_samples"] = int(len(contact_results))
+            if (
+                self.logger is not None
+                and hasattr(self.logger, "experiment")
+                and not (hasattr(self.trainer, "is_global_zero") and not self.trainer.is_global_zero)
+            ):
                 self.logger.experiment.log(payload_c)
-                for k, v in payload_c.items():
-                    if k in ("global_step", "epoch"):
-                        continue
-                    self.log(
-                        k, float(v),
-                        on_step=False, on_epoch=True,
-                        prog_bar=False, logger=False,
-                        rank_zero_only=True, sync_dist=False,
-                        add_dataloader_idx=False,
-                    )
+            for k, v in payload_c.items():
+                if k in ("global_step", "epoch"):
+                    continue
+                self.log(
+                    k, float(v),
+                    on_step=False, on_epoch=True,
+                    prog_bar=False, logger=False,
+                    rank_zero_only=False, sync_dist=False,
+                    add_dataloader_idx=False,
+                )
         self._validation_tmscore_results = []
         self._validation_contact_results = []
         self.validation_output_data = []
