@@ -122,11 +122,16 @@ log:
   log_structure_every_n_steps: 50
   checkpoint: True
   last_ckpt_every_n_steps: 200  # calibrated from the smoke test's measured ~2.6-2.9s/step -> ~200 steps = ~9min
-  # Disabled (2026-07-05, after 2 crashes): the best-tmscore checkpoint's cross-rank file-existence
-  # broadcast hit a gloo TCP connection drop twice in a row on this cluster's network -- a
-  # non-essential bookkeeping feature (doesn't affect what's learned) crashing the whole job
-  # repeatedly isn't worth chasing further; last.ckpt (plain, no broadcast) is unaffected.
-  checkpoint_best_tmscore_median: False
+  # RE-ENABLED (2026-07-05, after root-causing + fixing the underlying gloo issue): was disabled
+  # after 2 crashes on a gloo TCP connection drop during this callback's cross-rank
+  # file-existence broadcast. Root cause: gloo's rarely-used object-collective channel
+  # (broadcast_object_list, only exercised here) sits idle between validation cycles
+  # (~15-20 min) and gets dropped by network infrastructure -- confirmed NOT an OS
+  # keepalive issue (SuperCloud's tcp_keepalive_time is 7200s). Fixed via
+  # GlooObjectCollectiveKeepaliveCallback (proteinfoundation/utils/gloo_keepalive_callback.py),
+  # auto-enabled in train.py whenever dist_backend=gloo, which periodically exercises that
+  # channel so it never goes idle long enough to be reaped.
+  checkpoint_best_tmscore_median: True
 
 validation_sampling:
   dt: 0.005
