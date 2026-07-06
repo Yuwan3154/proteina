@@ -2511,39 +2511,52 @@ class ModelTrainerBase(L.LightningModule):
             )
 
         # Aggregate per-sample TMscores accumulated by _run_validation_trajectory.
-        if results and self.logger is not None and hasattr(self.logger, "experiment"):
-            if not (hasattr(self.trainer, "is_global_zero") and not self.trainer.is_global_zero):
-                tm_gt = np.array([r["tm_gt_norm"] for r in results], dtype=np.float64)
-                tm_pred = np.array([r["tm_pred_norm"] for r in results], dtype=np.float64)
-                rmsd = np.array([r["rmsd"] for r in results], dtype=np.float64)
-                payload = {
-                    "validation_sampling/tmscore_mean": float(tm_gt.mean()),
-                    "validation_sampling/tmscore_median": float(np.median(tm_gt)),
-                    "validation_sampling/tmscore_min": float(tm_gt.min()),
-                    "validation_sampling/tmscore_max": float(tm_gt.max()),
-                    "validation_sampling/tmscore_pred_norm_mean": float(tm_pred.mean()),
-                    "validation_sampling/rmsd_mean": float(rmsd.mean()),
-                    "validation_sampling/n_samples": int(len(results)),
-                    "global_step": self.global_step,
-                    "epoch": self.current_epoch,
-                }
+        # `results` is already identical on every rank (all_gather_object above), so the
+        # metric computation + self.log() below run on EVERY rank, not just rank 0 --
+        # ModelCheckpoint's monitor check (e.g. checkpoint_best_tmscore_median) runs
+        # per-rank against that rank's OWN callback_metrics, so if only rank 0 ever
+        # logged this key (the previous rank_zero_only=True), every non-zero rank would
+        # permanently lack it and crash with "could not find the monitored key" the moment such a
+        # callback is enabled (confirmed root cause of a real production crash,
+        # 2026-07-05/06 -- the earlier "gloo Connection closed" symptom on rank 0 was a
+        # DOWNSTREAM consequence of the other ranks dying first on this exact exception,
+        # not an independent network issue). Only the direct wandb dict-log (images/raw
+        # payload, only meaningful on rank 0's real wandb experiment) stays rank-0-gated.
+        if results:
+            tm_gt = np.array([r["tm_gt_norm"] for r in results], dtype=np.float64)
+            tm_pred = np.array([r["tm_pred_norm"] for r in results], dtype=np.float64)
+            rmsd = np.array([r["rmsd"] for r in results], dtype=np.float64)
+            payload = {
+                "validation_sampling/tmscore_mean": float(tm_gt.mean()),
+                "validation_sampling/tmscore_median": float(np.median(tm_gt)),
+                "validation_sampling/tmscore_min": float(tm_gt.min()),
+                "validation_sampling/tmscore_max": float(tm_gt.max()),
+                "validation_sampling/tmscore_pred_norm_mean": float(tm_pred.mean()),
+                "validation_sampling/rmsd_mean": float(rmsd.mean()),
+                "validation_sampling/n_samples": int(len(results)),
+                "global_step": self.global_step,
+                "epoch": self.current_epoch,
+            }
+            if (
+                self.logger is not None
+                and hasattr(self.logger, "experiment")
+                and not (hasattr(self.trainer, "is_global_zero") and not self.trainer.is_global_zero)
+            ):
                 self.logger.experiment.log(payload)
-                # Also publish through Lightning's metric system so ModelCheckpoint
-                # can see these values in callback_metrics (the direct wandb call
-                # above goes only to wandb, not to Lightning's metric dict).
-                # rank_zero_only + sync_dist=False because we're already inside
-                # the rank-0 guard above. Skip "global_step"/"epoch" — Lightning
-                # attaches its own versions of those keys to every logged metric.
-                for k, v in payload.items():
-                    if k in ("global_step", "epoch"):
-                        continue
-                    self.log(
-                        k, float(v),
-                        on_step=False, on_epoch=True,
-                        prog_bar=False, logger=False,
-                        rank_zero_only=True, sync_dist=False,
-                        add_dataloader_idx=False,
-                    )
+            # Also publish through Lightning's metric system, on EVERY rank, so
+            # ModelCheckpoint sees these values in callback_metrics regardless of which
+            # rank it's checking. Skip "global_step"/"epoch" — Lightning attaches its
+            # own versions of those keys to every logged metric.
+            for k, v in payload.items():
+                if k in ("global_step", "epoch"):
+                    continue
+                self.log(
+                    k, float(v),
+                    on_step=False, on_epoch=True,
+                    prog_bar=False, logger=False,
+                    rank_zero_only=False, sync_dist=False,
+                    add_dataloader_idx=False,
+                )
 
         # Aggregate per-sample contact-map metrics (only present in contact_map_mode
         # with discrete diffusion). Mean over the per-sample dicts (gathered
