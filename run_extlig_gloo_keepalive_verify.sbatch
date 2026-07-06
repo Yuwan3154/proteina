@@ -59,7 +59,7 @@ srun torchrun \
     --accumulate_grad_batches 1 \
     --resume_option allow \
     run_name_="$TEST_RUN" \
-    opt.max_steps=134600
+    opt.max_steps=138800
 RC=$?
 echo "[$(date)] torchrun exited rc=$RC"
 exit $RC
