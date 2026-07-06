@@ -582,6 +582,21 @@ if __name__ == "__main__":
         callbacks.append(DataloaderTimer(every_n_steps=int(os.environ.get("DIAG_DATALOADER_EVERY", "100"))))
         log_info("DIAG_DATALOADER: DataloaderTimer callback enabled")
 
+    # gloo's object-collective channel (broadcast_object_list, used rarely -- e.g. by
+    # ModelCheckpoint's cross-rank file-existence check) is a separate connection from
+    # the tensor all-reduce path (used every step) and can go idle long enough between
+    # uses to be dropped by network infrastructure (confirmed on SuperCloud 2026-07-05:
+    # not an OS keepalive issue, tcp_keepalive_time there is 7200s). Default on whenever
+    # gloo is the DDP backend; set opt.gloo_keepalive_every_n_seconds: 0 to disable.
+    if cfg_exp.opt.get("dist_backend", "nccl") == "gloo":
+        keepalive_every = float(cfg_exp.opt.get("gloo_keepalive_every_n_seconds", 120.0))
+        if keepalive_every > 0:
+            from proteinfoundation.utils.gloo_keepalive_callback import (
+                GlooObjectCollectiveKeepaliveCallback,
+            )
+            callbacks.append(GlooObjectCollectiveKeepaliveCallback(every_n_seconds=keepalive_every))
+            log_info(f"gloo backend: object-collective keepalive every {keepalive_every}s")
+
     # Set checkpointing
     if cfg_exp.log.checkpoint and not args.nolog:
         # last_ckpt_every_n_steps: default 1000 when omitted (only-save-last mode)
