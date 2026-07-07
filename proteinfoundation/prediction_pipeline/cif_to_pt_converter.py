@@ -15,6 +15,7 @@ OpenFold stub to ensure compatibility without requiring the external
 import argparse
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -41,24 +42,67 @@ from proteinfoundation.openfold_stub.np.residue_constants import (
 load_dotenv(os.path.expanduser('~/proteina/.env'))
 
 
+def _backfilled_atom_site_fields(lines: List[str], field: str, default_value: str) -> List[str]:
+    """Append a missing _atom_site.<field> column (as the new last column) to a
+    single un-nested loop_ _atom_site. block, one data row per line,
+    whitespace-separated values -- matches the minimal expand36 natives/
+    format. No-op if the field is already present."""
+    header_idxs = [i for i, l in enumerate(lines) if l.strip().startswith("_atom_site.")]
+    full_field = f"_atom_site.{field}"
+    if not header_idxs or any(lines[i].strip().split()[0] == full_field for i in header_idxs):
+        return lines
+    last_header_idx = header_idxs[-1]
+    data_start = last_header_idx + 1
+    data_end = data_start
+    while data_end < len(lines) and lines[data_end].strip() and not lines[data_end].lstrip().startswith(("_", "#", "loop_")):
+        data_end += 1
+    out_lines = list(lines)
+    out_lines.insert(data_start, f"{full_field} \n")
+    for i in range(data_start + 1, data_end + 1):
+        out_lines[i] = out_lines[i].rstrip("\n") + f" {default_value}\n"
+    return out_lines
+
+
+def _ensure_atom_site_required_fields(cif_file: str) -> str:
+    """Bio.PDB.MMCIFParser hard-requires _atom_site.B_iso_or_equiv and
+    _atom_site.occupancy; some minimal/extracted CIFs (e.g. expand36's
+    natives/) omit them since they only ever carry coordinates + identity.
+    Returns cif_file unchanged if both are already present, else a path to a
+    temp copy with them backfilled (0.00 / 1.00 -- unused downstream, only
+    sequence/identity are ever read from the resulting structure)."""
+    with open(cif_file) as f:
+        lines = f.readlines()
+    patched = _backfilled_atom_site_fields(lines, "B_iso_or_equiv", "0.00")
+    patched = _backfilled_atom_site_fields(patched, "occupancy", "1.00")
+    if patched == lines:
+        return cif_file
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".cif", delete=False)
+    tmp.writelines(patched)
+    tmp.close()
+    return tmp.name
+
+
 def extract_sequence_from_cif(cif_file: str, chain_id: str) -> Optional[List[str]]:
     """
     Extract amino acid sequence from a CIF file for a specific chain.
-    
+
     Args:
         cif_file: Path to the CIF file
         chain_id: Chain identifier to extract
-        
+
     Returns:
         List of 1-letter amino acid codes, or None if chain not found
     """
     try:
+        parse_path = _ensure_atom_site_required_fields(cif_file)
         parser = MMCIFParser(QUIET=True)
-        structure = parser.get_structure('protein', cif_file)
-        
+        structure = parser.get_structure('protein', parse_path)
+        if parse_path != cif_file:
+            os.unlink(parse_path)
+
         # Collect all available chains for debugging
         available_chains = []
-        
+
         for model in structure:
             for chain in model:
                 available_chains.append(chain.id)
