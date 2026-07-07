@@ -197,9 +197,12 @@ def _convert_one_from_csv(task) -> bool:
     task = (pdb_chain, cif_dir, processed_dir)."""
     pdb_chain, cif_dir, processed_dir = task
     pdb_id, chain_id = pdb_chain.split('_')
-    cif_file = _find_cif(cif_dir, pdb_id)
+    # Try the shared-CIF-per-entry convention first (one pdb_id.cif holds all
+    # chains), then fall back to a per-chain-named CIF (pdb_id_chain.cif),
+    # e.g. expand36's natives/ directory.
+    cif_file = _find_cif(cif_dir, pdb_id) or _find_cif(cif_dir, pdb_chain)
     if cif_file is None:
-        logger.warning(f"CIF file not found for {pdb_id}")
+        logger.warning(f"CIF file not found for {pdb_id} (tried {pdb_id}.cif and {pdb_chain}.cif)")
         return False
     output_file = os.path.join(processed_dir, f"{pdb_chain}.pt")
     return convert_cif_to_pt(cif_file, chain_id, output_file)
