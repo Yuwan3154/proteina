@@ -381,8 +381,10 @@ class CATBalancedSampler(Sampler):
             nocat_desc = "full_coverage=True (every no-CAT cluster used ~once/epoch, split across ranks)"
         elif self.nocat_bucket_inverse_freq:
             n_never = int((self._nocat_sample_counts == 0).sum().item())
+            target_total = int(round(self.nocat_bucket_inverse_freq_ratio * len(self._topologies)))
             nocat_desc = (
-                f"inverse_freq=True (draw {len(self._topologies)}/epoch, 1:1 with CAT topologies, "
+                f"inverse_freq=True (draw {target_total}/epoch, "
+                f"{self.nocat_bucket_inverse_freq_ratio:g}:1 with CAT topologies, "
                 f"weight=1/(count+1), split across ranks; {n_never}/{len(nocat_clusters)} never yet sampled)"
             )
         elif self.nocat_bucket_subsample_size is not None:
