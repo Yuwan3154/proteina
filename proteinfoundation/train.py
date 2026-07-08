@@ -691,7 +691,27 @@ if __name__ == "__main__":
         if pretrain_ckpt_path is not None:
             log_info(f"Loading from pre-trained checkpoint path {os.path.expanduser(pretrain_ckpt_path)}")
             ckpt = torch.load(os.path.expanduser(pretrain_ckpt_path), map_location="cpu", weights_only=False)
-            model.load_state_dict(ckpt["state_dict"], strict=False)
+            ckpt_state = ckpt["state_dict"]
+            # strict=False only tolerates MISSING/EXTRA keys, not shape-mismatched tensors for
+            # keys present in both (e.g. seq_emb_dim resizing an existing embedding table) --
+            # load_state_dict still hard-crashes on those. Drop them here so they cold-start
+            # from the model's own init instead, logging exactly what got cold-started.
+            model_state = model.state_dict()
+            shape_mismatched = [
+                k for k in ckpt_state
+                if k in model_state and ckpt_state[k].shape != model_state[k].shape
+            ]
+            if shape_mismatched:
+                log_info(
+                    f"Cold-starting {len(shape_mismatched)} shape-mismatched param(s) "
+                    "(checkpoint shape -> current model shape): " + ", ".join(
+                        f"{k} {tuple(ckpt_state[k].shape)}->{tuple(model_state[k].shape)}"
+                        for k in shape_mismatched
+                    )
+                )
+                for k in shape_mismatched:
+                    del ckpt_state[k]
+            model.load_state_dict(ckpt_state, strict=False)
             
         af2_ipa_weights_path = cfg_exp.get("af2_ipa_weights_path", None)
         if af2_ipa_weights_path is not None:
