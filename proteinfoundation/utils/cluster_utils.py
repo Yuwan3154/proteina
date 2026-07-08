@@ -258,6 +258,7 @@ class CATBalancedSampler(Sampler):
         nocat_bucket_full_coverage: bool = False,
         nocat_bucket_subsample_size: Optional[int] = None,
         nocat_bucket_inverse_freq: bool = False,
+        nocat_bucket_inverse_freq_ratio: float = 1.0,
         nocat_sample_counts_init: Optional[List[int]] = None,
         shuffle: bool = True,
         drop_last: bool = False,
@@ -286,12 +287,15 @@ class CATBalancedSampler(Sampler):
         self.nocat_bucket_subsample_size = (
             int(nocat_bucket_subsample_size) if nocat_bucket_subsample_size is not None else None
         )
-        # When True, draw len(self._topologies) no-CAT clusters per epoch (matching the CAT-labeled
-        # count 1:1) via inverse-frequency-weighted sampling WITHOUT replacement: weight = 1/(count+1)
-        # per no-CAT cluster, count = cumulative times drawn across the whole training run (persisted
-        # across checkpoints via nocat_sample_counts_init / the datamodule's state_dict hook). Takes
-        # priority over nocat_bucket_subsample_size when both are set; ignored if nocat_bucket_full_coverage.
+        # When True, draw round(nocat_bucket_inverse_freq_ratio * len(self._topologies)) no-CAT
+        # clusters per epoch (ratio=1.0 -> matches the CAT-labeled count 1:1; ratio=3.0 -> 3:1
+        # no-CAT:CAT) via inverse-frequency-weighted sampling WITHOUT replacement: weight =
+        # 1/(count+1) per no-CAT cluster, count = cumulative times drawn across the whole
+        # training run (persisted across checkpoints via nocat_sample_counts_init / the
+        # datamodule's state_dict hook). Takes priority over nocat_bucket_subsample_size when
+        # both are set; ignored if nocat_bucket_full_coverage.
         self.nocat_bucket_inverse_freq = bool(nocat_bucket_inverse_freq)
+        self.nocat_bucket_inverse_freq_ratio = float(nocat_bucket_inverse_freq_ratio)
         self._nocat_sample_counts_init = nocat_sample_counts_init
         self._nocat_sample_counts = None  # populated in _build_cat_index, once self.nocat_clusters exists
         if dataset.database == "pdb" or dataset.database == "scop":
@@ -594,7 +598,9 @@ class CATBalancedSampler(Sampler):
                 nocat_pairs = self._draw_nocat_full_coverage(draw_gen)
             elif self.nocat_bucket_inverse_freq:
                 nocat_pairs = self._draw_nocat_full_coverage(
-                    draw_gen, target_total=len(self._topologies), use_inverse_freq=True
+                    draw_gen,
+                    target_total=int(round(self.nocat_bucket_inverse_freq_ratio * len(self._topologies))),
+                    use_inverse_freq=True,
                 )
             elif self.nocat_bucket_subsample_size is not None:
                 nocat_pairs = self._draw_nocat_full_coverage(
@@ -622,7 +628,10 @@ class CATBalancedSampler(Sampler):
                     else m
                 )
             elif self.nocat_bucket_inverse_freq:
-                m = min(len(self._topologies), len(self.nocat_clusters))
+                m = min(
+                    int(round(self.nocat_bucket_inverse_freq_ratio * len(self._topologies))),
+                    len(self.nocat_clusters),
+                )
                 base += (
                     math.ceil(m * 1.0 / self.num_replicas)
                     if self.num_replicas is not None

@@ -61,6 +61,7 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         nocat_bucket_full_coverage: bool = False,
         nocat_bucket_subsample_size: Optional[int] = None,
         nocat_bucket_inverse_freq: bool = False,
+        nocat_bucket_inverse_freq_ratio: float = 1.0,
         cath_balanced_emit_topology: bool = False,
     ):
         """Initialising the base data module class.
@@ -123,6 +124,7 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         self.nocat_bucket_full_coverage = nocat_bucket_full_coverage
         self.nocat_bucket_subsample_size = nocat_bucket_subsample_size
         self.nocat_bucket_inverse_freq = nocat_bucket_inverse_freq
+        self.nocat_bucket_inverse_freq_ratio = nocat_bucket_inverse_freq_ratio
         self.cath_balanced_emit_topology = cath_balanced_emit_topology
         self._chain_to_cat = None  # lazy cache for cath-balanced sampling
         # Last-built samplers kept on the datamodule so on_{train,validation}_epoch_start
@@ -244,6 +246,7 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
                 nocat_bucket_full_coverage=self.nocat_bucket_full_coverage,
                 nocat_bucket_subsample_size=self.nocat_bucket_subsample_size,
                 nocat_bucket_inverse_freq=self.nocat_bucket_inverse_freq,
+                nocat_bucket_inverse_freq_ratio=self.nocat_bucket_inverse_freq_ratio,
                 nocat_sample_counts_init=nocat_sample_counts_init,
                 seed=self.cluster_sampler_seed,
                 v2=self.cluster_sampler_v2,
