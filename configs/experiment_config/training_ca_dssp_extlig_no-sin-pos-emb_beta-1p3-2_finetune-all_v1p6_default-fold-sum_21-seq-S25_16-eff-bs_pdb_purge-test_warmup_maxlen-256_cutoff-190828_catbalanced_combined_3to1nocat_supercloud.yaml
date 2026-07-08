@@ -1,0 +1,148 @@
+run_name_: ca_dssp_extlig_no-sin-pos-emb_beta-1p3-2_finetune-all_v1p6_default-fold-sum_21-seq-S25_16-eff-bs_pdb_purge-test_warmup_maxlen-256_cutoff-190828_catbalanced_combined_3to1nocat_supercloud
+# Round 2 of the ext_lig SuperCloud finetune (2026-07-07 user directive), NOT a continuation of
+# the just-finished run (step 187600, sacct-confirmed COMPLETED) -- starts FRESH from the
+# original v1.6 pretrain checkpoint below. Motivation: an eval on same-topology (TM>0.6) targets
+# showed the round-1 checkpoint (CAT-balanced 1:1 no-CAT sampling) was mixed/slightly negative
+# vs the pre-finetune baseline -- coverage analysis of that run found 42.1% of the 720,756 no-CAT
+# train clusters were NEVER sampled even once (draw budget < population size). This run: (a)
+# seq_emb_dim 2->21 (wider amino-acid-identity embedding, a real weight-shape change -- see
+# train.py's shape-tolerant pretrain-checkpoint loader, commit 06be98e, which cold-starts any
+# shape-mismatched/missing param while warm-starting everything else from v1.6); (b) 3:1
+# no-CAT:CAT sampling via nocat_bucket_inverse_freq_ratio=3.0 (see the sibling dataset config)
+# to directly address the coverage-budget shortfall; (c) 1000 TOTAL epochs (not additional --
+# this run starts at step 0), a ~5x-longer commitment than round 1's 200 epochs.
+# NO last.ckpt should exist in this run's store/checkpoints/ dir -- that's what makes train.py
+# take the pretrain_ckpt_path branch (see train.py:690, "if last_ckpt_path is None").
+pretrain_ckpt_path: ~/proteina/data/weights/proteina_v1.6_DFS_200M_notri_long_chain_generation.ckpt
+
+hardware:
+  ncpus_per_task_train_: 16
+  ncpus_per_task_prepro_: 16
+  accelerator: gpu
+  ngpus_per_node_: 2
+  nnodes_: 4
+
+loss:
+  t_distribution:
+    name: mix_up02_beta
+    p1: 1.3
+    p2: 2.0
+  loss_t_clamp: 0.9
+  use_aux_loss: True
+  aux_loss_t_lim: 0.3
+  thres_aux_2d_loss: 0.6
+  aux_loss_weight: 1.0
+  dssp_aux_loss_weight: 1.0
+  num_dist_buckets: 64
+  max_dist_boundary: 1.0
+
+defaults:
+  - model: caflow
+  - override model/nn: ca_af3_200M_no_tri
+  - _self_
+
+model:
+  nn:
+    multilabel_mode: "sum"
+    cath_dedupe_codes: True
+    residue_type_emb_init_seq: True
+    residue_type_emb_cond_seq: True
+    residue_type_emb_init_pair: True
+    residue_type_emb_cond_pair: True
+    seq_emb_dim: 21  # was 2 -- widened per 2026-07-07 directive; resizes an existing weight,
+                      # cold-started via train.py's shape-tolerant loader (everything else warm-starts)
+    predict_dssp: true
+    ext_lig_emb_init_seq: True
+    ext_lig_emb_cond_seq: True
+    ext_lig_emb_dim: 3
+
+# Dataset: same combined PDB+AFDB CAT-balanced data as round 1, but nocat_bucket_inverse_freq_ratio=3.0
+# (see configs/datasets_config/mixed/pdb_dFS_combined_catbalanced_extlig_3to1nocat.yaml).
+dataset: pdb_dFS_combined_catbalanced_extlig_3to1nocat
+dataset_config_subdir: mixed
+
+# V100 (Volta, sm_70) has no native bf16 tensor cores -- force fp32 per explicit user direction
+# (avoid fp16 too; suspected unstable even for fine-tuning, only a last resort).
+force_precision_f32: True
+
+# Packed-mmap in-RAM combined.pack (505GiB, transferred from Engaging) -- env-gated, null/no-op
+# when PACK_PATH unset. See this run's launcher sbatch for the export.
+datamodule:
+  pack_path: ${oc.env:PACK_PATH,null}
+
+training:
+  self_cond: True
+  seq_cond: True
+  fold_cond: True
+  mask_T_prob: 0.5
+  mask_A_prob: 0.5
+  mask_C_prob: 0.5
+  fold_label_sample_ratio: [0.67, 0.13, 0.2, 0.0]
+  mask_seq_proportion: 0.15
+  mask_extlig_proportion: 0.3  # inert while ext_lig_smart_unknown_augment=True below (documented fallback value)
+  ext_lig_smart_unknown_augment: True
+  ext_lig_frac_present_stats_path: ${oc.env:DATA_PATH}/ext_lig_stats/frac_present.npy
+  ext_lig_runlen_stats_path: ${oc.env:DATA_PATH}/ext_lig_stats/runlen_buckets.npz
+  finetune_seq_cond_lora_only: False
+  self_cond_use_copy: True
+  self_cond_copy_update_every: 10
+  zero_sin_pos_emb: True
+
+lora:
+  use: False
+  lora_alpha: 32.0
+  lora_dropout: 0.0
+  r: 0
+  train_bias: "none"
+
+opt:
+  lr: 0.0001
+  max_epochs: 100000  # non-binding; max_steps below is the real hard stop
+  # 1000 TOTAL epochs (2026-07-07 directive, fresh start from step 0, NOT additional).
+  # Per-rank epoch length recomputed for the 3:1 no-CAT:CAT ratio: 1282 CAT topologies
+  # (confirmed round 1) -> ceil(1282/8)=161 CAT/rank. no-CAT draws = 3*1282=3846 ->
+  # ceil(3846/8)=481 no-CAT/rank. Total = 161+481 = 642 steps/epoch/rank (vs round 1's 322 --
+  # roughly 2x, since the no-CAT portion tripled while CAT stayed fixed).
+  # 1000 epochs x 642 = 642,000 steps total.
+  max_steps: 642000
+  lr_horizon_from_max_steps: True
+  batch_size: 2  # confirmed safe (no OOM) on 32GB V100 + fp32 in round 1; unchanged, seq_emb_dim widening is a negligible memory delta
+  accumulate_grad_batches: 1  # 8 GPUs (4 nodes x 2) x batch 2 x accum 1 = eff batch 16, matching round 1
+  optimizer: muon
+  val_check_interval_optim_steps: 1000
+  skip_nan_grad: False
+  grad_and_weight_analysis: False
+  dist_strategy: ddp
+  dist_backend: gloo  # proven working end-to-end in round 1 (incl. the real rank_zero_only fix); unchanged
+  use_lr_warmup: True
+  warmup_steps: 3000
+  warmup_start_lr_ratio: 0.0
+  lr_scheduler_type: "cosine"
+  use_cueq: False
+
+log:
+  wandb_project: protein_transformer_big_runs
+  log_wandb: True
+  log_every_n_steps: 1
+  log_structure_every_n_steps: 50
+  checkpoint: True
+  last_ckpt_every_n_steps: 200  # same cadence as round 1 (~9min at similar throughput)
+  checkpoint_best_tmscore_median: True  # uses the real rank_zero_only fix from round 1 (commit dc7fcb0), proven solid over 27+ validation cycles
+
+validation_sampling:
+  dt: 0.005
+  sampling_mode: sc
+  sc_scale_noise: 0.45
+  tmscore_n_samples: 8
+  tmscore_every_n_val_epochs: 1
+  tmscore_mode: 5
+  tmscore_traj_chunk_size: 8
+  variable_length_sampling: False
+
+seed: 42
+
+ema:
+  decay: 0.999
+  validate_original_weights: False
+  every_n_steps: 1
+  cpu_offload: False
