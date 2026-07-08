@@ -711,7 +711,21 @@ if __name__ == "__main__":
                 )
                 for k in shape_mismatched:
                     del ckpt_state[k]
-            model.load_state_dict(ckpt_state, strict=False)
+            load_result = model.load_state_dict(ckpt_state, strict=False)
+            # Missing keys (in the current model, absent from the checkpoint -- e.g. a
+            # conditioning pathway that didn't exist yet when this checkpoint was trained)
+            # cold-start silently under strict=False; log them explicitly so "which params
+            # actually warm-started from this checkpoint" is never a silent question.
+            if load_result.missing_keys:
+                log_info(
+                    f"Cold-starting {len(load_result.missing_keys)} param(s) absent from the "
+                    f"checkpoint entirely: {', '.join(load_result.missing_keys)}"
+                )
+            if load_result.unexpected_keys:
+                log_info(
+                    f"Ignoring {len(load_result.unexpected_keys)} checkpoint param(s) not present "
+                    f"in the current model: {', '.join(load_result.unexpected_keys)}"
+                )
             
         af2_ipa_weights_path = cfg_exp.get("af2_ipa_weights_path", None)
         if af2_ipa_weights_path is not None:
