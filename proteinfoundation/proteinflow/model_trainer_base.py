@@ -1958,7 +1958,7 @@ class ModelTrainerBase(L.LightningModule):
             )
             x_1_pred = ca_coords
 
-        if x_1_pred is not None:
+        if x_1_pred is not None and residue_type is not None:
             # Save first sample as temporary PDB for logging
             atom37 = self.samples_to_atom37(x_1_pred, residue_type=residue_type).float().detach().cpu().numpy()
             aatype = residue_type.long().detach().cpu().numpy()
