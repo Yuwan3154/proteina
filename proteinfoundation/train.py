@@ -687,11 +687,27 @@ if __name__ == "__main__":
 
     # If this is the first run for fine-tuning, load pre-trained checkpoint and don't load optimizer states
     pretrain_ckpt_path = cfg_exp.get("pretrain_ckpt_path", None)
+    seed_global_step = None
+    seed_current_epoch = None
     if last_ckpt_path is None:
         if pretrain_ckpt_path is not None:
             log_info(f"Loading from pre-trained checkpoint path {os.path.expanduser(pretrain_ckpt_path)}")
             ckpt = torch.load(os.path.expanduser(pretrain_ckpt_path), map_location="cpu", weights_only=False)
             ckpt_state = ckpt["state_dict"]
+            if cfg_exp.get("pretrain_ckpt_seed_step", False):
+                seed_global_step = ckpt.get("global_step", None)
+                seed_current_epoch = ckpt.get("epoch", None)
+                if seed_global_step is None:
+                    log_info("pretrain_ckpt_seed_step=True but checkpoint has no 'global_step' key -- cannot seed, starting at step 0")
+                else:
+                    log_info(
+                        f"Will seed trainer.global_step={seed_global_step} (epoch={seed_current_epoch}) "
+                        "from pretrain_ckpt_path after Trainer construction. Weights-only load -- "
+                        "optimizer/scheduler state is NOT restored, only the step counter."
+                    )
+                    # Read by configure_optimizers (model_trainer_base.py) to seed the LR
+                    # scheduler's last_epoch so it doesn't restart the warmup/cosine curve.
+                    model._pretrain_seed_global_step = int(seed_global_step)
             # strict=False only tolerates MISSING/EXTRA keys, not shape-mismatched tensors for
             # keys present in both (e.g. seq_emb_dim resizing an existing embedding table) --
             # load_state_dict still hard-crashes on those. Drop them here so they cold-start
@@ -805,6 +821,22 @@ if __name__ == "__main__":
         # boundaries fast (worker-recreation leak hunt). Default 1.0 = all batches.
         limit_train_batches=(int(os.environ["LIMIT_TRAIN_BATCHES"]) if os.environ.get("LIMIT_TRAIN_BATCHES") else 1.0),
     )
+    if seed_global_step is not None:
+        # No public Lightning API seeds the starting step for a weights-only (non-full-resume)
+        # load -- write the internal progress counters directly before fit() begins. Verified
+        # against the installed Lightning version's actual internals (not guessed) and smoke-
+        # tested standalone: seeding then running N steps correctly lands at seed+N.
+        opt_progress = trainer.fit_loop.epoch_loop.automatic_optimization.optim_progress
+        opt_progress.optimizer.step.total.completed = seed_global_step
+        opt_progress.optimizer.step.total.ready = seed_global_step
+        opt_progress.optimizer.step.current.completed = seed_global_step
+        opt_progress.optimizer.step.current.ready = seed_global_step
+        if seed_current_epoch is not None:
+            trainer.fit_loop.epoch_progress.current.completed = seed_current_epoch
+            trainer.fit_loop.epoch_progress.current.ready = seed_current_epoch
+            trainer.fit_loop.epoch_progress.total.completed = seed_current_epoch
+            trainer.fit_loop.epoch_progress.total.ready = seed_current_epoch
+        log_info(f"Seeded trainer.global_step={trainer.global_step}, current_epoch={trainer.current_epoch}")
     trainer.fit(
         model, datamodule, ckpt_path=last_ckpt_path
     )  # If None then it starts from scratch

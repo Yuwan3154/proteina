@@ -1,0 +1,154 @@
+run_name_: dssp_contact_48M_udlm_pb_v2_stage1_ablation_noipa_adamw_eb32
+
+# Ablation run (2026-07-14, user directive): warm-start from the main 48M run's latest
+# checkpoint, but with IPA/projector/FAPE removed, optimizer swapped muon->adamw, and a much
+# smaller effective batch size. Weights-only load (pretrain_ckpt_path), NOT a full Lightning
+# resume -- optimizer/scheduler state is not compatible across this many changes anyway.
+# pretrain_ckpt_seed_step keeps the step/epoch counters continuing from the checkpoint instead
+# of restarting at 0, so the two runs' wandb curves share a comparable step axis.
+pretrain_ckpt_path: /home/chenxiou/proteina/store/dssp_contact_48M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined/checkpoints/last.ckpt
+pretrain_ckpt_seed_step: true
+
+# No IPA in this run -- must be null or import_jax_weights_ipa_ crashes (unconditional
+# dereference of model.coors_3d_decoder.ipa, which won't exist).
+af2_ipa_weights_path: null
+
+hardware:
+  ncpus_per_task_train_: 4
+  ncpus_per_task_prepro_: 16
+  accelerator: gpu
+  ngpus_per_node_: 2  # user directive: 2 GPUs, maximize per-GPU batch, minimize accumulation
+  nnodes_: 1
+
+loss:
+  t_distribution:
+    name: uniform
+    p1: 0.0
+    p2: 1.0
+  loss_t_clamp: 0.9
+  use_aux_loss: True
+  aux_loss_t_lim: 0.3
+  thres_aux_2d_loss: 0.6
+  aux_loss_weight: 1.0
+  dssp_aux_loss_weight: 0.0
+  num_dist_buckets: 39
+  distogram_min_bin: 0.325
+  distogram_max_bin: 5.075
+
+defaults:
+  - model: contactflow_discrete_uniform
+  - override model/nn: contact_af3_48M_tri_individual-embed_coor_ipa-coord_dssp
+  - _self_
+
+model:
+  dssp_diffusion:
+    enabled: true
+    type: udlm
+    loss_weight: 1.0
+    vocab_size: 3
+    noise_schedule: cosine
+    timesteps: 1000
+    cont_time: true
+    sampling_grid: cosine
+    eps: 1e-4
+
+  nn:
+    multilabel_mode: sum
+    cath_dedupe_codes: True
+    residue_type_emb_init_seq: False
+    residue_type_emb_cond_seq: False
+    residue_type_emb_init_pair: False
+    residue_type_emb_cond_pair: False
+    seq_emb_dim: 2
+    predict_dssp: true
+    dssp_diffusion_mode: true
+    ext_lig_emb_init_seq: True
+    ext_lig_emb_cond_seq: True
+    ext_lig_emb_dim: 3
+    # Ablation: no coordinate-prediction head -> no IPA, no ipa_linear_s/z projector, no FAPE
+    # loss (all three gated by this single flag, verified in code -- see proteina.py
+    # extract_clean_sample / model_trainer_base.py predict_coords gating).
+    predict_coords: none
+
+dataset: pdb_dFS_combined_catbalanced_domaincrop
+dataset_config_subdir: mixed
+
+datamodule:
+  in_memory: False
+  pack_path: ${oc.env:PACK_PATH,null}
+  nocat_bucket_draws: 322
+  prefetch_factor: 4
+
+force_precision_f32: False
+
+training:
+  self_cond: True
+  seq_cond: False
+  fold_cond: True
+  position_bias:
+    enabled: true
+    mode: sigmoid
+    k: 5.0
+    decouple_loss: true
+  mask_T_prob: 0.5
+  mask_A_prob: 0.5
+  mask_C_prob: 0.5
+  fold_label_sample_ratio: [0.67, 0.13, 0.2, 0.0]
+  mask_seq_proportion: 0.15
+  mask_extlig_proportion: 0.3
+  finetune_seq_cond_lora_only: False
+  self_cond_use_copy: True
+  self_cond_copy_update_every: 10
+  self_cond_mode: alias
+  zero_sin_pos_emb: False
+
+lora:
+  use: False
+  lora_alpha: 32.0
+  lora_dropout: 0.0
+  r: 0
+  train_bias: none
+
+opt:
+  lr: 0.0001  # unchanged from the original muon run -- not introducing an extra uncontrolled variable
+  max_epochs: 100000
+  max_steps: 150000  # same target as the original run, for a comparable trajectory endpoint
+  batch_size: 16  # per-GPU micro-batch -- probing whether this fits on H200 with IPA/FAPE removed
+  accumulate_grad_batches: 1  # 16 batch * 1 accum * 2 GPU = 32 effective (user directive: max batch, min accum)
+  optimizer: adamw  # was muon; AdamW path exists but is unexercised in this repo's real configs (flagged to user)
+  val_check_interval_optim_steps: 500
+  skip_nan_grad: False
+  debug_log_grads: False
+  grad_and_weight_analysis: False
+  dist_strategy: ddp
+  dist_backend: nccl
+  use_lr_warmup: True
+  warmup_steps: 3000
+  warmup_start_lr_ratio: 0.0
+  lr_scheduler_type: cosine
+  lr_horizon_from_max_steps: True
+  use_cueq: False
+
+log:
+  wandb_project: protein_transformer_big_runs  # SAME project as the original run, so the two runs' curves can be overlaid
+  log_wandb: True
+  log_every_n_steps: 1
+  log_structure_every_n_steps: 100
+  checkpoint: True
+  last_ckpt_every_n_steps: 10
+  checkpoint_best_tmscore_median: False
+
+validation_sampling:
+  dt: 0.005
+  sampling_mode: sc
+  sc_scale_noise: 0.45
+  tmscore_n_samples: 0
+  variable_length_sampling: True
+
+seed: 42
+
+ema:
+  decay: 0.999
+  validate_original_weights: False
+  every_n_steps: 1
+  cpu_offload: False

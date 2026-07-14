@@ -274,6 +274,8 @@ class Proteina(ModelTrainerBase):
                 x_1 = coords  # [b, n, 37?, 3]
             elif predict_coords_mode == "linear":
                 x_1 = coords[:, :, [0, 1, 2], :]  # backbone N, CA, C
+            else:
+                x_1 = coords[:, :, 1, :]  # CA only -- no coordinate-prediction head active
         else:
             x_1 = coords[:, :, 1, :]  # CA only
         

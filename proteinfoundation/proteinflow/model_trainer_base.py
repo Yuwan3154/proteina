@@ -234,8 +234,28 @@ class ModelTrainerBase(L.LightningModule):
                     else:
                         return 1.0
             
-            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-            
+            # pretrain_ckpt_seed_step (train.py) seeds trainer.global_step from a weights-only
+            # checkpoint load, but that doesn't touch this freshly-constructed optimizer/
+            # scheduler -- a plain LambdaLR would restart the warmup/cosine schedule from
+            # step 0, desyncing the LR from the reported step. Seed last_epoch to match:
+            # requires 'initial_lr' pre-set on each param group (PyTorch's own resume
+            # convention), and last_epoch=N-1 so construction immediately applies
+            # lr_lambda(N) -- verified against the installed torch version's actual
+            # LambdaLR(..., last_epoch=X) semantics, not assumed.
+            seed_step = getattr(self, "_pretrain_seed_global_step", None)
+            if seed_step is not None:
+                for g in optimizer.param_groups:
+                    g["initial_lr"] = g["lr"]
+                scheduler = torch.optim.lr_scheduler.LambdaLR(
+                    optimizer, lr_lambda, last_epoch=int(seed_step) - 1
+                )
+                logger.info(
+                    f"Seeded LR scheduler last_epoch={int(seed_step) - 1} "
+                    f"(applies lr_lambda({seed_step}) immediately) to match seeded global_step"
+                )
+            else:
+                scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
             return {
                 "optimizer": optimizer,
                 "lr_scheduler": {
