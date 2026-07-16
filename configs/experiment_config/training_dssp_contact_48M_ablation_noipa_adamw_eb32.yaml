@@ -113,8 +113,8 @@ opt:
   lr: 0.0001  # unchanged from the original muon run -- not introducing an extra uncontrolled variable
   max_epochs: 100000
   max_steps: 150000  # same target as the original run, for a comparable trajectory endpoint
-  batch_size: 64  # per-GPU micro-batch -- empirically probed on H200 (123069/141795 MiB peak, ~20GB margin), safe production value
-  accumulate_grad_batches: 1  # 64 batch * 1 accum * 2 GPU = 128 effective, matches original run's effective batch size
+  batch_size: 32  # per-GPU micro-batch -- stepped down from 64 after 3 real production OOM/crash failures near step ~125,650 (2026-07-16); smoke test at 64 was too short (max_steps=8) to catch the problem batch shape
+  accumulate_grad_batches: 1  # 32 batch * 1 accum * 2 GPU = 64 effective (down from 128 -- no accumulation per standing preference)
   optimizer: adamw  # was muon; AdamW path exists but is unexercised in this repo's real configs (flagged to user)
   val_check_interval_optim_steps: 500
   skip_nan_grad: False
