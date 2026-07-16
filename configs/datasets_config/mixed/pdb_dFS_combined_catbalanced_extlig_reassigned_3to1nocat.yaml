@@ -1,0 +1,66 @@
+# Same combined PDB+AFDB CAT-balanced dataset as pdb_dFS_combined_catbalanced_extlig_3to1nocat.yaml,
+# now layered on the foldseek structural-clustering "third option" per-member reassignment
+# (2026-07-13/16 investigation): no-CAT chains individually promoted into a real CAT-labeled
+# cluster when their single best structural (TM-align) hit against that cluster's real members
+# is >=0.5. Two new artifacts (built + verified separately, see chain_to_cat_path and
+# datasplitter.data_dir below): a modified cluster TSV (promoted chains physically moved from
+# their no-CAT origin cluster into their target CAT cluster's member list) and a purely-additive
+# chain_to_cat.pkl (original entries untouched, new entries for promoted chains inheriting their
+# target cluster's full CAT code set). No-CAT population shrinks 720,756 -> 656,933 (63,823
+# clusters fully absorbed); CAT-labeled cluster COUNT is unchanged (95,566) but 21,845 of them
+# gain members (mean 7.39, max 1,677).
+#
+# Also enables the two counting mechanisms that were previously only simulated, never built
+# (2026-07-16 directive): cat_cluster_draw="inverse_freq" (CAT-cluster-level tracking, shared
+# counter per cluster across its CAT codes) and cath_balanced_member_tracking=True (per-chain
+# intra-cluster tracking, both CAT and no-CAT sides). sharpness_power=8.0 sharpens all three
+# inverse-frequency mechanisms (weight=1/(count+1)**8) -- required for the 1000-epoch budget to
+# actually deliver >=4x coverage of every cluster (verified: p=8 gets 1x no-CAT coverage in
+# ~180 epochs at this population/budget, vs ~806 at the old p=1 default).
+datamodule:
+  _target_: "proteinfoundation.datasets.pdb_data.PDBLightningDataModule"
+  data_dir: ${oc.env:DATA_PATH}/pdb_dFS_combined/
+  in_memory: False
+  format: "pdb"
+  overwrite: False
+  regenerate_missing: False
+  cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/
+  multilabel_mode: "sample"
+  cath_dedupe_codes: True
+  batch_padding: True
+  sampling_mode: "cath-balanced"
+  chain_to_cat_path: ${oc.env:DATA_PATH}/pdb_dFS_combined/combined_chain_to_cat_reassigned.pkl
+  cat_cluster_draw: "inverse_freq"
+  cath_balanced_member_mode: "cluster-random"
+  cath_balanced_sharpness_power: 8.0
+  cath_balanced_member_tracking: True
+  nocat_bucket: True
+  nocat_bucket_full_coverage: False
+  nocat_bucket_inverse_freq: True
+  nocat_bucket_inverse_freq_ratio: 3.0
+  transforms:
+    - _target_: "proteinfoundation.datasets.transforms.GlobalRotationTransform"
+    - _target_: "proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform"
+    - _target_: "proteinfoundation.datasets.transforms.CATHLabelTransform"
+      root_dir: ${oc.env:DATA_PATH}/cathdata/
+    - _target_: "proteinfoundation.datasets.transforms.TEDLabelTransform"
+      file_path: ${oc.env:DATA_PATH}/d_FS/ted_365m.domain_summary.cath.globularity.taxid.tsv
+      pkl_path: ${oc.env:DATA_PATH}/d_FS/afdb_to_cath_ted.pkl
+    - _target_: "proteinfoundation.datasets.transforms.CATHToIndicesTransform"
+      cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/
+    - _target_: "proteinfoundation.datasets.transforms.DSSPTargetTransform"
+    - _target_: "proteinfoundation.datasets.transforms.PurgeConfindTransform"
+    - _target_: "proteinfoundation.datasets.transforms.PaddingTransform"
+      max_size: 256
+  batch_size: 8
+  num_workers: 8
+  pin_memory: True
+  prefetch_factor: 2
+
+  datasplitter:
+    _target_: "proteinfoundation.datasets.pdb_data.PDBDataSplitter"
+    data_dir: ${oc.env:DATA_PATH}/pdb_dFS_combined_reassigned/
+    train_val_test: [0.98, 0.019, 0.001]
+    split_type: "sequence_similarity"
+    split_sequence_similarity: 0.25
+    overwrite_sequence_clusters: False
