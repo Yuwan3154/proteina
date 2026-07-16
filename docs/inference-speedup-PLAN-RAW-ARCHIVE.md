@@ -412,3 +412,32 @@ new18 (SDE200 disadvantaged, N=512-1024 vs NFE's 8192): NFE-best mean=0.3620  SD
 ```
 
 See PLAN finding #14 for the interpretation. Retrieval script: `~/scratchpad/sde200_oracle_summary.py` (stdlib-only, reads `proteinebm_scores_{pid}.csv` directly out of each protein's tar via Python's `tarfile` module, no venv/dependencies needed) run on SuperCloud against the bare `_unified` config's `seq_cath_cond` directory.
+
+## N=1024/top-k=16 comparison + NFE30-50 @ SDE_UNTIL_T=0.8 launch (2026-07-16)
+
+Session resumed after a 13-day gap (last A6000 action was 2026-07-03). User: "Try compare everything at N=1024 with top-k=16. And also try NFE30-50 with SDE->0.8. Run on scaling 8."
+
+**N=1024/top-k=16 re-evaluation of existing data (no new compute, pure analysis):** for each config, took the FIRST 1024 rows of each protein's `proteinebm_scores_{pid}.csv` (generation order), sorted ascending by `energy` (lower = model-preferred, matching established `TM@minE` convention elsewhere in this doc), took the best (max `tm_ref_template`) among the 16 lowest-energy rows. Cross-checked the SDE-200 source: A6000 ALSO has a bare `_unified` config directory, but with only N=512 samples/protein -- a stale/different partial copy, inconsistent with the verified N=8192 SuperCloud baseline used for finding #14. Discarded the A6000 copy, used SuperCloud's N=8192 SDE-200 data throughout for consistency.
+
+Full N=1024/top16 table (protein, SDE200_pool@1024, SDE200_top16, NFE40_pool@1024, NFE40_top16, NFE50_pool@1024, NFE50_top16, winner-by-top16):
+```
+protein     SDE200_pool  SDE200_k16  NFE40_pool  NFE40_k16  NFE50_pool  NFE50_k16  best_k16_winner
+8QXI_A           0.5068      0.4814         nan        nan      0.5084     0.4818            nfe50
+6ZYG_A           0.4281      0.4281      0.3370     0.2698      0.4169     0.2665              sde
+7AD5_A           0.5738      0.5738      0.6223     0.6223      0.6141     0.6141            nfe40
+6ZUS_A           0.3029      0.2353      0.3289     0.2303      0.3232     0.2548            nfe50
+8RJX_A           0.3963      0.3963      0.3485     0.3464      0.3652     0.3652              sde
+7KW9_A           0.4584      0.4584      0.4668     0.4428      0.4689     0.4689            nfe50
+6ZTG_A           0.2823      0.2456      0.2580     0.2342      0.2699     0.2353              sde
+8XHT_A           0.3724      0.2434      0.3253     0.2420      0.3325     0.2161              sde
+
+mean top16_best_tm across 8 proteins: SDE200=0.3828  NFE40=0.3411 (n=7, 8QXI excluded -- known corrupted analysis)  NFE50=0.3628
+win counts: sde=4, nfe40=1, nfe50=3
+```
+8QXI_A's NFE40 entry is NaN because its `energy` column (not just `tm_ref_template`) is all-unparseable in that specific analysis CSV -- the same pre-existing corruption from the 2026-07-02 duplicate-driver incident, not new. Conclusion: even at the cheaper, more realistic N=1024/top-16 deployment scenario, SDE-200 remains ahead on both mean and per-protein win count -- reinforces finding #14, does not overturn it.
+
+**NFE30-50 @ SDE_UNTIL_T=0.8 launch.** First checked A6000 (where all prior nfe30/40/50 work ran): `date` showed 13 real days had passed; GPU0/GPU1 were now occupied by a legitimate, unrelated `train_openfold.py` job (prune_singleseq_ws5_continued_pda_eval, PID 709600, started 2026-07-14, 99.8% CPU, DDP across GPU0+GPU1 -- confirmed via `ps aux` + `nvidia-smi --query-compute-apps`, same `jupyter-chenxi` account but a different workstream, not touched). Only GPU2 was free; GPU3 remains the standing "never touch, another job's" exclusion regardless of instantaneous idle reading. Asked the user how to proceed given reduced A6000 capacity; user chose to run on SuperCloud instead.
+
+SuperCloud's `~/proteina/configs/experiment_config/` did NOT have the nfe30/40/50_sde06 YAML files (only the OUTPUT directories exist there, likely pushed as data via the SuperCloud-as-hub convention while the actual earlier sampling ran on A6000) -- so the sde08 configs were built fresh from SuperCloud's own bare `_unified` config (the verified SDE-200 baseline file) by changing only `inference.dt` (0.005 -> 0.0333/0.025/0.02 for nfe30/40/50) and `inference.schedule.{schedule_mode,schedule_p}` (log/2.0 -> power/3.0, matching the "targeted p3" shape) -- diff-verified against the A6000 nfe40_sde06 content to confirm no other fields drifted. `PROTEINA_SDE_UNTIL_T` is a pure runtime env var (confirmed by reading the nfe40_sde06 YAML in full -- no SDE-related key anywhere in it), so no other config changes were needed for the new threshold.
+
+Launched as 3 SLURM sbatch arrays (`scripts/scaling8_sde08_array.sh`, modeled on the existing `scaling_run_sc8.sh` but with `af2rank_top_k=0` instead of 8, `PROTEINA_NSAMPLES_PER_PROTEIN=1024`, and `PROTEINA_SDE_UNTIL_T=0.8` added), `--array=0-7` mapping array index to the 8 scaling8 proteins via a bash array (mirrors `~/data/bad_afdb/scaling8.csv` row order), one job per NFE config: 5156188=nfe30, 5156189=nfe40, 5156190=nfe50. Verified dependency paths (pae.ckpt, pretrain ckpt, scaling8.csv) exist before submitting. `xeon-g6-volta`'s per-account node cap throttled concurrent execution to ~4 nodes at a time (`AssocGrpNodeLimit` in squeue) -- expected/self-resolving, not an error, matches the memory note that this partition is capped.
