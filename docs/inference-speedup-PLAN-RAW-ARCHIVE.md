@@ -441,3 +441,51 @@ win counts: sde=4, nfe40=1, nfe50=3
 SuperCloud's `~/proteina/configs/experiment_config/` did NOT have the nfe30/40/50_sde06 YAML files (only the OUTPUT directories exist there, likely pushed as data via the SuperCloud-as-hub convention while the actual earlier sampling ran on A6000) -- so the sde08 configs were built fresh from SuperCloud's own bare `_unified` config (the verified SDE-200 baseline file) by changing only `inference.dt` (0.005 -> 0.0333/0.025/0.02 for nfe30/40/50) and `inference.schedule.{schedule_mode,schedule_p}` (log/2.0 -> power/3.0, matching the "targeted p3" shape) -- diff-verified against the A6000 nfe40_sde06 content to confirm no other fields drifted. `PROTEINA_SDE_UNTIL_T` is a pure runtime env var (confirmed by reading the nfe40_sde06 YAML in full -- no SDE-related key anywhere in it), so no other config changes were needed for the new threshold.
 
 Launched as 3 SLURM sbatch arrays (`scripts/scaling8_sde08_array.sh`, modeled on the existing `scaling_run_sc8.sh` but with `af2rank_top_k=0` instead of 8, `PROTEINA_NSAMPLES_PER_PROTEIN=1024`, and `PROTEINA_SDE_UNTIL_T=0.8` added), `--array=0-7` mapping array index to the 8 scaling8 proteins via a bash array (mirrors `~/data/bad_afdb/scaling8.csv` row order), one job per NFE config: 5156188=nfe30, 5156189=nfe40, 5156190=nfe50. Verified dependency paths (pae.ckpt, pretrain ckpt, scaling8.csv) exist before submitting. `xeon-g6-volta`'s per-account node cap throttled concurrent execution to ~4 nodes at a time (`AssocGrpNodeLimit` in squeue) -- expected/self-resolving, not an error, matches the memory note that this partition is capped.
+
+**Completion (2026-07-16, ~1h35min wall-clock from submission to all-done):** all 24/24 array tasks finished with `SDE08_EXIT=0`, zero failures (verified via grep across every `.out` log; spot-checked a `.err` file to confirm its non-empty content was routine warnings/INFO logging, not real errors). Per-task wall-clock ranged ~10-33min (much faster than the N=8192 campaigns, as expected at N=1024 with 2 V100s/task).
+
+Re-ran the N=1024/top-16 methodology (same script as the earlier SDE-200/NFE40/NFE50-sde06 comparison) against the 3 new sde08 configs:
+```
+config         protein     n_avail  n_used  pool_oracle@N  top16_best_tm
+NFE30_sde08    8QXI_A         1024    1024         0.2535         0.1752
+NFE30_sde08    6ZYG_A         1024    1024         0.2157         0.2140
+NFE30_sde08    7AD5_A         1024    1024         0.2646         0.2503
+NFE30_sde08    6ZUS_A         1024    1024         0.2474         0.2169
+NFE30_sde08    8RJX_A         1024    1024         0.2167         0.2167
+NFE30_sde08    7KW9_A         1024    1024         0.3689         0.3689
+NFE30_sde08    6ZTG_A         1024    1024         0.1531         0.1272
+NFE30_sde08    8XHT_A         1024    1024         0.2702         0.2702
+NFE40_sde08    8QXI_A         1024    1024         0.3660         0.3562
+NFE40_sde08    6ZYG_A         1024    1024         0.2855         0.2451
+NFE40_sde08    7AD5_A         1024    1024         0.4479         0.4479
+NFE40_sde08    6ZUS_A         1024    1024         0.2286         0.2045
+NFE40_sde08    8RJX_A         1024    1024         0.2418         0.1971
+NFE40_sde08    7KW9_A         1024    1024         0.2735         0.1997
+NFE40_sde08    6ZTG_A         1024    1024         0.1924         0.1824
+NFE40_sde08    8XHT_A         1024    1024         0.2207         0.2041
+NFE50_sde08    8QXI_A         1024    1024         0.3250         0.2259
+NFE50_sde08    6ZYG_A         1024    1024         0.3255         0.2737
+NFE50_sde08    7AD5_A         1024    1024         0.5262         0.4103
+NFE50_sde08    6ZUS_A         1024    1024         0.2181         0.1332
+NFE50_sde08    8RJX_A         1024    1024         0.2068         0.1983
+NFE50_sde08    7KW9_A         1024    1024         0.2931         0.2575
+NFE50_sde08    6ZTG_A         1024    1024         0.2669         0.2464
+NFE50_sde08    8XHT_A         1024    1024         0.2844         0.2563
+
+mean top16_best_tm NFE30_sde08: 0.2299
+mean top16_best_tm NFE40_sde08: 0.2546
+mean top16_best_tm NFE50_sde08: 0.2502
+```
+
+**Combined with the earlier N=1024/top-16 table, the full 6-config comparison on scaling8:**
+
+| config | mean top-16 TM |
+|---|---|
+| SDE-200 (baseline) | 0.3828 |
+| NFE40, SDE→0.6 | 0.3411 (n=7, 8QXI corrupted) |
+| NFE50, SDE→0.6 | 0.3628 |
+| NFE30, SDE→0.8 | 0.2299 |
+| NFE40, SDE→0.8 | 0.2546 |
+| NFE50, SDE→0.8 | 0.2502 |
+
+Every sde08 variant is worse than its sde06 counterpart at the same NFE, and further from SDE-200 than sde06 was. See PLAN finding #15 for the interpretation (fixed-NFE budget tradeoff: pushing the SDE/ODE switch later starves the final ODE-refinement phase). Retrieval script: `~/scratchpad/n1024_topk16_sde08.py` (same tarfile-based approach as the earlier N=1024/top-16 script), run on SuperCloud.
