@@ -112,9 +112,16 @@ lora:
 opt:
   lr: 0.0001  # unchanged from the original muon run -- not introducing an extra uncontrolled variable
   max_epochs: 100000
-  max_steps: 150000  # same target as the original run, for a comparable trajectory endpoint
-  batch_size: 32  # per-GPU micro-batch -- stepped down from 64 after 3 real production OOM/crash failures near step ~125,650 (2026-07-16); smoke test at 64 was too short (max_steps=8) to catch the problem batch shape
-  accumulate_grad_batches: 1  # 32 batch * 1 accum * 2 GPU = 64 effective (down from 128 -- no accumulation per standing preference)
+  max_steps: 152415  # 2026-07-18: extended from 150000 (which matched the original run's target but,
+  # per the user, "didn't even finish a whole epoch") by 5 real epochs at batch_size=2 -- confirmed via
+  # the run's own cluster_sampler_audit log (total_yielded=1934, world=2 -> 967 samples/rank/epoch ->
+  # 483 steps/epoch at batch_size=2) -- 150000 + 5*483 = 152415.
+  batch_size: 2  # per-GPU micro-batch -- auto-halved down from 32 by the watchdog's OOM policy
+  # (2026-07-17 user directive) after repeated real OOMs at 32/16/8/4; proven stable for ~10 real
+  # hours at 2 (steps 131,800-149,188) before an unrelated DataLoader-timeout + stale-node incident.
+  # State-file-driven (monitor/current_batch_size.txt) going forward, this YAML value is the
+  # documented-but-not-authoritative record of the last known-good value.
+  accumulate_grad_batches: 1  # 2 batch * 1 accum * 2 GPU = 4 effective at the current batch_size=2 (no accumulation per standing preference)
   optimizer: adamw  # was muon; AdamW path exists but is unexercised in this repo's real configs (flagged to user)
   val_check_interval_optim_steps: 500
   skip_nan_grad: False
