@@ -112,10 +112,10 @@ lora:
 opt:
   lr: 0.0001  # unchanged from the original muon run -- not introducing an extra uncontrolled variable
   max_epochs: 100000
-  max_steps: 152415  # 2026-07-18: extended from 150000 (which matched the original run's target but,
-  # per the user, "didn't even finish a whole epoch") by 5 real epochs at batch_size=2 -- confirmed via
-  # the run's own cluster_sampler_audit log (total_yielded=1934, world=2 -> 967 samples/rank/epoch ->
-  # 483 steps/epoch at batch_size=2) -- 150000 + 5*483 = 152415.
+  max_steps: 157199  # 2026-07-21: further extended from 152415 (real final step was 152369, the
+  # first 5-epoch extension) by 10 MORE epochs at batch_size=2, per user request -- 152369 + 10*483
+  # = 157199. steps/epoch=483 confirmed via the run's own cluster_sampler_audit log
+  # (total_yielded=1934, world=2 -> 967 samples/rank/epoch) -- see 2026-07-18 history above.
   batch_size: 2  # per-GPU micro-batch -- auto-halved down from 32 by the watchdog's OOM policy
   # (2026-07-17 user directive) after repeated real OOMs at 32/16/8/4; proven stable for ~10 real
   # hours at 2 (steps 131,800-149,188) before an unrelated DataLoader-timeout + stale-node incident.
