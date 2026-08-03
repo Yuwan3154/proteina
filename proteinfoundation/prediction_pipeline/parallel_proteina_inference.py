@@ -8,6 +8,7 @@ It processes all proteins from a CSV file and distributes them across available 
 
 import argparse
 import builtins
+import getpass
 import logging
 import sys
 import multiprocessing as mp
@@ -223,11 +224,33 @@ def run_cif_to_pt_conversion(csv_file, csv_col, cif_dir):
             stderr = str(e)
         return MockResult()
 
+def _compile_cache_env(gpu_id):
+    """Per-GPU-worker torch.compile cache dirs.
+
+    The GPU workers run concurrently and, sharing one inductor/triton cache dir,
+    race on it: worker A reads a `.best_config` JSON while worker B is still
+    writing it and gets `JSONDecodeError: Extra data` out of
+    `autotune_cache.LocalAutotuneCache._get`, which surfaces as
+    `BackendCompilerFailed` and kills that protein. Giving each worker its own
+    dir removes the shared mutable state; proteins within a worker are
+    sequential, so the cache still warms after the first compile.
+    """
+    if gpu_id is None:
+        return None
+    env = os.environ.copy()
+    base = env.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), f"torchinductor_{getpass.getuser()}")
+    env["TORCHINDUCTOR_CACHE_DIR"] = f"{base}_gpu{gpu_id}"
+    tbase = env.get("TRITON_CACHE_DIR") or os.path.join(tempfile.gettempdir(), f"triton_{getpass.getuser()}")
+    env["TRITON_CACHE_DIR"] = f"{tbase}_gpu{gpu_id}"
+    return env
+
+
 def run_proteina_inference(protein_name, inference_config, force_compile: bool = False,
                            max_nsamples: int = None,
                            conditioning_mode: str = None,
                            cath_code: str = None,
-                           nsamples_per_protein: int = None):
+                           nsamples_per_protein: int = None,
+                           gpu_id=None):
     """
     Run Proteina inference directly.
     Only uses subprocess for calling proteinfoundation/inference.py.
@@ -257,7 +280,8 @@ def run_proteina_inference(protein_name, inference_config, force_compile: bool =
         cmd,
         cwd=PROTEINA_BASE_DIR,
         capture_output=True,
-        text=True
+        text=True,
+        env=_compile_cache_env(gpu_id),
     )
     return result
 
@@ -408,7 +432,8 @@ def process_single_protein(args):
                                             max_nsamples=current_max_nsamples,
                                             conditioning_mode=conditioning_mode,
                                             cath_code=cath_code,
-                                            nsamples_per_protein=nsamples_per_protein)
+                                            nsamples_per_protein=nsamples_per_protein,
+                                            gpu_id=gpu_id)
 
             if result.returncode == 0:
                 break  # success
