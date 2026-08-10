@@ -445,10 +445,27 @@ class _CoordinateFlowMatcher:
         dtype: Optional[torch.dtype] = None,
         verbose: bool = False,
         zero_sin_pos_emb: bool = False,
+        x_1_partial: Optional[Float[Tensor, "* n 3"]] = None,
+        t_start: Optional[float] = None,
     ) -> Dict[str, Tensor]:
         """
         Generates samples by simulating the full process starting from
         t=0 up to t=1.
+
+        Partial diffusion (x_1_partial + t_start): instead of starting from pure reference
+        noise at t=0, start from a REAL structure noised only part-way, at t=t_start, and
+        integrate the rest of the way to t=1. This is the flow-matching analog of
+        RFdiffusion's `diffuser.partial_T` (see T2 in ESMFOLD2_RECYCLE_SCALING.md).
+
+        ⛔ The noise-level convention is INVERTED relative to RFdiffusion. RFdiffusion is a
+        DDPM (t=0 data, t=T noise) so LARGER partial_T = MORE noise. Here t is the
+        flow-matching interpolation time (t=0 noise, t=1 data), so LARGER t_start = LESS
+        noise = output stays CLOSER to x_1_partial (higher TM). Do not port a partial_T value
+        across directly.
+
+        x_1_partial must be in the same units/frame the model works in: NANOMETERS
+        (Angstrom / 10, see coors_utils.ang_to_nm) -- raw Angstrom coordinates will be ~10x
+        out of scale relative to the unit-Gaussian reference and silently produce garbage.
 
         Args:
             predict_clean_n_v: A function that predicts clean sample and vector field
@@ -523,6 +540,35 @@ class _CoordinateFlowMatcher:
             if _sc_fork and _sc_fork_idx is not None:
                 _sc_start = int(_sc_fork_idx)
                 x = torch.load(_sc_fork, weights_only=False)["x_t"].to(device=x.device, dtype=x.dtype)
+
+            # --- T2 partial diffusion: seed from a real structure noised to t_start ---
+            if x_1_partial is not None or t_start is not None:
+                assert (
+                    x_1_partial is not None and t_start is not None
+                ), "partial diffusion needs BOTH x_1_partial and t_start"
+                assert 0.0 < t_start < 1.0, f"t_start must be in (0, 1), got {t_start}"
+                # Snap the requested t_start onto the schedule grid and begin the loop at that
+                # index, so the t used to BUILD x_t is exactly the t the loop first evaluates at.
+                # An off-grid t_start would leave the first step's dt inconsistent with the state.
+                _sc_start = int(
+                    torch.searchsorted(ts, torch.tensor(t_start, dtype=ts.dtype)).item()
+                )
+                _sc_start = min(max(_sc_start, 0), nsteps - 1)
+                t_snap = float(ts[_sc_start])
+                # Reuse self.interpolate -- the SAME function used to build x_t during training --
+                # rather than reimplementing (1-t)x_0 + t*x_1 here, so the seeded state provably
+                # lies on the interpolation path the model was trained to denoise.
+                x = self.interpolate(
+                    x_0=x,
+                    x_1=x_1_partial.to(device=x.device, dtype=x.dtype),
+                    t=t_snap * torch.ones(nsamples, device=device, dtype=x.dtype),
+                    mask=mask,
+                )
+                if verbose:
+                    print(
+                        f"Partial diffusion: requested t_start={t_start:.4f}, snapped to "
+                        f"ts[{_sc_start}]={t_snap:.4f}, integrating {nsteps - _sc_start} steps to t=1"
+                    )
             # speedup HYBRID sampler (env-gated, default OFF): SDE (sc) for high-noise t<thresh,
             # ODE (vf) for the rest. gt is always computed above so sc steps work on any config.
             _sde_until = os.environ.get("PROTEINA_SDE_UNTIL_T")
@@ -1339,6 +1385,8 @@ class FlowMatcher:
         predict_coords: bool = True,
         verbose: bool = False,
         zero_sin_pos_emb: bool = False,
+        x_1_partial: Optional[Float[Tensor, "* n 3"]] = None,
+        t_start: Optional[float] = None,
     ) -> Dict[str, Optional[Tensor]]:
         """
         Full simulation supporting both coordinate and contact map modalities.
@@ -1377,8 +1425,16 @@ class FlowMatcher:
                 fixed_structure_mask=fixed_structure_mask,
                 verbose=verbose,
                 zero_sin_pos_emb=zero_sin_pos_emb,
+                x_1_partial=x_1_partial,
+                t_start=t_start,
             )
             return {"coords": x, "contact_map": None, "distogram": None}
+
+        # Fail loudly rather than silently dropping partial-diffusion args: the contact-map
+        # matcher has no x_1_partial/t_start support, so honoring them here is impossible.
+        assert (
+            x_1_partial is None and t_start is None
+        ), "partial diffusion (x_1_partial/t_start) is only supported in 'coordinates' modality"
 
         # Delegate to contact map flow matcher
         return self.contact_fm.full_simulation(
