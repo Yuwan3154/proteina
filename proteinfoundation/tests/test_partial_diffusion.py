@@ -58,29 +58,39 @@ class TestPartialDiffusionSeeding:
                 mask=mask, modality="coordinates", x_1_partial=x_1, t_start=t_start,
             )
 
-    def test_higher_t_start_stays_closer_to_input(self):
-        """The defining property: larger t_start = less noise = output closer to the input
-        structure. This is the INVERTED convention vs RFdiffusion's partial_T and is the
-        single easiest thing to get backwards, so it is asserted directly."""
+    def test_higher_t_start_retains_more_of_the_input(self):
+        """The defining property: larger t_start = less noise = state retains MORE of the
+        input structure. This is the INVERTED convention vs RFdiffusion's partial_T and is
+        the single easiest thing to get backwards, so it is asserted directly.
+
+        Uses a stationary predictor (predicts x_t is already clean => v=0), so the output is
+        exactly the seeded state and the measurement isolates seeding alone. A predictor with
+        a nonzero vector field would confound this: with the exact field toward a fixed
+        target, dx/dt = (x_tgt - x)/(1-t) converges to x_tgt from ANY start, analytically
+        erasing the initial condition -- so such a test would show no t_start dependence even
+        though the seeding is correct. This tests the seeding, NOT the denoising trajectory
+        (the latter needs the real network + weights, so it is out of scope for a unit test).
+        """
         fm, mask, x_1, n, nsamples = _setup()
-        # Predictor pulls toward an UNRELATED structure, so any resemblance to x_1 in the
-        # output can only come from the partial-diffusion seeding, not from the predictor.
-        torch.manual_seed(99)
-        x_other = torch.randn(nsamples, n, 3)
-        x_other = x_other - x_other.mean(dim=-2, keepdim=True)
+
+        def stationary_predict(nn_in):
+            return {
+                "coords": nn_in["x_t"].clone(),
+                "v": torch.zeros_like(nn_in["x_t"]),
+            }
 
         dists = {}
         for t_start in (0.1, 0.5, 0.9):
-            torch.manual_seed(7)  # same reference noise draw across settings
+            torch.manual_seed(7)  # identical reference-noise draw across settings
             out = fm.full_simulation(
-                _fake_predictor(x_other), dt=0.02, nsamples=nsamples, n=n,
+                stationary_predict, dt=0.02, nsamples=nsamples, n=n,
                 self_cond=False, mask=mask, modality="coordinates",
                 x_1_partial=x_1, t_start=t_start,
             )["coords"]
             dists[t_start] = (out - x_1).pow(2).sum(-1).sqrt().mean().item()
 
         assert dists[0.9] < dists[0.5] < dists[0.1], (
-            f"expected monotonically closer to input as t_start rises, got {dists}"
+            f"expected state to retain more of the input as t_start rises, got {dists}"
         )
 
     def test_seeded_state_is_on_the_training_interpolation_path(self):
