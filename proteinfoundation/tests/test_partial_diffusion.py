@@ -170,6 +170,62 @@ class TestPartialDiffusionSeeding:
         assert torch.equal(a, b)
 
 
+class TestPartialDiffusionWithSDE:
+    """Partial diffusion must compose with SDE sampling (sampling_mode='sc'), which is what
+    this lab's production configs actually use (sc_scale_noise=0.45, gt_mode='1/t').
+    Seeding at high t is the risky case: vf_to_score divides by (1-t), so a seed too close to
+    t=1 could blow up -- full_simulation forces 'vf' above t=0.99, and that guard is checked."""
+
+    def _pred(self, x_1_fixed):
+        def predict(nn_in):
+            x_t, t = nn_in["x_t"], nn_in["t"]
+            t_ = t[..., None, None]
+            return {
+                "coords": x_1_fixed.clone(),
+                "v": (x_1_fixed - x_t) / (1.0 - t_).clamp(min=1e-6),
+            }
+
+        return predict
+
+    @pytest.mark.parametrize("t_start", [0.2, 0.6, 0.95])
+    def test_sde_mode_runs_and_stays_finite(self, t_start):
+        fm, mask, x_1, n, nsamples = _setup()
+        out = fm.full_simulation(
+            self._pred(x_1), dt=0.02, nsamples=nsamples, n=n, self_cond=False,
+            mask=mask, modality="coordinates", x_1_partial=x_1, t_start=t_start,
+            sampling_mode="sc", sc_scale_noise=0.45, sc_scale_score=1.0,
+            gt_mode="1/t", gt_p=1.0,
+        )["coords"]
+        assert torch.isfinite(out).all(), f"non-finite output with SDE at t_start={t_start}"
+        assert out.shape == (nsamples, n, 3)
+
+    def test_sde_injects_extra_stochasticity_vs_ode(self):
+        """The reason SDE matters here: from the SAME seed state, ODE is deterministic while
+        SDE wanders. This is the second, independent diversity knob (alongside t_start)."""
+        fm, mask, x_1, n, nsamples = _setup()
+        pred = self._pred(x_1)
+        common = dict(
+            dt=0.02, nsamples=nsamples, n=n, self_cond=False, mask=mask,
+            modality="coordinates", x_1_partial=x_1, t_start=0.5,
+        )
+
+        def run(seed, **kw):
+            torch.manual_seed(seed)
+            return fm.full_simulation(pred, **common, **kw)["coords"]
+
+        # ODE: identical seeds -> identical output (deterministic given the seed draw)
+        assert torch.allclose(run(3, sampling_mode="vf"), run(3, sampling_mode="vf"))
+
+        # SDE: the integration itself draws noise, so two runs that share the same
+        # reference-noise seed still diverge downstream.
+        sde_kw = dict(
+            sampling_mode="sc", sc_scale_noise=0.45, sc_scale_score=1.0,
+            gt_mode="1/t", gt_p=1.0,
+        )
+        a, b = run(3, **sde_kw), run(4, **sde_kw)
+        assert not torch.allclose(a, b), "SDE mode produced identical outputs across seeds"
+
+
 class TestPartialDiffusionModalityGuard:
     def test_contact_map_modality_rejects_partial_args(self):
         """Contact-map mode cannot honor these args; it must raise rather than ignore them."""
