@@ -323,6 +323,42 @@ class TestCorrectorSteps:
         )["coords"]
         assert torch.isfinite(out).all()
 
+    def test_corrector_dump_captures_every_intermediate(self, tmp_path, monkeypatch):
+        """PROTEINA_TRAJ_DUMP (2026-08-12, user request): each corrector iteration's post-update
+        state must be saved, so a single generate() call yields the whole graded family of
+        synthetic templates (0..corrector_steps) instead of needing a separate rerun per level."""
+        fm, mask, x_1, n, nsamples = _setup()
+        dump_path = tmp_path / "corrector_dump.pt"
+        monkeypatch.setenv("PROTEINA_TRAJ_DUMP", str(dump_path))
+        corrector_steps = 5
+        fm.full_simulation(
+            self._pred(x_1), dt=0.02, nsamples=nsamples, n=n, self_cond=False,
+            mask=mask, modality="coordinates", x_1_partial=x_1, t_start=0.5,
+            corrector_steps=corrector_steps, sampling_mode="sc", sc_scale_noise=0.45,
+            gt_mode="1/t", gt_p=1.0,
+        )
+        dump = torch.load(dump_path, weights_only=False)
+        corrector_x = dump["corrector_x"]
+        # index 0 = the seed (0 corrector steps applied); one more entry per extra iteration.
+        assert len(corrector_x) == corrector_steps + 1
+        for state in corrector_x:
+            assert state.shape == (nsamples, n, 3)
+            assert torch.isfinite(state).all()
+
+    def test_corrector_dump_absent_without_corrector_steps(self, tmp_path, monkeypatch):
+        """corrector_x must stay None when corrector_steps=0 -- the dump key exists but is empty,
+        not a stale/wrong-length list from a previous call."""
+        fm, mask, x_1, n, nsamples = _setup()
+        dump_path = tmp_path / "no_corrector_dump.pt"
+        monkeypatch.setenv("PROTEINA_TRAJ_DUMP", str(dump_path))
+        fm.full_simulation(
+            self._pred(x_1), dt=0.02, nsamples=nsamples, n=n, self_cond=False,
+            mask=mask, modality="coordinates", x_1_partial=x_1, t_start=0.5,
+            sampling_mode="sc", sc_scale_noise=0.45, gt_mode="1/t", gt_p=1.0,
+        )
+        dump = torch.load(dump_path, weights_only=False)
+        assert dump["corrector_x"] is None
+
 
 class TestPartialDiffusionModalityGuard:
     def test_contact_map_modality_rejects_partial_args(self):

@@ -583,6 +583,10 @@ class _CoordinateFlowMatcher:
             # advancing forward, instead of moving on after a single step. Reuses the model's own
             # existing per-step update (v drift + g(t)*score + noise) and the already-established
             # dt/g(t)/sc_scale_noise -- no new hyperparameters beyond how many extra iterations.
+            _sc_corrector_x = None  # per-iteration post-update coords during the corrector phase,
+            # for PROTEINA_TRAJ_DUMP -- index 0 is the seed (0 corrector steps applied), index k
+            # is the state after k corrector steps, so each entry is itself a usable synthetic
+            # template at that diversity level (2026-08-12, user request).
             if corrector_steps > 0:
                 assert x_1_partial is not None and t_start is not None, (
                     "corrector_steps is only meaningful paired with partial diffusion "
@@ -590,6 +594,8 @@ class _CoordinateFlowMatcher:
                 )
                 t_fixed = ts[_sc_start] * torch.ones(nsamples, device=device)
                 gt_fixed = gt[_sc_start]
+                if _sc_dump is not None:
+                    _sc_corrector_x = [x.detach().to("cpu", torch.float32)]
                 for _ in range(corrector_steps):
                     nn_in = {"x_t": x, "t": t_fixed, "mask": mask}
                     if zero_sin_pos_emb:
@@ -611,6 +617,8 @@ class _CoordinateFlowMatcher:
                         x_t=x, v=v, t=t_fixed, dt=dt, gt=gt_fixed, sampling_mode="sc",
                         sc_scale_noise=sc_scale_noise, sc_scale_score=sc_scale_score, mask=mask,
                     )
+                    if _sc_corrector_x is not None:
+                        _sc_corrector_x.append(x.detach().to("cpu", torch.float32))
                 if verbose:
                     print(f"Corrector: {corrector_steps} extra steps at fixed t={float(ts[_sc_start]):.4f}")
 
@@ -690,6 +698,7 @@ class _CoordinateFlowMatcher:
             if _sc_dump is not None:
                 torch.save({"t": _sc_t_list, "x0_pred": _sc_x0_list, "x_t": _sc_xt_list,
                             "x_final": x.detach().to("cpu", torch.float32),
+                            "corrector_x": _sc_corrector_x,
                             "schedule_ts": ts.detach().to("cpu")}, _sc_dump)
             return x
 
