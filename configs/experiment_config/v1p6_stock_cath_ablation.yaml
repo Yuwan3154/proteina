@@ -8,24 +8,36 @@ defaults:
 # architecture at all (seq conditioning was added by later finetunes), so
 # --conditioning_mode unconditional/cath_only exercise its native, extensively
 # pretrained mode of operation rather than an unexercised code path.
+#
+# Full key set copied from the project's own proven
+# inference_cath_cond_sampling_v1-6-control_045-noise.yaml (same checkpoint) rather
+# than hand-picking a "minimal" subset -- two real ConfigKeyError/ConfigAttributeError
+# crashes (missing seq_cond, then missing data_dir) came from under-declaring this
+# config; every key below actually gets read somewhere in the per-protein inference
+# path regardless of conditioning mode. fold_cond/seq_cond values here are just
+# defaults -- --conditioning_mode (unconditional / cath_only) overrides both per-run.
 run_name_: v1p6_stock_cath_ablation
 ckpt_name: proteina_v1.6_DFS_200M_notri_long_chain_generation.ckpt
 
 self_cond: True
-
-# seq_cond must be pre-declared (inference_base.yaml has no such key, unlike the
-# finetuned checkpoint's config) so compose_inference_cfg's OmegaConf.merge can
-# set it -- Hydra composes this into struct mode, which rejects merging in a
-# brand-new key. fold_cond IS already declared by inference_base.yaml (False).
-# Actual value driven per-run by --conditioning_mode (unconditional / cath_only)
-# so both arms share one config; the value here is just a placeholder default.
+fold_cond: True
+cath_code_level: "T"  # Guidance level -- C, A, or T
 seq_cond: False
+data_dir: ${oc.env:DATA_PATH}/pdb_train/ # Directory where the dataset is stored
+cath_code_file: unique_fold_cath_codes_train_df_pdb_f1_minl50_maxl384_mtprotein_etdiffractionEM_minoNone_maxoNone_minr0.0_maxr5.0_hl_rl_rnsrTrue_rpuTrue_l_rcuFalse_ex11.csv # only used when cath_codes_override is None -- never the case for unconditional/cath_only
+
+dt: 0.005
+
+lora:
+  use: False
+  lora_alpha: 32.0
+  lora_dropout: 0.0
+  r: 0
+  train_bias: "none"
 
 sampling_caflow:
   sampling_mode: sc
   sc_scale_noise: 0.45  # matches inference_cath_cond_sampling_v1-6-control_045-noise.yaml, the project's own proven setting for this checkpoint
-
-dt: 0.005
 
 compute_designability: False
 compute_fid: False
