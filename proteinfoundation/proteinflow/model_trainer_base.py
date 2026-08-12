@@ -3307,6 +3307,8 @@ class ModelTrainerBase(L.LightningModule):
         trajectory_stride: int = 1,
         verbose: bool = False,
         zero_sin_pos_emb: bool = False,
+        x_1_partial: Optional[Tensor] = None,
+        t_start: Optional[float] = None,
     ) -> Dict[str, Tensor]:
         """
         Generates samples by integrating ODE with learned vector field.
@@ -3317,6 +3319,10 @@ class ModelTrainerBase(L.LightningModule):
                 at every trajectory step. Must match the training-time setting
                 (``training.zero_sin_pos_emb``) to keep train/val/inference
                 forward semantics consistent.
+            x_1_partial: partial-diffusion seed (T2), real structure in nm, zero-COM,
+                [nsamples, n, 3]. Coordinate modality only -- see full_simulation docstring
+                in r3n_fm.py. Requires t_start.
+            t_start: partial-diffusion start time in (0, 1), paired with x_1_partial.
 
         Returns:
             Dictionary with keys:
@@ -3338,6 +3344,8 @@ class ModelTrainerBase(L.LightningModule):
         contact_map_mode = getattr(self, "contact_map_mode", False)
         discrete_enabled = contact_map_mode and self._discrete_diffusion_enabled()
         dssp_diff_enabled = self._dssp_diffusion_enabled()
+        if x_1_partial is not None and (discrete_enabled or dssp_diff_enabled):
+            raise ValueError("x_1_partial/t_start (T2 partial diffusion) is coordinate-modality only, not supported for discrete contact-map/DSSP sampling.")
         if discrete_enabled or dssp_diff_enabled:
             if discrete_enabled and self.discrete_diffusion_type not in ("md4", "udlm"):
                 raise ValueError("GenMD4 sampling is not implemented for inference.")
@@ -3515,6 +3523,8 @@ class ModelTrainerBase(L.LightningModule):
             predict_coords=predict_coords,
             verbose=verbose,
             zero_sin_pos_emb=zero_sin_pos_emb,
+            x_1_partial=x_1_partial,
+            t_start=t_start,
         )
 
 
