@@ -608,7 +608,13 @@ class _CoordinateFlowMatcher:
                         nn_in["cath_code_indices_mask"] = cath_code_indices_mask
                 elif cath_code is not None:
                     nn_in["cath_code"] = cath_code
-                if step > 0 and self_cond:
+                if step > _sc_start and self_cond:
+                    # Self-conditioning needs a PRIOR prediction from this same loop; only the very
+                    # first evaluated step has none. `step > 0` was wrong whenever the loop starts
+                    # mid-trajectory (T2 partial diffusion, or the PROTEINA_FORK_FROM resume hook) --
+                    # x_1_pred was never set in this call, so the first iteration referenced an
+                    # unbound local. `_sc_start` is the loop's actual first index in every case
+                    # (0 for a normal full simulation).
                     nn_in["x_sc"] = x_1_pred  # Self-conditioning
                 if residue_type is not None:
                     nn_in["residue_type"] = residue_type
