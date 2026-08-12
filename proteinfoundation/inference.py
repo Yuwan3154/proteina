@@ -482,7 +482,7 @@ def load_model_for_worker(cfg, *, force_compile, dynamic_shapes=True, verbose=Fa
     return model, nn_ag, trainer
 
 
-def _compute_root_path(config_name, conditioning_mode, pt_name, seq_cond):
+def _compute_root_path(config_name, conditioning_mode, pt_name):
     """Per-protein output dir: inference/{config}/{seq_cond|seq_cath_cond|unconditional_cond|cath_only_cond|legacy}/{protein}/"""
     root_path = f"./inference/{config_name}"
     if conditioning_mode == "seq":
@@ -495,8 +495,14 @@ def _compute_root_path(config_name, conditioning_mode, pt_name, seq_cond):
         root_path = os.path.join(root_path, "cath_only_cond")
     else:
         root_path = os.path.join(root_path, "legacy")
-    if seq_cond:
-        root_path = os.path.join(root_path, pt_name)
+    # ALWAYS append the per-protein directory: this pipeline always samples for one
+    # specific query protein (matching its length/identity), regardless of whether
+    # the MODEL receives its sequence as conditioning input. Gating this on seq_cond
+    # was a real bug: every seq_cond=False protein in a batch shared ONE directory,
+    # so run_one_protein_in_process's resume-count check (a plain, unfiltered
+    # os.listdir(root_path) for *.pdb) saw the FIRST protein's samples and concluded
+    # every subsequent protein was "already complete" -- silently skipping them.
+    root_path = os.path.join(root_path, pt_name)
     return root_path
 
 
@@ -517,7 +523,7 @@ def run_one_protein_in_process(model, nn_ag, trainer, cfg, *,
     Caller propagates the returned 'final_max_nsamples' to subsequent calls so the
     reduction sticks across proteins.
     """
-    root_path = _compute_root_path(config_name, conditioning_mode, pt_name, cfg.seq_cond)
+    root_path = _compute_root_path(config_name, conditioning_mode, pt_name)
 
     # Resume detection
     existing_sample_count = 0
