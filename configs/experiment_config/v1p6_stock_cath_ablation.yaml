@@ -1,0 +1,26 @@
+defaults:
+  - inference_base
+  - _self_
+
+# Stock (pretrain) v1.6 checkpoint -- the finetuning starting point for the
+# locked bad_afdb sequence/CATH-conditioned checkpoint. Used as an in-distribution
+# control for the CATH-conditioning ablation: this checkpoint has no residue_type_emb
+# architecture at all (seq conditioning was added by later finetunes), so
+# --conditioning_mode unconditional/cath_only exercise its native, extensively
+# pretrained mode of operation rather than an unexercised code path.
+run_name_: v1p6_stock_cath_ablation
+ckpt_name: proteina_v1.6_DFS_200M_notri_long_chain_generation.ckpt
+
+self_cond: True
+
+# fold_cond/seq_cond deliberately NOT set here -- driven per-run by
+# --conditioning_mode (unconditional / cath_only) so both arms share one config.
+
+sampling_caflow:
+  sampling_mode: sc
+  sc_scale_noise: 0.45  # matches inference_cath_cond_sampling_v1-6-control_045-noise.yaml, the project's own proven setting for this checkpoint
+
+dt: 0.005
+
+compute_designability: False
+compute_fid: False
