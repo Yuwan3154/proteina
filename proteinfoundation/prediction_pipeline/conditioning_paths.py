@@ -5,16 +5,17 @@ samples. It is REQUIRED everywhere — the inference writes it, scoring + analys
 read it — with NO silent fallback, so the inference and the downstream steps can
 never disagree on which folder the samples live in.
 
-    seq       -> inference/{config}/seq_cond/      (seq_cond_segment if PROTEINA_SEGMENT_MODE=joint)
-    seq_cath  -> inference/{config}/seq_cath_cond/
-    legacy    -> inference/{config}/legacy/        (explicit only — for reading pre-namespaced runs)
+    seq            -> inference/{config}/seq_cond/      (seq_cond_segment if PROTEINA_SEGMENT_MODE=joint)
+    seq_cath       -> inference/{config}/seq_cath_cond/
+    unconditional  -> inference/{config}/unconditional_cond/  (fold_cond=False, seq_cond=False: length-only)
+    legacy         -> inference/{config}/legacy/        (explicit only — for reading pre-namespaced runs)
 
 Mode source: inference takes it from --conditioning_mode; scoring/analysis read
 PROTEINA_CONDITIONING_MODE (the orchestrator propagates one to the other).
 """
 import os
 
-VALID_CONDITIONING_MODES = ("seq", "seq_cath", "legacy")
+VALID_CONDITIONING_MODES = ("seq", "seq_cath", "unconditional", "legacy")
 
 
 def conditioning_label(mode):
@@ -28,6 +29,8 @@ def conditioning_label(mode):
         return "seq_cond_segment" if os.environ.get("PROTEINA_SEGMENT_MODE", "") == "joint" else "seq_cond"
     if mode == "seq_cath":
         return "seq_cath_cond"
+    if mode == "unconditional":
+        return "unconditional_cond"
     if mode == "legacy":
         return "legacy"
     raise ValueError(f"unknown conditioning mode {mode!r}; expected one of {VALID_CONDITIONING_MODES}")

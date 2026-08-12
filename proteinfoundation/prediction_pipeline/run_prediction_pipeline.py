@@ -295,7 +295,7 @@ def step_proteina_inference(
     # parallel_proteina_inference.py uses this to load per-protein cath_codes
     # from the CSV and route them into inference.py's cath conditioning path.
     _cm = os.environ.get("PROTEINA_CONDITIONING_MODE", "").strip()
-    if _cm in ("seq", "seq_cath"):
+    if _cm in ("seq", "seq_cath", "unconditional"):
         cmd.extend(["--conditioning_mode", _cm])
     # Force subprocess-per-protein mode. The in_process ProcessPoolExecutor
     # path sets CUDA_VISIBLE_DEVICES via worker_init, but by then torch +

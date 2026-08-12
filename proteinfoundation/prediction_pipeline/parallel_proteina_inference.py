@@ -685,10 +685,11 @@ def main():
                         help="Thread workers for progress checks (default: min(32, cpu_count * 4)).")
     parser.add_argument("--dynamic_resharding", action=argparse.BooleanOptionalAction, default=True,
                         help="Filter global progress before sharding each step to reduce idle shards (default: True).")
-    parser.add_argument("--conditioning_mode", choices=["seq", "seq_cath", "legacy"], default=None,
+    parser.add_argument("--conditioning_mode", choices=["seq", "seq_cath", "unconditional", "legacy"], default=None,
                         help="Which conditioning to apply this run (REQUIRED; no silent fallback — omitting it raises). "
                              "'seq' = sequence only (forces cath='x.x.x.x', fold_cond=False). "
                              "'seq_cath' = sequence + top-1 CATH (requires a 'cath_code' column in --csv_file). "
+                             "'unconditional' = length only (fold_cond=False, seq_cond=False). "
                              "'legacy' = read/write the old un-namespaced 'legacy/' subdir (explicit only).")
     parser.add_argument("--nsamples_per_protein", type=int, default=None,
                         help="Override nsamples_per_len (total samples per protein) per inference subprocess.")
