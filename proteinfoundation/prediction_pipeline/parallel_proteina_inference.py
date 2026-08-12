@@ -16,7 +16,6 @@ import os
 import shutil
 import signal
 import subprocess
-import tempfile
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -234,13 +233,32 @@ def _compile_cache_env(gpu_id):
     `BackendCompilerFailed` and kills that protein. Giving each worker its own
     dir removes the shared mutable state; proteins within a worker are
     sequential, so the cache still warms after the first compile.
+
+    ⛔ Base dir is deliberately NOT `tempfile.gettempdir()` (found 2026-08-12): on
+    SuperCloud, SLURM sets `TMPDIR=/state/partition1/slurm_tmp/<jobid>.../`, a
+    node-local dir scoped to ONE job. Within-job reuse across proteins on the same
+    worker DOES work (verified: zero new cache files written for a 2nd, 3rd, ... 4th
+    protein after the 1st protein's compile) -- the actual problem is CROSS-job: every
+    fresh `sbatch` submission gets a fresh `$SLURM_JOBID`, hence a fresh empty cache,
+    even for a config/shape this exact checkpoint has compiled dozens of times before
+    across earlier jobs. Pointing this at the repo (shared Lustre, outlives any one
+    job/node) fixes that. Residual risk this reintroduces, narrower than the original
+    bug: two DIFFERENT jobs that happen to both run a first-ever (cold-cache) compile
+    of the same shape at the same wall-clock moment can still race on this shared dir
+    -- e.g. two arms launched together, both hitting a brand-new graph. Bounded and
+    recoverable (a raced protein fails that one sample batch; on-disk state gets
+    verified before being trusted anywhere in this pipeline, and a retry just re-runs
+    it against an already-warm cache) -- not the silent, structural per-job cost this
+    fixes. Tighten further (e.g. a lock file) only if that residual race is ever
+    actually observed.
     """
     if gpu_id is None:
         return None
     env = os.environ.copy()
-    base = env.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), f"torchinductor_{getpass.getuser()}")
+    persistent_default = os.path.join(PROTEINA_BASE_DIR, ".torch_compile_cache")
+    base = env.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(persistent_default, f"torchinductor_{getpass.getuser()}")
     env["TORCHINDUCTOR_CACHE_DIR"] = f"{base}_gpu{gpu_id}"
-    tbase = env.get("TRITON_CACHE_DIR") or os.path.join(tempfile.gettempdir(), f"triton_{getpass.getuser()}")
+    tbase = env.get("TRITON_CACHE_DIR") or os.path.join(persistent_default, f"triton_{getpass.getuser()}")
     env["TRITON_CACHE_DIR"] = f"{tbase}_gpu{gpu_id}"
     return env
 
