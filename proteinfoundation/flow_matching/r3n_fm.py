@@ -447,6 +447,7 @@ class _CoordinateFlowMatcher:
         zero_sin_pos_emb: bool = False,
         x_1_partial: Optional[Float[Tensor, "* n 3"]] = None,
         t_start: Optional[float] = None,
+        corrector_steps: int = 0,
     ) -> Dict[str, Tensor]:
         """
         Generates samples by simulating the full process starting from
@@ -575,6 +576,44 @@ class _CoordinateFlowMatcher:
             _sde_until = float(_sde_until) if _sde_until else None
             # --- end speedup hook ---
 
+            x_1_pred = None  # most recent clean-sample prediction, for self-conditioning below
+
+            # --- corrector (user hypothesis, 2026-08-12): repeat the SAME stochastic ("sc") step
+            # several extra times at a FIXED t (t_snap, the partial-diffusion seed point) before
+            # advancing forward, instead of moving on after a single step. Reuses the model's own
+            # existing per-step update (v drift + g(t)*score + noise) and the already-established
+            # dt/g(t)/sc_scale_noise -- no new hyperparameters beyond how many extra iterations.
+            if corrector_steps > 0:
+                assert x_1_partial is not None and t_start is not None, (
+                    "corrector_steps is only meaningful paired with partial diffusion "
+                    "(a fixed t to hold the extra steps at)"
+                )
+                t_fixed = ts[_sc_start] * torch.ones(nsamples, device=device)
+                gt_fixed = gt[_sc_start]
+                for _ in range(corrector_steps):
+                    nn_in = {"x_t": x, "t": t_fixed, "mask": mask}
+                    if zero_sin_pos_emb:
+                        nn_in["_zero_idx_emb"] = True
+                    if cath_code_indices is not None:
+                        nn_in["cath_code_indices"] = cath_code_indices
+                        if cath_code_indices_mask is not None:
+                            nn_in["cath_code_indices_mask"] = cath_code_indices_mask
+                    elif cath_code is not None:
+                        nn_in["cath_code"] = cath_code
+                    if self_cond and x_1_pred is not None:
+                        nn_in["x_sc"] = x_1_pred
+                    if residue_type is not None:
+                        nn_in["residue_type"] = residue_type
+                    result = predict_clean_n_v(nn_in)
+                    x_1_pred = result["coords"]
+                    v = result["v"]
+                    x, _ = self.simulation_step(
+                        x_t=x, v=v, t=t_fixed, dt=dt, gt=gt_fixed, sampling_mode="sc",
+                        sc_scale_noise=sc_scale_noise, sc_scale_score=sc_scale_score, mask=mask,
+                    )
+                if verbose:
+                    print(f"Corrector: {corrector_steps} extra steps at fixed t={float(ts[_sc_start]):.4f}")
+
             if fixed_sequence_mask is not None:
                 x_motif = (x_motif - mean_w_mask(x_motif, fixed_sequence_mask, keepdim=True)) * fixed_sequence_mask[..., None]
                 
@@ -608,13 +647,12 @@ class _CoordinateFlowMatcher:
                         nn_in["cath_code_indices_mask"] = cath_code_indices_mask
                 elif cath_code is not None:
                     nn_in["cath_code"] = cath_code
-                if step > _sc_start and self_cond:
-                    # Self-conditioning needs a PRIOR prediction from this same loop; only the very
-                    # first evaluated step has none. `step > 0` was wrong whenever the loop starts
-                    # mid-trajectory (T2 partial diffusion, or the PROTEINA_FORK_FROM resume hook) --
-                    # x_1_pred was never set in this call, so the first iteration referenced an
-                    # unbound local. `_sc_start` is the loop's actual first index in every case
-                    # (0 for a normal full simulation).
+                if self_cond and x_1_pred is not None:
+                    # Self-conditioning needs a PRIOR prediction from this call; only the very
+                    # first prediction ever made has none. Gating on "x_1_pred exists" (rather
+                    # than a step-index comparison like `step > 0`) is correct regardless of
+                    # where the loop starts (T2 partial diffusion, the PROTEINA_FORK_FROM resume
+                    # hook) or whether a corrector phase already ran and produced one.
                     nn_in["x_sc"] = x_1_pred  # Self-conditioning
                 if residue_type is not None:
                     nn_in["residue_type"] = residue_type
@@ -1393,6 +1431,7 @@ class FlowMatcher:
         zero_sin_pos_emb: bool = False,
         x_1_partial: Optional[Float[Tensor, "* n 3"]] = None,
         t_start: Optional[float] = None,
+        corrector_steps: int = 0,
     ) -> Dict[str, Optional[Tensor]]:
         """
         Full simulation supporting both coordinate and contact map modalities.
@@ -1433,14 +1472,16 @@ class FlowMatcher:
                 zero_sin_pos_emb=zero_sin_pos_emb,
                 x_1_partial=x_1_partial,
                 t_start=t_start,
+                corrector_steps=corrector_steps,
             )
             return {"coords": x, "contact_map": None, "distogram": None}
 
         # Fail loudly rather than silently dropping partial-diffusion args: the contact-map
-        # matcher has no x_1_partial/t_start support, so honoring them here is impossible.
+        # matcher has no x_1_partial/t_start/corrector_steps support, so honoring them here is
+        # impossible.
         assert (
-            x_1_partial is None and t_start is None
-        ), "partial diffusion (x_1_partial/t_start) is only supported in 'coordinates' modality"
+            x_1_partial is None and t_start is None and corrector_steps == 0
+        ), "partial diffusion (x_1_partial/t_start/corrector_steps) is only supported in 'coordinates' modality"
 
         # Delegate to contact map flow matcher
         return self.contact_fm.full_simulation(

@@ -216,6 +216,104 @@ class TestPartialDiffusionWithSDE:
         # ODE: identical seeds -> identical output (deterministic given the seed draw)
         assert torch.allclose(run(3, sampling_mode="vf"), run(3, sampling_mode="vf"))
 
+
+class TestCorrectorSteps:
+    """corrector_steps (2026-08-12 user hypothesis): repeat the SAME stochastic ('sc') step
+    several extra times at the fixed t_start seed point before advancing forward, instead of
+    moving on after one step. Only meaningful paired with partial diffusion."""
+
+    def _pred(self, x_1_fixed):
+        def predict(nn_in):
+            x_t, t = nn_in["x_t"], nn_in["t"]
+            t_ = t[..., None, None]
+            return {
+                "coords": x_1_fixed.clone(),
+                "v": (x_1_fixed - x_t) / (1.0 - t_).clamp(min=1e-6),
+            }
+
+        return predict
+
+    def test_requires_partial_diffusion(self):
+        """corrector_steps without a fixed seed point to hold it at makes no sense -- must fail
+        loudly, not silently no-op."""
+        fm, mask, x_1, n, nsamples = _setup()
+        with pytest.raises(AssertionError):
+            fm.full_simulation(
+                self._pred(x_1), dt=0.02, nsamples=nsamples, n=n, self_cond=False,
+                mask=mask, modality="coordinates", corrector_steps=3,
+            )
+
+    def test_default_zero_unchanged(self):
+        """Regression guard: corrector_steps=0 (the default) must be bit-identical to omitting
+        the argument entirely -- purely additive feature."""
+        fm, mask, x_1, n, nsamples = _setup()
+        pred = self._pred(x_1)
+        common = dict(
+            dt=0.02, nsamples=nsamples, n=n, self_cond=False, mask=mask,
+            modality="coordinates", x_1_partial=x_1, t_start=0.5,
+            sampling_mode="sc", sc_scale_noise=0.45, gt_mode="1/t", gt_p=1.0,
+        )
+        torch.manual_seed(9)
+        a = fm.full_simulation(pred, **common)["coords"]
+        torch.manual_seed(9)
+        b = fm.full_simulation(pred, **common, corrector_steps=0)["coords"]
+        assert torch.equal(a, b)
+
+    def test_corrector_calls_predictor_extra_times(self):
+        """The extra iterations must actually run a forward pass each -- not a no-op stub."""
+        fm, mask, x_1, n, nsamples = _setup()
+        counts = {"n": 0}
+
+        def counting_pred(nn_in):
+            counts["n"] += 1
+            return self._pred(x_1)(nn_in)
+
+        common = dict(
+            dt=0.02, nsamples=nsamples, n=n, self_cond=False, mask=mask,
+            modality="coordinates", x_1_partial=x_1, t_start=0.5,
+            sampling_mode="sc", sc_scale_noise=0.45, gt_mode="1/t", gt_p=1.0,
+        )
+        fm.full_simulation(counting_pred, **common)
+        base_calls = counts["n"]
+        counts["n"] = 0
+        fm.full_simulation(counting_pred, **common, corrector_steps=4)
+        assert counts["n"] == base_calls + 4
+
+    def test_corrector_holds_t_fixed(self):
+        """Every corrector iteration must evaluate at the SAME t (the seeded t_start) -- it must
+        not advance time, or it stops being 'extra steps at this noise level'."""
+        fm, mask, x_1, n, nsamples = _setup()
+        seen_t = []
+
+        def capture_pred(nn_in):
+            seen_t.append(float(nn_in["t"][0]))
+            return self._pred(x_1)(nn_in)
+
+        ts = fm.get_schedule(mode="uniform", nsteps=10, modality="coordinates")
+        t_start = float(ts[6])
+        fm.full_simulation(
+            capture_pred, dt=0.1, nsamples=nsamples, n=n, self_cond=False, mask=mask,
+            modality="coordinates", x_1_partial=x_1, t_start=t_start, corrector_steps=5,
+            sampling_mode="sc", sc_scale_noise=0.45, gt_mode="1/t", gt_p=1.0,
+        )
+        corrector_ts = seen_t[:5]
+        assert all(v == pytest.approx(t_start) for v in corrector_ts), (
+            f"corrector must hold t fixed at {t_start}, saw {corrector_ts}"
+        )
+
+    def test_runs_with_self_cond_true(self):
+        """Exactly the combination (self_cond + partial diffusion + extra fixed-t iterations)
+        that exposed the step > 0 self-conditioning bug for the main loop -- verify the
+        corrector's own self-conditioning gating doesn't hit the same class of bug."""
+        fm, mask, x_1, n, nsamples = _setup()
+        out = fm.full_simulation(
+            self._pred(x_1), dt=0.02, nsamples=nsamples, n=n, self_cond=True,
+            mask=mask, modality="coordinates", x_1_partial=x_1, t_start=0.5,
+            corrector_steps=3, sampling_mode="sc", sc_scale_noise=0.45,
+            gt_mode="1/t", gt_p=1.0,
+        )["coords"]
+        assert torch.isfinite(out).all()
+
         # SDE: the integration itself draws noise, so two runs that share the same
         # reference-noise seed still diverge downstream.
         sde_kw = dict(

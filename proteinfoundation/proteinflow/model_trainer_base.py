@@ -3309,6 +3309,7 @@ class ModelTrainerBase(L.LightningModule):
         zero_sin_pos_emb: bool = False,
         x_1_partial: Optional[Tensor] = None,
         t_start: Optional[float] = None,
+        corrector_steps: int = 0,
     ) -> Dict[str, Tensor]:
         """
         Generates samples by integrating ODE with learned vector field.
@@ -3323,6 +3324,8 @@ class ModelTrainerBase(L.LightningModule):
                 [nsamples, n, 3]. Coordinate modality only -- see full_simulation docstring
                 in r3n_fm.py. Requires t_start.
             t_start: partial-diffusion start time in (0, 1), paired with x_1_partial.
+            corrector_steps: extra stochastic steps repeated at the fixed t_start seed point
+                before advancing forward (see full_simulation docstring). Requires x_1_partial.
 
         Returns:
             Dictionary with keys:
@@ -3525,6 +3528,7 @@ class ModelTrainerBase(L.LightningModule):
             zero_sin_pos_emb=zero_sin_pos_emb,
             x_1_partial=x_1_partial,
             t_start=t_start,
+            corrector_steps=corrector_steps,
         )
 
 
