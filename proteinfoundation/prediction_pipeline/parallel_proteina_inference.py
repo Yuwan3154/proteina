@@ -132,9 +132,9 @@ def _get_or_load_worker_model(inference_config, conditioning_mode, force_compile
 
     # First call (or key change): build a synthetic args namespace to drive
     # the shared compose_inference_cfg from inference.py. cath_code is
-    # per-protein, not per-worker — for seq_cath mode we feed a placeholder
-    # here so the initial cfg merge succeeds; the real cath_code is supplied
-    # to run_one_protein_in_process below.
+    # per-protein, not per-worker — for seq_cath/cath_only modes we feed a
+    # placeholder here so the initial cfg merge succeeds; the real cath_code
+    # is supplied to run_one_protein_in_process below.
     from proteinfoundation.inference import compose_inference_cfg, load_model_for_worker
     import types
     a = types.SimpleNamespace(
@@ -144,7 +144,7 @@ def _get_or_load_worker_model(inference_config, conditioning_mode, force_compile
         max_nsamples=None,
         nsamples_per_protein=None,
         conditioning_mode=conditioning_mode,
-        cath_code=("x.x.x.x" if conditioning_mode == "seq_cath" else None),
+        cath_code=("x.x.x.x" if conditioning_mode in ("seq_cath", "cath_only") else None),
     )
     cfg, config_name, _ = compose_inference_cfg(a)
     model, nn_ag, trainer = load_model_for_worker(
@@ -304,11 +304,11 @@ def _step2_inference_in_process(protein_name, gpu_id, inference_config, conditio
     # Apply per-protein cath_codes_override
     if conditioning_mode == "seq":
         cath_codes_override = ["x.x.x.x"]
-    elif conditioning_mode == "seq_cath":
+    elif conditioning_mode in ("seq_cath", "cath_only"):
         if cath_code is None:
             return {'protein': protein_name, 'gpu': gpu_id, 'status': 'failed',
                     'error_type': 'BAD_INPUT',
-                    'error': "--conditioning_mode seq_cath but no cath_code for this protein",
+                    'error': f"--conditioning_mode {conditioning_mode} but no cath_code for this protein",
                     'output_dir': protein_output_dir}
         from proteinfoundation.inference import _normalize_cath_code
         cath_codes_override = [_normalize_cath_code(cath_code)]
@@ -685,11 +685,12 @@ def main():
                         help="Thread workers for progress checks (default: min(32, cpu_count * 4)).")
     parser.add_argument("--dynamic_resharding", action=argparse.BooleanOptionalAction, default=True,
                         help="Filter global progress before sharding each step to reduce idle shards (default: True).")
-    parser.add_argument("--conditioning_mode", choices=["seq", "seq_cath", "unconditional", "legacy"], default=None,
+    parser.add_argument("--conditioning_mode", choices=["seq", "seq_cath", "unconditional", "cath_only", "legacy"], default=None,
                         help="Which conditioning to apply this run (REQUIRED; no silent fallback — omitting it raises). "
                              "'seq' = sequence only (forces cath='x.x.x.x', fold_cond=False). "
                              "'seq_cath' = sequence + top-1 CATH (requires a 'cath_code' column in --csv_file). "
                              "'unconditional' = length only (fold_cond=False, seq_cond=False). "
+                             "'cath_only' = top-1 CATH, no sequence (requires a 'cath_code' column in --csv_file; fold_cond=True, seq_cond=False). "
                              "'legacy' = read/write the old un-namespaced 'legacy/' subdir (explicit only).")
     parser.add_argument("--nsamples_per_protein", type=int, default=None,
                         help="Override nsamples_per_len (total samples per protein) per inference subprocess.")
@@ -753,12 +754,12 @@ def main():
         PROTEINA_BASE_DIR, "inference", args.inference_config, _conditioning_label(args.conditioning_mode)
     )
 
-    # Resolve per-protein cath_codes when conditioning_mode is seq_cath.
+    # Resolve per-protein cath_codes when conditioning_mode is seq_cath or cath_only.
     cath_by_name = {}
-    if args.conditioning_mode == "seq_cath":
+    if args.conditioning_mode in ("seq_cath", "cath_only"):
         cath_df = pd.read_csv(args.csv_file)
         if "cath_code" not in cath_df.columns:
-            logger.error(f"--conditioning_mode seq_cath requires a 'cath_code' column in {args.csv_file}")
+            logger.error(f"--conditioning_mode {args.conditioning_mode} requires a 'cath_code' column in {args.csv_file}")
             sys.exit(1)
         cath_by_name = dict(zip(cath_df[args.csv_col].astype(str), cath_df["cath_code"].astype(str)))
         n_null = sum(1 for v in cath_by_name.values() if v.strip().lower() in ("", "nan", "x.x.x.x"))

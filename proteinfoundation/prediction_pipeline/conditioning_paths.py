@@ -8,6 +8,7 @@ never disagree on which folder the samples live in.
     seq            -> inference/{config}/seq_cond/      (seq_cond_segment if PROTEINA_SEGMENT_MODE=joint)
     seq_cath       -> inference/{config}/seq_cath_cond/
     unconditional  -> inference/{config}/unconditional_cond/  (fold_cond=False, seq_cond=False: length-only)
+    cath_only      -> inference/{config}/cath_only_cond/      (fold_cond=True, seq_cond=False: CATH, no sequence)
     legacy         -> inference/{config}/legacy/        (explicit only — for reading pre-namespaced runs)
 
 Mode source: inference takes it from --conditioning_mode; scoring/analysis read
@@ -15,7 +16,7 @@ PROTEINA_CONDITIONING_MODE (the orchestrator propagates one to the other).
 """
 import os
 
-VALID_CONDITIONING_MODES = ("seq", "seq_cath", "unconditional", "legacy")
+VALID_CONDITIONING_MODES = ("seq", "seq_cath", "unconditional", "cath_only", "legacy")
 
 
 def conditioning_label(mode):
@@ -31,6 +32,8 @@ def conditioning_label(mode):
         return "seq_cath_cond"
     if mode == "unconditional":
         return "unconditional_cond"
+    if mode == "cath_only":
+        return "cath_only_cond"
     if mode == "legacy":
         return "legacy"
     raise ValueError(f"unknown conditioning mode {mode!r}; expected one of {VALID_CONDITIONING_MODES}")

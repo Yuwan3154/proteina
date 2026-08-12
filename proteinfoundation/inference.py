@@ -360,6 +360,15 @@ def compose_inference_cfg(args):
             cfg = OmegaConf.merge(cfg, {"fold_cond": False, "seq_cond": False})
             cath_codes_override = ["x.x.x.x"]
             logger.info("Conditioning mode 'unconditional': fold_cond=False, seq_cond=False, cath_codes=['x.x.x.x']")
+        elif args.conditioning_mode == "cath_only":
+            # Same seq_cond=False mechanism as 'unconditional', but fold_cond=True so the
+            # model also receives the CATH code -- isolates the CATH-conditioning effect
+            # from the sequence-conditioning effect.
+            cfg = OmegaConf.merge(cfg, {"fold_cond": True, "seq_cond": False})
+            if args.cath_code is None:
+                raise SystemExit("--conditioning_mode cath_only requires --cath_code")
+            cath_codes_override = [_normalize_cath_code(args.cath_code)]
+            logger.info(f"Conditioning mode 'cath_only': fold_cond=True, seq_cond=False, cath_codes={cath_codes_override}")
         elif args.cath_code is not None:
             cath_codes_override = [_normalize_cath_code(args.cath_code)]
             logger.info(f"Using --cath_code override (no explicit mode): cath_codes={cath_codes_override}")
@@ -474,7 +483,7 @@ def load_model_for_worker(cfg, *, force_compile, dynamic_shapes=True, verbose=Fa
 
 
 def _compute_root_path(config_name, conditioning_mode, pt_name, seq_cond):
-    """Per-protein output dir: inference/{config}/{seq_cond|seq_cath_cond|unconditional_cond|legacy}/{protein}/"""
+    """Per-protein output dir: inference/{config}/{seq_cond|seq_cath_cond|unconditional_cond|cath_only_cond|legacy}/{protein}/"""
     root_path = f"./inference/{config_name}"
     if conditioning_mode == "seq":
         root_path = os.path.join(root_path, "seq_cond")
@@ -482,6 +491,8 @@ def _compute_root_path(config_name, conditioning_mode, pt_name, seq_cond):
         root_path = os.path.join(root_path, "seq_cath_cond")
     elif conditioning_mode == "unconditional":
         root_path = os.path.join(root_path, "unconditional_cond")
+    elif conditioning_mode == "cath_only":
+        root_path = os.path.join(root_path, "cath_only_cond")
     else:
         root_path = os.path.join(root_path, "legacy")
     if seq_cond:
@@ -852,11 +863,12 @@ def main():
         "--conditioning_mode",
         type=str,
         default=None,
-        choices=["seq", "seq_cath", "unconditional"],
+        choices=["seq", "seq_cath", "unconditional", "cath_only"],
         help="Which conditioning to apply this run. "
              "'seq' = sequence only (forces cath='x.x.x.x', fold_cond=False). "
              "'seq_cath' = sequence + top-1 CATH (requires --cath_code, sets fold_cond=True). "
              "'unconditional' = length only (forces cath='x.x.x.x', fold_cond=False, seq_cond=False). "
+             "'cath_only' = top-1 CATH, no sequence (requires --cath_code, sets fold_cond=True, seq_cond=False). "
              "If omitted, behavior is unchanged from baseline (uses cfg.fold_cond + cfg.cath_code_file).",
     )
     parser.add_argument(
