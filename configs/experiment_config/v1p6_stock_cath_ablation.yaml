@@ -13,8 +13,13 @@ ckpt_name: proteina_v1.6_DFS_200M_notri_long_chain_generation.ckpt
 
 self_cond: True
 
-# fold_cond/seq_cond deliberately NOT set here -- driven per-run by
-# --conditioning_mode (unconditional / cath_only) so both arms share one config.
+# seq_cond must be pre-declared (inference_base.yaml has no such key, unlike the
+# finetuned checkpoint's config) so compose_inference_cfg's OmegaConf.merge can
+# set it -- Hydra composes this into struct mode, which rejects merging in a
+# brand-new key. fold_cond IS already declared by inference_base.yaml (False).
+# Actual value driven per-run by --conditioning_mode (unconditional / cath_only)
+# so both arms share one config; the value here is just a placeholder default.
+seq_cond: False
 
 sampling_caflow:
   sampling_mode: sc
