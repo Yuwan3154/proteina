@@ -216,6 +216,15 @@ class TestPartialDiffusionWithSDE:
         # ODE: identical seeds -> identical output (deterministic given the seed draw)
         assert torch.allclose(run(3, sampling_mode="vf"), run(3, sampling_mode="vf"))
 
+        # SDE: the integration itself draws noise, so two runs that share the same
+        # reference-noise seed still diverge downstream.
+        sde_kw = dict(
+            sampling_mode="sc", sc_scale_noise=0.45, sc_scale_score=1.0,
+            gt_mode="1/t", gt_p=1.0,
+        )
+        a, b = run(3, **sde_kw), run(4, **sde_kw)
+        assert not torch.allclose(a, b), "SDE mode produced identical outputs across seeds"
+
 
 class TestCorrectorSteps:
     """corrector_steps (2026-08-12 user hypothesis): repeat the SAME stochastic ('sc') step
@@ -313,15 +322,6 @@ class TestCorrectorSteps:
             gt_mode="1/t", gt_p=1.0,
         )["coords"]
         assert torch.isfinite(out).all()
-
-        # SDE: the integration itself draws noise, so two runs that share the same
-        # reference-noise seed still diverge downstream.
-        sde_kw = dict(
-            sampling_mode="sc", sc_scale_noise=0.45, sc_scale_score=1.0,
-            gt_mode="1/t", gt_p=1.0,
-        )
-        a, b = run(3, **sde_kw), run(4, **sde_kw)
-        assert not torch.allclose(a, b), "SDE mode produced identical outputs across seeds"
 
 
 class TestPartialDiffusionModalityGuard:
