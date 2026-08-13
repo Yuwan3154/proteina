@@ -307,10 +307,15 @@ class ModelTrainerBase(L.LightningModule):
         after the FIRST backward. Used to debug the DDP
         find_unused_parameters requirement.
         """
-        if getattr(self, "global_rank", 0) != 0:
-            return
+        # Must run on EVERY rank, not just rank 0 -- a rank whose local batch
+        # triggered a nonfinite-loss skip still needs its grad zeroed before
+        # DDP all-reduces it into every other rank's gradient (a single
+        # un-cleared NaN grad on any one rank poisons the averaged gradient,
+        # hence every rank's weights, once the optimizer step applies it).
         if getattr(self, "_skip_update_due_to_nonfinite_loss", False):
             self.zero_grad()
+        if getattr(self, "global_rank", 0) != 0:
+            return
 
         # Unused-params diagnostic: scan EVERY step. The first step prints a
         # full report. Subsequent steps print only newly-unused params (sticky

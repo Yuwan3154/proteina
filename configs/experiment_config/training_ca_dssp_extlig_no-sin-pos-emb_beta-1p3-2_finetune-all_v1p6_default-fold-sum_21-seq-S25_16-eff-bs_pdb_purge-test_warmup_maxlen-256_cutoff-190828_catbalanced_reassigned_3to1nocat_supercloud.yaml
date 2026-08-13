@@ -106,7 +106,7 @@ opt:
   accumulate_grad_batches: 1  # 8 GPUs (4 nodes x 2) x batch 2 x accum 1 = eff batch 16, matching round 2
   optimizer: muon
   val_check_interval_optim_steps: 1000
-  skip_nan_grad: False
+  skip_nan_grad: True  # 2026-08-12: was False, let a NaN grad reach muon unguarded and permanently poison weights/momentum -- see model_trainer_base.py on_after_backward fix in the same commit
   grad_and_weight_analysis: False
   dist_strategy: ddp
   dist_backend: gloo  # proven working end-to-end in round 1/2 (incl. the real rank_zero_only fix); unchanged
