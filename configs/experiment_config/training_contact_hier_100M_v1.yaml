@@ -35,7 +35,7 @@ model:
     seq_emb_dim: 4
 
 # Dataset params
-dataset: pdb_train_contact_S25_max384_purge-test_cutoff-190828
+dataset: pdb_train_contact-confind_S25_max512_purge-test_cutoff-190828
 dataset_config_subdir: pdb
 
 force_precision_f32: False
