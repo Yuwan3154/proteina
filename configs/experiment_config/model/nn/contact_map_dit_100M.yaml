@@ -1,4 +1,5 @@
 name: contact_map_dit_100M
+nn_class: ContactMapSiT   # dispatches Proteina's NN_REGISTRY; absent -> ProteinTransformerAF3
 
 # ── Phase 1: Protein Encoder ─────────────────────────────────────────────────
 # Existing modules (MultiheadAttnAndTransition + PairReprUpdate), no triangle mult.

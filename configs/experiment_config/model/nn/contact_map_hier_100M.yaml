@@ -1,0 +1,60 @@
+name: contact_map_hier_100M
+nn_class: ContactMapHierSiT   # dispatches Proteina's NN_REGISTRY; absent -> ProteinTransformerAF3
+
+# ── Phase 1: Protein Encoder ─────────────────────────────────────────────────
+# Identical to contact_map_dit_100M: sequence + pair representations, pair-biased
+# MHSA interleaved with PairReprUpdate, no triangle multiplication.
+
+token_dim: 256
+pair_repr_dim: 128
+dim_cond: 256
+n_enc_layers: 4
+enc_pair_update_every_n: 2
+nheads_enc: 8
+use_qkln: True
+strict_feats: False
+
+feats_init_seq: ["res_seq_pdb_idx", "chain_break_per_res"]
+feats_cond_seq: ["time_emb", "fold_emb"]
+feats_pair_repr: ["rel_seq_sep", "contact_map_sc"]
+feats_pair_cond: ["time_emb"]
+
+t_emb_dim: 256
+idx_emb_dim: 128
+fold_emb_dim: 256
+seq_sep_dim: 63   # AF2-style relpos at cell level: uniform bins of i-j clipped at +/-31
+contact_map_sc_embed_dim: 64
+cath_code_dir: ${oc.env:DATA_PATH}/pdb_raw/
+multilabel_mode: "sample"
+
+# ── Hierarchy geometry ───────────────────────────────────────────────────────
+# Sequence length is zero-padded up to a multiple of block_size * super_factor
+# and cropped back after the output head.
+block_size: 12       # PROVISIONAL: set from the 8/12/16 runtime benchmark
+super_factor: 4      # super-block spans 4x4 blocks
+max_seq_len: 384     # training set is pdb_train_contact_S25_max384; sets the
+                     # relative-position clip radii so nothing in range is clipped
+
+# ── Level 0: cells ───────────────────────────────────────────────────────────
+# Cell input is [contact_map_t, contact_map_sc, pair_rep] so every cell sees the
+# encoder's full-resolution output directly.
+block_featurizer: local_attn   # local_attn | conv; conv = no within-block attention,
+                               # leaving the level-1 pooling as a strided conv (v1 patchify)
+d_local: 64
+n_local_layers: 2
+nheads_local: 8      # mirrors nheads_dit; head_dim = d_local / nheads_local = 8
+
+# ── Levels 1/2 and attention stacks ──────────────────────────────────────────
+d_block: 512
+d_super: 512
+nheads_dit: 8
+d_cond_dit: 256
+mlp_ratio: 4.0
+n_global_layers: 8   # all-by-all over super-block tokens
+n_block_layers: 4    # all-by-all over block tokens, after the skip concat
+
+# ── Contact map diffusion settings ───────────────────────────────────────────
+contact_map_mode: True
+contact_map_input_dim: 1
+non_contact_value: 0
+predict_coords: False

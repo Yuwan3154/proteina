@@ -380,9 +380,9 @@ class ContactMapSiT(nn.Module):
         # Apply patch mask
         tokens = tokens * patch_mask[..., None]
 
-        # N_dit SiT blocks
+        # N_dit SiT blocks (SiTBlock already applies both residuals internally)
         for block in self.dit_blocks:
-            tokens = tokens + block(tokens, cond, patch_mask)
+            tokens = block(tokens, cond, patch_mask)
 
         # ── Output head: unpatchify ───────────────────────────────────────────
         tokens = self.output_norm(tokens)                              # [B, P², d_patch]

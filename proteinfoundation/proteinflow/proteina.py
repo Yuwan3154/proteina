@@ -25,6 +25,8 @@ from torch import Tensor
 from torch.nn.modules.module import _IncompatibleKeys
 
 from proteinfoundation.flow_matching.r3n_fm import FlowMatcher
+from proteinfoundation.nn.contact_map_dit import ContactMapSiT
+from proteinfoundation.nn.contact_map_hier import ContactMapHierSiT
 from proteinfoundation.nn.protein_transformer import ProteinTransformerAF3
 from proteinfoundation.proteinflow.model_trainer_base import ModelTrainerBase
 from proteinfoundation.utils.align_utils.align_utils import kabsch_align
@@ -113,6 +115,13 @@ def sample_uniform_rotation(
     return Q.reshape(*shape, 3, 3)
 
 
+NN_REGISTRY = {
+    "ProteinTransformerAF3": ProteinTransformerAF3,
+    "ContactMapSiT": ContactMapSiT,
+    "ContactMapHierSiT": ContactMapHierSiT,
+}
+
+
 class Proteina(ModelTrainerBase):
     def __init__(self, cfg_exp, store_dir=None):
         super(Proteina, self).__init__(cfg_exp=cfg_exp, store_dir=store_dir)
@@ -163,7 +172,13 @@ class Proteina(ModelTrainerBase):
                 cfg_exp.model.nn[key] = val
         # Pass the DictConfig through so OmegaConf interpolations (e.g. ${oc.env:DATA_PATH})
         # resolve correctly in the actual training environment.
-        self.nn = ProteinTransformerAF3(**cfg_exp.model.nn)
+        nn_class_name = cfg_exp.model.nn.get("nn_class", "ProteinTransformerAF3")
+        if nn_class_name not in NN_REGISTRY:
+            raise ValueError(
+                f"model.nn.nn_class={nn_class_name!r} is not registered. "
+                f"Available: {sorted(NN_REGISTRY)}"
+            )
+        self.nn = NN_REGISTRY[nn_class_name](**cfg_exp.model.nn)
         # Single switch for compiling the self-conditioning forward via the
         # _forward_impl_sc wrapper (separate Dynamo cache, isolates grad-mode
         # specialization from the training cache). Applies to whichever module

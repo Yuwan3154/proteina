@@ -1,1 +1,2 @@
 from proteinfoundation.nn.contact_map_dit import ContactMapSiT
+from proteinfoundation.nn.contact_map_hier import ContactMapHierSiT
