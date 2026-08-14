@@ -62,3 +62,7 @@ datamodule:
     # For random split: only the specified IDs will be excluded
     exclude_ids: []  # Inline IDs excluded from train, distributed to val/test
     exclude_ids_from_file: ${oc.env:DATA_PATH}/pdb_train/rosetta_decoys.txt  # One chain ID per line
+    # Unusable structures removed from EVERY split (per-chain, not cluster-aware, not
+    # redistributed to val/test): 46 chains that model one sequence position twice, plus one
+    # fragmented CA trace cg2all could not reconstruct.
+    drop_ids_from_file: ${oc.env:DATA_PATH}/pdb_train/unusable_chains.txt

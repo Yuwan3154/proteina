@@ -322,6 +322,7 @@ class PDBDataSplitter:
         exclude_ids_from_file: str = None,
         exclude_ids_val_from_file: str = None,
         exclude_ids_test_from_file: str = None,
+        drop_ids_from_file: str = None,
         cat_aware_split: bool = False,
         chain_to_cat_path: Optional[str] = None,
     ) -> None:
@@ -352,6 +353,10 @@ class PDBDataSplitter:
                 exclude_ids_from_file is set, derived as {exclude_ids_from_file base}_val.txt.
             exclude_ids_test_from_file (str, optional): Path to txt file with IDs for test set. If None and
                 exclude_ids_from_file is set, derived as {exclude_ids_from_file base}_test.txt.
+            drop_ids_from_file (str, optional): Path to a txt file of chain IDs to remove from ALL
+                splits, one per line (``#`` comments allowed). Unlike exclude_ids_from_file this is
+                per-chain, not cluster-aware, and the IDs are not redistributed to val/test -- it is
+                for structures that are unusable rather than held out. Defaults to None.
         """
 
         self.df_data = df_data
@@ -364,6 +369,7 @@ class PDBDataSplitter:
         self.exclude_ids_from_file = exclude_ids_from_file
         self.exclude_ids_val_from_file = exclude_ids_val_from_file
         self.exclude_ids_test_from_file = exclude_ids_test_from_file
+        self.drop_ids_from_file = drop_ids_from_file
         self.splits = ["train", "val", "test"]
         self.dfs_splits = None
         self.clusterid_to_seqid_mappings = None
@@ -658,6 +664,32 @@ class PDBDataSplitter:
                 test_add = df_data_full[df_data_full["id"].isin(exclude_ids_test)]
                 self.dfs_splits["test"] = pd.concat([self.dfs_splits["test"], test_add], ignore_index=True)
                 rank_zero_info(f"Added {len(test_add)} excluded IDs to test set")
+
+        # Per-chain drop of unusable structures. Unlike exclude_ids_from_file this is NOT
+        # cluster-aware and does NOT redistribute to val/test: the listed chains are bad data,
+        # so they leave every split. Both dfs_splits and the cluster mappings must be filtered
+        # because the cluster samplers draw ids from the latter.
+        if self.drop_ids_from_file:
+            drop_ids = {
+                line.strip()
+                for line in open(self.drop_ids_from_file)
+                if line.strip() and not line.startswith("#")
+            }
+            rank_zero_info(f"Dropping {len(drop_ids)} unusable chains listed in {self.drop_ids_from_file}...")
+            n_before = sum(len(df) for df in self.dfs_splits.values())
+            self.dfs_splits = {
+                split: df.loc[~df.id.isin(drop_ids)] for split, df in self.dfs_splits.items()
+            }
+            for split, mapping in self.clusterid_to_seqid_mappings.items():
+                kept = {}
+                for clusterid, seqids in mapping.items():
+                    remaining = [s for s in seqids if s not in drop_ids]
+                    if remaining:
+                        kept[clusterid] = remaining
+                self.clusterid_to_seqid_mappings[split] = kept
+            n_after = sum(len(df) for df in self.dfs_splits.values())
+            rank_zero_info(f"Dropped {n_before - n_after} chains; {n_after} remain across all splits")
+
         return (
             self.dfs_splits,
             self.clusterid_to_seqid_mappings,
