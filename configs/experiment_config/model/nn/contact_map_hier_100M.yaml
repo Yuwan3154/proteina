@@ -30,10 +30,13 @@ multilabel_mode: "sample"
 # ── Hierarchy geometry ───────────────────────────────────────────────────────
 # Sequence length is zero-padded up to a multiple of block_size * super_factor
 # and cropped back after the output head.
-block_size: 12       # PROVISIONAL: set from the 8/12/16 runtime benchmark
+block_size: 12       # L40S benchmark: 12 and 16 tie at L=384, and 12 gives a 1.8x
+                     # finer global grid (1024 vs 576 block tokens) for the same
+                     # time and memory. Switch to 16 if training moves to L=512,
+                     # where it is 12% faster at the same max batch size.
 super_factor: 4      # super-block spans 4x4 blocks
-max_seq_len: 384     # training set is pdb_train_contact_S25_max384; sets the
-                     # relative-position clip radii so nothing in range is clipped
+max_seq_len: 512     # target training length; sets the relative-position clip radii
+                     # so nothing in range is clipped (dataset is currently max384)
 
 # ── Level 0: cells ───────────────────────────────────────────────────────────
 # Cell input is [contact_map_t, contact_map_sc, pair_rep] so every cell sees the

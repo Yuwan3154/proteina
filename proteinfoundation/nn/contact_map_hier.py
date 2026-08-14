@@ -424,8 +424,13 @@ class ContactMapHierSiT(nn.Module):
 
         # Relative position bias tables. The clip radius covers the full grid at
         # max_seq_len, so nothing inside the training length range is clipped.
-        max_off_super = max(1, math.ceil(self.max_seq_len / self.pad_period) - 1)
-        max_off_block = max(1, math.ceil(self.max_seq_len / self.block_size) - 1)
+        # Both radii come from the PADDED length: max_seq_len is rounded up to a
+        # multiple of pad_period, which can add one more block per side (e.g.
+        # max_seq_len=512, block_size=12, super_factor=4 pads to 528 -> 44 blocks,
+        # so offsets reach 43, not the 42 that ceil(512/12)-1 would allow for).
+        n_super_max = math.ceil(self.max_seq_len / self.pad_period)
+        max_off_super = max(1, n_super_max - 1)
+        max_off_block = max(1, n_super_max * self.super_factor - 1)
         self.rel_pos_super = RelPosBias2D(nheads_attn, max_off_super)
         self.rel_pos_block = RelPosBias2D(nheads_attn, max_off_block)
 
