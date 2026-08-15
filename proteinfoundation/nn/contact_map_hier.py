@@ -63,6 +63,7 @@ from proteinfoundation.nn.alphafold3_pytorch_utils.modules import (
     AdaptiveLayerNormOutputScale,
     Transition,
 )
+from proteinfoundation.datasets.sse_topology import PAD_TOKEN as TOPOLOGY_PAD_TOKEN
 from proteinfoundation.nn.feature_factory import FeatureFactory
 from proteinfoundation.nn.protein_transformer import (
     MultiheadAttnAndTransition,
@@ -213,7 +214,10 @@ class BiasedMHSA(nn.Module):
             neg = torch.finfo(q.dtype).min
             m = torch.where(mask[:, None, None, :], 0.0, neg).to(q.dtype)  # [B, 1, 1, N]
             m = m.masked_fill(query_invalid, 0.0)  # [B, 1, N, N]
-            attn_mask = m + bias[None].to(q.dtype)  # [B, nheads, N, N]
+            # Relative-position tables are shared across the batch ([nheads, N, N]); a bias
+            # derived from the pair representation is per-sample ([B, nheads, N, N]).
+            b = bias if bias.dim() == 4 else bias[None]
+            attn_mask = m + b.to(q.dtype)  # [B, nheads, N, N]
 
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         out = out.transpose(1, 2).reshape(B, N, -1)
@@ -260,6 +264,200 @@ class BiasedSiTBlock(nn.Module):
         x = x + self.scale_output(h, cond, mask)
         x = x + self.mlp(x, cond, mask)
         return x * mask[..., None]
+
+
+def rope_1d_from_positions(
+    pos: torch.Tensor, head_dim: int, base: float = 10000.0
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """RoPE cos/sin tables at arbitrary (possibly fractional) positions.
+
+    Positions are floats rather than indices because topology-element positions are rescaled onto
+    the query grid, which rarely lands on integers.
+    """
+    if head_dim % 2 != 0:
+        raise ValueError(f"head_dim must be even for RoPE, got {head_dim}")
+    half = head_dim // 2
+    inv_freq = base ** (-torch.arange(0, half, device=pos.device, dtype=torch.float32) / half)
+    ang = pos.float().unsqueeze(-1) * inv_freq  # [..., half]
+    # apply_rope pairs channels as (0,1), (2,3), ... so the angle table must be interleaved to
+    # match; a half-split layout would not be a rotation and would break relative-offset behaviour.
+    ang = ang.repeat_interleave(2, dim=-1)
+    return ang.cos(), ang.sin()
+
+
+class CrossAttention(nn.Module):
+    """Query tokens attend to a topology reference of unrelated length, with relative positions.
+
+    Query index and topology-element index are different coordinate systems, so a bare cross
+    attention would have no notion of "this element sits near this residue". Each element carries a
+    residue-space midpoint rescaled onto the query grid, and RoPE is applied to queries at their own
+    index and to keys at those rescaled positions -- the mixed-resolution RoPE alignment trick, which
+    makes the attention logit depend on the query-key offset in query-residue units.
+    """
+
+    def __init__(self, dim_q: int, dim_kv: int, nheads: int, use_rope: bool = True):
+        super().__init__()
+        if dim_q % nheads != 0:
+            raise ValueError(f"dim_q={dim_q} not divisible by nheads={nheads}")
+        self.nheads = nheads
+        self.head_dim = dim_q // nheads
+        self.use_rope = use_rope
+        self.norm_q = nn.LayerNorm(dim_q)
+        self.norm_kv = nn.LayerNorm(dim_kv)
+        self.to_q = nn.Linear(dim_q, dim_q, bias=False)
+        self.to_k = nn.Linear(dim_kv, dim_q, bias=False)
+        self.to_v = nn.Linear(dim_kv, dim_q, bias=False)
+        self.proj = nn.Linear(dim_q, dim_q, bias=False)
+        nn.init.zeros_(self.proj.weight)  # zero-init gate, matching the adaLN-Zero blocks
+
+    def forward(
+        self,
+        x: torch.Tensor,               # [B, N, dim_q]
+        kv: torch.Tensor,              # [B, T, dim_kv]
+        kv_mask: torch.Tensor,         # [B, T] bool
+        q_pos: Optional[torch.Tensor] = None,   # [N] query grid positions
+        kv_pos: Optional[torch.Tensor] = None,  # [B, T] key positions on the query grid
+    ) -> torch.Tensor:
+        B, N, _ = x.shape
+        q = self.to_q(self.norm_q(x))
+        h = self.norm_kv(kv)
+        k, v = self.to_k(h), self.to_v(h)
+        q = q.reshape(B, N, self.nheads, self.head_dim).transpose(1, 2)
+        k = k.reshape(B, -1, self.nheads, self.head_dim).transpose(1, 2)
+        v = v.reshape(B, -1, self.nheads, self.head_dim).transpose(1, 2)
+
+        if self.use_rope and q_pos is not None and kv_pos is not None:
+            cq, sq = rope_1d_from_positions(q_pos, self.head_dim)
+            q = apply_rope(q, cq[None, None].to(q.dtype), sq[None, None].to(q.dtype))
+            ck, sk = rope_1d_from_positions(kv_pos, self.head_dim)
+            k = apply_rope(k, ck[:, None].to(k.dtype), sk[:, None].to(k.dtype))
+
+        # A reference that is entirely padding (no template at all) would softmax to NaN, so
+        # such rows are allowed to attend freely and zeroed on the way out instead.
+        empty = ~kv_mask.any(dim=-1)  # [B]
+        attn_mask = kv_mask[:, None, None, :] | empty[:, None, None, None]
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        out = out.transpose(1, 2).reshape(B, N, -1)
+        return self.proj(out) * (~empty)[:, None, None].to(out.dtype)
+
+
+class TopologyPairReference(nn.Module):
+    """Embeds the T x T SSE-by-SSE contact reference into cross-attention keys/values.
+
+    Only helices and strands index this reference: loops are flexible linkers whose contacts carry
+    no topological constraint, and including them would square a four-times-longer axis.
+    """
+
+    def __init__(self, dim_token: int, dim_out: int):
+        super().__init__()
+        self.proj = nn.Linear(2 * dim_token + 1, dim_out)
+
+    def forward(self, tok_embed: torch.Tensor, contact: torch.Tensor) -> torch.Tensor:
+        """[B, T, d], [B, T, T] -> [B, T*T, dim_out]"""
+        B, T, _ = tok_embed.shape
+        a = tok_embed[:, :, None, :].expand(B, T, T, tok_embed.shape[-1])
+        b = tok_embed[:, None, :, :].expand(B, T, T, tok_embed.shape[-1])
+        feat = torch.cat([a, b, contact[..., None]], dim=-1)
+        return self.proj(feat).reshape(B, T * T, -1)
+
+
+class CrossAttention2D(nn.Module):
+    """2D grid queries attend to the flattened SSE-pair reference with a joint 2D relative bias.
+
+    A pair query at grid position (u, v) relates to reference pair (s, t) through the joint offset
+    (u - p_s, v - p_t), where p is the element position rescaled onto the query grid. That is the
+    same Swin-style joint 2D bias used by the pooled self-attention levels, just evaluated across
+    two different grids instead of one.
+    """
+
+    def __init__(self, dim_q: int, dim_kv: int, nheads: int, max_offset: int):
+        super().__init__()
+        if dim_q % nheads != 0:
+            raise ValueError(f"dim_q={dim_q} not divisible by nheads={nheads}")
+        self.nheads = nheads
+        self.head_dim = dim_q // nheads
+        self.max_offset = max_offset
+        self.span = 2 * max_offset + 1
+        self.norm_q = nn.LayerNorm(dim_q)
+        self.norm_kv = nn.LayerNorm(dim_kv)
+        self.to_q = nn.Linear(dim_q, dim_q, bias=False)
+        self.to_k = nn.Linear(dim_kv, dim_q, bias=False)
+        self.to_v = nn.Linear(dim_kv, dim_q, bias=False)
+        self.proj = nn.Linear(dim_q, dim_q, bias=False)
+        nn.init.zeros_(self.proj.weight)
+        self.bias_table = nn.Parameter(torch.zeros(self.span * self.span, nheads))
+        nn.init.trunc_normal_(self.bias_table, std=0.02)
+
+    def _bias(self, P: int, kv_pos: torch.Tensor) -> torch.Tensor:
+        """[B, T] element positions on the query grid -> [B, nheads, P*P, T*T]."""
+        B, T = kv_pos.shape
+        grid = torch.arange(P, device=kv_pos.device, dtype=torch.float32)
+        d = grid[:, None] - kv_pos[:, None, :]  # [B, P, T]
+        d = d.round().long().clamp(-self.max_offset, self.max_offset) + self.max_offset
+        # row offset varies with the query row and the reference's first element; column with the
+        # second -- the outer sum over the two axes is the joint 2D offset index.
+        idx = d[:, :, None, :, None] * self.span + d[:, None, :, None, :]  # [B, P, P, T, T]
+        idx = idx.reshape(B, P * P, T * T)
+        bias = self.bias_table[idx]  # [B, P*P, T*T, nheads]
+        return bias.permute(0, 3, 1, 2)
+
+    def forward(
+        self,
+        x: torch.Tensor,        # [B, P*P, dim_q]
+        kv: torch.Tensor,       # [B, T*T, dim_kv]
+        kv_mask: torch.Tensor,  # [B, T*T] bool
+        P: int,
+        kv_pos: torch.Tensor,   # [B, T] positions on the query grid
+    ) -> torch.Tensor:
+        B, N, _ = x.shape
+        q = self.to_q(self.norm_q(x))
+        h = self.norm_kv(kv)
+        k, v = self.to_k(h), self.to_v(h)
+        q = q.reshape(B, N, self.nheads, self.head_dim).transpose(1, 2)
+        k = k.reshape(B, -1, self.nheads, self.head_dim).transpose(1, 2)
+        v = v.reshape(B, -1, self.nheads, self.head_dim).transpose(1, 2)
+
+        empty = ~kv_mask.any(dim=-1)
+        neg = torch.finfo(q.dtype).min
+        m = torch.where(kv_mask, 0.0, neg).to(q.dtype)[:, None, None, :]
+        m = m.masked_fill(empty[:, None, None, None], 0.0)
+        attn_mask = m + self._bias(P, kv_pos).to(q.dtype)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        out = out.transpose(1, 2).reshape(B, N, -1)
+        return self.proj(out) * (~empty)[:, None, None].to(out.dtype)
+
+
+class OuterProductMean(nn.Module):
+    """AlphaFold-style single -> pair projection: outer product of two low-rank projections."""
+
+    def __init__(self, dim_single: int, dim_pair: int, dim_hidden: int = 16):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim_single)
+        self.to_a = nn.Linear(dim_single, dim_hidden, bias=False)
+        self.to_b = nn.Linear(dim_single, dim_hidden, bias=False)
+        self.proj = nn.Linear(dim_hidden * dim_hidden, dim_pair)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, s: torch.Tensor) -> torch.Tensor:
+        """[B, N, d_single] -> [B, N, N, dim_pair]"""
+        h = self.norm(s)
+        a, b = self.to_a(h), self.to_b(h)
+        outer = torch.einsum("bic,bjd->bijcd", a, b)
+        return self.proj(outer.flatten(start_dim=-2))
+
+
+class PairToBias(nn.Module):
+    """2D pair grid -> additive per-head attention bias for the 1D track at the same level."""
+
+    def __init__(self, dim_pair: int, nheads: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim_pair)
+        self.proj = nn.Linear(dim_pair, nheads, bias=False)
+
+    def forward(self, pair_grid: torch.Tensor) -> torch.Tensor:
+        """[B, N, N, dim_pair] -> [B, nheads, N, N]"""
+        return self.proj(self.norm(pair_grid)).permute(0, 3, 1, 2)
 
 
 class ContactMapHierSiT(nn.Module):
@@ -317,6 +515,32 @@ class ContactMapHierSiT(nn.Module):
         self.n_block_layers = int(kwargs["n_block_layers"])
         self.d_cond_dit = int(kwargs.get("d_cond_dit", self.dim_cond))
         mlp_ratio = float(kwargs.get("mlp_ratio", 4.0))
+
+        # Optional 1D single track cross-attending to a reference topology. Absent from a
+        # config -> False -> the model behaves exactly as the 2D-only architecture.
+        self.topology_cond = bool(kwargs.get("topology_cond", False))
+        self.topology_vocab_size = int(kwargs.get("topology_vocab_size", 0))
+        self.max_topology_len = int(kwargs.get("max_topology_len", 0))
+        self.d_topo = int(kwargs.get("d_topo", 0))
+        self.d_single = int(kwargs.get("d_single", 0))
+        self.n_topo_layers = int(kwargs.get("n_topo_layers", 0))
+        nheads_topo = int(kwargs.get("nheads_topo", 0))
+        self.topology_reinject = bool(kwargs.get("topology_reinject", True))
+        if self.topology_cond:
+            missing = [
+                k
+                for k, v in (
+                    ("topology_vocab_size", self.topology_vocab_size),
+                    ("max_topology_len", self.max_topology_len),
+                    ("d_topo", self.d_topo),
+                    ("d_single", self.d_single),
+                    ("n_topo_layers", self.n_topo_layers),
+                    ("nheads_topo", nheads_topo),
+                )
+                if v <= 0
+            ]
+            if missing:
+                raise ValueError(f"topology_cond=True requires {missing} to be set > 0")
 
         # Attributes read by Proteina
         self.contact_map_mode = True
@@ -454,6 +678,82 @@ class ContactMapHierSiT(nn.Module):
         self.output_norm = nn.LayerNorm(2 * self.d_local + self.pair_repr_dim)
         self.output_head = nn.Linear(2 * self.d_local + self.pair_repr_dim, 1, bias=True)
 
+        # ── Optional 1D single track conditioned on a reference topology ──────
+        # Absent -> the model is exactly the 2D-only architecture above.
+        if self.topology_cond:
+            self.topology_embed = nn.Embedding(
+                self.topology_vocab_size, self.d_topo, padding_idx=TOPOLOGY_PAD_TOKEN
+            )
+            self.topology_pos = nn.Embedding(self.max_topology_len, self.d_topo)
+            self.single_in = nn.Linear(self.token_dim, self.d_single)
+            self.single_self_blocks = nn.ModuleList(
+                [
+                    BiasedSiTBlock(self.d_single, nheads_topo, self.d_cond_dit, mlp_ratio)
+                    for _ in range(self.n_topo_layers)
+                ]
+            )
+            self.single_cross_blocks = nn.ModuleList(
+                [
+                    CrossAttention(self.d_single, self.d_topo, nheads_topo)
+                    for _ in range(self.n_topo_layers)
+                ]
+            )
+            # 1D mirrors the 2D pooling exactly: flatten `factor` consecutive positions and
+            # project, so the single track has the same token count as the pair grid side
+            # length at every level.
+            self.pool_single_to_block = nn.Linear(self.block_size * self.d_single, self.d_block)
+            self.pool_single_to_super = nn.Linear(self.super_factor * self.d_block, self.d_super)
+            self.unpool_single_super_to_block = nn.Linear(
+                self.d_super, self.super_factor * self.d_block
+            )
+            self.merge_single_block_skip = nn.Linear(2 * self.d_block, self.d_block)
+            self.unpool_single_block_to_cell = nn.Linear(
+                self.d_block, self.block_size * self.d_single
+            )
+            self.merge_single_cell_skip = nn.Linear(2 * self.d_single, self.d_single)
+
+            # Per-level AF3-style coupling, one set per 2D layer at that level.
+            self.single_super_blocks = nn.ModuleList(
+                [
+                    BiasedSiTBlock(self.d_super, nheads_attn, self.d_cond_dit, mlp_ratio)
+                    for _ in range(self.n_global_layers)
+                ]
+            )
+            self.opm_super = nn.ModuleList(
+                [OuterProductMean(self.d_super, self.d_super) for _ in range(self.n_global_layers)]
+            )
+            self.pair_to_bias_super = nn.ModuleList(
+                [PairToBias(self.d_super, nheads_attn) for _ in range(self.n_global_layers)]
+            )
+            self.single_block_blocks = nn.ModuleList(
+                [
+                    BiasedSiTBlock(self.d_block, nheads_attn, self.d_cond_dit, mlp_ratio)
+                    for _ in range(self.n_block_layers)
+                ]
+            )
+            self.opm_block = nn.ModuleList(
+                [OuterProductMean(self.d_block, self.d_block) for _ in range(self.n_block_layers)]
+            )
+            self.pair_to_bias_block = nn.ModuleList(
+                [PairToBias(self.d_block, nheads_attn) for _ in range(self.n_block_layers)]
+            )
+            # 2D SSE-by-SSE contact reference, cross-attended by the pair track at both pooled
+            # levels. Offsets are clipped at the padded block-grid width, which is the widest
+            # query grid that ever attends to it.
+            self.topology_pair_ref = TopologyPairReference(self.d_topo, self.d_topo)
+            self.cross2d_super = CrossAttention2D(
+                self.d_super, self.d_topo, nheads_attn, max_off_super
+            )
+            self.cross2d_block = CrossAttention2D(
+                self.d_block, self.d_topo, nheads_attn, max_off_block
+            )
+            if self.topology_reinject:
+                self.reinject_super = CrossAttention(self.d_super, self.d_topo, nheads_attn)
+                self.reinject_block = CrossAttention(self.d_block, self.d_topo, nheads_attn)
+            # The single track reaches the output head alongside the 2D cell features, so a
+            # residue-level signal can influence its own row/column of the map.
+            self.single_to_cell = nn.Linear(self.d_single, self.d_local, bias=False)
+
     # ── Grid helpers ──────────────────────────────────────────────────────────
 
     @staticmethod
@@ -520,6 +820,7 @@ class ContactMapHierSiT(nn.Module):
         # ── Padding to a multiple of block_size * super_factor ────────────────
         pad_L = (self.pad_period - L % self.pad_period) % self.pad_period
         L_pad = L + pad_L
+        mask_pad = F.pad(mask, (0, pad_L)) if pad_L > 0 else mask  # [B, L_pad]
         if pad_L > 0:
             contact_map_t = F.pad(contact_map_t, (0, pad_L, 0, pad_L))
             contact_map_sc = F.pad(contact_map_sc, (0, pad_L, 0, pad_L))
@@ -529,6 +830,44 @@ class ContactMapHierSiT(nn.Module):
         P1 = L_pad // self.block_size
         P2 = P1 // self.super_factor
         cell_mask_f = pair_mask.to(dtype)
+
+        # ── Optional 1D single track, conditioned on a reference topology ─────
+        single = topo = topo_mask = ref_kv = ref_mask = None
+        topo_pos = he_pos_block = he_pos_super = None
+        if self.topology_cond:
+            tokens = batch["topology_tokens"]  # [B, T] padded with TOPOLOGY_PAD_TOKEN
+            topo_mask = tokens != TOPOLOGY_PAD_TOKEN
+            T = tokens.shape[1]
+            pos_idx = torch.arange(T, device=device).clamp(max=self.max_topology_len - 1)
+            topo = self.topology_embed(tokens) + self.topology_pos(pos_idx)[None]
+            topo = topo * topo_mask[..., None].to(dtype)
+            # Element positions arrive already rescaled onto the query residue grid, so a query
+            # residue and a topology element can be compared directly.
+            topo_pos = batch["topology_pos"].to(torch.float32)  # [B, T]
+
+            single = self.single_in(seq)
+            for self_blk, cross_blk in zip(self.single_self_blocks, self.single_cross_blocks):
+                single = self_blk(single, cond, mask, bias=None)
+                single = single + cross_blk(
+                    single,
+                    topo,
+                    topo_mask,
+                    q_pos=torch.arange(L, device=device, dtype=torch.float32),
+                    kv_pos=topo_pos,
+                )
+            single = single * mask[..., None].to(dtype)
+            if pad_L > 0:
+                single = F.pad(single, (0, 0, 0, pad_L))
+
+            he_tokens = batch["topology_he_tokens"]  # [B, T_he]
+            he_valid = he_tokens != TOPOLOGY_PAD_TOKEN
+            he_embed = self.topology_embed(he_tokens) * he_valid[..., None].to(dtype)
+            ref_kv = self.topology_pair_ref(he_embed, batch["topology_he_contact"].to(dtype))
+            ref_mask = (he_valid[:, :, None] & he_valid[:, None, :]).reshape(B, -1)
+            # The same element positions expressed on each pooled grid.
+            he_pos = batch["topology_he_pos"].to(torch.float32)  # [B, T_he], residue units
+            he_pos_block = he_pos / self.block_size
+            he_pos_super = he_pos / self.pad_period
 
         # ── Level 0: cell features ────────────────────────────────────────────
         cell_in = torch.cat(
@@ -579,10 +918,47 @@ class ContactMapHierSiT(nn.Module):
         )
         super_tok = super_tok * super_mask[..., None]
 
+        # ── Pool the single track alongside, level by level ───────────────────
+        if self.topology_cond:
+            single_block = self.pool_single_to_block(
+                single.reshape(B, P1, self.block_size * self.d_single)
+            )
+            single_mask_block = mask_pad.reshape(B, P1, self.block_size).any(dim=-1)
+            single_block = single_block * single_mask_block[..., None]
+            single_super = self.pool_single_to_super(
+                single_block.reshape(B, P2, self.super_factor * self.d_block)
+            )
+            single_mask_super = single_mask_block.reshape(B, P2, self.super_factor).any(dim=-1)
+            single_super = single_super * single_mask_super[..., None]
+
         # ── Global all-by-all attention over super-block tokens ───────────────
         bias_super = self.rel_pos_super(P2)
-        for blk in self.global_blocks:
-            super_tok = blk(super_tok, cond, super_mask, bias=bias_super)
+        if not self.topology_cond:
+            for blk in self.global_blocks:
+                super_tok = blk(super_tok, cond, super_mask, bias=bias_super)
+        else:
+            super_grid = super_tok.reshape(B, P2, P2, self.d_super)
+            if self.topology_reinject:
+                single_super = single_super + self.reinject_super(
+                    single_super, topo, topo_mask,
+                    q_pos=torch.arange(P2, device=device, dtype=torch.float32),
+                    kv_pos=topo_pos / self.pad_period,
+                )
+            for i, blk in enumerate(self.global_blocks):
+                # AF3-style coupling: pair biases the single attention, then the single feeds
+                # back into the pair through an outer product mean.
+                single_super = self.single_super_blocks[i](
+                    single_super, cond, single_mask_super,
+                    bias=self.pair_to_bias_super[i](super_grid),
+                )
+                super_grid = super_grid + self.opm_super[i](single_super)
+                super_tok = super_grid.reshape(B, P2 * P2, self.d_super)
+                super_tok = super_tok + self.cross2d_super(
+                    super_tok, ref_kv, ref_mask, P2, he_pos_super
+                )
+                super_tok = blk(super_tok, cond, super_mask, bias=bias_super)
+                super_grid = super_tok.reshape(B, P2, P2, self.d_super)
+            super_tok = super_grid.reshape(B, P2 * P2, self.d_super)
 
         # ── Decoder: super -> blocks, with skip ───────────────────────────────
         up = self._tokens_to_grid(
@@ -591,13 +967,52 @@ class ContactMapHierSiT(nn.Module):
         block_tok = self.merge_block_skip(torch.cat([up, block_tok], dim=-1)) * block_mask[..., None]
 
         bias_block = self.rel_pos_block(P1)
-        for blk in self.block_blocks:
-            block_tok = blk(block_tok, cond, block_mask, bias=bias_block)
+        if not self.topology_cond:
+            for blk in self.block_blocks:
+                block_tok = blk(block_tok, cond, block_mask, bias=bias_block)
+        else:
+            # The single track unpools and merges its own skip, mirroring the pair track exactly.
+            single_up = self.unpool_single_super_to_block(single_super).reshape(B, P1, self.d_block)
+            single_block = self.merge_single_block_skip(
+                torch.cat([single_up, single_block], dim=-1)
+            ) * single_mask_block[..., None]
+            if self.topology_reinject:
+                single_block = single_block + self.reinject_block(
+                    single_block, topo, topo_mask,
+                    q_pos=torch.arange(P1, device=device, dtype=torch.float32),
+                    kv_pos=topo_pos / self.block_size,
+                )
+            block_grid = block_tok.reshape(B, P1, P1, self.d_block)
+            for i, blk in enumerate(self.block_blocks):
+                single_block = self.single_block_blocks[i](
+                    single_block, cond, single_mask_block,
+                    bias=self.pair_to_bias_block[i](block_grid),
+                )
+                block_grid = block_grid + self.opm_block[i](single_block)
+                block_tok = block_grid.reshape(B, P1 * P1, self.d_block)
+                block_tok = block_tok + self.cross2d_block(
+                    block_tok, ref_kv, ref_mask, P1, he_pos_block
+                )
+                block_tok = blk(block_tok, cond, block_mask, bias=bias_block)
+                block_grid = block_tok.reshape(B, P1, P1, self.d_block)
+            block_tok = block_grid.reshape(B, P1 * P1, self.d_block)
 
         # ── Decoder: blocks -> cells, with skip ───────────────────────────────
         cell_up = self._tokens_to_grid(
             self.unpool_block_to_cell(block_tok), P1, self.block_size, self.d_local
         )  # [B, L_pad, L_pad, d_local]
+
+        if self.topology_cond:
+            # Unpool the single track back to residue resolution with its own skip, then let it
+            # reach the map as an outer sum over rows and columns -- residue i's state informs its
+            # entire row and column, which is where a 1D track can help a 2D output.
+            single_cell = self.unpool_single_block_to_cell(block_tok.reshape(B, P1, P1, self.d_block).mean(dim=2))
+            single_cell = single_cell.reshape(B, L_pad, self.d_single)
+            single_cell = self.merge_single_cell_skip(
+                torch.cat([single_cell, single], dim=-1)
+            ) * mask_pad[..., None].to(dtype)
+            s_cell = self.single_to_cell(single_cell)  # [B, L_pad, d_local]
+            cell_up = cell_up + s_cell[:, :, None, :] + s_cell[:, None, :, :]
 
         out = torch.cat([cell_up, cells, pair_rep], dim=-1)
         logits = self.output_head(self.output_norm(out)).squeeze(-1)  # [B, L_pad, L_pad]

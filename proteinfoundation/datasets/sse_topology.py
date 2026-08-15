@@ -171,6 +171,61 @@ def encode_topology(
     return torch.tensor(alphabet.runs_to_tokens(runs), dtype=torch.long)
 
 
+def runs_to_spans(runs: Sequence[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    """Residue interval [start, end) covered by each run, in the source chain's own coordinates."""
+    spans = []
+    pos = 0
+    for _, n in runs:
+        spans.append((pos, pos + n))
+        pos += n
+    return spans
+
+
+def element_positions(
+    runs: Sequence[Tuple[int, int]], target_len: Optional[int] = None
+) -> torch.Tensor:
+    """Residue-space midpoint of each element, optionally rescaled onto another chain's length.
+
+    Query residue index and topology element index are different coordinate systems, so a relative
+    position between them is only meaningful once both are expressed on the same grid. Rescaling by
+    ``target_len / template_len`` is the mixed-resolution RoPE trick: equal physical distances along
+    the two chains then produce equal positional offsets.
+    """
+    spans = runs_to_spans(runs)
+    if not spans:
+        return torch.zeros(0, dtype=torch.float32)
+    mids = torch.tensor([(a + b) / 2.0 for a, b in spans], dtype=torch.float32)
+    template_len = spans[-1][1]
+    if target_len is not None and template_len > 0:
+        mids = mids * (float(target_len) / float(template_len))
+    return mids
+
+
+def sse_contact_reference(
+    contact_map: torch.Tensor,
+    runs: Sequence[Tuple[int, int]],
+    keep_types: Sequence[int] = (DSSP_HELIX, DSSP_STRAND),
+) -> Tuple[torch.Tensor, List[int]]:
+    """Coarse-grain a residue-level contact map onto an element-by-element one.
+
+    Returns the [T, T] element contact map and the indices (into ``runs``) of the kept elements.
+    Max-pooling over each element pair matches the paper's notion of an SSE contact: two elements
+    are in contact if ANY of their residues are, rather than on average.
+    """
+    spans = runs_to_spans(runs)
+    keep = [i for i, (t, _) in enumerate(runs) if t in keep_types]
+    T = len(keep)
+    out = contact_map.new_zeros((T, T))
+    for a, ia in enumerate(keep):
+        s0, e0 = spans[ia]
+        for b, ib in enumerate(keep):
+            s1, e1 = spans[ib]
+            block = contact_map[s0:e0, s1:e1]
+            if block.numel():
+                out[a, b] = block.max()
+    return out, keep
+
+
 def alphabet_summary(alphabet: SSEAlphabet) -> Dict[str, object]:
     names = {DSSP_LOOP: "loop", DSSP_HELIX: "helix", DSSP_STRAND: "strand"}
     return {
