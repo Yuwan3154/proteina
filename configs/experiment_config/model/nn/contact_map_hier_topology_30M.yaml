@@ -1,54 +1,78 @@
-# Small topology-conditioned contact-map backbone (~29.7M params) for template generation /
-# topology sampling. Widths were chosen by measuring parameter counts across a sweep, not
-# estimated: the 8 global + 4 block layer split and the local_attn featurizer are kept from the
-# 100M config, and the remaining budget went to d_local (48) rather than encoder depth, since
-# d_local feeds the output head directly. Measured split: 16.49M 2D backbone + 13.23M topology.
-nn_class: ContactMapHierSiT
+name: contact_map_hier_topology_30M
+nn_class: ContactMapHierSiT   # dispatches Proteina's NN_REGISTRY; absent -> ProteinTransformerAF3
 
-# Hierarchy geometry (unchanged from the 100M config; block_size 12 was chosen from the
-# runtime benchmark, and max_seq_len 512 sets the relative-position clip radius)
-block_size: 12
-super_factor: 4
-max_seq_len: 512
-block_featurizer: local_attn
+# ── Phase 1: Protein Encoder ─────────────────────────────────────────────────
+# Identical to contact_map_dit_100M: sequence + pair representations, pair-biased
+# MHSA interleaved with PairReprUpdate, no triangle multiplication.
 
-# Phase 1 encoder
 token_dim: 128
 pair_repr_dim: 64
 dim_cond: 128
-n_enc_layers: 2
+n_enc_layers: 4
 enc_pair_update_every_n: 1
 nheads_enc: 8
 use_qkln: True
+strict_feats: False
 
-# Level 0 (cells)
-d_local: 48
+feats_init_seq: ["res_seq_pdb_idx", "chain_break_per_res"]
+feats_cond_seq: ["time_emb", "fold_emb"]
+feats_pair_repr: ["rel_seq_sep", "contact_map_sc"]
+feats_pair_cond: ["time_emb"]
+
+t_emb_dim: 128
+idx_emb_dim: 64
+fold_emb_dim: 128
+seq_sep_dim: 63   # AF2-style relpos at cell level: uniform bins of i-j clipped at +/-31
+contact_map_sc_embed_dim: 64
+cath_code_dir: ${oc.env:DATA_PATH}/pdb_raw/
+multilabel_mode: "sample"
+
+# ── Hierarchy geometry ───────────────────────────────────────────────────────
+# Sequence length is zero-padded up to a multiple of block_size * super_factor
+# and cropped back after the output head.
+block_size: 12       # L40S benchmark: 12 and 16 tie at L=384, and 12 gives a 1.8x
+                     # finer global grid (1024 vs 576 block tokens) for the same
+                     # time and memory. Switch to 16 if training moves to L=512,
+                     # where it is 12% faster at the same max batch size.
+super_factor: 4      # super-block spans 4x4 blocks
+max_seq_len: 512     # target training length; sets the relative-position clip radii
+                     # so nothing in range is clipped
+
+# ── Level 0: cells ───────────────────────────────────────────────────────────
+# Cell input is [contact_map_t, contact_map_sc, pair_rep] so every cell sees the
+# encoder's full-resolution output directly.
+block_featurizer: local_attn   # local_attn | conv; conv = no within-block attention,
+                               # leaving the level-1 pooling as a strided conv (v1 patchify)
+d_local: 64
 n_local_layers: 2
-nheads_local: 8
+nheads_local: 8      # mirrors nheads_dit; head_dim = d_local / nheads_local = 8
 
-# Levels 1/2
+# ── Levels 1/2 and attention stacks ──────────────────────────────────────────
 d_block: 192
 d_super: 192
 nheads_dit: 8
-n_global_layers: 8
-n_block_layers: 4
+d_cond_dit: 128
 mlp_ratio: 4.0
+n_global_layers: 8   # all-by-all over super-block tokens
+n_block_layers: 4    # all-by-all over block tokens, after the skip concat
 
-# Sequence conditioning (as in the 100M config)
-residue_type_emb_init_seq: True
-residue_type_emb_cond_seq: True
-residue_type_emb_init_pair: True
-residue_type_emb_cond_pair: True
-seq_emb_dim: 4
-
-# ── Topology conditioning ────────────────────────────────────────────────────────────
-# topology_vocab_size = 2 special + 3 types x 21 slots, matching SSEAlphabet(exact_max=10,
-# bin_step=2, catch_all_above=30, min_len=1). Changing the alphabet requires changing this.
+# ── Topology conditioning ────────────────────────────────────────────────────
+# 1D single track cross-attending to a retrieved template's compressed SSE topology, plus a
+# 2D SSE-by-SSE contact reference cross-attended by the pair track at both pooled levels.
+# Absent -> the model is exactly the 2D-only architecture.
 topology_cond: True
-topology_vocab_size: 65
-max_topology_len: 128
+topology_vocab_size: 65   # 2 special + 3 types x 21 slots; must match SSEAlphabet(exact_max=10,
+                          # bin_step=2, catch_all_above=30, min_len=1)
+max_topology_len: 128     # element axis; covers 99.935% of chains (p99.9=125, max=145)
 d_topo: 64
-d_single: 64
-n_topo_layers: 4
+d_single: 96
+n_topo_layers: 4          # self-attention + cross-attention to the topology, before the hierarchy
 nheads_topo: 8
-topology_reinject: True
+topology_reinject: True   # also cross-attend at the pooled levels, so the topology does not have
+                          # to survive pooling to influence the output
+
+# ── Contact map diffusion settings ───────────────────────────────────────────
+contact_map_mode: True
+contact_map_input_dim: 1
+non_contact_value: 0
+predict_coords: False
