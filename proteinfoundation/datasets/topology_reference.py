@@ -1,0 +1,188 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+
+"""Attaches a retrieved, augmented topology reference to each training example.
+
+The reference is another chain's fold description, not the query's own: a chain is drawn from the
+query's 25%-identity cluster, excluding mates that share its sequence, so the model learns to
+realise a topology it is given rather than to copy itself. Chains with no different-sequence mate
+(6.66% of the training split, measured) fall back to their own topology.
+
+Everything the transform needs comes from a precomputed flat index, so no second .pt is read per
+sample. Element positions are rescaled from the template's length onto the query's, which is what
+lets cross-attention relate a topology element to a query residue at all.
+"""
+
+from typing import Optional
+
+import torch
+import torch_geometric.transforms as T
+from torch_geometric.data import Data
+
+from proteinfoundation.datasets.sse_topology import (
+    DSSP_HELIX,
+    DSSP_STRAND,
+    MASK_TOKEN,
+    PAD_TOKEN,
+    SSEAlphabet,
+    element_positions,
+    perturb_runs,
+)
+
+
+class TopologyReferenceTransform(T.BaseTransform):
+    """Adds topology_tokens / topology_pos / topology_he_* to a graph.
+
+    Args:
+        index_path: file written by precompute_topology_index.py.
+        max_topology_len: element axis is truncated to this; sequences longer than it lose their
+            tail rather than silently reshaping the batch.
+        max_topology_he_len: same, for the helix/strand axis of the 2D reference.
+        sigma_frac: augmentation sigma as a fraction of each element's own length.
+        mutate_prob: per-element probability of being perturbed.
+        drop_prob: probability of replacing the whole reference with MASK, so the model can also
+            run unconditioned (needed for classifier-free guidance at sampling time).
+        self_fallback: use the query's own topology when no valid template exists.
+    """
+
+    def __init__(
+        self,
+        index_path: str,
+        max_topology_len: int = 128,
+        max_topology_he_len: int = 64,
+        sigma_frac: float = 0.15,
+        mutate_prob: float = 0.3,
+        drop_prob: float = 0.0,
+        self_fallback: bool = True,
+        exact_max: int = 10,
+        bin_step: int = 2,
+        catch_all_above: int = 30,
+        min_len: int = 1,
+        seed: int = 0,
+    ):
+        self.index_path = index_path
+        self.max_topology_len = max_topology_len
+        self.max_topology_he_len = max_topology_he_len
+        self.sigma_frac = sigma_frac
+        self.mutate_prob = mutate_prob
+        self.drop_prob = drop_prob
+        self.self_fallback = self_fallback
+        self.alphabet = SSEAlphabet(
+            exact_max=exact_max, bin_step=bin_step, catch_all_above=catch_all_above, min_len=min_len
+        )
+        self.seed = seed
+        self._index = None
+        self._id_to_row = None
+        self._generator = None
+
+    # The index is loaded lazily so it is materialised once per process and inherited by forked
+    # dataloader workers rather than being deserialised in each of them.
+    def _ensure_loaded(self) -> None:
+        if self._index is not None:
+            return
+        self._index = torch.load(self.index_path, map_location="cpu", weights_only=False)
+        self._id_to_row = {s: i for i, s in enumerate(self._index["ids"])}
+        self._generator = torch.Generator().manual_seed(self.seed)
+
+    def _runs_for(self, row: int):
+        idx = self._index
+        a, b = int(idx["runs_offset"][row]), int(idx["runs_offset"][row + 1])
+        if b <= a:
+            return []
+        return [(int(t), int(n)) for t, n in idx["runs_flat"][a:b].tolist()]
+
+    def _he_contact_for(self, row: int) -> torch.Tensor:
+        idx = self._index
+        a, b = int(idx["he_offset"][row]), int(idx["he_offset"][row + 1])
+        size = int(idx["he_size"][row])
+        if size <= 0 or b <= a:
+            return torch.zeros(0, 0)
+        return idx["he_flat"][a:b].reshape(size, size).float()
+
+    def _pick_template(self, row: int) -> int:
+        """A same-cluster chain with a different sequence, or the query itself as fallback."""
+        idx = self._index
+        cl = int(idx["cluster_of"][row])
+        lo, hi = int(idx["members_offset"][cl]), int(idx["members_offset"][cl + 1])
+        members = idx["members_flat"][lo:hi]
+        if members.numel() <= 1:
+            return row
+        own = idx["seq_hash"][row]
+        cand = members[idx["seq_hash"][members.long()] != own]
+        if cand.numel() == 0:
+            return row
+        j = int(torch.randint(cand.numel(), (1,), generator=self._generator))
+        return int(cand[j])
+
+    def forward(self, graph: Data) -> Data:
+        self._ensure_loaded()
+        L = int(graph.coords.shape[0])
+        stem = str(getattr(graph, "protein_id", getattr(graph, "id", "")))
+        row = self._id_to_row.get(stem)
+
+        drop = float(torch.rand(1, generator=self._generator)) < self.drop_prob
+        if row is None or drop:
+            graph.topology_tokens = torch.full((1,), MASK_TOKEN, dtype=torch.long)
+            graph.topology_pos = torch.zeros(1, dtype=torch.float32)
+            graph.topology_he_tokens = torch.full((1,), MASK_TOKEN, dtype=torch.long)
+            graph.topology_he_pos = torch.zeros(1, dtype=torch.float32)
+            graph.topology_he_contact = torch.zeros(1, 1)
+            return graph
+
+        t_row = self._pick_template(row)  # returns `row` itself when no valid template exists
+        if t_row == row and not self.self_fallback:
+            graph.topology_tokens = torch.full((1,), MASK_TOKEN, dtype=torch.long)
+            graph.topology_pos = torch.zeros(1, dtype=torch.float32)
+            graph.topology_he_tokens = torch.full((1,), MASK_TOKEN, dtype=torch.long)
+            graph.topology_he_pos = torch.zeros(1, dtype=torch.float32)
+            graph.topology_he_contact = torch.zeros(1, 1)
+            return graph
+        runs = self._runs_for(t_row)
+        if not runs:
+            t_row = row
+            runs = self._runs_for(row)
+
+        he_contact = self._he_contact_for(t_row)
+        keep = [i for i, (t, _) in enumerate(runs) if t in (DSSP_HELIX, DSSP_STRAND)]
+        # The stored map was built from the unperturbed runs, so its axis must stay aligned with
+        # them even if augmentation changes element lengths (which never changes their count).
+        if he_contact.shape[0] != len(keep):
+            he_contact = torch.zeros(len(keep), len(keep))
+
+        if self.mutate_prob > 0.0 and self.sigma_frac > 0.0:
+            runs = perturb_runs(
+                runs,
+                self.sigma_frac,
+                self.mutate_prob,
+                self._generator,
+                min_len=self.alphabet.min_len,
+            )
+
+        tokens = torch.tensor(self.alphabet.runs_to_tokens(runs), dtype=torch.long)
+        pos = element_positions(runs, target_len=L)
+        he_tokens = torch.tensor(
+            [self.alphabet.token(*runs[i]) for i in keep], dtype=torch.long
+        )
+        he_pos = pos[keep] if len(keep) else torch.zeros(0, dtype=torch.float32)
+
+        tokens = tokens[: self.max_topology_len]
+        pos = pos[: self.max_topology_len]
+        k = min(len(keep), self.max_topology_he_len)
+        he_tokens, he_pos = he_tokens[:k], he_pos[:k]
+        he_contact = he_contact[:k, :k]
+
+        graph.topology_tokens = tokens if tokens.numel() else torch.full((1,), MASK_TOKEN, dtype=torch.long)
+        graph.topology_pos = pos if pos.numel() else torch.zeros(1, dtype=torch.float32)
+        graph.topology_he_tokens = (
+            he_tokens if he_tokens.numel() else torch.full((1,), MASK_TOKEN, dtype=torch.long)
+        )
+        graph.topology_he_pos = he_pos if he_pos.numel() else torch.zeros(1, dtype=torch.float32)
+        graph.topology_he_contact = he_contact if he_contact.numel() else torch.zeros(1, 1)
+        return graph
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}(max_topology_len={self.max_topology_len}, "
+            f"sigma_frac={self.sigma_frac}, mutate_prob={self.mutate_prob}, "
+            f"drop_prob={self.drop_prob})"
+        )

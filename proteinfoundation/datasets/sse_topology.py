@@ -215,14 +215,24 @@ def sse_contact_reference(
     spans = runs_to_spans(runs)
     keep = [i for i, (t, _) in enumerate(runs) if t in keep_types]
     T = len(keep)
-    out = contact_map.new_zeros((T, T))
+    if T == 0:
+        return contact_map.new_zeros((0, 0)), keep
+
+    # Two scatter-reduce passes (rows, then columns) instead of a T^2 Python loop over slices:
+    # the loop version costs ~20ms per chain, which is hours across the full training set.
+    L = contact_map.shape[0]
+    elem = torch.full((L,), -1, dtype=torch.long, device=contact_map.device)
     for a, ia in enumerate(keep):
-        s0, e0 = spans[ia]
-        for b, ib in enumerate(keep):
-            s1, e1 = spans[ib]
-            block = contact_map[s0:e0, s1:e1]
-            if block.numel():
-                out[a, b] = block.max()
+        s, e = spans[ia]
+        elem[s:e] = a
+    valid = elem >= 0
+    sub = contact_map[valid][:, valid]
+    row = elem[valid]
+
+    rows = contact_map.new_zeros((T, sub.shape[1]))
+    rows.scatter_reduce_(0, row[:, None].expand(-1, sub.shape[1]), sub, reduce="amax")
+    out = contact_map.new_zeros((T, T))
+    out.scatter_reduce_(1, row[None, :].expand(T, -1), rows, reduce="amax")
     return out, keep
 
 

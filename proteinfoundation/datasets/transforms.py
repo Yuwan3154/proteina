@@ -176,15 +176,19 @@ class PaddingTransform(T.BaseTransform):
     with a fill value up to max_size along the first dimension.
     """
 
-    def __init__(self, max_size=256, fill_value=0):
+    def __init__(self, max_size=256, fill_value=0, topology_max_size=None):
         """Initializes the transform.
 
         Args:
             max_size: Target size for padding
             fill_value: Value to use for padding
+            topology_max_size: Separate target for ``topology_*`` tensors. The topology reference
+                is ~an order of magnitude shorter than the residue axis, so padding it to max_size
+                would inflate every cross-attention key set for nothing. None -> use max_size.
         """
         self.max_size = max_size
         self.fill_value = fill_value
+        self.topology_max_size = topology_max_size
 
     def forward(self, graph: Data) -> Data:
         """Applies padding to all applicable tensors in graph.
@@ -204,12 +208,22 @@ class PaddingTransform(T.BaseTransform):
                         fill_value = -1  # ignore_index for CE loss
                     elif key == "ext_lig":
                         fill_value = 2  # unknown class for padded residues
-                    if "contact_map" in key and value.dim() == 2:
-                        # Pad dimension 0 first, then dimension 1
-                        value = self.pad_tensor(value, self.max_size, dim=0, fill_value=fill_value)
-                        value = self.pad_tensor(value, self.max_size, dim=1, fill_value=fill_value)
+                    is_topology = key.startswith("topology_")
+                    if is_topology:
+                        # Topology tensors live on the element axis, not the residue axis, and
+                        # their padding must read as absent rather than as a real element: token
+                        # tensors pad with TOPOLOGY_PAD_TOKEN (0) and float ones with 0.0, never
+                        # with FLOAT_PADDING_VALUE.
+                        size = self.topology_max_size or self.max_size
+                        fill_value = 0
                     else:
-                        value = self.pad_tensor(value, self.max_size, dim=0, fill_value=fill_value)
+                        size = self.max_size
+                    if (("contact_map" in key or is_topology) and value.dim() == 2):
+                        # Pad dimension 0 first, then dimension 1
+                        value = self.pad_tensor(value, size, dim=0, fill_value=fill_value)
+                        value = self.pad_tensor(value, size, dim=1, fill_value=fill_value)
+                    else:
+                        value = self.pad_tensor(value, size, dim=0, fill_value=fill_value)
                     graph[key] = value
         return graph
 

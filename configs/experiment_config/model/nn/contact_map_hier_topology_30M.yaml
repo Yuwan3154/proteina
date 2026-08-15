@@ -1,0 +1,54 @@
+# Small topology-conditioned contact-map backbone (~29.7M params) for template generation /
+# topology sampling. Widths were chosen by measuring parameter counts across a sweep, not
+# estimated: the 8 global + 4 block layer split and the local_attn featurizer are kept from the
+# 100M config, and the remaining budget went to d_local (48) rather than encoder depth, since
+# d_local feeds the output head directly. Measured split: 16.49M 2D backbone + 13.23M topology.
+nn_class: ContactMapHierSiT
+
+# Hierarchy geometry (unchanged from the 100M config; block_size 12 was chosen from the
+# runtime benchmark, and max_seq_len 512 sets the relative-position clip radius)
+block_size: 12
+super_factor: 4
+max_seq_len: 512
+block_featurizer: local_attn
+
+# Phase 1 encoder
+token_dim: 128
+pair_repr_dim: 64
+dim_cond: 128
+n_enc_layers: 2
+enc_pair_update_every_n: 1
+nheads_enc: 8
+use_qkln: True
+
+# Level 0 (cells)
+d_local: 48
+n_local_layers: 2
+nheads_local: 8
+
+# Levels 1/2
+d_block: 192
+d_super: 192
+nheads_dit: 8
+n_global_layers: 8
+n_block_layers: 4
+mlp_ratio: 4.0
+
+# Sequence conditioning (as in the 100M config)
+residue_type_emb_init_seq: True
+residue_type_emb_cond_seq: True
+residue_type_emb_init_pair: True
+residue_type_emb_cond_pair: True
+seq_emb_dim: 4
+
+# ── Topology conditioning ────────────────────────────────────────────────────────────
+# topology_vocab_size = 2 special + 3 types x 21 slots, matching SSEAlphabet(exact_max=10,
+# bin_step=2, catch_all_above=30, min_len=1). Changing the alphabet requires changing this.
+topology_cond: True
+topology_vocab_size: 65
+max_topology_len: 128
+d_topo: 64
+d_single: 64
+n_topo_layers: 4
+nheads_topo: 8
+topology_reinject: True
