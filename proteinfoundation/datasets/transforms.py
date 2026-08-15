@@ -176,7 +176,8 @@ class PaddingTransform(T.BaseTransform):
     with a fill value up to max_size along the first dimension.
     """
 
-    def __init__(self, max_size=256, fill_value=0, topology_max_size=None):
+    def __init__(self, max_size=256, fill_value=0, topology_max_size=None,
+                 topology_he_max_size=None):
         """Initializes the transform.
 
         Args:
@@ -185,10 +186,15 @@ class PaddingTransform(T.BaseTransform):
             topology_max_size: Separate target for ``topology_*`` tensors. The topology reference
                 is ~an order of magnitude shorter than the residue axis, so padding it to max_size
                 would inflate every cross-attention key set for nothing. None -> use max_size.
+            topology_he_max_size: Separate target again for the ``topology_he_*`` tensors, which
+                live on the shorter helix/strand axis. The 2D reference is that axis SQUARED, so
+                padding it to topology_max_size costs four times the cross-attention keys.
+                None -> use topology_max_size.
         """
         self.max_size = max_size
         self.fill_value = fill_value
         self.topology_max_size = topology_max_size
+        self.topology_he_max_size = topology_he_max_size
 
     def forward(self, graph: Data) -> Data:
         """Applies padding to all applicable tensors in graph.
@@ -214,7 +220,11 @@ class PaddingTransform(T.BaseTransform):
                         # their padding must read as absent rather than as a real element: token
                         # tensors pad with TOPOLOGY_PAD_TOKEN (0) and float ones with 0.0, never
                         # with FLOAT_PADDING_VALUE.
-                        size = self.topology_max_size or self.max_size
+                        size = (
+                            (self.topology_he_max_size or self.topology_max_size or self.max_size)
+                            if key.startswith("topology_he")
+                            else (self.topology_max_size or self.max_size)
+                        )
                         fill_value = 0
                     else:
                         size = self.max_size

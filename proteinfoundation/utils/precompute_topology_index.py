@@ -21,9 +21,12 @@ Usage:
 """
 
 import argparse
+import gc
 import hashlib
+import itertools
 import os
 import sys
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import hydra
@@ -41,6 +44,24 @@ from proteinfoundation.datasets.sse_topology import (  # noqa: E402
 )
 
 
+def _read_one(path: str, min_len: int, threshold: float):
+    """Worker: one .pt -> (runs, flattened SSE contact reference, T_he). None runs = unusable."""
+    if not os.path.exists(path):
+        return None, None, 0
+    g = torch.load(path, map_location="cpu", weights_only=False)
+    dssp = getattr(g, "dssp_target", None)
+    raw = getattr(g, "contact_map_confind", None)
+    if dssp is None or bool((dssp < 0).all()) or raw is None:
+        return None, None, 0
+    runs = dssp_to_runs(dssp, min_len=min_len)
+    cm = (raw.float() >= threshold).float()
+    ref, keep = sse_contact_reference(cm, runs, keep_types=(DSSP_HELIX, DSSP_STRAND))
+    # Returned as raw bytes, not a tensor: torch pickles tensors through shared memory, and one
+    # segment per chain exhausts it ("unable to mmap ...: Cannot allocate memory") long before
+    # the scan finishes.
+    return runs, ref.to(torch.uint8).flatten().numpy().tobytes(), len(keep)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", required=True)
@@ -50,6 +71,7 @@ def main() -> None:
     parser.add_argument("--min-len", type=int, default=1)
     parser.add_argument("--contact-threshold", type=float, default=0.01)
     parser.add_argument("--limit", type=int, default=0, help="debug: only index N chains")
+    parser.add_argument("--workers", type=int, default=32)
     args = parser.parse_args()
 
     cfg_path = os.path.join(
@@ -95,43 +117,49 @@ def main() -> None:
     he_flat, he_offset, he_size = [], [0], torch.zeros(n, dtype=torch.int16)
     n_missing = 0
 
-    for i in range(n):
-        stem = ids[i]
-        path = ds._processed_path_for(f"{stem}.pt")
-        if not os.path.exists(path):
-            n_missing += 1
-            runs_offset.append(len(runs_flat))
-            he_offset.append(len(he_flat))
-            continue
-        g = torch.load(path, map_location="cpu", weights_only=False)
-        dssp = getattr(g, "dssp_target", None)
-        raw = getattr(g, "contact_map_confind", None)
-        if dssp is None or bool((dssp < 0).all()) or raw is None:
-            n_missing += 1
-            runs_offset.append(len(runs_flat))
-            he_offset.append(len(he_flat))
-            continue
+    # Reading ~300k .pt files off the HDD-backed pool is I/O bound, not compute bound (the
+    # single-process version sat in uninterruptible I/O wait at ~100k after an hour). Parallel
+    # readers overlap those waits; ex.map preserves order, so the offset arrays stay aligned.
+    paths = [str(ds._processed_path_for(f"{ids[i]}.pt")) for i in range(n)]
+    # Drop the datamodule before forking: workers only need paths, and inheriting the parent's
+    # heap is what broke the pool (the same copy-on-write problem the flat storage avoids).
+    del ds, dm, df, id_to_row
+    gc.collect()
+    with ProcessPoolExecutor(max_workers=args.workers) as ex:
+        results = []
+        for j, r in enumerate(ex.map(_read_one, paths, itertools.repeat(args.min_len),
+                                     itertools.repeat(args.contact_threshold), chunksize=32)):
+            results.append(r)
+            if (j + 1) % 20000 == 0:
+                print(f"  {j + 1}/{n}", flush=True)
 
-        runs = dssp_to_runs(dssp, min_len=args.min_len)
-        runs_flat.extend(runs)  # list of (type, length); stacked into [total, 2] below
+    for i, (runs, ref_bytes, t_he) in enumerate(results):
+        if runs is None:
+            n_missing += 1
+            runs_offset.append(runs_offset[-1])
+            he_offset.append(he_offset[-1])
+            continue
+        runs_flat.extend(runs)
         runs_offset.append(runs_offset[-1] + len(runs))
-
-        cm = (raw.float() >= args.contact_threshold).float()
-        ref, keep = sse_contact_reference(cm, runs, keep_types=(DSSP_HELIX, DSSP_STRAND))
-        he_size[i] = len(keep)
-        he_flat.append(ref.to(torch.uint8).flatten())
-        he_offset.append(he_offset[-1] + ref.numel())
+        he_size[i] = t_he
+        # A chain with no helix or strand at all yields a 0x0 reference, hence 0 bytes;
+        # torch.frombuffer rejects an empty buffer.
+        ref_flat = (
+            torch.frombuffer(bytearray(ref_bytes), dtype=torch.uint8)
+            if ref_bytes
+            else torch.zeros(0, dtype=torch.uint8)
+        )
+        he_flat.append(ref_flat)
+        he_offset.append(he_offset[-1] + ref_flat.numel())
 
         # Sequences come from the selection CSV, not the graph: if the attribute were absent the
         # hash would fall back to the chain id, every mate would look sequence-distinct, and the
         # "exclude identical-sequence templates" policy would silently do nothing.
-        seq = id_to_seq.get(stem)
+        seq = id_to_seq.get(ids[i])
         if seq is None:
             n_no_seq += 1
-        key = str(seq) if seq is not None else stem
+        key = str(seq) if seq is not None else ids[i]
         seq_hash[i] = int(hashlib.blake2b(key.encode(), digest_size=8).hexdigest(), 16) % (2**62)
-        if (i + 1) % 20000 == 0:
-            print(f"  {i + 1}/{n}", flush=True)
 
     print(f"chains without usable DSSP or contact map: {n_missing}", flush=True)
     print(f"chains with no sequence in the CSV: {n_no_seq}", flush=True)

@@ -35,7 +35,8 @@ datamodule:
       min_len: 1                     # 1-residue elements are kept: 16.87% of all elements
     - _target_: "proteinfoundation.datasets.transforms.PaddingTransform"
       max_size: 512
-      topology_max_size: 128
+      topology_max_size: 128       # element axis
+      topology_he_max_size: 64     # helix/strand axis; the 2D reference is this SQUARED
   batch_size: 4 # Batch size for dataloader
   num_workers: 8 # Number of workers for dataloader
   pin_memory: True # Pin memory for dataloader
