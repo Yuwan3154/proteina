@@ -10,7 +10,19 @@
 
 import torch
 from typing import Dict
-from proteinfoundation.openfold_stub.np.residue_constants import atom_types
+from proteinfoundation.openfold_stub.np.residue_constants import atom_types, restypes
+
+
+# One-letter codes for residue_type indices (0-19 standard, 20=UNK). The ordering is exactly
+# residue_type's: resnames is built as [restype_1to3[r] for r in restypes] + [UNK], so
+# resname_to_idx shares it.
+RESIDUE_TYPE_TO_ONE_LETTER = restypes + ["X"]
+
+
+def residue_type_to_sequence(residue_type) -> str:
+    """One-letter sequence for a graph's residue_type tensor, unknown residues as 'X'."""
+    n = len(RESIDUE_TYPE_TO_ONE_LETTER) - 1
+    return "".join(RESIDUE_TYPE_TO_ONE_LETTER[min(int(i), n)] for i in residue_type.tolist())
 
 
 ATOM_NUMBERING: Dict[str, int] = {

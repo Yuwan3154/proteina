@@ -30,21 +30,9 @@ import torch_geometric.data.data as tgd
 from torch.serialization import add_safe_globals
 from tqdm import tqdm
 
-from proteinfoundation.openfold_stub.np.residue_constants import resname_to_idx, restypes
+from proteinfoundation.openfold_stub.np.residue_constants import resname_to_idx
 
 
-# restypes_with_x[i] is exactly the letter for residue_type index i: resnames is built as
-# [restype_1to3[r] for r in restypes] + [UNK], so resname_to_idx shares that ordering.
-_RESTYPE_LETTERS = restypes + ["X"]
-
-
-def residue_type_to_sequence(residue_type) -> str:
-    """One-letter sequence for a graph's residue_type tensor, unknown residues as 'X'."""
-    n = len(_RESTYPE_LETTERS) - 1
-    return "".join(_RESTYPE_LETTERS[min(int(i), n)] for i in residue_type.tolist())
-
-# One-letter codes for residue_type indices (0-19 standard, 20=UNK)
-_RESIDUE_TYPE_TO_ONE_LETTER = restypes + ["X"]
 from proteinfoundation.datasets.base_data import BaseLightningDataModule
 from proteinfoundation.utils.cluster_utils import (
     cluster_sequences,
@@ -55,7 +43,11 @@ from proteinfoundation.utils.cluster_utils import (
     setup_clustering_file_paths,
     split_dataframe,
 )
-from proteinfoundation.utils.constants import PDB_TO_OPENFOLD_INDEX_TENSOR
+from proteinfoundation.utils.constants import (
+    PDB_TO_OPENFOLD_INDEX_TENSOR,
+    RESIDUE_TYPE_TO_ONE_LETTER as _RESIDUE_TYPE_TO_ONE_LETTER,
+    residue_type_to_sequence,
+)
 from proteinfoundation.graphein_utils.graphein_utils import (
     protein_to_pyg,
     read_pdb_to_dataframe,
