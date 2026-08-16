@@ -23,10 +23,14 @@ from proteinfoundation.datasets.sse_topology import (
     DSSP_HELIX,
     DSSP_STRAND,
     MASK_TOKEN,
+    N_PAIR_FEATURES,
     PAD_TOKEN,
+    STRUCTURAL_PAIR_FEATURES,
     SSEAlphabet,
+    circuit_topology_features,
     element_positions,
     perturb_runs,
+    sse_sequence_gap,
 )
 
 
@@ -74,15 +78,33 @@ class TopologyReferenceTransform(T.BaseTransform):
         self._index = None
         self._id_to_row = None
         self._generator = None
+        self.has_pair_features = False
+        self._feat_mean = torch.zeros(N_PAIR_FEATURES)
+        self._feat_std = torch.ones(N_PAIR_FEATURES)
 
     # The index is loaded lazily so it is materialised once per process and inherited by forked
     # dataloader workers rather than being deserialised in each of them.
     def _ensure_loaded(self) -> None:
         if self._index is not None:
             return
-        self._index = torch.load(self.index_path, map_location="cpu", weights_only=False)
+        # mmap: the index carries a per-element-pair feature block, so a resident copy in each of
+        # the dataloader workers would multiply a multi-gigabyte allocation by num_workers. Memory
+        # mapping leaves it in the page cache, shared by every worker.
+        self._index = torch.load(
+            self.index_path, map_location="cpu", weights_only=False, mmap=True
+        )
         self._id_to_row = {s: i for i, s in enumerate(self._index["ids"])}
         self._generator = torch.Generator().manual_seed(self.seed)
+        self.has_pair_features = "feat_flat" in self._index
+        if self.has_pair_features:
+            self._feat_mean = self._index["pair_feature_mean"].float()
+            self._feat_std = self._index["pair_feature_std"].float().clamp(min=1e-6)
+        else:
+            # An index built before the featurization still drives the contact-only mode: the
+            # shape is unchanged, the structural channels read as zero, and standardisation is
+            # the identity. The other modes need a rebuilt index to be meaningful.
+            self._feat_mean = torch.zeros(N_PAIR_FEATURES)
+            self._feat_std = torch.ones(N_PAIR_FEATURES)
 
     def _runs_for(self, row: int):
         idx = self._index
@@ -98,6 +120,34 @@ class TopologyReferenceTransform(T.BaseTransform):
         if size <= 0 or b <= a:
             return torch.zeros(0, 0)
         return idx["he_flat"][a:b].reshape(size, size).float()
+
+    def _he_structural_for(self, row: int, size: int) -> torch.Tensor:
+        """The [T, T, 3] channels that only the index can supply (see sse_topology)."""
+        idx = self._index
+        n_struct = len(STRUCTURAL_PAIR_FEATURES)
+        if not self.has_pair_features or size <= 0:
+            return torch.zeros(size, size, n_struct)
+        a, b = int(idx["feat_offset"][row]), int(idx["feat_offset"][row + 1])
+        if b - a != size * size * n_struct:
+            return torch.zeros(size, size, n_struct)
+        return idx["feat_flat"][a:b].reshape(size, size, n_struct).float()
+
+    def _pair_features(
+        self, contact: torch.Tensor, structural: torch.Tensor, runs, keep
+    ) -> torch.Tensor:
+        """Assemble and standardise the [T, T, N_PAIR_FEATURES] reference the model consumes.
+
+        Circuit topology and the sequence gap are rebuilt here rather than read from the index:
+        both must describe the reference AS THE MODEL SEES IT, i.e. after truncation to the
+        helix/strand cap and after length augmentation.
+        """
+        T = contact.shape[0]
+        circuit = circuit_topology_features(contact)
+        gap = sse_sequence_gap(runs, keep)
+        feat = torch.cat(
+            [contact[..., None], structural, circuit, gap[..., None]], dim=-1
+        )
+        return (feat - self._feat_mean) / self._feat_std
 
     def _pick_template(self, row: int) -> int:
         """A same-cluster chain with a different sequence, or the query itself as fallback."""
@@ -122,21 +172,11 @@ class TopologyReferenceTransform(T.BaseTransform):
 
         drop = float(torch.rand(1, generator=self._generator)) < self.drop_prob
         if row is None or drop:
-            graph.topology_tokens = torch.full((1,), MASK_TOKEN, dtype=torch.long)
-            graph.topology_pos = torch.zeros(1, dtype=torch.float32)
-            graph.topology_he_tokens = torch.full((1,), MASK_TOKEN, dtype=torch.long)
-            graph.topology_he_pos = torch.zeros(1, dtype=torch.float32)
-            graph.topology_he_contact = torch.zeros(1, 1)
-            return graph
+            return self._set_empty(graph)
 
         t_row = self._pick_template(row)  # returns `row` itself when no valid template exists
         if t_row == row and not self.self_fallback:
-            graph.topology_tokens = torch.full((1,), MASK_TOKEN, dtype=torch.long)
-            graph.topology_pos = torch.zeros(1, dtype=torch.float32)
-            graph.topology_he_tokens = torch.full((1,), MASK_TOKEN, dtype=torch.long)
-            graph.topology_he_pos = torch.zeros(1, dtype=torch.float32)
-            graph.topology_he_contact = torch.zeros(1, 1)
-            return graph
+            return self._set_empty(graph)
         runs = self._runs_for(t_row)
         if not runs:
             t_row = row
@@ -146,8 +186,10 @@ class TopologyReferenceTransform(T.BaseTransform):
         keep = [i for i, (t, _) in enumerate(runs) if t in (DSSP_HELIX, DSSP_STRAND)]
         # The stored map was built from the unperturbed runs, so its axis must stay aligned with
         # them even if augmentation changes element lengths (which never changes their count).
+        structural = self._he_structural_for(t_row, he_contact.shape[0])
         if he_contact.shape[0] != len(keep):
             he_contact = torch.zeros(len(keep), len(keep))
+            structural = torch.zeros(len(keep), len(keep), len(STRUCTURAL_PAIR_FEATURES))
 
         if self.mutate_prob > 0.0 and self.sigma_frac > 0.0:
             runs = perturb_runs(
@@ -170,6 +212,7 @@ class TopologyReferenceTransform(T.BaseTransform):
         k = min(len(keep), self.max_topology_he_len)
         he_tokens, he_pos = he_tokens[:k], he_pos[:k]
         he_contact = he_contact[:k, :k]
+        he_feat = self._pair_features(he_contact, structural[:k, :k], runs, keep[:k])
 
         graph.topology_tokens = tokens if tokens.numel() else torch.full((1,), MASK_TOKEN, dtype=torch.long)
         graph.topology_pos = pos if pos.numel() else torch.zeros(1, dtype=torch.float32)
@@ -178,6 +221,19 @@ class TopologyReferenceTransform(T.BaseTransform):
         )
         graph.topology_he_pos = he_pos if he_pos.numel() else torch.zeros(1, dtype=torch.float32)
         graph.topology_he_contact = he_contact if he_contact.numel() else torch.zeros(1, 1)
+        graph.topology_he_feat = (
+            he_feat if he_feat.numel() else torch.zeros(1, 1, N_PAIR_FEATURES)
+        )
+        return graph
+
+    def _set_empty(self, graph: Data) -> Data:
+        """The no-reference case: a single MASK element, which the model treats as unconditioned."""
+        graph.topology_tokens = torch.full((1,), MASK_TOKEN, dtype=torch.long)
+        graph.topology_pos = torch.zeros(1, dtype=torch.float32)
+        graph.topology_he_tokens = torch.full((1,), MASK_TOKEN, dtype=torch.long)
+        graph.topology_he_pos = torch.zeros(1, dtype=torch.float32)
+        graph.topology_he_contact = torch.zeros(1, 1)
+        graph.topology_he_feat = torch.zeros(1, 1, N_PAIR_FEATURES)
         return graph
 
     def __repr__(self) -> str:

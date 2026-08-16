@@ -70,6 +70,13 @@ n_topo_layers: 4          # self-attention + cross-attention to the topology, be
 nheads_topo: 8
 topology_reinject: True   # also cross-attend at the pooled levels, so the topology does not have
                           # to survive pooling to influence the output
+pair_ref_features: both   # contact | circuit | proximity | both -- which descriptors of each
+                          # element PAIR the 2D reference carries beyond the two element
+                          # embeddings. "contact" is a bare binary touch flag; "circuit" adds the
+                          # Series/Parallel/Cross relation counts; "proximity" adds contact
+                          # density, closest/mean CA-CA distance and sequence gap; "both" is the
+                          # union. Switching mode only resizes topology_pair_ref.proj.
+                          # Needs a topology index built with the featurization (feat_flat).
 
 # ── Contact map diffusion settings ───────────────────────────────────────────
 contact_map_mode: True

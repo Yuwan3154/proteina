@@ -39,27 +39,51 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from proteinfoundation.datasets.sse_topology import (  # noqa: E402
     DSSP_HELIX,
     DSSP_STRAND,
+    N_PAIR_FEATURES,
+    PAIR_FEATURE_NAMES,
+    STRUCTURAL_PAIR_FEATURES,
+    assemble_pair_features,
     dssp_to_runs,
     sse_contact_reference,
+    sse_structural_pair_features,
 )
 
 
 def _read_one(path: str, min_len: int, threshold: float):
-    """Worker: one .pt -> (runs, flattened SSE contact reference, T_he). None runs = unusable."""
+    """Worker: one .pt -> (runs, contact bytes, T_he, structural-feature bytes, channel stats).
+
+    Only the three structural channels are returned densely; the rest are recomputed by the
+    transform, which is both cheaper to store and necessary for the length-derived one (see the
+    featurization note in sse_topology). Statistics are accumulated over ALL channels so the
+    transform can standardise every one of them against real dataset scales.
+    """
+    empty = (None, None, 0, None, None)
     if not os.path.exists(path):
-        return None, None, 0
+        return empty
     g = torch.load(path, map_location="cpu", weights_only=False)
     dssp = getattr(g, "dssp_target", None)
     raw = getattr(g, "contact_map_confind", None)
     if dssp is None or bool((dssp < 0).all()) or raw is None:
-        return None, None, 0
+        return empty
     runs = dssp_to_runs(dssp, min_len=min_len)
     cm = (raw.float() >= threshold).float()
     ref, keep = sse_contact_reference(cm, runs, keep_types=(DSSP_HELIX, DSSP_STRAND))
+
+    structural = sse_structural_pair_features(cm, g.coords, g.coord_mask, runs, keep)
+    feat = assemble_pair_features(ref, structural, runs, keep)
+    flat = feat.reshape(-1, N_PAIR_FEATURES)
+    stats = torch.stack([flat.sum(0), (flat**2).sum(0)]) if flat.numel() else torch.zeros(2, N_PAIR_FEATURES)
+
     # Returned as raw bytes, not a tensor: torch pickles tensors through shared memory, and one
     # segment per chain exhausts it ("unable to mmap ...: Cannot allocate memory") long before
     # the scan finishes.
-    return runs, ref.to(torch.uint8).flatten().numpy().tobytes(), len(keep)
+    return (
+        runs,
+        ref.to(torch.uint8).flatten().numpy().tobytes(),
+        len(keep),
+        structural.to(torch.float16).flatten().numpy().tobytes(),
+        (stats.tolist(), flat.shape[0]),
+    )
 
 
 def main() -> None:
@@ -115,6 +139,10 @@ def main() -> None:
     seq_hash = torch.zeros(n, dtype=torch.int64)
     runs_flat, runs_offset = [], [0]
     he_flat, he_offset, he_size = [], [0], torch.zeros(n, dtype=torch.int16)
+    feat_flat, feat_offset = [], [0]
+    feat_sum = torch.zeros(N_PAIR_FEATURES, dtype=torch.float64)
+    feat_sumsq = torch.zeros(N_PAIR_FEATURES, dtype=torch.float64)
+    feat_count = 0
     n_missing = 0
 
     # Reading ~300k .pt files off the HDD-backed pool is I/O bound, not compute bound (the
@@ -133,11 +161,12 @@ def main() -> None:
             if (j + 1) % 20000 == 0:
                 print(f"  {j + 1}/{n}", flush=True)
 
-    for i, (runs, ref_bytes, t_he) in enumerate(results):
+    for i, (runs, ref_bytes, t_he, feat_bytes, stats) in enumerate(results):
         if runs is None:
             n_missing += 1
             runs_offset.append(runs_offset[-1])
             he_offset.append(he_offset[-1])
+            feat_offset.append(feat_offset[-1])
             continue
         runs_flat.extend(runs)
         runs_offset.append(runs_offset[-1] + len(runs))
@@ -151,6 +180,17 @@ def main() -> None:
         )
         he_flat.append(ref_flat)
         he_offset.append(he_offset[-1] + ref_flat.numel())
+        f = (
+            torch.frombuffer(bytearray(feat_bytes), dtype=torch.float16)
+            if feat_bytes
+            else torch.zeros(0, dtype=torch.float16)
+        )
+        feat_flat.append(f)
+        feat_offset.append(feat_offset[-1] + f.numel())
+        sums, cnt = stats
+        feat_sum += torch.tensor(sums[0], dtype=torch.float64)
+        feat_sumsq += torch.tensor(sums[1], dtype=torch.float64)
+        feat_count += cnt
 
         # Sequences come from the selection CSV, not the graph: if the attribute were absent the
         # hash would fall back to the chain id, every mate would look sequence-distinct, and the
@@ -163,6 +203,15 @@ def main() -> None:
 
     print(f"chains without usable DSSP or contact map: {n_missing}", flush=True)
     print(f"chains with no sequence in the CSV: {n_no_seq}", flush=True)
+
+    # Per-channel standardisation statistics, measured rather than assumed: the channels span
+    # fractions in [0, 1], distances in angstrom and residue counts, so feeding them raw would
+    # let the largest-scale channel dominate the pair projection at initialisation.
+    mean = feat_sum / max(feat_count, 1)
+    var = (feat_sumsq / max(feat_count, 1) - mean**2).clamp(min=0.0)
+    std = var.sqrt().clamp(min=1e-6)
+    for name, m, s in zip(PAIR_FEATURE_NAMES, mean.tolist(), std.tolist()):
+        print(f"  {name:<24} mean={m:10.4f} std={s:10.4f}", flush=True)
     runs_tensor = (
         torch.tensor(runs_flat, dtype=torch.int16)
         if runs_flat
@@ -180,6 +229,12 @@ def main() -> None:
         "he_offset": torch.tensor(he_offset, dtype=torch.int64),
         "he_size": he_size,
         "he_flat": torch.cat(he_flat) if he_flat else torch.zeros(0, dtype=torch.uint8),
+        "feat_offset": torch.tensor(feat_offset, dtype=torch.int64),
+        "feat_flat": torch.cat(feat_flat) if feat_flat else torch.zeros(0, dtype=torch.float16),
+        "pair_feature_names": list(PAIR_FEATURE_NAMES),
+        "structural_feature_names": list(STRUCTURAL_PAIR_FEATURES),
+        "pair_feature_mean": mean.to(torch.float32),
+        "pair_feature_std": std.to(torch.float32),
         "min_len": args.min_len,
         "contact_threshold": args.contact_threshold,
     }

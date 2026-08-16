@@ -236,6 +236,192 @@ def sse_contact_reference(
     return out, keep
 
 
+# ── Element-pair featurization ────────────────────────────────────────────────────────────────
+#
+# The 2D reference started as an outer concat of the two element embeddings plus a binary contact,
+# which describes WHICH elements touch but nothing about HOW. Two richer descriptions are available
+# and are both computed here so they can be compared:
+#
+#   * circuit topology -- the Series / Parallel / Cross relation between chain loops (Mashaghi et
+#     al., "Circuit topology of proteins and nucleic acids", Structure 2014). Every contacting
+#     element pair (s, t) spans a loop along the chain, and its relation to every other contact is
+#     one of nested (series), disjoint (parallel), or interlocked (cross). These relations, not the
+#     contact set alone, are what distinguish folds that share a contact count.
+#   * secondary-structure contact/proximity -- how strongly and how closely two elements pack:
+#     the fraction of their residue pairs in contact, their closest and mean CA-CA distance, and
+#     the number of residues separating them along the chain.
+#
+# Channels split by WHERE they can be computed. The three structural ones need residue-level data
+# (the full contact map and the coordinates) that the dataloader never sees, so they are stored in
+# the precomputed index. The rest are derived from the element contact map and the run lengths,
+# both of which the transform already holds -- and the sequence gap MUST be derived there, because
+# augmentation perturbs element lengths and a stored gap would describe the unperturbed topology.
+PAIR_FEATURE_NAMES = (
+    "contact_max",
+    "contact_frac",
+    "min_ca_dist",
+    "mean_ca_dist",
+    "circuit_parallel",
+    "circuit_series_inside",
+    "circuit_series_outside",
+    "circuit_cross",
+    "seq_gap",
+)
+N_PAIR_FEATURES = len(PAIR_FEATURE_NAMES)
+STRUCTURAL_PAIR_FEATURES = ("contact_frac", "min_ca_dist", "mean_ca_dist")
+CIRCUIT_PAIR_FEATURES = (
+    "circuit_parallel",
+    "circuit_series_inside",
+    "circuit_series_outside",
+    "circuit_cross",
+)
+PROXIMITY_PAIR_FEATURES = ("contact_frac", "min_ca_dist", "mean_ca_dist", "seq_gap")
+
+CA_ATOM_INDEX = 1  # ATOM_NUMBERING order, which is what the stored .pt uses
+
+
+def pair_feature_indices(names: Sequence[str]) -> List[int]:
+    return [PAIR_FEATURE_NAMES.index(n) for n in names]
+
+
+def circuit_topology_features(contact: torch.Tensor) -> torch.Tensor:
+    """[T, T] element contact map -> [T, T, 4] circuit-topology relation counts.
+
+    Each element pair (s, t) delimits a loop along the chain. Its relation to another contact
+    (u, v) is Parallel when the two loops are disjoint, Series when one contains the other, and
+    Cross when they interlock. Counting each relation over all contacts gives a per-pair
+    fingerprint of how that pair sits within the fold rather than merely whether it touches.
+
+    Loops that share an endpoint are a degenerate case the original definition does not cover;
+    touching intervals count as Parallel and shared-endpoint nesting counts as Series, so every
+    pair falls in exactly one class. Counts are divided by the number of contacts, which keeps the
+    channel scale-free across chains of very different sizes.
+    """
+    T = contact.shape[0]
+    out = contact.new_zeros((T, T, 4))
+    if T == 0:
+        return out
+    u, v = torch.triu_indices(T, T, offset=1, device=contact.device)
+    sel = contact[u, v] > 0
+    u, v = u[sel], v[sel]
+    K = u.numel()
+    if K == 0:
+        return out
+
+    a = torch.arange(T, device=contact.device)
+    lo = torch.minimum(a[:, None], a[None, :])[..., None]  # [T, T, 1]
+    hi = torch.maximum(a[:, None], a[None, :])[..., None]
+    u, v = u[None, None, :], v[None, None, :]
+
+    same = (u == lo) & (v == hi)  # a contact compared against its own loop
+    parallel = (v <= lo) | (u >= hi)
+    inside = (lo <= u) & (v <= hi) & ~same & ~parallel
+    outside = (u <= lo) & (hi <= v) & ~same & ~parallel & ~inside
+    cross = ~(parallel | inside | outside | same)
+
+    for c, rel in enumerate((parallel, inside, outside, cross)):
+        out[..., c] = rel.sum(dim=-1).to(out.dtype) / float(K)
+    return out
+
+
+def sse_sequence_gap(runs: Sequence[Tuple[int, int]], keep: Sequence[int]) -> torch.Tensor:
+    """[T, T] residues lying strictly between each pair of kept elements.
+
+    Derived from the run lengths in force at call time, so it tracks length augmentation instead
+    of describing the template's original spacing.
+    """
+    T = len(keep)
+    out = torch.zeros((T, T), dtype=torch.float32)
+    if T == 0:
+        return out
+    spans = runs_to_spans(runs)
+    starts = torch.tensor([spans[i][0] for i in keep], dtype=torch.float32)
+    ends = torch.tensor([spans[i][1] for i in keep], dtype=torch.float32)
+    gap = torch.maximum(starts[None, :] - ends[:, None], starts[:, None] - ends[None, :])
+    return gap.clamp(min=0.0)
+
+
+def sse_structural_pair_features(
+    contact_map: torch.Tensor,
+    coords: torch.Tensor,
+    coord_mask: torch.Tensor,
+    runs: Sequence[Tuple[int, int]],
+    keep: Sequence[int],
+) -> torch.Tensor:
+    """[T, T, 3] contact fraction and closest/mean CA-CA distance for each element pair.
+
+    Args:
+        contact_map: [L, L] binarised residue contact map.
+        coords: [L, n_atoms, 3] as stored in the .pt (ATOM_NUMBERING order).
+        coord_mask: [L, n_atoms] validity flags for those coordinates.
+        runs, keep: the run-length decomposition and the indices retained in the 2D reference.
+
+    Residues without a resolved CA are excluded from the distance reductions; a pair with no
+    resolved CA on either side gets distance 0, which the contact channels already mark as
+    uninformative.
+    """
+    T = len(keep)
+    out = torch.zeros((T, T, 3), dtype=torch.float32)
+    if T == 0:
+        return out
+    spans = runs_to_spans(runs)
+    L = contact_map.shape[0]
+
+    elem = torch.full((L,), -1, dtype=torch.long)
+    for a, ia in enumerate(keep):
+        s, e = spans[ia]
+        elem[s:e] = a
+
+    # Element-block reductions run as two scatter passes (rows, then columns) rather than a T^2
+    # loop over slices, the same reason sse_contact_reference is written this way.
+    valid = elem >= 0
+    row = elem[valid]
+    n_res = torch.zeros(T).scatter_add_(0, row, torch.ones(row.numel()))
+    pair_res = n_res[:, None] * n_res[None, :]
+
+    sub = contact_map[valid][:, valid].float()
+    out[..., 0] = _block_reduce(sub, row, T, "sum") / pair_res.clamp(min=1.0)
+
+    ca_ok = valid & (coord_mask[:, CA_ATOM_INDEX] > 0.5)
+    if ca_ok.any():
+        row_ca = elem[ca_ok]
+        n_ca = torch.zeros(T).scatter_add_(0, row_ca, torch.ones(row_ca.numel()))
+        d = torch.cdist(
+            coords[ca_ok, CA_ATOM_INDEX, :].float()[None],
+            coords[ca_ok, CA_ATOM_INDEX, :].float()[None],
+        )[0]
+        has_ca = (n_ca[:, None] > 0) & (n_ca[None, :] > 0)
+        dmin = _block_reduce(d, row_ca, T, "amin")
+        out[..., 1] = torch.where(has_ca, dmin, torch.zeros_like(dmin))
+        dmean = _block_reduce(d, row_ca, T, "sum") / (n_ca[:, None] * n_ca[None, :]).clamp(min=1.0)
+        out[..., 2] = torch.where(has_ca, dmean, torch.zeros_like(dmean))
+    return out
+
+
+def _block_reduce(m: torch.Tensor, row: torch.Tensor, T: int, reduce: str) -> torch.Tensor:
+    """Reduce an [n, n] residue matrix onto its [T, T] element blocks."""
+    init = float("inf") if reduce == "amin" else 0.0
+    rows = torch.full((T, m.shape[1]), init, dtype=m.dtype)
+    rows.scatter_reduce_(0, row[:, None].expand(-1, m.shape[1]), m, reduce=reduce)
+    out = torch.full((T, T), init, dtype=m.dtype)
+    out.scatter_reduce_(1, row[None, :].expand(T, -1), rows, reduce=reduce)
+    return torch.nan_to_num(out, posinf=0.0)
+
+
+def assemble_pair_features(
+    contact: torch.Tensor,
+    structural: torch.Tensor,
+    runs: Sequence[Tuple[int, int]],
+    keep: Sequence[int],
+) -> torch.Tensor:
+    """Stack every channel of PAIR_FEATURE_NAMES into one [T, T, N_PAIR_FEATURES] tensor."""
+    circuit = circuit_topology_features(contact)
+    gap = sse_sequence_gap(runs, keep)
+    return torch.cat(
+        [contact[..., None].float(), structural.float(), circuit.float(), gap[..., None]], dim=-1
+    )
+
+
 def alphabet_summary(alphabet: SSEAlphabet) -> Dict[str, object]:
     names = {DSSP_LOOP: "loop", DSSP_HELIX: "helix", DSSP_STRAND: "strand"}
     return {

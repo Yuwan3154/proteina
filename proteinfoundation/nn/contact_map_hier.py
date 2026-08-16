@@ -63,6 +63,12 @@ from proteinfoundation.nn.alphafold3_pytorch_utils.modules import (
     AdaptiveLayerNormOutputScale,
     Transition,
 )
+from proteinfoundation.datasets.sse_topology import (
+    CIRCUIT_PAIR_FEATURES,
+    PAIR_FEATURE_NAMES,
+    PROXIMITY_PAIR_FEATURES,
+    pair_feature_indices,
+)
 from proteinfoundation.datasets.sse_topology import PAD_TOKEN as TOPOLOGY_PAD_TOKEN
 from proteinfoundation.nn.feature_factory import FeatureFactory
 from proteinfoundation.nn.protein_transformer import (
@@ -71,6 +77,16 @@ from proteinfoundation.nn.protein_transformer import (
     PairReprUpdate,
     TransitionADALN,
 )
+
+# Which channels of the 2D SSE reference the pair track sees. "contact" is the original
+# behaviour (which elements touch, nothing more); the other three add the descriptions of HOW they
+# touch that sse_topology computes, and exist so the two can be compared empirically.
+PAIR_FEATURE_MODES: Dict[str, Tuple[str, ...]] = {
+    "contact": ("contact_max",),
+    "circuit": ("contact_max",) + CIRCUIT_PAIR_FEATURES,
+    "proximity": ("contact_max",) + PROXIMITY_PAIR_FEATURES,
+    "both": PAIR_FEATURE_NAMES,
+}
 
 # Cache of relative-position index grids, keyed by (P, max_offset, device).
 # Shared across layers and levels since the indices depend only on the geometry.
@@ -342,22 +358,26 @@ class CrossAttention(nn.Module):
 
 
 class TopologyPairReference(nn.Module):
-    """Embeds the T x T SSE-by-SSE contact reference into cross-attention keys/values.
+    """Embeds the T x T SSE-by-SSE reference into cross-attention keys/values.
 
     Only helices and strands index this reference: loops are flexible linkers whose contacts carry
     no topological constraint, and including them would square a four-times-longer axis.
+
+    Each element pair contributes the two element embeddings plus a selectable block of pair
+    descriptors -- see PAIR_FEATURE_MODES for what each choice supplies.
     """
 
-    def __init__(self, dim_token: int, dim_out: int):
+    def __init__(self, dim_token: int, dim_out: int, n_pair_features: int = 1):
         super().__init__()
-        self.proj = nn.Linear(2 * dim_token + 1, dim_out)
+        self.n_pair_features = n_pair_features
+        self.proj = nn.Linear(2 * dim_token + n_pair_features, dim_out)
 
-    def forward(self, tok_embed: torch.Tensor, contact: torch.Tensor) -> torch.Tensor:
-        """[B, T, d], [B, T, T] -> [B, T*T, dim_out]"""
+    def forward(self, tok_embed: torch.Tensor, pair_feat: torch.Tensor) -> torch.Tensor:
+        """[B, T, d], [B, T, T, F] -> [B, T*T, dim_out]"""
         B, T, _ = tok_embed.shape
         a = tok_embed[:, :, None, :].expand(B, T, T, tok_embed.shape[-1])
         b = tok_embed[:, None, :, :].expand(B, T, T, tok_embed.shape[-1])
-        feat = torch.cat([a, b, contact[..., None]], dim=-1)
+        feat = torch.cat([a, b, pair_feat], dim=-1)
         return self.proj(feat).reshape(B, T * T, -1)
 
 
@@ -526,6 +546,13 @@ class ContactMapHierSiT(nn.Module):
         self.n_topo_layers = int(kwargs.get("n_topo_layers", 0))
         nheads_topo = int(kwargs.get("nheads_topo", 0))
         self.topology_reinject = bool(kwargs.get("topology_reinject", True))
+        self.pair_ref_features = str(kwargs.get("pair_ref_features", "contact"))
+        if self.pair_ref_features not in PAIR_FEATURE_MODES:
+            raise ValueError(
+                f"pair_ref_features must be one of {sorted(PAIR_FEATURE_MODES)}, "
+                f"got {self.pair_ref_features!r}"
+            )
+        self.pair_feat_idx = pair_feature_indices(PAIR_FEATURE_MODES[self.pair_ref_features])
         if self.topology_cond:
             missing = [
                 k
@@ -740,7 +767,9 @@ class ContactMapHierSiT(nn.Module):
             # 2D SSE-by-SSE contact reference, cross-attended by the pair track at both pooled
             # levels. Offsets are clipped at the padded block-grid width, which is the widest
             # query grid that ever attends to it.
-            self.topology_pair_ref = TopologyPairReference(self.d_topo, self.d_topo)
+            self.topology_pair_ref = TopologyPairReference(
+                self.d_topo, self.d_topo, len(self.pair_feat_idx)
+            )
             self.cross2d_super = CrossAttention2D(
                 self.d_super, self.d_topo, nheads_attn, max_off_super
             )
@@ -867,7 +896,18 @@ class ContactMapHierSiT(nn.Module):
             he_tokens = batch["topology_he_tokens"]  # [B, T_he]
             he_valid = he_tokens > 0
             he_embed = self.topology_embed(he_tokens.clamp(min=0)) * he_valid[..., None].to(dtype)
-            ref_kv = self.topology_pair_ref(he_embed, batch["topology_he_contact"].to(dtype))
+            # An index built before the pair featurization only supplies the contact channel, so
+            # the mode that needs nothing else keeps working against it.
+            if "topology_he_feat" in batch:
+                pair_feat = batch["topology_he_feat"].to(dtype)[..., self.pair_feat_idx]
+            elif self.pair_ref_features == "contact":
+                pair_feat = batch["topology_he_contact"].to(dtype)[..., None]
+            else:
+                raise KeyError(
+                    f"pair_ref_features={self.pair_ref_features!r} needs topology_he_feat, which "
+                    "TopologyReferenceTransform only emits from a featurized topology index"
+                )
+            ref_kv = self.topology_pair_ref(he_embed, pair_feat)
             ref_mask = (he_valid[:, :, None] & he_valid[:, None, :]).reshape(B, -1)
             # The same element positions expressed on each pooled grid.
             he_pos = batch["topology_he_pos"].to(torch.float32)  # [B, T_he], residue units
