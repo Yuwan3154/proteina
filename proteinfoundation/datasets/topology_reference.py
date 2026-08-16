@@ -94,7 +94,12 @@ class TopologyReferenceTransform(T.BaseTransform):
             self.index_path, map_location="cpu", weights_only=False, mmap=True
         )
         self._id_to_row = {s: i for i, s in enumerate(self._index["ids"])}
-        self._generator = torch.Generator().manual_seed(self.seed)
+        # Mixed with torch's per-worker seed: every dataloader worker calls this with the same
+        # self.seed, so a bare manual_seed would give all of them one identical stream of template
+        # choices, jitter and dropout decisions.
+        self._generator = torch.Generator().manual_seed(
+            (self.seed + torch.initial_seed()) % (2**63)
+        )
         self.has_pair_features = "feat_flat" in self._index
         if self.has_pair_features:
             self._feat_mean = self._index["pair_feature_mean"].float()
