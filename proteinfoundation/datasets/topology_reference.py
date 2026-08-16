@@ -13,8 +13,6 @@ sample. Element positions are rescaled from the template's length onto the query
 lets cross-attention relate a topology element to a query residue at all.
 """
 
-from typing import Optional
-
 import torch
 import torch_geometric.transforms as T
 from torch_geometric.data import Data
@@ -24,7 +22,6 @@ from proteinfoundation.datasets.sse_topology import (
     DSSP_STRAND,
     MASK_TOKEN,
     N_PAIR_FEATURES,
-    PAD_TOKEN,
     STRUCTURAL_PAIR_FEATURES,
     SSEAlphabet,
     circuit_topology_features,
@@ -146,7 +143,6 @@ class TopologyReferenceTransform(T.BaseTransform):
         both must describe the reference AS THE MODEL SEES IT, i.e. after truncation to the
         helix/strand cap and after length augmentation.
         """
-        T = contact.shape[0]
         circuit = circuit_topology_features(contact)
         gap = sse_sequence_gap(runs, keep)
         feat = torch.cat(
