@@ -32,6 +32,17 @@ from tqdm import tqdm
 
 from proteinfoundation.openfold_stub.np.residue_constants import resname_to_idx, restypes
 
+
+# restypes_with_x[i] is exactly the letter for residue_type index i: resnames is built as
+# [restype_1to3[r] for r in restypes] + [UNK], so resname_to_idx shares that ordering.
+_RESTYPE_LETTERS = restypes + ["X"]
+
+
+def residue_type_to_sequence(residue_type) -> str:
+    """One-letter sequence for a graph's residue_type tensor, unknown residues as 'X'."""
+    n = len(_RESTYPE_LETTERS) - 1
+    return "".join(_RESTYPE_LETTERS[min(int(i), n)] for i in residue_type.tolist())
+
 # One-letter codes for residue_type indices (0-19 standard, 20=UNK)
 _RESIDUE_TYPE_TO_ONE_LETTER = restypes + ["X"]
 from proteinfoundation.datasets.base_data import BaseLightningDataModule
@@ -1836,6 +1847,10 @@ class PDBLightningDataModule(BaseLightningDataModule):
             graph.residue_type = torch.tensor(
                 [resname_to_idx[residue] for residue in graph.residues]
             ).long()
+            # Derived from residue_type rather than from the selection CSV, so it is consistent
+            # with coords by construction (the CSV may carry full SEQRES while the graph holds
+            # only resolved residues).
+            graph.sequence = residue_type_to_sequence(graph.residue_type)
             graph.database = database_tag
 
             # Compute ext_lig: for AFDB set all unknown, for PDB compute from full deposit
@@ -1965,6 +1980,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
         graph.residue_type = torch.tensor(
             [resname_to_idx[residue] for residue in graph.residues]
         ).long()
+        graph.sequence = residue_type_to_sequence(graph.residue_type)
         graph.database = database_tag
 
         if database_tag == "afdb":

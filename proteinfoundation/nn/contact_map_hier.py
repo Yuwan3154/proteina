@@ -835,8 +835,13 @@ class ContactMapHierSiT(nn.Module):
         single = topo = topo_mask = ref_kv = ref_mask = None
         topo_pos = he_pos_block = he_pos_super = None
         if self.topology_cond:
-            tokens = batch["topology_tokens"]  # [B, T] padded with TOPOLOGY_PAD_TOKEN
-            topo_mask = tokens != TOPOLOGY_PAD_TOKEN
+            tokens = batch["topology_tokens"]  # [B, T]
+            # Validity is `> 0`, not `!= PAD`: the dense collate pads integer tensors with
+            # NON_FLOAT_PADDING_VALUE (-1), not with TOPOLOGY_PAD_TOKEN (0), so testing against
+            # the pad token alone would treat -1 as a real element and index the embedding at -1.
+            # MASK_TOKEN (1) stays valid -- it is the explicit "no topology" element.
+            topo_mask = tokens > 0
+            tokens = tokens.clamp(min=0)
             T = tokens.shape[1]
             pos_idx = torch.arange(T, device=device).clamp(max=self.max_topology_len - 1)
             topo = self.topology_embed(tokens) + self.topology_pos(pos_idx)[None]
@@ -860,8 +865,8 @@ class ContactMapHierSiT(nn.Module):
                 single = F.pad(single, (0, 0, 0, pad_L))
 
             he_tokens = batch["topology_he_tokens"]  # [B, T_he]
-            he_valid = he_tokens != TOPOLOGY_PAD_TOKEN
-            he_embed = self.topology_embed(he_tokens) * he_valid[..., None].to(dtype)
+            he_valid = he_tokens > 0
+            he_embed = self.topology_embed(he_tokens.clamp(min=0)) * he_valid[..., None].to(dtype)
             ref_kv = self.topology_pair_ref(he_embed, batch["topology_he_contact"].to(dtype))
             ref_mask = (he_valid[:, :, None] & he_valid[:, None, :]).reshape(B, -1)
             # The same element positions expressed on each pooled grid.

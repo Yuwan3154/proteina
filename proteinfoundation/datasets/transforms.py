@@ -214,21 +214,14 @@ class PaddingTransform(T.BaseTransform):
                         fill_value = -1  # ignore_index for CE loss
                     elif key == "ext_lig":
                         fill_value = 2  # unknown class for padded residues
-                    is_topology = key.startswith("topology_")
-                    if is_topology:
-                        # Topology tensors live on the element axis, not the residue axis, and
-                        # their padding must read as absent rather than as a real element: token
-                        # tensors pad with TOPOLOGY_PAD_TOKEN (0) and float ones with 0.0, never
-                        # with FLOAT_PADDING_VALUE.
-                        size = (
-                            (self.topology_he_max_size or self.topology_max_size or self.max_size)
-                            if key.startswith("topology_he")
-                            else (self.topology_max_size or self.max_size)
-                        )
-                        fill_value = 0
-                    else:
-                        size = self.max_size
-                    if (("contact_map" in key or is_topology) and value.dim() == 2):
+                    if key.startswith("topology_"):
+                        # Left unpadded on purpose: the dense collate pads each key to the BATCH
+                        # maximum, so the topology axes cost what a batch actually needs (median
+                        # ~42 elements) instead of a fixed worst-case cap. The transform has
+                        # already truncated them to their safety bounds.
+                        continue
+                    size = self.max_size
+                    if ("contact_map" in key and value.dim() == 2):
                         # Pad dimension 0 first, then dimension 1
                         value = self.pad_tensor(value, size, dim=0, fill_value=fill_value)
                         value = self.pad_tensor(value, size, dim=1, fill_value=fill_value)
