@@ -245,8 +245,10 @@ def sse_contact_reference(
 #   * circuit topology -- the Series / Parallel / Cross relation between chain loops (Mashaghi et
 #     al., "Circuit topology of proteins and nucleic acids", Structure 2014). Every contacting
 #     element pair (s, t) spans a loop along the chain, and its relation to every other contact is
-#     one of nested (series), disjoint (parallel), or interlocked (cross). These relations, not the
-#     contact set alone, are what distinguish folds that share a contact count.
+#     one of disjoint (SERIES), nested (PARALLEL), or interlocked (CROSS). Note the naming: in this
+#     framework Series is the non-intersecting case and Parallel is the encompassed one, which is
+#     the opposite of the everyday reading of those two words. These relations, not the contact set
+#     alone, are what distinguish folds that share a contact count.
 #   * secondary-structure contact/proximity -- how strongly and how closely two elements pack:
 #     the fraction of their residue pairs in contact, their closest and mean CA-CA distance, and
 #     the number of residues separating them along the chain.
@@ -261,18 +263,18 @@ PAIR_FEATURE_NAMES = (
     "contact_frac",
     "min_ca_dist",
     "mean_ca_dist",
-    "circuit_parallel",
-    "circuit_series_inside",
-    "circuit_series_outside",
+    "circuit_series",
+    "circuit_parallel_contains",
+    "circuit_parallel_inside",
     "circuit_cross",
     "seq_gap",
 )
 N_PAIR_FEATURES = len(PAIR_FEATURE_NAMES)
 STRUCTURAL_PAIR_FEATURES = ("contact_frac", "min_ca_dist", "mean_ca_dist")
 CIRCUIT_PAIR_FEATURES = (
-    "circuit_parallel",
-    "circuit_series_inside",
-    "circuit_series_outside",
+    "circuit_series",
+    "circuit_parallel_contains",
+    "circuit_parallel_inside",
     "circuit_cross",
 )
 PROXIMITY_PAIR_FEATURES = ("contact_frac", "min_ca_dist", "mean_ca_dist", "seq_gap")
@@ -288,14 +290,17 @@ def circuit_topology_features(contact: torch.Tensor) -> torch.Tensor:
     """[T, T] element contact map -> [T, T, 4] circuit-topology relation counts.
 
     Each element pair (s, t) delimits a loop along the chain. Its relation to another contact
-    (u, v) is Parallel when the two loops are disjoint, Series when one contains the other, and
-    Cross when they interlock. Counting each relation over all contacts gives a per-pair
+    (u, v) is SERIES when the two loops are disjoint, PARALLEL when one encompasses the other
+    (split here by which encompasses which, which the single P class does not distinguish), and
+    CROSS when they interlock. Counting each relation over all contacts gives a per-pair
     fingerprint of how that pair sits within the fold rather than merely whether it touches.
 
-    Loops that share an endpoint are a degenerate case the original definition does not cover;
-    touching intervals count as Parallel and shared-endpoint nesting counts as Series, so every
-    pair falls in exactly one class. Counts are divided by the number of contacts, which keeps the
-    channel scale-free across chains of very different sizes.
+    Two departures from the published definition, both deliberate: loops sharing an endpoint are
+    the "concerted" subclass, folded here into whichever of Series or Parallel they border on so
+    that every pair falls in exactly one of four channels; and a contact is not counted against
+    itself, since "this pair is a contact" is already the contact_max channel. Counts are divided
+    by the number of contacts, which keeps the channel scale-free across chains of very different
+    sizes.
     """
     T = contact.shape[0]
     out = contact.new_zeros((T, T, 4))
@@ -314,12 +319,12 @@ def circuit_topology_features(contact: torch.Tensor) -> torch.Tensor:
     u, v = u[None, None, :], v[None, None, :]
 
     same = (u == lo) & (v == hi)  # a contact compared against its own loop
-    parallel = (v <= lo) | (u >= hi)
-    inside = (lo <= u) & (v <= hi) & ~same & ~parallel
-    outside = (u <= lo) & (hi <= v) & ~same & ~parallel & ~inside
-    cross = ~(parallel | inside | outside | same)
+    series = (v <= lo) | (u >= hi)
+    contains = (lo <= u) & (v <= hi) & ~same & ~series
+    inside = (u <= lo) & (hi <= v) & ~same & ~series & ~contains
+    cross = ~(series | contains | inside | same)
 
-    for c, rel in enumerate((parallel, inside, outside, cross)):
+    for c, rel in enumerate((series, contains, inside, cross)):
         out[..., c] = rel.sum(dim=-1).to(out.dtype) / float(K)
     return out
 
