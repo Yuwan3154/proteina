@@ -58,6 +58,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from loguru import logger
+
 from proteinfoundation.nn.alphafold3_pytorch_utils.modules import (
     AdaptiveLayerNorm,
     AdaptiveLayerNormOutputScale,
@@ -804,6 +806,8 @@ class ContactMapHierSiT(nn.Module):
 
     # ── Forward ───────────────────────────────────────────────────────────────
 
+    _warned_missing_topology = False
+
     def _ensure_topology_keys(self, batch: Dict, B: int, device) -> Dict:
         """Supply an unconditioned topology reference when the batch carries none.
 
@@ -816,6 +820,18 @@ class ContactMapHierSiT(nn.Module):
         """
         if batch.get("topology_tokens") is not None:
             return batch
+        # Warn once per process. Nothing outside TopologyReferenceTransform produces these keys,
+        # and generate() rebuilds its batch from scratch without them, so a topology-conditioned
+        # model reaching here is sampling UNCONDITIONED. That is intended for length-based
+        # generation but silently wrong if the caller believed it was passing a topology, and the
+        # KeyError this guard replaced was previously the only signal.
+        if not ContactMapHierSiT._warned_missing_topology:
+            ContactMapHierSiT._warned_missing_topology = True
+            logger.warning(
+                "topology_cond=True but the batch carries no topology_* keys; generating with an "
+                "unconditioned (MASK) reference. Only TopologyReferenceTransform emits them, and "
+                "generate() does not forward them."
+            )
         batch = dict(batch)
         mask_tok = torch.full((B, 1), TOPOLOGY_MASK_TOKEN, dtype=torch.long, device=device)
         zeros = torch.zeros(B, 1, dtype=torch.float32, device=device)
