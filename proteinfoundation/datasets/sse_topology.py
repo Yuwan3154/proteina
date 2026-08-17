@@ -252,6 +252,9 @@ def sse_contact_reference(
 #   * secondary-structure contact/proximity -- how strongly and how closely two elements pack:
 #     the fraction of their residue pairs in contact, their closest and mean CA-CA distance, and
 #     the number of residues separating them along the chain.
+#   * relative orientation -- the cosine between the two elements' axes, which is what separates
+#     parallel from antiparallel beta pairing and fixes helix packing angles. Contacts and
+#     distances cannot express it: two strands at +1 and -1 can pack identically closely.
 #
 # Channels split by WHERE they can be computed. The three structural ones need residue-level data
 # (the full contact map and the coordinates) that the dataloader never sees, so they are stored in
@@ -263,6 +266,7 @@ PAIR_FEATURE_NAMES = (
     "contact_frac",
     "min_ca_dist",
     "mean_ca_dist",
+    "orientation_cos",
     "circuit_series",
     "circuit_parallel_contains",
     "circuit_parallel_inside",
@@ -270,7 +274,8 @@ PAIR_FEATURE_NAMES = (
     "seq_gap",
 )
 N_PAIR_FEATURES = len(PAIR_FEATURE_NAMES)
-STRUCTURAL_PAIR_FEATURES = ("contact_frac", "min_ca_dist", "mean_ca_dist")
+STRUCTURAL_PAIR_FEATURES = ("contact_frac", "min_ca_dist", "mean_ca_dist", "orientation_cos")
+ORIENTATION_PAIR_FEATURES = ("orientation_cos",)
 CIRCUIT_PAIR_FEATURES = (
     "circuit_series",
     "circuit_parallel_contains",
@@ -353,7 +358,7 @@ def sse_structural_pair_features(
     runs: Sequence[Tuple[int, int]],
     keep: Sequence[int],
 ) -> torch.Tensor:
-    """[T, T, 3] contact fraction and closest/mean CA-CA distance for each element pair.
+    """[T, T, 4] contact fraction, closest/mean CA-CA distance and axis cosine per element pair.
 
     Args:
         contact_map: [L, L] binarised residue contact map.
@@ -366,7 +371,7 @@ def sse_structural_pair_features(
     uninformative.
     """
     T = len(keep)
-    out = torch.zeros((T, T, 3), dtype=torch.float32)
+    out = torch.zeros((T, T, len(STRUCTURAL_PAIR_FEATURES)), dtype=torch.float32)
     if T == 0:
         return out
     spans = runs_to_spans(runs)
@@ -400,11 +405,37 @@ def sse_structural_pair_features(
         out[..., 1] = torch.where(has_ca, dmin, torch.zeros_like(dmin))
         dmean = _block_reduce(d, row_ca, T, "sum") / (n_ca[:, None] * n_ca[None, :]).clamp(min=1.0)
         out[..., 2] = torch.where(has_ca, dmean, torch.zeros_like(dmean))
+        axes = _element_axes(coords[:, CA_ATOM_INDEX, :].float(), elem, ca_ok, T)
+        out[..., 3] = (axes @ axes.T).clamp(-1.0, 1.0)
     # All three channels are symmetric by definition, but torch.cdist takes a matmul path for
     # larger inputs that is asymmetric at ~1e-5, and the float16 storage then amplifies that to a
     # whole ulp (0.03 A) whenever a mirrored pair straddles a rounding boundary. Averaging the two
     # halves restores the invariant exactly, at float32 precision, before it is ever cast.
     return 0.5 * (out + out.transpose(0, 1))
+
+
+def _element_axes(
+    ca: torch.Tensor, elem: torch.Tensor, ca_ok: torch.Tensor, T: int
+) -> torch.Tensor:
+    """[T, 3] unit axis per element, oriented from its first residue toward its last.
+
+    The axis is the least-squares line through the element's CA atoms (its first principal
+    component), which follows a curved helix better than a bare end-to-end vector while agreeing
+    with it on a straight strand. Signing it N-to-C is what makes the pairwise cosine distinguish
+    parallel from antiparallel rather than collapsing both onto |cos|. An element with fewer than
+    two resolved CA atoms has no definable axis and is left at zero, giving cosine 0 everywhere.
+    """
+    axes = torch.zeros(T, 3)
+    for a in range(T):
+        m = (elem == a) & ca_ok
+        if int(m.sum()) < 2:
+            continue
+        x = ca[m]
+        v = torch.linalg.svd(x - x.mean(0, keepdim=True), full_matrices=False).Vh[0]
+        if torch.dot(v, x[-1] - x[0]) < 0:
+            v = -v
+        axes[a] = v / v.norm().clamp(min=1e-8)
+    return axes
 
 
 def _block_reduce(m: torch.Tensor, row: torch.Tensor, T: int, reduce: str) -> torch.Tensor:

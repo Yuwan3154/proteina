@@ -58,8 +58,8 @@ def _read_one(path: str, min_len: int, threshold: float):
     featurization note in sse_topology). Statistics are accumulated over ALL channels so the
     transform can standardise every one of them against real dataset scales.
     """
-    def empty(reason):
-        return (None, None, 0, None, None, reason)
+    def empty(reason, seq=None):
+        return (None, None, 0, None, None, reason, seq)
 
     if not os.path.exists(path):
         return empty("missing_file")
@@ -69,16 +69,19 @@ def _read_one(path: str, min_len: int, threshold: float):
         g = torch.load(path, map_location="cpu", weights_only=False)
     except Exception as e:
         return empty(f"load_failed:{type(e).__name__}")
+    # The sequence is returned even on the skip paths: a skipped chain still needs a seq_hash,
+    # because other chains in its cluster consult it when excluding same-sequence templates.
+    seq = getattr(g, "sequence", None)
     dssp = getattr(g, "dssp_target", None)
     raw = getattr(g, "contact_map_confind", None)
     if dssp is None:
-        return empty("no_dssp_attr")
+        return empty("no_dssp_attr", seq)
     if bool((dssp < 0).all()):
-        return empty("dssp_all_ignore")
+        return empty("dssp_all_ignore", seq)
     if raw is None:
-        return empty("no_contact_map")
+        return empty("no_contact_map", seq)
     if getattr(g, "coords", None) is None or getattr(g, "coord_mask", None) is None:
-        return empty("no_coords")
+        return empty("no_coords", seq)
     runs = dssp_to_runs(dssp, min_len=min_len)
     cm = (raw.float() >= threshold).float()
     ref, keep = sse_contact_reference(cm, runs, keep_types=(DSSP_HELIX, DSSP_STRAND))
@@ -98,7 +101,26 @@ def _read_one(path: str, min_len: int, threshold: float):
         structural.to(torch.float16).flatten().numpy().tobytes(),
         (stats.tolist(), flat.shape[0]),
         "",
+        seq,
     )
+
+
+def _hash_sequence(seq, id_to_seq, stem):
+    """Hash the RESOLVED sequence carried on the graph, falling back to the CSV then the id.
+
+    Resolved rather than SEQRES on purpose: two crystal copies of one construct share a SEQRES but
+    usually resolve different residues, and hashing SEQRES made them look identical and therefore
+    excluded each other as templates. Measured on this dataset, 64.7% of identical-SEQRES
+    cluster-mates differ once resolution is taken into account, and those mates are literal
+    self-references only 0.4% of the time -- lower than the templates already in use.
+    """
+    if isinstance(seq, str) and seq:
+        key, source = seq, "graph"
+    elif id_to_seq.get(stem) is not None:
+        key, source = id_to_seq[stem], "csv_fallback"
+    else:
+        key, source = stem, "id_fallback"
+    return int(hashlib.blake2b(str(key).encode(), digest_size=8).hexdigest(), 16) % (2**62), source
 
 
 def main() -> None:
@@ -148,7 +170,7 @@ def main() -> None:
     df = pd.read_csv(csv_path)
     id_to_seq = dict(zip(df["id"].astype(str), df["sequence"].astype(str)))
     print(f"sequences from {csv_path.name}: {len(id_to_seq)}", flush=True)
-    n_no_seq = 0
+    hash_sources = Counter()
 
     ds = dm.train_ds
     n = len(ids) if args.limit <= 0 else min(args.limit, len(ids))
@@ -178,10 +200,12 @@ def main() -> None:
             if (j + 1) % 20000 == 0:
                 print(f"  {j + 1}/{n}", flush=True)
 
-    for i, (runs, ref_bytes, t_he, feat_bytes, stats, reason) in enumerate(results):
+    for i, (runs, ref_bytes, t_he, feat_bytes, stats, reason, seq) in enumerate(results):
         if runs is None:
             n_missing += 1
             skipped.append((ids[i], reason, paths[i]))
+            seq_hash[i], src = _hash_sequence(seq, id_to_seq, ids[i])
+            hash_sources[src] += 1
             runs_offset.append(runs_offset[-1])
             he_offset.append(he_offset[-1])
             feat_offset.append(feat_offset[-1])
@@ -210,17 +234,12 @@ def main() -> None:
         feat_sumsq += torch.tensor(sums[1], dtype=torch.float64)
         feat_count += cnt
 
-        # Sequences come from the selection CSV, not the graph: if the attribute were absent the
-        # hash would fall back to the chain id, every mate would look sequence-distinct, and the
-        # "exclude identical-sequence templates" policy would silently do nothing.
-        seq = id_to_seq.get(ids[i])
-        if seq is None:
-            n_no_seq += 1
-        key = str(seq) if seq is not None else ids[i]
-        seq_hash[i] = int(hashlib.blake2b(key.encode(), digest_size=8).hexdigest(), 16) % (2**62)
+        seq_hash[i], src = _hash_sequence(seq, id_to_seq, ids[i])
+        hash_sources[src] += 1
 
     print(f"chains without usable DSSP or contact map: {n_missing}", flush=True)
-    print(f"chains with no sequence in the CSV: {n_no_seq}", flush=True)
+    for src, cnt in sorted(hash_sources.items(), key=lambda kv: -kv[1]):
+        print(f"  seq_hash source {src:<16} {cnt}", flush=True)
     # A count alone does not establish that a skip was correct, so every skipped chain is written
     # out with its reason for a separate audit pass.
     by_reason = Counter(r for _, r, _ in skipped)
