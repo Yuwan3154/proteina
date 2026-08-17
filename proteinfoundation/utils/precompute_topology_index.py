@@ -181,7 +181,7 @@ def main() -> None:
     for i, (runs, ref_bytes, t_he, feat_bytes, stats, reason) in enumerate(results):
         if runs is None:
             n_missing += 1
-            skipped.append((ids[i], reason))
+            skipped.append((ids[i], reason, paths[i]))
             runs_offset.append(runs_offset[-1])
             he_offset.append(he_offset[-1])
             feat_offset.append(feat_offset[-1])
@@ -223,14 +223,18 @@ def main() -> None:
     print(f"chains with no sequence in the CSV: {n_no_seq}", flush=True)
     # A count alone does not establish that a skip was correct, so every skipped chain is written
     # out with its reason for a separate audit pass.
-    by_reason = Counter(r for _, r in skipped)
+    by_reason = Counter(r for _, r, _ in skipped)
     for reason, cnt in sorted(by_reason.items(), key=lambda kv: -kv[1]):
         print(f"  skip reason {reason:<28} {cnt}", flush=True)
     if args.skip_log:
+        # Path first, reason second: that is the layout backfill_graph_sequence --audit-skips
+        # reads, so the same audit pass covers both loops.
         with open(args.skip_log, "w") as fh:
-            for stem, reason in skipped:
-                fh.write(f"{stem}\t{reason}\n")
+            for stem, reason, path in skipped:
+                fh.write(f"{path}\t{reason}\t{stem}\n")
         print(f"skipped chains listed in {args.skip_log}", flush=True)
+        print(f"audit them with: python -m proteinfoundation.utils.backfill_graph_sequence "
+              f"--processed-dir <dir> --audit-skips {args.skip_log}", flush=True)
 
     # Per-channel standardisation statistics, measured rather than assumed: the channels span
     # fractions in [0, 1], distances in angstrom and residue counts, so feeding them raw would
