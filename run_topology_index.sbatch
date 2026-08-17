@@ -24,6 +24,7 @@ DATASET="${DATASET:-pdb_train_contact-confind_S25_max512_purge-test_cutoff-19082
 OUT="${OUT:-$DATA_PATH/pdb_train/topology_index.pt}"
 WORKERS="${WORKERS:-32}"
 SKIP_LOG="${SKIP_LOG:-$DATA_PATH/pdb_train/topology_index.skips.tsv}"
+LIMIT="${LIMIT:-0}"   # >0 indexes only the first N chains, for a smoke test
 
 module load miniforge
 source "$(conda info --base)/etc/profile.d/conda.sh"
@@ -39,12 +40,13 @@ echo "[$(date)] host=$(hostname) dataset=$DATASET out=$OUT workers=$WORKERS"
 TMP="$OUT.building"
 python -u -m proteinfoundation.utils.precompute_topology_index \
     --dataset "$DATASET" --out "$TMP" --workers "$WORKERS" --repo "$PROTEINA_REPO" \
-    --skip-log "$SKIP_LOG"
+    --skip-log "$SKIP_LOG" --limit "$LIMIT"
 RC=$?
-if [ $RC -eq 0 ]; then
+if [ $RC -eq 0 ] && [ "$LIMIT" -eq 0 ]; then
     [ -f "$OUT" ] && mv "$OUT" "$OUT.prev"
     mv "$TMP" "$OUT"
     ls -lh "$OUT"
 fi
+[ "$LIMIT" -ne 0 ] && echo "[$(date)] LIMIT=$LIMIT smoke run, $TMP left in place, live index untouched"
 echo "[$(date)] done rc=$RC"
 exit $RC
