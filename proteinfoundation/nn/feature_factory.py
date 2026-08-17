@@ -240,6 +240,15 @@ class FoldEmbeddingSeqFeat(Feature):
                 )
             elif self.multilabel_mode == "sum":
                 fold_emb = (fold_emb * valid[:, :, None].float()).sum(dim=1)
+            else:
+                # "sample" mode reaching a 3-D idx. The dataset normally collapses to [b, 3]
+                # itself, but the validation-sampling path builds [nsamples, 1, 3] all-null
+                # indices deliberately (see model_trainer_base), and with no branch here the
+                # embedding stayed [b, max_labels, d] and the unsqueeze below made it 4-D,
+                # crashing the expand. Take the first valid label per row: in the only case
+                # that reaches this today max_labels is 1, so every selection rule agrees.
+                first = valid.float().argmax(dim=1)  # [b]
+                fold_emb = fold_emb[torch.arange(fold_emb.shape[0], device=fold_emb.device), first]
         fold_emb = fold_emb[:, None, :]  # [b, 1, fold_emb_dim * 3]
         return fold_emb.expand(
             (fold_emb.shape[0], n, fold_emb.shape[2])
