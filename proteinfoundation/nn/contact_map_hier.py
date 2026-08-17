@@ -65,10 +65,12 @@ from proteinfoundation.nn.alphafold3_pytorch_utils.modules import (
 )
 from proteinfoundation.datasets.sse_topology import (
     CIRCUIT_PAIR_FEATURES,
+    N_PAIR_FEATURES,
     PAIR_FEATURE_NAMES,
     PROXIMITY_PAIR_FEATURES,
     pair_feature_indices,
 )
+from proteinfoundation.datasets.sse_topology import MASK_TOKEN as TOPOLOGY_MASK_TOKEN
 from proteinfoundation.datasets.sse_topology import PAD_TOKEN as TOPOLOGY_PAD_TOKEN
 from proteinfoundation.nn.feature_factory import FeatureFactory
 from proteinfoundation.nn.protein_transformer import (
@@ -802,6 +804,31 @@ class ContactMapHierSiT(nn.Module):
 
     # ── Forward ───────────────────────────────────────────────────────────────
 
+    def _ensure_topology_keys(self, batch: Dict, B: int, device) -> Dict:
+        """Supply an unconditioned topology reference when the batch carries none.
+
+        Sampling generates from the length dataset, so those batches never pass through
+        TopologyReferenceTransform and have no topology_* keys at all. The substitute is exactly
+        what the transform emits for a dropped sample -- a single MASK element -- which is a
+        regime the model trains in (drop_prob), not an improvised input. It also mirrors how the
+        trainer handles CATH on the same path, where it builds all-null fold indices rather than
+        conditioning on a fold it does not have.
+        """
+        if batch.get("topology_tokens") is not None:
+            return batch
+        batch = dict(batch)
+        mask_tok = torch.full((B, 1), TOPOLOGY_MASK_TOKEN, dtype=torch.long, device=device)
+        zeros = torch.zeros(B, 1, dtype=torch.float32, device=device)
+        batch["topology_tokens"] = mask_tok
+        batch["topology_pos"] = zeros
+        batch["topology_he_tokens"] = mask_tok.clone()
+        batch["topology_he_pos"] = zeros.clone()
+        batch["topology_he_contact"] = torch.zeros(B, 1, 1, dtype=torch.float32, device=device)
+        batch["topology_he_feat"] = torch.zeros(
+            B, 1, 1, N_PAIR_FEATURES, dtype=torch.float32, device=device
+        )
+        return batch
+
     def forward(self, batch: Dict, force_compile: bool = False) -> Dict:
         """Run the hierarchy over a batch.
 
@@ -873,6 +900,7 @@ class ContactMapHierSiT(nn.Module):
         single = topo = topo_mask = ref_kv = ref_mask = None
         topo_pos = he_pos_block = he_pos_super = None
         if self.topology_cond:
+            batch = self._ensure_topology_keys(batch, B, device)
             tokens = batch["topology_tokens"]  # [B, T]
             # Validity is `> 0`, not `!= PAD`: the dense collate pads integer tensors with
             # NON_FLOAT_PADDING_VALUE (-1), not with TOPOLOGY_PAD_TOKEN (0), so testing against
