@@ -241,17 +241,34 @@ class FoldEmbeddingSeqFeat(Feature):
             elif self.multilabel_mode == "sum":
                 fold_emb = (fold_emb * valid[:, :, None].float()).sum(dim=1)
             else:
-                # "sample" mode reaching a 3-D idx: draw ONE label per row, uniformly among the
-                # valid ones, which is what the mode's name promises. Without this branch the
-                # embedding stayed [b, max_labels, d], the unsqueeze below made it 4-D and the
-                # expand raised -- the crash every fold-conditioned "sample" config hit at its
-                # first sampling validation. A row that is entirely padding has nothing to draw
-                # from, so it falls back to a uniform draw over all slots rather than dividing
-                # by a zero weight sum.
-                w = valid.float()
-                w = torch.where(w.sum(dim=1, keepdim=True) > 0, w, torch.ones_like(w))
-                pick = torch.multinomial(w, 1).squeeze(1)  # [b]
-                fold_emb = fold_emb[torch.arange(fold_emb.shape[0], device=fold_emb.device), pick]
+                # "sample" mode reaching a 3-D idx. Without this branch the embedding stayed
+                # [b, max_labels, d], the unsqueeze below made it 4-D and the expand raised --
+                # the crash every fold-conditioned "sample" config hit at its first sampling
+                # validation.
+                #
+                # Selection here is DELIBERATELY deterministic. The random draw that "sample"
+                # mode names already happens once per sample in the collate
+                # (dense_padding_data_loader, which picks one label with random.randint and
+                # returns a 2-D idx), so training never reaches this branch at all. Drawing
+                # again here would be a second, wrongly-placed sample: forward runs once per
+                # diffusion step during generation, so a stochastic pick would re-roll the fold
+                # label at every step and make the conditioning flicker along a single
+                # trajectory. Taking the first valid label keeps one fold fixed for the whole
+                # trajectory and consumes no RNG, leaving sample streams reproducible.
+                #
+                # Padded slots are always a suffix (the collate fills valid labels first), so
+                # argmax over the 0/1 validity mask is the first valid index. An all-padding row
+                # yields 0, which the collate filled with the null "unknown fold" code -- the
+                # same embedding the 2-D path gives a chain with no CATH label.
+                if valid.sum(dim=1).max() > 1:
+                    logger.warning(
+                        "fold_emb: multilabel_mode='sample' received %d valid labels in a 3-D "
+                        "batch; the per-sample draw belongs in the collate, so the first label "
+                        "is used here and the others are ignored.",
+                        int(valid.sum(dim=1).max()),
+                    )
+                first = valid.float().argmax(dim=1)  # [b]
+                fold_emb = fold_emb[torch.arange(fold_emb.shape[0], device=fold_emb.device), first]
         fold_emb = fold_emb[:, None, :]  # [b, 1, fold_emb_dim * 3]
         return fold_emb.expand(
             (fold_emb.shape[0], n, fold_emb.shape[2])
