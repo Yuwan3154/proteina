@@ -814,6 +814,10 @@ if __name__ == "__main__":
         plugins=plugins,
         accumulate_grad_batches=cfg_exp.opt.accumulate_grad_batches,
         num_sanity_val_steps=1,
+        # Cap validation work. Unset, Lightning walks the FULL val split (8082 chains here),
+        # which at a short val cadence costs more wall clock than the training between
+        # validations. Default 1.0 = every batch, so configs that omit it are unchanged.
+        limit_val_batches=cfg_exp.opt.get("limit_val_batches", 1.0),
         precision=precision,
         gradient_clip_algorithm="norm",
         gradient_clip_val=1.0,

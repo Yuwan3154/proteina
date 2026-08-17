@@ -241,14 +241,17 @@ class FoldEmbeddingSeqFeat(Feature):
             elif self.multilabel_mode == "sum":
                 fold_emb = (fold_emb * valid[:, :, None].float()).sum(dim=1)
             else:
-                # "sample" mode reaching a 3-D idx. The dataset normally collapses to [b, 3]
-                # itself, but the validation-sampling path builds [nsamples, 1, 3] all-null
-                # indices deliberately (see model_trainer_base), and with no branch here the
-                # embedding stayed [b, max_labels, d] and the unsqueeze below made it 4-D,
-                # crashing the expand. Take the first valid label per row: in the only case
-                # that reaches this today max_labels is 1, so every selection rule agrees.
-                first = valid.float().argmax(dim=1)  # [b]
-                fold_emb = fold_emb[torch.arange(fold_emb.shape[0], device=fold_emb.device), first]
+                # "sample" mode reaching a 3-D idx: draw ONE label per row, uniformly among the
+                # valid ones, which is what the mode's name promises. Without this branch the
+                # embedding stayed [b, max_labels, d], the unsqueeze below made it 4-D and the
+                # expand raised -- the crash every fold-conditioned "sample" config hit at its
+                # first sampling validation. A row that is entirely padding has nothing to draw
+                # from, so it falls back to a uniform draw over all slots rather than dividing
+                # by a zero weight sum.
+                w = valid.float()
+                w = torch.where(w.sum(dim=1, keepdim=True) > 0, w, torch.ones_like(w))
+                pick = torch.multinomial(w, 1).squeeze(1)  # [b]
+                fold_emb = fold_emb[torch.arange(fold_emb.shape[0], device=fold_emb.device), pick]
         fold_emb = fold_emb[:, None, :]  # [b, 1, fold_emb_dim * 3]
         return fold_emb.expand(
             (fold_emb.shape[0], n, fold_emb.shape[2])

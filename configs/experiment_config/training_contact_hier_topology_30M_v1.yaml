@@ -75,10 +75,13 @@ opt:
   # accumulation; this knob is now multiplied by accumulate_grad_batches in
   # train.py so a value of 1000 here = 1000 gradient updates between val runs.
   val_check_interval_optim_steps: 1000
+  limit_val_batches: 64  # batches per rank per validation. Unset walks all 8082
+                         # val chains, which dominates wall clock at a short cadence.
   skip_nan_grad: False
   grad_and_weight_analysis: False
   dist_strategy: ddp
-  dist_backend: gloo
+  dist_backend: nccl   # measured +19% throughput over gloo on 2x L40S
+                       # (1.19 vs 1.00 minibatches/s/rank), no P2P hang
   use_lr_warmup: True
   warmup_steps: 1000
   warmup_start_lr_ratio: 0.0
