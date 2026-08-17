@@ -205,6 +205,7 @@ class BiasedMHSA(nn.Module):
         mask: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
         rope: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        mask_all_valid: bool = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -212,6 +213,9 @@ class BiasedMHSA(nn.Module):
             mask: [B, N] bool, True for valid tokens.
             bias: Optional [nheads, N, N] additive attention bias.
             rope: Optional (cos, sin) tables of shape [N, head_dim].
+            mask_all_valid: caller asserts every token is valid, so the mask can be dropped and
+                SDPA can take the flash path. Computed once by the caller rather than here to
+                avoid a device sync per layer.
 
         Returns:
             [B, N, dim]
@@ -228,7 +232,13 @@ class BiasedMHSA(nn.Module):
         # softmaxes to NaN on some SDPA backends, so invalid queries are allowed to
         # attend freely and their output is zeroed on the way out instead.
         query_invalid = ~mask[:, None, :, None]  # [B, 1, N, 1]
-        if bias is None:
+        if bias is None and mask_all_valid:
+            # Every token valid and no bias: passing attn_mask=None lets SDPA choose the flash
+            # backend, which it cannot do with an explicit mask. This is the dominant cost in the
+            # model -- within-block attention is ~153x a sequence model's at L=512 -- and interior
+            # blocks are fully valid, so the mask was pure overhead on the hot path.
+            attn_mask = None
+        elif bias is None:
             attn_mask = mask[:, None, None, :] | query_invalid  # [B, 1, N, N] bool
         else:
             neg = torch.finfo(q.dtype).min
@@ -267,6 +277,7 @@ class BiasedSiTBlock(nn.Module):
         mask: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
         rope: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        mask_all_valid: bool = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -280,7 +291,7 @@ class BiasedSiTBlock(nn.Module):
             [B, N, dim]
         """
         h = self.adaln(x, cond, mask)
-        h = self.attn(h, mask, bias=bias, rope=rope)
+        h = self.attn(h, mask, bias=bias, rope=rope, mask_all_valid=mask_all_valid)
         x = x + self.scale_output(h, cond, mask)
         x = x + self.mlp(x, cond, mask)
         return x * mask[..., None]
@@ -984,8 +995,10 @@ class ContactMapHierSiT(nn.Module):
             m = self._grid_to_tokens(pair_mask[..., None], l).reshape(B * n_blocks, l * l) > 0
             cond_local = cond.expand(B, n_blocks, self.d_cond_dit).reshape(B * n_blocks, 1, self.d_cond_dit)
             rope = rope_2d_tables(l, self.local_head_dim, device, x.dtype)
+            # One device sync for the whole stack rather than one per layer.
+            m_all = bool(m.all())
             for blk in self.local_blocks:
-                x = blk(x, cond_local, m, bias=None, rope=rope)
+                x = blk(x, cond_local, m, bias=None, rope=rope, mask_all_valid=m_all)
             cells = self._tokens_to_grid(
                 x.reshape(B, n_blocks, l * l * self.d_local), P1, l, self.d_local
             )

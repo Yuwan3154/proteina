@@ -2493,6 +2493,12 @@ class ModelTrainerBase(L.LightningModule):
         # Reset the per-epoch TMscore accumulator. This runs on every rank, but
         # _run_validation_trajectory only appends on rank 0 (the only rank that
         # holds a logger), so the aggregation is rank-0 local.
+        # The trajectory gate must be per-VALIDATION, like the accumulators below. Keyed on the
+        # training epoch it only fired on the first validation of each epoch, so with a short
+        # val_check_interval (many validations per epoch) every later validation reset these
+        # accumulators, skipped the trajectory and logged no tmscore -- and the best-TM
+        # ModelCheckpoint then raised MisconfigurationException on the missing monitor.
+        self._logged_val_traj_epoch = -1
         self._validation_tmscore_results: List[Dict[str, float]] = []
         # Per-epoch contact-map metrics accumulator (only populated in contact_map_mode
         # with discrete diffusion). Same per-sample-dict pattern as tmscore.
