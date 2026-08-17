@@ -158,22 +158,19 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         inverse-frequency sample-count histories (no-CAT cluster, CAT cluster, member) are
         currently enabled -- empty/no-op keys omitted otherwise."""
         out = {}
-        if self._train_cluster_sampler is not None:
-            train_state = self._train_cluster_sampler.state_dict()
-            if "nocat_sample_counts" in train_state:
-                out["train_nocat_sample_counts"] = train_state["nocat_sample_counts"]
-            if "cat_cluster_sample_counts" in train_state:
-                out["train_cat_cluster_sample_counts"] = train_state["cat_cluster_sample_counts"]
-            if "member_sample_counts" in train_state:
-                out["train_member_sample_counts"] = train_state["member_sample_counts"]
-        if self._val_cluster_sampler is not None:
-            val_state = self._val_cluster_sampler.state_dict()
-            if "nocat_sample_counts" in val_state:
-                out["val_nocat_sample_counts"] = val_state["nocat_sample_counts"]
-            if "cat_cluster_sample_counts" in val_state:
-                out["val_cat_cluster_sample_counts"] = val_state["cat_cluster_sample_counts"]
-            if "member_sample_counts" in val_state:
-                out["val_member_sample_counts"] = val_state["member_sample_counts"]
+        for prefix, sampler in (("train", self._train_cluster_sampler),
+                                ("val", self._val_cluster_sampler)):
+            # Only CATBalancedSampler keeps inverse-frequency counts. A plain ClusterSampler
+            # (sampling_mode: cluster-random) has no state_dict at all, and calling it
+            # unconditionally made EVERY checkpoint save raise AttributeError -- invisible until
+            # a run's checkpoint cadence was short enough to actually reach a save.
+            state = getattr(sampler, "state_dict", None)
+            if state is None:
+                continue
+            state = state()
+            for key in ("nocat_sample_counts", "cat_cluster_sample_counts", "member_sample_counts"):
+                if key in state:
+                    out[f"{prefix}_{key}"] = state[key]
         return out
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
