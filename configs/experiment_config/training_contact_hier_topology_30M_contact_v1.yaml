@@ -1,4 +1,4 @@
-run_name_: train_run_contact_hier_topology_30M_v1
+run_name_: train_run_contact_hier_topology_30M_contact_v1
 
 hardware:
   ncpus_per_task_train_: 8
@@ -28,9 +28,11 @@ defaults:
 
 model:
   nn:
-    # A/B arm: this run sees every element-pair descriptor. The baseline arm
-    # (training_contact_hier_topology_30M_contact_v1) sets `contact` and differs in nothing else.
-    pair_ref_features: both
+    # A/B baseline arm: the 2D reference carries only the binary "do these two elements
+    # touch" flag, i.e. the behaviour before the featurization. The full arm
+    # (training_contact_hier_topology_30M_v1) sets `both` and differs in nothing else, so the
+    # comparison isolates the descriptors rather than any other change.
+    pair_ref_features: contact
     residue_type_emb_init_seq: True
     residue_type_emb_cond_seq: True
     residue_type_emb_init_pair: True
