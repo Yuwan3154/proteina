@@ -36,6 +36,13 @@ conda deactivate 2>/dev/null
 conda activate "$CONDA_ENV"
 set -u
 
+# One thread per worker: with 32 pool workers each letting torch open a full BLAS thread pool,
+# the node hit a load average of 1773 on 96 cores and the scan crawled. The work here is per-chain
+# and already parallel across processes, so intra-op threading only fights itself.
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+
 cd "$PROTEINA_REPO"
 [ -d "$PROCESSED" ] || { echo "no such processed dir: $PROCESSED"; exit 2; }
 echo "[$(date)] host=$(hostname) processed=$PROCESSED workers=$WORKERS"
