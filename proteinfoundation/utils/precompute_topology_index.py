@@ -26,6 +26,7 @@ import hashlib
 import itertools
 import os
 import sys
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
@@ -57,14 +58,27 @@ def _read_one(path: str, min_len: int, threshold: float):
     featurization note in sse_topology). Statistics are accumulated over ALL channels so the
     transform can standardise every one of them against real dataset scales.
     """
-    empty = (None, None, 0, None, None)
+    def empty(reason):
+        return (None, None, 0, None, None, reason)
+
     if not os.path.exists(path):
-        return empty
-    g = torch.load(path, map_location="cpu", weights_only=False)
+        return empty("missing_file")
+    # One unreadable .pt must not abort a 307k-chain scan; the reason is recorded per chain
+    # instead and every skip is audited afterwards (--skip-log).
+    try:
+        g = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as e:
+        return empty(f"load_failed:{type(e).__name__}")
     dssp = getattr(g, "dssp_target", None)
     raw = getattr(g, "contact_map_confind", None)
-    if dssp is None or bool((dssp < 0).all()) or raw is None:
-        return empty
+    if dssp is None:
+        return empty("no_dssp_attr")
+    if bool((dssp < 0).all()):
+        return empty("dssp_all_ignore")
+    if raw is None:
+        return empty("no_contact_map")
+    if getattr(g, "coords", None) is None or getattr(g, "coord_mask", None) is None:
+        return empty("no_coords")
     runs = dssp_to_runs(dssp, min_len=min_len)
     cm = (raw.float() >= threshold).float()
     ref, keep = sse_contact_reference(cm, runs, keep_types=(DSSP_HELIX, DSSP_STRAND))
@@ -83,6 +97,7 @@ def _read_one(path: str, min_len: int, threshold: float):
         len(keep),
         structural.to(torch.float16).flatten().numpy().tobytes(),
         (stats.tolist(), flat.shape[0]),
+        "",
     )
 
 
@@ -96,6 +111,7 @@ def main() -> None:
     parser.add_argument("--contact-threshold", type=float, default=0.01)
     parser.add_argument("--limit", type=int, default=0, help="debug: only index N chains")
     parser.add_argument("--workers", type=int, default=32)
+    parser.add_argument("--skip-log", default="", help="write every skipped chain id and reason")
     args = parser.parse_args()
 
     cfg_path = os.path.join(
@@ -144,6 +160,7 @@ def main() -> None:
     feat_sumsq = torch.zeros(N_PAIR_FEATURES, dtype=torch.float64)
     feat_count = 0
     n_missing = 0
+    skipped = []
 
     # Reading ~300k .pt files off the HDD-backed pool is I/O bound, not compute bound (the
     # single-process version sat in uninterruptible I/O wait at ~100k after an hour). Parallel
@@ -161,9 +178,10 @@ def main() -> None:
             if (j + 1) % 20000 == 0:
                 print(f"  {j + 1}/{n}", flush=True)
 
-    for i, (runs, ref_bytes, t_he, feat_bytes, stats) in enumerate(results):
+    for i, (runs, ref_bytes, t_he, feat_bytes, stats, reason) in enumerate(results):
         if runs is None:
             n_missing += 1
+            skipped.append((ids[i], reason))
             runs_offset.append(runs_offset[-1])
             he_offset.append(he_offset[-1])
             feat_offset.append(feat_offset[-1])
@@ -203,6 +221,16 @@ def main() -> None:
 
     print(f"chains without usable DSSP or contact map: {n_missing}", flush=True)
     print(f"chains with no sequence in the CSV: {n_no_seq}", flush=True)
+    # A count alone does not establish that a skip was correct, so every skipped chain is written
+    # out with its reason for a separate audit pass.
+    by_reason = Counter(r for _, r in skipped)
+    for reason, cnt in sorted(by_reason.items(), key=lambda kv: -kv[1]):
+        print(f"  skip reason {reason:<28} {cnt}", flush=True)
+    if args.skip_log:
+        with open(args.skip_log, "w") as fh:
+            for stem, reason in skipped:
+                fh.write(f"{stem}\t{reason}\n")
+        print(f"skipped chains listed in {args.skip_log}", flush=True)
 
     # Per-channel standardisation statistics, measured rather than assumed: the channels span
     # fractions in [0, 1], distances in angstrom and residue counts, so feeding them raw would

@@ -23,6 +23,7 @@ set -uo pipefail
 DATASET="${DATASET:-pdb_train_contact-confind_S25_max512_purge-test_cutoff-190828}"
 OUT="${OUT:-$DATA_PATH/pdb_train/topology_index.pt}"
 WORKERS="${WORKERS:-32}"
+SKIP_LOG="${SKIP_LOG:-$DATA_PATH/pdb_train/topology_index.skips.tsv}"
 
 module load miniforge
 source "$(conda info --base)/etc/profile.d/conda.sh"
@@ -37,7 +38,8 @@ echo "[$(date)] host=$(hostname) dataset=$DATASET out=$OUT workers=$WORKERS"
 # rebuild cannot leave training pointed at a truncated file.
 TMP="$OUT.building"
 python -u -m proteinfoundation.utils.precompute_topology_index \
-    --dataset "$DATASET" --out "$TMP" --workers "$WORKERS" --repo "$PROTEINA_REPO"
+    --dataset "$DATASET" --out "$TMP" --workers "$WORKERS" --repo "$PROTEINA_REPO" \
+    --skip-log "$SKIP_LOG"
 RC=$?
 if [ $RC -eq 0 ]; then
     [ -f "$OUT" ] && mv "$OUT" "$OUT.prev"
