@@ -870,7 +870,10 @@ class ContactMapHierSiT(nn.Module):
         pair_mask = mask[:, :, None] & mask[:, None, :]  # [B, L, L]
 
         # Feature factories read x_t purely for its (B, N) shape in contact map mode.
-        if "x_t" not in batch:
+        # `.get(...) is None`, not `not in`: the sampling path passes x_t explicitly as None for a
+        # contact-map model (it has no coordinates to carry), so a membership test leaves the None
+        # in place and the feature factory dereferences it.
+        if batch.get("x_t") is None:
             batch = dict(batch)
             batch["x_t"] = torch.zeros(B, L, 3, device=device, dtype=dtype)
 
