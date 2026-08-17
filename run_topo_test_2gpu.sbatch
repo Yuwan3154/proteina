@@ -11,8 +11,17 @@
 #SBATCH --error=/orcd/scratch/orcd/011/chenxiou/proteina_cmhier/logs/%x-%j.err
 
 # Authorised test run: the 28.07M topology-conditioned contact model, `both` featurization arm,
-# on 2 L40S. Current settings verbatim -- the point is to confirm it trains and to measure step
-# time and memory headroom, not to change hyperparameters.
+# on 2 L40S.
+#
+# Cadence is overridden on the command line rather than in the config, so the production configs
+# keep their real values. Derived from the measured 128s per optimizer step (1.00 minibatch/s/rank
+# x accumulate_grad_batches 128): 6h holds ~168 optimizer steps before validation cost, so a
+# 25-step cadence gives roughly hourly validations and checkpoints instead of the configured 1000
+# and 5000, which land at 35.6h and 177h and so produce NOTHING inside a 6h allocation.
+#
+# dist_backend=nccl is the thing under test. ⚠️ 2-GPU DDP on NCCL is the exact shape that hung on
+# the A6000 box through broken PCIe P2P; if this stalls at the first all-reduce, retry with
+# NCCL_P2P_DISABLE=1 before concluding anything about NCCL vs gloo.
 #
 # 6h is mit_normal_gpu's maximum. The cluster-wide maintenance reservation begins 2026-08-18T00:00,
 # so this must be submitted with enough margin to finish before then.
@@ -60,4 +69,9 @@ python -c "import proteinfoundation; print('proteinfoundation from', proteinfoun
 exec torchrun --standalone --nproc_per_node=2 proteinfoundation/train.py \
     --config_name training_contact_hier_topology_30M_v1 \
     --ngpus_per_node 2 \
-    --nnodes 1
+    --nnodes 1 \
+    run_name_=train_run_contact_hier_topology_30M_nccltest \
+    opt.dist_backend=nccl \
+    opt.val_check_interval_optim_steps=25 \
+    log.last_ckpt_every_n_steps=25 \
+    log.checkpoint_every_n_steps=25
