@@ -400,7 +400,11 @@ def sse_structural_pair_features(
         out[..., 1] = torch.where(has_ca, dmin, torch.zeros_like(dmin))
         dmean = _block_reduce(d, row_ca, T, "sum") / (n_ca[:, None] * n_ca[None, :]).clamp(min=1.0)
         out[..., 2] = torch.where(has_ca, dmean, torch.zeros_like(dmean))
-    return out
+    # All three channels are symmetric by definition, but torch.cdist takes a matmul path for
+    # larger inputs that is asymmetric at ~1e-5, and the float16 storage then amplifies that to a
+    # whole ulp (0.03 A) whenever a mirrored pair straddles a rounding boundary. Averaging the two
+    # halves restores the invariant exactly, at float32 precision, before it is ever cast.
+    return 0.5 * (out + out.transpose(0, 1))
 
 
 def _block_reduce(m: torch.Tensor, row: torch.Tensor, T: int, reduce: str) -> torch.Tensor:
