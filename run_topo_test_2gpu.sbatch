@@ -2,7 +2,7 @@
 #SBATCH --job-name=topo30M_test
 #SBATCH --partition=mit_normal_gpu
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=2
+#SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:l40s:2
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=200G
@@ -42,13 +42,22 @@ export TORCHINDUCTOR_CACHE_DIR=/orcd/scratch/orcd/011/chenxiou/torchinductor_cac
 export TRITON_CACHE_DIR=/orcd/scratch/orcd/011/chenxiou/triton_cache_cmhier
 mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$REPO/logs"
 
+# This checkout must win over the editable install of `proteinfoundation` in cue_openfold, which
+# points at /orcd/scratch/.../proteina (branch main) and has no topology_reference module. Running
+# `python proteinfoundation/train.py` puts the SCRIPT's directory on sys.path, not the repo root,
+# so without this hydra resolves targets against the other tree.
+export PYTHONPATH=$REPO${PYTHONPATH:+:$PYTHONPATH}
+
 cd "$REPO"
 echo "[$(date)] host=$(hostname) jobid=${SLURM_JOB_ID:-?}"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv
 python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), 'devices', torch.cuda.device_count())"
 
-# srun spawns one task per GPU so Lightning wires 2-rank DDP from the SLURM environment.
-exec srun python proteinfoundation/train.py \
+python -c "import proteinfoundation; print('proteinfoundation from', proteinfoundation.__file__)"
+
+# torchrun, not bare srun: train.py reads RANK/WORLD_SIZE/LOCAL_RANK, which srun does not set (it
+# sets SLURM_PROCID/SLURM_NTASKS instead), and the run would otherwise proceed with rank=-1.
+exec torchrun --standalone --nproc_per_node=2 proteinfoundation/train.py \
     --config_name training_contact_hier_topology_30M_v1 \
     --ngpus_per_node 2 \
     --nnodes 1
