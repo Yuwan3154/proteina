@@ -802,7 +802,16 @@ class ContactMapHierSiT(nn.Module):
 
     # ── Forward ───────────────────────────────────────────────────────────────
 
-    def forward(self, batch: Dict) -> Dict:
+    def forward(self, batch: Dict, force_compile: bool = False) -> Dict:
+        """Run the hierarchy over a batch.
+
+        Args:
+            batch: dataloader batch (see the module docstring for required keys).
+            force_compile: accepted and ignored. model_trainer_base passes it to every nn on the
+                sampling path (`eval_nn(batch, force_compile=...)`); only ProteinTransformerAF3
+                uses it to pick a compile path, but a forward that refuses the kwarg raises
+                TypeError the first time validation sampling runs.
+        """
         contact_map_t = batch["contact_map_t"]  # [B, L, L]
         if contact_map_t.dim() != 3:
             # Multi-channel maps (e.g. the discrete-diffusion configs) would silently

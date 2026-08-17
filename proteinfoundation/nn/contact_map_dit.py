@@ -267,7 +267,7 @@ class ContactMapSiT(nn.Module):
 
     # ── Forward ───────────────────────────────────────────────────────────────
 
-    def forward(self, batch: Dict) -> Dict:
+    def forward(self, batch: Dict, force_compile: bool = False) -> Dict:
         """
         Args:
             batch: dict with keys as documented in class docstring.
