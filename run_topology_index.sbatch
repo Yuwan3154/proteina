@@ -27,9 +27,13 @@ SKIP_LOG="${SKIP_LOG:-$DATA_PATH/pdb_train/topology_index.skips.tsv}"
 LIMIT="${LIMIT:-0}"   # >0 indexes only the first N chains, for a smoke test
 
 module load miniforge
+# conda's own activate.d hooks reference unset variables (the proteina env's MKL hook does), so
+# nounset has to stand down across activation or the job dies before it runs anything.
+set +u
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda deactivate 2>/dev/null
 conda activate "$CONDA_ENV"
+set -u
 
 cd "$PROTEINA_REPO"
 export DATA_PATH

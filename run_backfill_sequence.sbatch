@@ -28,9 +28,13 @@ SKIP_LOG="${SKIP_LOG:-$DATA_PATH/pdb_train/backfill_sequence.skips.tsv}"
 WORKERS="${WORKERS:-32}"   # matches the topology index build, the only measured point we have
 
 module load miniforge
+# conda's own activate.d hooks reference unset variables (the proteina env's MKL hook does), so
+# nounset has to stand down across activation or the job dies before it runs anything.
+set +u
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda deactivate 2>/dev/null
 conda activate "$CONDA_ENV"
+set -u
 
 cd "$PROTEINA_REPO"
 [ -d "$PROCESSED" ] || { echo "no such processed dir: $PROCESSED"; exit 2; }
