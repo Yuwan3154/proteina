@@ -53,11 +53,11 @@ training:
   mask_A_prob: 0.5
   mask_C_prob: 0.5
   fold_label_sample_ratio: [0.5, 0.1, 0.15, 0.25]
-  mask_seq_proportion: 0.15  # matches the ext_lig/CA lineage. NOTE this is PER-RESIDUE: every
-                             # sample trains with 15% of its residues hidden. ProteinEBM is not
-                             # the same mechanism -- it has no partial masking, only whole-sequence
-                             # dropout (drop_seq_prob 0.1) for 10% of samples. The sibling contact
-                             # configs (contact_dit_100M, contact_hier_100M) use 0.1.
+  mask_seq_proportion: 0.1   # PROPORTIONAL per-residue random masking as augmentation: every
+                             # sample trains with 10% of its residues hidden, chosen fresh each
+                             # time. Deliberately NOT whole-sequence masking -- ProteinEBM's
+                             # drop_seq_prob hides the entire sequence for a fraction of samples,
+                             # a different regime. Matches the sibling contact configs.
   finetune_seq_cond_lora_only: False
   contact_map_coord_loss_weight: 0.0  # ContactMapHierSiT does not predict coordinates
 
