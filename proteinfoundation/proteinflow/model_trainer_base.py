@@ -2846,7 +2846,18 @@ class ModelTrainerBase(L.LightningModule):
             file_names=stems,
             num_workers=0,
         )
-        loader = DensePaddingDataLoader(ds, batch_size=chunk, shuffle=False, num_workers=0)
+        # cath_code_dir / multilabel_mode are what turn the per-sample CATH lists into the
+        # [b, 3] index tensor the fold embedding expects. Omitting them leaves a raw Python list
+        # in the batch and the fold conditioning silently degrades to the null embedding.
+        loader = DensePaddingDataLoader(
+            ds,
+            batch_size=chunk,
+            shuffle=False,
+            num_workers=0,
+            cath_code_dir=getattr(dm, "cath_code_dir", None),
+            multilabel_mode=getattr(dm, "multilabel_mode", "sample"),
+            cath_dedupe_codes=getattr(dm, "cath_dedupe_codes", True),
+        )
         batches = []
         for b in loader:
             batches.append(b if isinstance(b, dict) else b.to_dict())

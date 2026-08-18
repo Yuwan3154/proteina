@@ -103,7 +103,10 @@ log:
   last_ckpt_every_n_steps: 50
 
 validation_sampling:
-  dt: 0.005
+  # Sampling steps = ceil(1/dt). 200 was inherited from coordinate diffusion; a binary
+  # L x L contact map does not need that schedule, and at ~51 ms/step for a batch of 4
+  # the schedule was most of the validation cost. 50 steps cuts it 4x.
+  dt: 0.02
   sampling_mode: sc
   sc_scale_noise: 0.45
   # Buffer the first N val batches each val epoch and run ONE batched full-trajectory
