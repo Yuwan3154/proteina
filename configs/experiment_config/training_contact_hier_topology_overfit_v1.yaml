@@ -97,11 +97,14 @@ log:
   log_wandb: True
   log_every_n_steps: 100
   log_structure_every_n_steps: 100
-  # Off for the overfit A/B, which is decided on train/validation loss. It monitors
-  # validation_sampling/tmscore_median, which only exists when the sampling trajectory yields TM
-  # scores, and a missing monitor makes ModelCheckpoint raise. Validation sampling now conditions
-  # on each chain's own topology, so the metric is meaningful again -- but the two arms were
-  # launched without it and must stay comparable, so re-enabling it is a separate decision.
+  # ⛔ Cannot be True for THIS architecture, and the reason is not the topology plumbing.
+  # It monitors validation_sampling/tmscore_median, which requires COORDINATES. TM-score is
+  # accumulated only when `coords is not None`, and coords come from either the NN
+  # (predict_coords) or _predict_structure_from_distogram (needs a distogram). ContactMapHierSiT
+  # returns only {contact_map_logits, contact_map_pred} -- no coords, no distogram -- so the
+  # monitored key is never logged and ModelCheckpoint raises on the first validation.
+  # Measured on run 20676811: 103/103 validations logged tm_total=0.
+  # Re-enable only once a contact-map -> structure step exists on the validation path.
   checkpoint_best_tmscore_median: False
   checkpoint: True
   checkpoint_every_n_steps: 50

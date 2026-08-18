@@ -1069,6 +1069,7 @@ class _ContactMapFlowMatcher:
             coords_pred = None
             c_1_pred = None
             distogram = None
+            c_logits = None
 
             for step in tqdm(range(nsteps), desc="Contact Map Diffusion", disable=not verbose):
                 t = ts[step] * torch.ones(nsamples, device=device)
@@ -1113,6 +1114,7 @@ class _ContactMapFlowMatcher:
                 c_1_pred = result.get("contact_map")
                 c_v = result.get("contact_map_v")
                 distogram = result.get("distogram")  # Capture for final output
+                c_logits = result.get("contact_map_logits")  # ditto, for the val contact metrics
 
                 if c_1_pred is None:
                     raise ValueError("Contact map prediction missing during contact map diffusion.")
@@ -1141,6 +1143,10 @@ class _ContactMapFlowMatcher:
                 "coords": x if predict_coords and x is not None else None,
                 "contact_map": c,
                 "distogram": distogram,
+                # The discrete sampler already returns this for the same reason: without it the
+                # validation contact-map metrics have nothing to score, so a contact-map model
+                # with no coordinate head produces no validation metric at all.
+                "contact_map_logits": c_logits.detach() if c_logits is not None else None,
             }
 
     def get_schedule(self, mode: str, nsteps: int, *, p1: float = None, eps=1e-5):

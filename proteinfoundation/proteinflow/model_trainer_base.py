@@ -3335,6 +3335,16 @@ class ModelTrainerBase(L.LightningModule):
         else:
             x_motif = fixed_sequence_mask = fixed_structure_mask = None
 
+        # Topology conditioning at inference comes from the batch, the same way motif and CATH
+        # conditioning do. Absent -> generate() falls back to the unconditioned MASK reference.
+        topology = {k: batch[k].to(self.device) for k in self.TOPOLOGY_KEYS if batch.get(k) is not None}
+        if topology and len(topology) != len(self.TOPOLOGY_KEYS):
+            raise ValueError(
+                f"predict_step: batch carries a partial topology reference {sorted(topology)}; "
+                f"all of {list(self.TOPOLOGY_KEYS)} are required together."
+            )
+        topology = topology or None
+
         save_trajectory = bool(self.inf_cfg.get("save_trajectory", False))
         save_trajectory_gif = bool(self.inf_cfg.get("save_trajectory_gif", False))
         return_trajectory = save_trajectory or save_trajectory_gif
@@ -3363,6 +3373,7 @@ class ModelTrainerBase(L.LightningModule):
             x_motif=x_motif,
             fixed_sequence_mask=fixed_sequence_mask,
             fixed_structure_mask=fixed_structure_mask,
+            topology=topology,
             force_compile=force_compile,
             return_trajectory=return_trajectory,
             trajectory_stride=trajectory_stride,
