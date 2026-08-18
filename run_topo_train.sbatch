@@ -16,14 +16,20 @@
 # One arm per GPU, so both arms fit inside the 2-GPU-per-user cap on mit_normal_gpu and run
 # concurrently on identical data. Set FEAT and RUN:
 #   FEAT=local_attn RUN=overfit_localattn
-#   FEAT=conv_next  RUN=overfit_convnext
-# Everything else is shared, so the comparison isolates the block featurizer.
+#   FEAT=conv_next  RUN=overfit_convnext  NLOCAL=3 KERNEL=13
+# NLOCAL/KERNEL default to the config; the conv arm runs deeper because conv layers are far
+# cheaper than attention layers, so matching layer counts would not be the fair comparison.
 set -uo pipefail
 trap 'echo "[$(date)] SIGUSR1 received; waiting for SIGTERM."' USR1
 
 : "${FEAT:?set FEAT to local_attn or conv_next}"
 : "${RUN:?set RUN to the run name}"
 CONFIG="${CONFIG:-training_contact_hier_topology_overfit_v1}"
+NLOCAL="${NLOCAL:-}"
+KERNEL="${KERNEL:-}"
+EXTRA=""
+[ -n "$NLOCAL" ] && EXTRA="$EXTRA model.nn.n_local_layers=$NLOCAL"
+[ -n "$KERNEL" ] && EXTRA="$EXTRA model.nn.conv_kernel_size=$KERNEL"
 REPO=/orcd/scratch/orcd/011/chenxiou/proteina_cmhier
 export DATA_PATH=/orcd/pool/006/chenxiou/proteina/data
 
@@ -50,7 +56,7 @@ mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$REPO/logs"
 export PYTHONPATH=$REPO${PYTHONPATH:+:$PYTHONPATH}
 
 cd "$REPO"
-echo "[$(date)] host=$(hostname) jobid=${SLURM_JOB_ID:-?} config=$CONFIG feat=$FEAT run=$RUN"
+echo "[$(date)] host=$(hostname) jobid=${SLURM_JOB_ID:-?} config=$CONFIG feat=$FEAT run=$RUN extra=$EXTRA"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv
 python -c "import proteinfoundation; print('proteinfoundation from', proteinfoundation.__file__)"
 
@@ -60,4 +66,5 @@ exec torchrun --standalone --nproc_per_node=1 proteinfoundation/train.py \
     --ngpus_per_node 1 \
     --nnodes 1 \
     run_name_="$RUN" \
-    model.nn.block_featurizer="$FEAT"
+    model.nn.block_featurizer="$FEAT" \
+    $EXTRA
