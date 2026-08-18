@@ -91,6 +91,12 @@ log:
   wandb_project: protein_transformer_big_runs
   log_wandb: True
   log_every_n_steps: 100
+  # Top-L precision of the SINGLE-STEP denoised map, logged for train and validation.
+  # Full de-novo sampling from noise on 25%-identity-held-out chains is the hardest
+  # possible setting and is not expected to work at this budget, so it says little about
+  # learning; this is the setting the loss is actually trained on. Same cadence as the
+  # other step logs -- it costs one topk per sample, so it is not run every step.
+  single_step_metrics_every_n_steps: 100
   log_structure_every_n_steps: 100
   checkpoint: True
   # Selection metric for a contact-map model: top-L precision of the SAMPLED contact map

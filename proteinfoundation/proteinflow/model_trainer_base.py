@@ -1475,6 +1475,9 @@ class ModelTrainerBase(L.LightningModule):
                 )
             contact_map_loss = _sanitize_and_log_loss_vec(contact_map_loss, "contact_map_loss")
             train_loss = torch.mean(contact_map_loss)
+            self._log_single_step_contact_metrics(
+                nn_out, batch, c_1, mask, t, log_prefix, val_step, batch_idx
+            )
 
             # DSSP discrete diffusion loss
             if dssp_enabled and dssp_tokens is not None and dssp_zt is not None:
@@ -2817,6 +2820,54 @@ class ModelTrainerBase(L.LightningModule):
         if isinstance(obj, (list, tuple)) and obj and torch.is_tensor(obj[0]):
             return type(obj)(self._to_device_recursive(v) for v in obj)
         return obj
+
+    def _log_single_step_contact_metrics(
+        self, nn_out, batch, c_1, mask, t, log_prefix, val_step, batch_idx
+    ):
+        """Top-L precision of the SINGLE-STEP denoised contact map, at the sampled noise level.
+
+        The only contact accuracy recorded until now came from full reverse-diffusion sampling --
+        de novo prediction from pure noise, on chains held out at 25% sequence identity. That is
+        the hardest possible setting and is not expected to work at this training budget, so it
+        gives almost no signal about whether the model is learning. This is the easy setting the
+        loss is actually trained on: recover c_1 from a partially noised map at time t.
+
+        Deliberately computed by the SAME function as the sampling metric, so the two are directly
+        comparable -- an easy-setting number derived a different way would not be.
+
+        ``t`` is logged alongside because the metric is meaningless without it: an average over
+        the logit-normal t distribution moves if that distribution ever changes.
+        """
+        every_n = int(self.cfg_exp.log.get("single_step_metrics_every_n_steps", 0))
+        if every_n <= 0:
+            return
+        fire = (batch_idx % every_n == 0) if val_step else (self.global_step % every_n == 0)
+        if not fire:
+            return
+        logits = self._nn_out_to_c_logits(nn_out, batch)
+        if logits is None:
+            return
+        # The metric wants ground truth in {0, 1}; c_1 is in {-1, 1} when non_contact_value == -1.
+        gt = c_1 if getattr(self.nn, "non_contact_value", 0) == 0 else (c_1 + 1.0) * 0.5
+        precs = []
+        for i in range(mask.shape[0]):
+            if not bool(mask[i].any()):
+                continue
+            m = self._compute_contact_map_metrics(logits[i].detach(), gt[i].detach(), mask[i])
+            if m is not None and "contact_precision_at_L" in m:
+                precs.append(m["contact_precision_at_L"])
+        if not precs:
+            return
+        for name, value in (
+            ("contact_precision_at_L_single_step", float(np.mean(precs))),
+            ("contact_single_step_t", float(t.float().mean())),
+        ):
+            self.log(
+                f"{log_prefix}/{name}", value,
+                on_step=not val_step, on_epoch=True,
+                prog_bar=False, logger=True,
+                batch_size=mask.shape[0], sync_dist=True, add_dataloader_idx=False,
+            )
 
     def _fixed_val_batches(self, val_sampling_cfg) -> Optional[List[dict]]:
         """Batches over a FIXED chain list, built with the val dataloader's own transforms.
