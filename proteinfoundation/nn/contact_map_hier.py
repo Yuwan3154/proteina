@@ -495,6 +495,51 @@ class PairToBias(nn.Module):
         return self.proj(self.norm(pair_grid)).permute(0, 3, 1, 2)
 
 
+class ConvNeXtBlockADALN(nn.Module):
+    """Modern conv block over the cell grid, as a drop-in alternative to within-block attention.
+
+    ConvNeXt-style rather than a plain conv stack, because one convolution is not a substitute for
+    an attention layer: large-kernel DEPTHWISE convolution for spatial mixing, then a pointwise
+    INVERTED BOTTLENECK (expand, GELU, contract) for channel mixing, LayerNorm rather than
+    BatchNorm (the batch here is tiny and the grid is masked), a residual around the whole block,
+    and one activation per block rather than one per layer.
+
+    Conditioning matters as much as the convolution: the attention path this replaces carries the
+    diffusion time through adaLN, so the same AdaptiveLayerNorm and adaLN-Zero output gate are used
+    here. Without them the level-0 features would be blind to t, which no amount of convolution
+    would recover. The zero-initialised gate also plays the role ConvNeXt's LayerScale plays,
+    starting each block as the identity.
+
+    Padded cells are re-zeroed on entry and exit: the depthwise kernel would otherwise smear
+    padding into real cells and back.
+    """
+
+    def __init__(self, dim: int, dim_cond: int, kernel_size: int = 7, mlp_ratio: float = 4.0):
+        super().__init__()
+        if kernel_size % 2 != 1:
+            raise ValueError(f"kernel_size must be odd for same-padding, got {kernel_size}")
+        self.dwconv = nn.Conv2d(
+            dim, dim, kernel_size, padding=kernel_size // 2, groups=dim
+        )  # depthwise: spatial mixing at O(dim * k^2), not O(dim^2 * k^2)
+        self.adaln = AdaptiveLayerNorm(dim=dim, dim_cond=dim_cond)
+        hidden = int(dim * mlp_ratio)
+        self.pw1 = nn.Linear(dim, hidden)
+        self.act = nn.GELU()
+        self.pw2 = nn.Linear(hidden, dim)
+        self.scale_output = AdaptiveLayerNormOutputScale(dim=dim, dim_cond=dim_cond)
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor, mask_f: torch.Tensor) -> torch.Tensor:
+        """[B, H, W, dim] -> [B, H, W, dim]; mask_f is [B, H, W] float, 1 for valid cells."""
+        B, H, W, D = x.shape
+        h = (x * mask_f[..., None]).permute(0, 3, 1, 2)
+        h = self.dwconv(h).permute(0, 2, 3, 1).reshape(B, H * W, D)
+        flat_mask = mask_f.reshape(B, H * W) > 0
+        h = self.adaln(h, cond, flat_mask)
+        h = self.pw2(self.act(self.pw1(h)))
+        h = self.scale_output(h, cond, flat_mask).reshape(B, H, W, D)
+        return (x + h) * mask_f[..., None]
+
+
 class ContactMapHierSiT(nn.Module):
     """Two-level hierarchical contact map backbone (see module docstring).
 
@@ -534,10 +579,12 @@ class ContactMapHierSiT(nn.Module):
 
         # Level 0 (cells)
         self.block_featurizer = str(kwargs["block_featurizer"])
-        if self.block_featurizer not in ("local_attn", "conv"):
+        if self.block_featurizer not in ("local_attn", "conv", "conv_next"):
             raise ValueError(
-                f"block_featurizer must be 'local_attn' or 'conv', got {self.block_featurizer!r}"
+                "block_featurizer must be 'local_attn', 'conv' or 'conv_next', got "
+                f"{self.block_featurizer!r}"
             )
+        self.conv_kernel_size = int(kwargs.get("conv_kernel_size", 7))
         self.d_local = int(kwargs["d_local"])
         self.n_local_layers = int(kwargs["n_local_layers"])
         nheads_local = int(kwargs["nheads_local"])
@@ -676,6 +723,16 @@ class ContactMapHierSiT(nn.Module):
             [
                 BiasedSiTBlock(self.d_local, nheads_local, self.d_cond_dit, mlp_ratio)
                 for _ in range(self.n_local_layers if self.block_featurizer == "local_attn" else 0)
+            ]
+        )
+        # n_local_layers conv blocks when the featurizer is conv_next -- one conv layer is not a
+        # substitute for an attention layer, so the depth matches the stack it replaces.
+        self.conv_blocks = nn.ModuleList(
+            [
+                ConvNeXtBlockADALN(
+                    self.d_local, self.d_cond_dit, self.conv_kernel_size, mlp_ratio
+                )
+                for _ in range(self.n_local_layers if self.block_featurizer == "conv_next" else 0)
             ]
         )
         self.local_head_dim = self.d_local // nheads_local
@@ -999,7 +1056,10 @@ class ContactMapHierSiT(nn.Module):
         )  # [B, L_pad, L_pad, 2 + pair_repr_dim]
         cells = self.cell_embed(cell_in) * cell_mask_f[..., None]  # [B, L_pad, L_pad, d_local]
 
-        if self.block_featurizer == "local_attn":
+        if self.block_featurizer == "conv_next":
+            for cblk in self.conv_blocks:
+                cells = cblk(cells, cond, cell_mask_f)
+        elif self.block_featurizer == "local_attn":
             l = self.block_size
             n_blocks = P1 * P1
             # One attention problem per block: [B * P1**2, l**2, d_local]
