@@ -554,38 +554,55 @@ class CadencedEmaModelCheckpoint(EmaModelCheckpoint):
     """An EmaModelCheckpoint whose monitored metric is only produced on SOME validations.
 
     The validation sampling trajectory runs every ``tmscore_every_n_val_epochs`` validations, so
-    its metrics are simply absent in between. Lightning raises MisconfigurationException on an
-    absent monitor once a validation loop has run, which would turn that cadence into a crash.
+    its metrics are computed on those passes only. Lightning's ``callback_metrics`` is a
+    persistent dict that is never cleared between validations, so on the passes in between the
+    stock ModelCheckpoint does NOT crash -- it silently re-reads the PREVIOUS pass's value and
+    treats it as a new measurement. While fewer than ``save_top_k`` checkpoints exist it saves
+    unconditionally, so those stale reads write near-duplicate checkpoints at different steps and
+    fill the top-k with one measurement.
 
-    Skipping silently would trade that crash for a worse failure -- a monitor that never appears
-    at all (exactly what happened to validation_sampling/tmscore_median, which needs coordinates
-    a contact-map model never produces) would then quietly save nothing for the whole run. So the
-    skips are counted and shouted about once they can no longer be explained by the cadence.
+    ``validation_sampling/metrics_step`` (logged by the trainer only when the trajectory actually
+    produced metrics) distinguishes a fresh reading from that stale copy. An unchanged stamp means
+    skip. A monitor that never appears at all is also skipped -- otherwise Lightning raises once a
+    validation loop has run -- but that case is counted and warned about, because it is the real
+    failure (validation_sampling/tmscore_median needs coordinates a contact-map model never
+    produces) and silence would turn a crash into a run that quietly saves nothing.
     """
 
+    STAMP_KEY = "validation_sampling/metrics_step"
     _warn_after_skips = 20
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._last_metrics_stamp = None
         self._monitor_absent_skips = 0
+        self._stale_skips = 0
         self._warned_monitor_never_seen = False
 
     def _save_topk_checkpoint(self, trainer, monitor_candidates) -> None:
-        if self.monitor is not None and self.monitor not in monitor_candidates:
-            self._monitor_absent_skips += 1
-            if (
-                not self._warned_monitor_never_seen
-                and not self.best_k_models
-                and self._monitor_absent_skips >= self._warn_after_skips
-            ):
-                self._warned_monitor_never_seen = True
-                logging.warning(
-                    "ModelCheckpoint(monitor=%r) has been skipped %d times and has never once "
-                    "seen its metric, so it has saved nothing. Either the metric is never "
-                    "computed for this model or the name is wrong. Available: %s",
-                    self.monitor,
-                    self._monitor_absent_skips,
-                    sorted(monitor_candidates),
-                )
-            return
+        if self.monitor is not None:
+            if self.monitor not in monitor_candidates:
+                self._monitor_absent_skips += 1
+                if (
+                    not self._warned_monitor_never_seen
+                    and not self.best_k_models
+                    and self._monitor_absent_skips >= self._warn_after_skips
+                ):
+                    self._warned_monitor_never_seen = True
+                    logging.warning(
+                        "ModelCheckpoint(monitor=%r) has been skipped %d times and has never "
+                        "once seen its metric, so it has saved nothing. Either the metric is "
+                        "never computed for this model or the name is wrong. Available: %s",
+                        self.monitor,
+                        self._monitor_absent_skips,
+                        sorted(monitor_candidates),
+                    )
+                return
+            stamp = monitor_candidates.get(self.STAMP_KEY)
+            stamp = None if stamp is None else float(stamp)
+            if stamp is not None:
+                if stamp == self._last_metrics_stamp:
+                    self._stale_skips += 1
+                    return
+                self._last_metrics_stamp = stamp
         super()._save_topk_checkpoint(trainer, monitor_candidates)

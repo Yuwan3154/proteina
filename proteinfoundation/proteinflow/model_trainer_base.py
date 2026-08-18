@@ -2652,6 +2652,18 @@ class ModelTrainerBase(L.LightningModule):
                     rank_zero_only=False, sync_dist=False,
                     add_dataloader_idx=False,
                 )
+        if results or contact_results:
+            # Stamp the step this measurement was actually taken at. Lightning's callback_metrics
+            # is never cleared, so on the validations where the sampling trajectory does not run
+            # (see tmscore_every_n_val_epochs) a checkpoint callback would otherwise re-read the
+            # previous pass's value and treat it as new. CadencedEmaModelCheckpoint compares this.
+            self.log(
+                "validation_sampling/metrics_step", float(self.global_step),
+                on_step=False, on_epoch=True,
+                prog_bar=False, logger=False,
+                rank_zero_only=False, sync_dist=False,
+                add_dataloader_idx=False,
+            )
         self._validation_tmscore_results = []
         self._validation_contact_results = []
         self.validation_output_data = []
