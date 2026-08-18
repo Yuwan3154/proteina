@@ -2867,7 +2867,7 @@ class ModelTrainerBase(L.LightningModule):
         gt = c_1 if binary_gt else (c_1 + 1.0) * 0.5
         noisy = batch.get("contact_map_t")
 
-        overall, floor, per_bin = [], [], {}
+        overall, floor, per_bin, floor_per_bin = [], [], {}, {}
         for i in range(mask.shape[0]):
             if not bool(mask[i].any()):
                 continue
@@ -2875,14 +2875,20 @@ class ModelTrainerBase(L.LightningModule):
             if m is None or "contact_precision_at_L" not in m:
                 continue
             p = m["contact_precision_at_L"]
+            bin_name = self._t_bin_name(float(t[i]))
             overall.append(p)
-            per_bin.setdefault(self._t_bin_name(float(t[i])), []).append(p)
+            per_bin.setdefault(bin_name, []).append(p)
             if noisy is not None:
                 mb = self._compute_contact_map_metrics(
                     noisy[i].detach().float(), gt[i].detach(), mask[i]
                 )
                 if mb is not None and "contact_precision_at_L" in mb:
                     floor.append(mb["contact_precision_at_L"])
+                    # Binned on the SAME t as the model's number. The floor rises steeply as
+                    # noise falls, so an all-t floor compared against a per-bin model score
+                    # would make the model look worse at high noise and better at low noise
+                    # purely from the mismatch.
+                    floor_per_bin.setdefault(bin_name, []).append(mb["contact_precision_at_L"])
         if not overall:
             return
 
@@ -2894,6 +2900,8 @@ class ModelTrainerBase(L.LightningModule):
             entries.append(("contact_precision_at_L_noisy_floor", float(np.mean(floor))))
         for name, vals in per_bin.items():
             entries.append((f"contact_precision_at_L_single_step_{name}", float(np.mean(vals))))
+        for name, vals in floor_per_bin.items():
+            entries.append((f"contact_precision_at_L_noisy_floor_{name}", float(np.mean(vals))))
         for name, value in entries:
             self.log(
                 f"{log_prefix}/{name}", value,
