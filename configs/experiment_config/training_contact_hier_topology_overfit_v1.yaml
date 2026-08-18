@@ -97,6 +97,12 @@ log:
   log_wandb: True
   log_every_n_steps: 100
   log_structure_every_n_steps: 100
+  # Off for the overfit A/B. It monitors validation_sampling/tmscore_median, which is only
+  # produced when the sampling trajectory yields TM scores; generate() does not forward the
+  # topology reference yet, so that metric measures UNCONDITIONED sampling and says nothing about
+  # either arm. A missing monitor makes ModelCheckpoint raise, which would kill the comparison.
+  # The A/B is decided on train/validation loss.
+  checkpoint_best_tmscore_median: False
   checkpoint: True
   checkpoint_every_n_steps: 50
   last_ckpt_every_n_steps: 50
