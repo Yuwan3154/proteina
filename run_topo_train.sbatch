@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH --job-name=topo30M
+#SBATCH --job-name=topo_ab
 #SBATCH --partition=mit_normal_gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:l40s:2
+#SBATCH --gres=gpu:l40s:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=200G
 #SBATCH --time=6:00:00
@@ -13,16 +13,17 @@
 #SBATCH --signal=B:USR1@60
 
 # One arm of the pair-feature A/B. Pick the arm with CONFIG:
-#   CONFIG=training_contact_hier_topology_30M_v1          # pair_ref_features: both
-#   CONFIG=training_contact_hier_topology_30M_contact_v1  # pair_ref_features: contact
-# The two configs differ in that field and the run name and nothing else.
-#
-# ⛔ mit_normal_gpu allows 2 GPUs PER USER, and each arm asks for 2, so the arms CANNOT run
-# concurrently here -- submit the second only after the first releases, or halve each to 1 GPU.
+# One arm per GPU, so both arms fit inside the 2-GPU-per-user cap on mit_normal_gpu and run
+# concurrently on identical data. Set FEAT and RUN:
+#   FEAT=local_attn RUN=overfit_localattn
+#   FEAT=conv_next  RUN=overfit_convnext
+# Everything else is shared, so the comparison isolates the block featurizer.
 set -uo pipefail
 trap 'echo "[$(date)] SIGUSR1 received; waiting for SIGTERM."' USR1
 
-: "${CONFIG:?set CONFIG to the training config name (see header)}"
+: "${FEAT:?set FEAT to local_attn or conv_next}"
+: "${RUN:?set RUN to the run name}"
+CONFIG="${CONFIG:-training_contact_hier_topology_overfit_v1}"
 REPO=/orcd/scratch/orcd/011/chenxiou/proteina_cmhier
 export DATA_PATH=/orcd/pool/006/chenxiou/proteina/data
 
@@ -49,12 +50,14 @@ mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$REPO/logs"
 export PYTHONPATH=$REPO${PYTHONPATH:+:$PYTHONPATH}
 
 cd "$REPO"
-echo "[$(date)] host=$(hostname) jobid=${SLURM_JOB_ID:-?} config=$CONFIG"
+echo "[$(date)] host=$(hostname) jobid=${SLURM_JOB_ID:-?} config=$CONFIG feat=$FEAT run=$RUN"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv
 python -c "import proteinfoundation; print('proteinfoundation from', proteinfoundation.__file__)"
 
 # torchrun, not bare srun: train.py reads RANK/WORLD_SIZE/LOCAL_RANK, which srun does not set.
-exec torchrun --standalone --nproc_per_node=2 proteinfoundation/train.py \
+exec torchrun --standalone --nproc_per_node=1 proteinfoundation/train.py \
     --config_name "$CONFIG" \
-    --ngpus_per_node 2 \
-    --nnodes 1
+    --ngpus_per_node 1 \
+    --nnodes 1 \
+    run_name_="$RUN" \
+    model.nn.block_featurizer="$FEAT"
