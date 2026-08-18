@@ -1,0 +1,31 @@
+name: contact_map_tri_30M
+nn_class: ContactMapTriSiT   # dispatches Proteina's NN_REGISTRY
+
+# ── Deliberately the opposite design to contact_map_hier_topology_30M ────────────────────────
+# No 1D single track, no attention, no hierarchy: one pair representation, updated only by
+# triangle multiplicative updates plus the AF2 Evoformer transition. The topology reference is
+# CONCATENATED onto the token axis rather than cross-attended, so the grid is (L+T) x (L+T) and
+# triangle multiplication carries information between query and reference through the same
+# i -> k -> j paths it uses within each.
+
+pair_dim: 256        # 20 blocks x ~1.41M params/block ~= 28M, matching the other two arms.
+                     # Per block: 2 triangle updates (~6*d^2 each) + transition (2*d*4d = 8*d^2).
+tri_hidden: 256      # c_hidden == c_z; equal dims are also what cuequivariance's fused kernel needs
+n_blocks: 20
+transition_n: 4      # AF2 Evoformer expansion factor
+dim_cond: 128
+
+max_rel_pos: 64      # clip radius for the LEFT-ALIGNED relative position. Query residue i sits at
+                     # i and reference element e at its own-chain midpoint, both from 0, so this
+                     # radius has to cover query-to-element offsets as well as query-to-query.
+max_topology_he_len: 64
+topology_vocab_size: 65
+n_residue_types: 22
+
+pair_ref_features: both   # same channel selection as the hier arms, read from their own mapping
+                          # so the three models are fed identical reference features
+
+contact_map_mode: True
+contact_map_input_dim: 1
+non_contact_value: 0
+predict_coords: False

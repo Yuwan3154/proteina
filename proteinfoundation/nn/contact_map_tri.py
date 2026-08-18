@@ -29,12 +29,12 @@ import torch.nn.functional as F
 
 from proteinfoundation.datasets.sse_topology import MASK_TOKEN as TOPOLOGY_MASK_TOKEN
 from proteinfoundation.datasets.sse_topology import N_PAIR_FEATURES, PAIR_FEATURE_NAMES
+from proteinfoundation.nn.contact_map_hier import PAIR_FEATURE_MODES
 from proteinfoundation.openfold_stub.model.pair_transition import PairTransition
 from proteinfoundation.openfold_stub.model.triangular_multiplicative_update import (
     TriangleMultiplicationIncoming,
     TriangleMultiplicationOutgoing,
 )
-from proteinfoundation.nn.contact_map_hier import PAIR_FEATURE_MODES, STRUCTURAL_PAIR_FEATURES
 
 # Which region of the joint grid a cell belongs to. The model cannot infer this from the features
 # alone (a zeroed query-reference cell looks like a zeroed query-query cell), and the four regions
@@ -209,16 +209,11 @@ class ContactMapTriSiT(nn.Module):
 
 
 def _pair_feature_indices(mode: str):
-    """Which of the reference's element-pair channels this mode consumes."""
+    """Which of the reference's element-pair channels this mode consumes.
+
+    Reuses ContactMapHierSiT's own mapping so the two architectures are fed the SAME channels for
+    the same `pair_ref_features` setting -- a second definition here would let the arms drift
+    apart silently and make the comparison meaningless.
+    """
     names = list(PAIR_FEATURE_NAMES)
-    circuit = [n for n in names if n.startswith("circuit_")]
-    proximity = [n for n in STRUCTURAL_PAIR_FEATURES if n != "contact_frac"] + ["seq_gap", "contact_frac"]
-    if mode == "contact":
-        keep = ["contact_max"]
-    elif mode == "circuit":
-        keep = ["contact_max"] + circuit
-    elif mode == "proximity":
-        keep = ["contact_max"] + [n for n in proximity if n in names]
-    else:
-        keep = names
-    return [names.index(n) for n in keep]
+    return [names.index(n) for n in PAIR_FEATURE_MODES[mode]]
