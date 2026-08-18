@@ -42,6 +42,11 @@ from proteinfoundation.datasets.cath_utils import (
     apply_fold_mask_to_indices,
     load_cath_mapping,
 )
+from proteinfoundation.datasets.topology_reference import TopologyReferenceTransform
+from proteinfoundation.utils.dense_padding_data_loader import (
+    FLOAT_PADDING_VALUE,
+    NON_FLOAT_PADDING_VALUE,
+)
 from proteinfoundation.utils.ff_utils.pdb_utils import (
     mask_ext_lig_blocky,
     mask_seq,
@@ -2676,6 +2681,95 @@ class ModelTrainerBase(L.LightningModule):
         # Default when flag is omitted: enable when bounds are available.
         return min_l is not None and max_l is not None and max_l >= min_l
 
+    TOPOLOGY_KEYS = (
+        "topology_tokens",
+        "topology_pos",
+        "topology_he_tokens",
+        "topology_he_pos",
+        "topology_he_contact",
+        "topology_he_feat",
+    )
+
+    def _find_topology_transform(self) -> Optional[TopologyReferenceTransform]:
+        """The TopologyReferenceTransform in the datamodule's transform pipeline, or None."""
+        dm = getattr(self.trainer, "datamodule", None)
+        composed = getattr(dm, "transform", None)
+        if composed is None:
+            return None
+        for t in getattr(composed, "transforms", [composed]):
+            if isinstance(t, TopologyReferenceTransform):
+                return t
+        return None
+
+    @staticmethod
+    def _stack_topology(values: List[Tensor]) -> Tensor:
+        """Pad a per-sample list to the batch maximum on every axis and stack.
+
+        Uses the dense collate's padding values so the model's ``tokens > 0`` validity test means
+        exactly the same thing for a reference built here as for one that came off the dataloader.
+        """
+        pad_v = (
+            FLOAT_PADDING_VALUE
+            if torch.is_floating_point(values[0])
+            else NON_FLOAT_PADDING_VALUE
+        )
+        sizes = [max(v.shape[d] for v in values) for d in range(values[0].dim())]
+        out = []
+        for v in values:
+            pad = []
+            for d in reversed(range(v.dim())):
+                pad.extend([0, sizes[d] - v.shape[d]])
+            out.append(
+                torch.nn.functional.pad(v, pad, value=pad_v) if any(pad) else v
+            )
+        return torch.stack(out, dim=0)
+
+    def _build_self_reference_topology(
+        self, batch, nsamples: int, mask: Tensor
+    ) -> Optional[Dict[str, Tensor]]:
+        """Each validation chain's OWN topology, unaugmented -- the "correct conditioning" case.
+
+        Without this, sampling reaches the NN with no ``topology_*`` keys at all and generates
+        UNCONDITIONED, so the resulting TM-score says nothing about whether the model can realise
+        a topology it is given. The reference is rebuilt from the index rather than taken from the
+        batch because the batch carries a RETRIEVED, length-augmented cluster-mate (the training
+        regime), not the ground truth.
+
+        Returns None when any prerequisite is missing, so the caller falls back to unconditioned
+        sampling rather than conditioning on something invented.
+        """
+        if not self.cfg_exp.model.nn.get("topology_cond", False):
+            return None
+        transform = self._find_topology_transform()
+        if transform is None:
+            logger.warning(
+                "validation_sampling: topology_cond=True but the datamodule has no "
+                "TopologyReferenceTransform; sampling UNCONDITIONED."
+            )
+            return None
+        stems = batch.get("protein_id") or batch.get("id")
+        if not isinstance(stems, (list, tuple)) or len(stems) < nsamples:
+            logger.warning(
+                "validation_sampling: batch carries no per-sample chain ids "
+                f"(got {type(stems).__name__}); sampling UNCONDITIONED."
+            )
+            return None
+        refs = []
+        for s in range(nsamples):
+            stem = str(stems[s])
+            ref = transform.self_reference(stem, int(mask[s].sum()))
+            if ref is None:
+                logger.warning(
+                    f"validation_sampling: {stem} is absent from the topology index; "
+                    "sampling UNCONDITIONED."
+                )
+                return None
+            refs.append(ref)
+        return {
+            k: self._stack_topology([r[k] for r in refs]).to(self.device)
+            for k in self.TOPOLOGY_KEYS
+        }
+
     def _run_validation_trajectory(
         self,
         batch,
@@ -2799,11 +2893,24 @@ class ModelTrainerBase(L.LightningModule):
             else:
                 fixed_structure_mask = fixed_sequence_mask[:, :, None] * fixed_sequence_mask[:, None, :]
 
+        # Ground-truth (self-reference) topology conditioning, built before the length draw
+        # below because it fixes the length.
+        topology = self._build_self_reference_topology(batch, nsamples, mask)
+
         # Variable-length validation trajectory: sample L ~ Uniform(min_length, max_length).
         # Inputs stay padded to max length (fixed shapes for compile); only ``mask`` is set so
         # positions [L:] are invalid (False), matching the sampled sequence length L.
         min_l, max_l = self._resolve_validation_length_bounds(val_sampling_cfg)
-        if self._use_variable_length_validation_sampling(val_sampling_cfg, min_l, max_l):
+        if topology is not None:
+            # A self-reference describes THIS chain at ITS length: its element positions were
+            # rescaled onto mask.sum(), and the GT structure and contact map it is scored against
+            # are this chain's. Redrawing L would leave the conditioning, the sample and the
+            # target all describing different proteins.
+            logger.info(
+                "validation_sampling: ground-truth topology conditioning active; keeping each "
+                "chain's own length instead of a variable-length draw."
+            )
+        elif self._use_variable_length_validation_sampling(val_sampling_cfg, min_l, max_l):
             n_pad = n
             L = random.randint(min_l, max_l)
             L = min(L, n_pad)  # cannot exceed padded tensor width
@@ -2853,6 +2960,7 @@ class ModelTrainerBase(L.LightningModule):
                 x_motif=x_motif,
                 fixed_sequence_mask=fixed_sequence_mask,
                 fixed_structure_mask=fixed_structure_mask,
+                topology=topology,
                 # Keep val trajectory's pos-emb behavior consistent with training:
                 # if training zeros sinusoidal pos embs, val must too (and vice versa).
                 zero_sin_pos_emb=bool(self.cfg_exp.training.get("zero_sin_pos_emb", False)),
@@ -3288,6 +3396,36 @@ class ModelTrainerBase(L.LightningModule):
             "trajectory_tokens": result.get("trajectory_tokens"),
         }
 
+    def _draw_fold_label_once(
+        self, idx: Optional[Tensor], idx_mask: Optional[Tensor]
+    ) -> Tuple[Optional[Tensor], Optional[Tensor]]:
+        """Resolve multi-label CATH indices to ONE label per sample, once per generate() call.
+
+        ``multilabel_mode='sample'`` means a single fold label conditions a whole trajectory. The
+        draw cannot live in the NN: ``FoldEmbeddingSeqFeat.forward`` runs once per diffusion step,
+        so a stochastic pick there would re-roll the fold at every step of one sample. Training
+        draws in the collate for exactly the same reason; this is the sampling-side equivalent,
+        and it is a genuine draw, not the first valid label.
+
+        A no-op for the other multilabel modes (they aggregate over all labels by design) and for
+        indices that already arrive as [b, 3].
+        """
+        if idx is None or idx.dim() != 3:
+            return idx, idx_mask
+        if self.cfg_exp.model.nn.get("multilabel_mode", "sample") != "sample":
+            return idx, idx_mask
+        valid = (
+            torch.ones(idx.shape[:2], dtype=torch.bool, device=idx.device)
+            if idx_mask is None
+            else ~idx_mask
+        )
+        weights = valid.float()
+        # An all-padding row keeps slot 0, which the collate filled with the null "unknown fold"
+        # code -- the same embedding a chain with no CATH label gets.
+        weights[valid.sum(dim=1) == 0, 0] = 1.0
+        pick = torch.multinomial(weights, num_samples=1).squeeze(1)  # [b]
+        return idx[torch.arange(idx.shape[0], device=idx.device), pick], None
+
     def generate(
         self,
         nsamples: int,
@@ -3313,6 +3451,7 @@ class ModelTrainerBase(L.LightningModule):
         x_motif = None,
         fixed_sequence_mask = None,
         fixed_structure_mask = None,
+        topology: Optional[Dict[str, Tensor]] = None,
         force_compile: bool = False,
         return_trajectory: bool = False,
         trajectory_stride: int = 1,
@@ -3323,6 +3462,10 @@ class ModelTrainerBase(L.LightningModule):
         Generates samples by integrating ODE with learned vector field.
 
         Args:
+            topology: optional ``topology_*`` conditioning tensors, forwarded unchanged into
+                every step's ``nn_in``. Drawn once by the caller and held fixed for the whole
+                trajectory -- a reference that changed between steps would be a different
+                conditioning signal at each step of one sample.
             zero_sin_pos_emb: when True, set ``nn_in["_zero_idx_emb"] = True`` so
                 ``SeqPosEmbFeature`` zeros out the sinusoidal positional embedding
                 at every trajectory step. Must match the training-time setting
@@ -3343,6 +3486,9 @@ class ModelTrainerBase(L.LightningModule):
         )
         if torch.is_tensor(residue_type) and residue_type.dim() == 2 and residue_type.shape[0] == 1 and nsamples > 1:
             residue_type = residue_type.expand(nsamples, -1)
+        cath_code_indices, cath_code_indices_mask = self._draw_fold_label_once(
+            cath_code_indices, cath_code_indices_mask
+        )
         if mask is None:
             mask = torch.ones(nsamples, n).long().bool().to(self.device)
 
@@ -3421,6 +3567,8 @@ class ModelTrainerBase(L.LightningModule):
                     nn_in["fixed_structure_mask"] = fixed_structure_mask
                 if x_motif is not None:
                     nn_in["x_motif"] = x_motif
+                if topology is not None:
+                    nn_in.update(topology)
 
                 # Self-conditioning (shared flag for both tracks)
                 if self_cond:
@@ -3522,6 +3670,7 @@ class ModelTrainerBase(L.LightningModule):
             x_motif=x_motif,
             fixed_sequence_mask=fixed_sequence_mask,
             fixed_structure_mask=fixed_structure_mask,
+            topology=topology,
             modality=modality,
             predict_coords=predict_coords,
             verbose=verbose,

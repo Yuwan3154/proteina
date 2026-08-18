@@ -427,6 +427,7 @@ class _CoordinateFlowMatcher:
         cath_code_indices: Optional[Tensor] = None,
         cath_code_indices_mask: Optional[Tensor] = None,
         residue_type: Optional[List[List[int]]] = None,
+        topology: Optional[Dict[str, Tensor]] = None,
         device: torch.device = None,
         mask: Bool[Tensor, "* n"] = None,
         schedule_mode: Literal[
@@ -566,6 +567,8 @@ class _CoordinateFlowMatcher:
                     nn_in["x_sc"] = x_1_pred  # Self-conditioning
                 if residue_type is not None:
                     nn_in["residue_type"] = residue_type
+                if topology is not None:
+                    nn_in.update(topology)
 
                 result = predict_clean_n_v(nn_in)
                 x_1_pred = result["coords"]
@@ -998,6 +1001,7 @@ class _ContactMapFlowMatcher:
         cath_code_indices: Optional[Tensor] = None,
         cath_code_indices_mask: Optional[Tensor] = None,
         residue_type: Optional[List[List[int]]] = None,
+        topology: Optional[Dict[str, Tensor]] = None,
         device: torch.device = None,
         mask: Bool[Tensor, "* n"] = None,
         dtype: Optional[torch.dtype] = None,
@@ -1088,6 +1092,8 @@ class _ContactMapFlowMatcher:
                     nn_in["cath_code"] = cath_code
                 if residue_type is not None:
                     nn_in["residue_type"] = residue_type
+                if topology is not None:
+                    nn_in.update(topology)
                 if fixed_sequence_mask is not None:
                     nn_in["fixed_sequence_mask"] = fixed_sequence_mask
                 if fixed_structure_mask is not None:
@@ -1321,6 +1327,7 @@ class FlowMatcher:
         cath_code_indices: Optional[Tensor] = None,
         cath_code_indices_mask: Optional[Tensor] = None,
         residue_type: Optional[List[List[int]]] = None,
+        topology: Optional[Dict[str, Tensor]] = None,
         device: torch.device = None,
         mask: Bool[Tensor, "* n"] = None,
         dtype: Optional[torch.dtype] = None,
@@ -1368,7 +1375,7 @@ class FlowMatcher:
                 predict_clean_n_v, dt=dt, nsamples=nsamples, n=n, self_cond=self_cond,
                 cath_code=cath_code, cath_code_indices=cath_code_indices,
                 cath_code_indices_mask=cath_code_indices_mask,
-                residue_type=residue_type, device=device,
+                residue_type=residue_type, topology=topology, device=device,
                 mask=mask, dtype=dtype, schedule_mode=schedule_mode,
                 schedule_p=schedule_p, sampling_mode=sampling_mode,
                 sc_scale_noise=sc_scale_noise, sc_scale_score=sc_scale_score,
@@ -1385,7 +1392,7 @@ class FlowMatcher:
             predict_clean_n_v, dt=dt, nsamples=nsamples, n=n, self_cond=self_cond,
             cath_code=cath_code, cath_code_indices=cath_code_indices,
             cath_code_indices_mask=cath_code_indices_mask,
-            residue_type=residue_type, device=device,
+            residue_type=residue_type, topology=topology, device=device,
             mask=mask, dtype=dtype, schedule_mode=schedule_mode,
             schedule_p=schedule_p, sampling_mode=sampling_mode,
             sc_scale_noise=sc_scale_noise, sc_scale_score=sc_scale_score,

@@ -13,6 +13,8 @@ sample. Element positions are rescaled from the template's length onto the query
 lets cross-attention relate a topology element to a query residue at all.
 """
 
+from typing import Dict, Optional
+
 import torch
 import torch_geometric.transforms as T
 from torch_geometric.data import Data
@@ -165,6 +167,71 @@ class TopologyReferenceTransform(T.BaseTransform):
         j = int(torch.randint(cand.numel(), (1,), generator=self._generator))
         return int(cand[j])
 
+    def _build_reference(self, t_row: int, length: int, augment: bool) -> Dict[str, torch.Tensor]:
+        """The six tensors the model consumes, for index row ``t_row`` rescaled onto a
+        ``length``-residue query.
+
+        ``augment=False`` skips the length perturbation AND consumes no RNG, which is what the
+        ground-truth (self-reference) path needs: it must describe the query exactly, and it runs
+        outside the dataloader where drawing from ``self._generator`` would be meaningless.
+        """
+        runs = self._runs_for(t_row)
+        he_contact = self._he_contact_for(t_row)
+        keep = [i for i, (t, _) in enumerate(runs) if t in (DSSP_HELIX, DSSP_STRAND)]
+        # The stored map was built from the unperturbed runs, so its axis must stay aligned with
+        # them even if augmentation changes element lengths (which never changes their count).
+        structural = self._he_structural_for(t_row, he_contact.shape[0])
+        if he_contact.shape[0] != len(keep):
+            he_contact = torch.zeros(len(keep), len(keep))
+            structural = torch.zeros(len(keep), len(keep), len(STRUCTURAL_PAIR_FEATURES))
+
+        if augment and self.mutate_prob > 0.0 and self.sigma_frac > 0.0:
+            runs = perturb_runs(
+                runs,
+                self.sigma_frac,
+                self.mutate_prob,
+                self._generator,
+                min_len=self.alphabet.min_len,
+            )
+
+        tokens = torch.tensor(self.alphabet.runs_to_tokens(runs), dtype=torch.long)
+        pos = element_positions(runs, target_len=length)
+        he_tokens = torch.tensor(
+            [self.alphabet.token(*runs[i]) for i in keep], dtype=torch.long
+        )
+        he_pos = pos[keep] if len(keep) else torch.zeros(0, dtype=torch.float32)
+
+        tokens = tokens[: self.max_topology_len]
+        pos = pos[: self.max_topology_len]
+        k = min(len(keep), self.max_topology_he_len)
+        he_tokens, he_pos = he_tokens[:k], he_pos[:k]
+        he_contact = he_contact[:k, :k]
+        he_feat = self._pair_features(he_contact, structural[:k, :k], runs, keep[:k])
+
+        return {
+            "topology_tokens": tokens if tokens.numel() else torch.full((1,), MASK_TOKEN, dtype=torch.long),
+            "topology_pos": pos if pos.numel() else torch.zeros(1, dtype=torch.float32),
+            "topology_he_tokens": (
+                he_tokens if he_tokens.numel() else torch.full((1,), MASK_TOKEN, dtype=torch.long)
+            ),
+            "topology_he_pos": he_pos if he_pos.numel() else torch.zeros(1, dtype=torch.float32),
+            "topology_he_contact": he_contact if he_contact.numel() else torch.zeros(1, 1),
+            "topology_he_feat": he_feat if he_feat.numel() else torch.zeros(1, 1, N_PAIR_FEATURES),
+        }
+
+    def self_reference(self, stem: str, length: int) -> Optional[Dict[str, torch.Tensor]]:
+        """The chain's OWN topology, unaugmented and never dropped.
+
+        Used by validation sampling to condition on the correct answer, which measures whether the
+        model can realise a topology it is given. Returns None for a chain the index does not
+        cover, so the caller can fall back rather than condition on something invented.
+        """
+        self._ensure_loaded()
+        row = self._id_to_row.get(stem)
+        if row is None:
+            return None
+        return self._build_reference(row, length, augment=False)
+
     def forward(self, graph: Data) -> Data:
         self._ensure_loaded()
         L = int(graph.coords.shape[0])
@@ -178,53 +245,11 @@ class TopologyReferenceTransform(T.BaseTransform):
         t_row = self._pick_template(row)  # returns `row` itself when no valid template exists
         if t_row == row and not self.self_fallback:
             return self._set_empty(graph)
-        runs = self._runs_for(t_row)
-        if not runs:
+        if not self._runs_for(t_row):
             t_row = row
-            runs = self._runs_for(row)
 
-        he_contact = self._he_contact_for(t_row)
-        keep = [i for i, (t, _) in enumerate(runs) if t in (DSSP_HELIX, DSSP_STRAND)]
-        # The stored map was built from the unperturbed runs, so its axis must stay aligned with
-        # them even if augmentation changes element lengths (which never changes their count).
-        structural = self._he_structural_for(t_row, he_contact.shape[0])
-        if he_contact.shape[0] != len(keep):
-            he_contact = torch.zeros(len(keep), len(keep))
-            structural = torch.zeros(len(keep), len(keep), len(STRUCTURAL_PAIR_FEATURES))
-
-        if self.mutate_prob > 0.0 and self.sigma_frac > 0.0:
-            runs = perturb_runs(
-                runs,
-                self.sigma_frac,
-                self.mutate_prob,
-                self._generator,
-                min_len=self.alphabet.min_len,
-            )
-
-        tokens = torch.tensor(self.alphabet.runs_to_tokens(runs), dtype=torch.long)
-        pos = element_positions(runs, target_len=L)
-        he_tokens = torch.tensor(
-            [self.alphabet.token(*runs[i]) for i in keep], dtype=torch.long
-        )
-        he_pos = pos[keep] if len(keep) else torch.zeros(0, dtype=torch.float32)
-
-        tokens = tokens[: self.max_topology_len]
-        pos = pos[: self.max_topology_len]
-        k = min(len(keep), self.max_topology_he_len)
-        he_tokens, he_pos = he_tokens[:k], he_pos[:k]
-        he_contact = he_contact[:k, :k]
-        he_feat = self._pair_features(he_contact, structural[:k, :k], runs, keep[:k])
-
-        graph.topology_tokens = tokens if tokens.numel() else torch.full((1,), MASK_TOKEN, dtype=torch.long)
-        graph.topology_pos = pos if pos.numel() else torch.zeros(1, dtype=torch.float32)
-        graph.topology_he_tokens = (
-            he_tokens if he_tokens.numel() else torch.full((1,), MASK_TOKEN, dtype=torch.long)
-        )
-        graph.topology_he_pos = he_pos if he_pos.numel() else torch.zeros(1, dtype=torch.float32)
-        graph.topology_he_contact = he_contact if he_contact.numel() else torch.zeros(1, 1)
-        graph.topology_he_feat = (
-            he_feat if he_feat.numel() else torch.zeros(1, 1, N_PAIR_FEATURES)
-        )
+        for key, value in self._build_reference(t_row, L, augment=True).items():
+            setattr(graph, key, value)
         return graph
 
     def _set_empty(self, graph: Data) -> Data:
