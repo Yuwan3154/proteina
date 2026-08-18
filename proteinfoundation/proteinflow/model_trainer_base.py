@@ -2821,6 +2821,17 @@ class ModelTrainerBase(L.LightningModule):
             return type(obj)(self._to_device_recursive(v) for v in obj)
         return obj
 
+    # Thirds of the unit interval. t is defined on (0, 1) and the bins exist to answer "where in
+    # the noise range is the model improving", so equal thirds are the neutral split; nothing here
+    # is tuned to the observed distribution.
+    T_BIN_EDGES = (1.0 / 3.0, 2.0 / 3.0)
+    T_BIN_NAMES = ("tlow", "tmid", "thigh")
+
+    @classmethod
+    def _t_bin_name(cls, t_value: float) -> str:
+        lo, hi = cls.T_BIN_EDGES
+        return cls.T_BIN_NAMES[0] if t_value < lo else (cls.T_BIN_NAMES[1] if t_value < hi else cls.T_BIN_NAMES[2])
+
     def _log_single_step_contact_metrics(
         self, nn_out, batch, c_1, mask, t, log_prefix, val_step, batch_idx
     ):
@@ -2832,11 +2843,15 @@ class ModelTrainerBase(L.LightningModule):
         gives almost no signal about whether the model is learning. This is the easy setting the
         loss is actually trained on: recover c_1 from a partially noised map at time t.
 
-        Deliberately computed by the SAME function as the sampling metric, so the two are directly
-        comparable -- an easy-setting number derived a different way would not be.
+        Three things are logged per sample, all through the SAME
+        ``_compute_contact_map_metrics`` as the sampling path so every number is comparable:
 
-        ``t`` is logged alongside because the metric is meaningless without it: an average over
-        the logit-normal t distribution moves if that distribution ever changes.
+        - the model's precision at the sampled t, overall and split into three t bins, because a
+          single average over the logit-normal t distribution hides where the model is improving;
+        - a FLOOR: the precision of ranking pairs by the NOISY INPUT itself. Top-L precision
+          depends only on the ranking, and sigmoid is monotonic, so feeding the noisy map in
+          place of logits gives exactly the do-nothing baseline. Any learned number is only
+          meaningful as a margin over this.
         """
         every_n = int(self.cfg_exp.log.get("single_step_metrics_every_n_steps", 0))
         if every_n <= 0:
@@ -2848,20 +2863,38 @@ class ModelTrainerBase(L.LightningModule):
         if logits is None:
             return
         # The metric wants ground truth in {0, 1}; c_1 is in {-1, 1} when non_contact_value == -1.
-        gt = c_1 if getattr(self.nn, "non_contact_value", 0) == 0 else (c_1 + 1.0) * 0.5
-        precs = []
+        binary_gt = getattr(self.nn, "non_contact_value", 0) == 0
+        gt = c_1 if binary_gt else (c_1 + 1.0) * 0.5
+        noisy = batch.get("contact_map_t")
+
+        overall, floor, per_bin = [], [], {}
         for i in range(mask.shape[0]):
             if not bool(mask[i].any()):
                 continue
             m = self._compute_contact_map_metrics(logits[i].detach(), gt[i].detach(), mask[i])
-            if m is not None and "contact_precision_at_L" in m:
-                precs.append(m["contact_precision_at_L"])
-        if not precs:
+            if m is None or "contact_precision_at_L" not in m:
+                continue
+            p = m["contact_precision_at_L"]
+            overall.append(p)
+            per_bin.setdefault(self._t_bin_name(float(t[i])), []).append(p)
+            if noisy is not None:
+                mb = self._compute_contact_map_metrics(
+                    noisy[i].detach().float(), gt[i].detach(), mask[i]
+                )
+                if mb is not None and "contact_precision_at_L" in mb:
+                    floor.append(mb["contact_precision_at_L"])
+        if not overall:
             return
-        for name, value in (
-            ("contact_precision_at_L_single_step", float(np.mean(precs))),
+
+        entries = [
+            ("contact_precision_at_L_single_step", float(np.mean(overall))),
             ("contact_single_step_t", float(t.float().mean())),
-        ):
+        ]
+        if floor:
+            entries.append(("contact_precision_at_L_noisy_floor", float(np.mean(floor))))
+        for name, vals in per_bin.items():
+            entries.append((f"contact_precision_at_L_single_step_{name}", float(np.mean(vals))))
+        for name, value in entries:
             self.log(
                 f"{log_prefix}/{name}", value,
                 on_step=not val_step, on_epoch=True,

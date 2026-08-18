@@ -99,6 +99,10 @@ log:
   # learning; this is the setting the loss is actually trained on. Same cadence as the
   # other step logs -- it costs one topk per sample, so it is not run every step.
   single_step_metrics_every_n_steps: 100
+  # The same single-step block also logs a t-binned split (tlow/tmid/thigh, equal thirds
+  # of the unit interval) and contact_precision_at_L_noisy_floor -- the precision of
+  # ranking pairs by the NOISY INPUT itself, which is the do-nothing baseline every
+  # learned number has to beat.
   log_structure_every_n_steps: 100
   checkpoint: True
   # Selection metric for a contact-map model: top-L precision of the SAMPLED contact map

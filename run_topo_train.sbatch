@@ -63,6 +63,17 @@ echo "[$(date)] host=$(hostname) jobid=${SLURM_JOB_ID:-?} config=$CONFIG feat=$F
 nvidia-smi --query-gpu=index,name,memory.total --format=csv
 python -c "import proteinfoundation; print('proteinfoundation from', proteinfoundation.__file__)"
 
+# Auto-chain: queue the next segment before training starts, depending on THIS job however it
+# ends. 6 h is the mit_normal_gpu maximum, and a real plateau needs more than that; the follow-on
+# resumes from last.ckpt exactly as a manual resubmission would. CHAIN counts down so the chain
+# terminates instead of running forever.
+CHAIN="${CHAIN:-0}"
+if [ "$CHAIN" -gt 0 ]; then
+    CHAIN=$((CHAIN - 1)) FEAT="$FEAT" RUN="$RUN" NLOCAL="$NLOCAL" KERNEL="$KERNEL" \
+        sbatch --dependency=afterany:${SLURM_JOB_ID} "$REPO/run_topo_train.sbatch" \
+        && echo "[$(date)] queued next chain segment (CHAIN=$((CHAIN - 1)) remaining)"
+fi
+
 # torchrun, not bare srun: train.py reads RANK/WORLD_SIZE/LOCAL_RANK, which srun does not set.
 exec torchrun --standalone --nproc_per_node=1 proteinfoundation/train.py \
     --config_name "$CONFIG" \

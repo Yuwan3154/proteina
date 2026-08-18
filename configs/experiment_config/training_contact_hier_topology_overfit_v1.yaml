@@ -102,6 +102,10 @@ log:
   # learning; this is the setting the loss is actually trained on. Same cadence as the
   # other step logs -- it costs one topk per sample, so it is not run every step.
   single_step_metrics_every_n_steps: 100
+  # The same single-step block also logs a t-binned split (tlow/tmid/thigh, equal thirds
+  # of the unit interval) and contact_precision_at_L_noisy_floor -- the precision of
+  # ranking pairs by the NOISY INPUT itself, which is the do-nothing baseline every
+  # learned number has to beat.
   log_structure_every_n_steps: 100
   # ⛔ Cannot be True for THIS architecture, and the reason is not the topology plumbing.
   # It monitors validation_sampling/tmscore_median, which requires COORDINATES. TM-score is
