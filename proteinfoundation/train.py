@@ -40,7 +40,11 @@ from einops._torch_specific import allow_ops_in_compiled_graph
 allow_ops_in_compiled_graph()
 
 from proteinfoundation.utils.precompute_confind_maps import run_precompute
-from proteinfoundation.utils.ema_utils.ema_callback import EMA, EmaModelCheckpoint
+from proteinfoundation.utils.ema_utils.ema_callback import (
+    EMA,
+    CadencedEmaModelCheckpoint,
+    EmaModelCheckpoint,
+)
 from proteinfoundation.utils.fetch_last_ckpt import fetch_last_ckpt
 from proteinfoundation.utils.lora_utils import replace_lora_layers
 from proteinfoundation.utils.metric_utils import (
@@ -651,8 +655,27 @@ if __name__ == "__main__":
                 # _val_traj_buffer hasn't filled yet).
                 "save_on_train_epoch_end": False,
             }
-            checkpoint_callback_best_tm = EmaModelCheckpoint(**args_ckpt_best_tm)
+            checkpoint_callback_best_tm = CadencedEmaModelCheckpoint(**args_ckpt_best_tm)
             callbacks.append(checkpoint_callback_best_tm)
+
+        # Best-of-validation CONTACT-MAP checkpoint. TM-score needs coordinates, which a
+        # contact-map model with no coordinate head never produces, so top-L precision is the
+        # only selection signal such a run has. Default save_top_k=5 rather than 1 because the
+        # metric is measured on the handful of validation chains the trajectory happens to draw
+        # and is therefore noisy -- keeping five candidates means one lucky or unlucky draw does
+        # not decide which checkpoint survives.
+        if cfg_exp.log.get("checkpoint_best_contact_precision", False):
+            args_ckpt_best_contact = {
+                "dirpath": checkpoint_path_store,
+                "save_last": False,
+                "save_weights_only": True,
+                "filename": "chk_best_contact_precL_{epoch:08d}_{step:012d}",
+                "monitor": "validation_sampling/contact_precision_at_L_median",
+                "save_top_k": int(cfg_exp.log.get("checkpoint_best_contact_save_top_k", 5)),
+                "mode": "max",  # higher top-L precision = better
+                "save_on_train_epoch_end": False,
+            }
+            callbacks.append(CadencedEmaModelCheckpoint(**args_ckpt_best_contact))
 
         # Save and log config files
         path_configs = [

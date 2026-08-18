@@ -2446,6 +2446,17 @@ class ModelTrainerBase(L.LightningModule):
         # for-loop), so ranks 1-3 re-entered the buffer/chunk path on every
         # subsequent val batch.
         self._logged_val_traj_epoch = self.current_epoch
+        # Amortise the trajectory: it is the most expensive part of validation, and
+        # `tmscore_every_n_val_epochs` is what the configs have always claimed controls that.
+        # Counted in VALIDATION PASSES, not training epochs -- val_check_interval fires many
+        # validations inside one epoch, so an epoch-keyed counter would not advance between them.
+        every_n = max(1, int(val_sampling_cfg.get("tmscore_every_n_val_epochs", 1)))
+        if self._val_pass_idx % every_n != 0:
+            self._diag_log(
+                "val_step_data: trajectory skipped (cadence)",
+                f"pass={self._val_pass_idx} every_n={every_n}",
+            )
+            return
         if tmscore_n == 0:
             # Stage-1: validation inference trajectory DISABLED. Only the
             # per-batch val loss (computed above) runs; we skip the full
@@ -2504,6 +2515,9 @@ class ModelTrainerBase(L.LightningModule):
         # accumulators, skipped the trajectory and logged no tmscore -- and the best-TM
         # ModelCheckpoint then raised MisconfigurationException on the missing monitor.
         self._logged_val_traj_epoch = -1
+        # Counts validation PASSES over the whole run, so the trajectory cadence survives both
+        # multiple validations per epoch and multiple epochs per validation.
+        self._val_pass_idx = getattr(self, "_val_pass_idx", -1) + 1
         self._validation_tmscore_results: List[Dict[str, float]] = []
         # Per-epoch contact-map metrics accumulator (only populated in contact_map_mode
         # with discrete diffusion). Same per-sample-dict pattern as tmscore.
@@ -3267,6 +3281,38 @@ class ModelTrainerBase(L.LightningModule):
                 self.discrete_diffusion.position_bias_w_min = w_min
                 self.discrete_diffusion.position_bias_w_max = w_max
                 self.discrete_diffusion.position_bias_k = k
+        # Topology conditioning from a structure file. Read ONCE here rather than per batch:
+        # it parses the file, runs DSSP and (usually) the ConFind binary. Only the length-
+        # dependent rescaling is redone per batch, in predict_step.
+        self._inf_topology_source = None
+        topo_cfg = inf_cfg.get("topology_reference", None)
+        if topo_cfg is not None and topo_cfg.get("structure_path", None):
+            from proteinfoundation.utils.topology_from_structure import (
+                structure_to_topology_source,
+            )
+
+            self._inf_topology_source = structure_to_topology_source(
+                topo_cfg["structure_path"],
+                topo_cfg["index_path"],
+                chain=topo_cfg.get("chain", "all"),
+                rotlib_path=topo_cfg.get("rotlib_path", None),
+                confind_bin=topo_cfg.get("confind_bin", "confind"),
+            )
+            self._inf_topology_transform = TopologyReferenceTransform(
+                index_path=topo_cfg["index_path"],
+                max_topology_len=int(self.cfg_exp.model.nn.get("max_topology_len", 128)),
+                max_topology_he_len=int(topo_cfg.get("max_topology_he_len", 64)),
+                mutate_prob=0.0,
+                sigma_frac=0.0,
+                drop_prob=0.0,
+            )
+            logger.info(
+                f"inference: topology reference read from {topo_cfg['structure_path']} "
+                f"(chain={topo_cfg.get('chain', 'all')}), "
+                f"{len(self._inf_topology_source[0])} elements, "
+                f"{self._inf_topology_source[1].shape[0]} helix/strand elements."
+            )
+
         # Also propagate sampling_grid to DSSP diffusion if present
         if self.dssp_diffusion is not None:
             dssp_sampling_grid = inf_cfg.get("dssp_sampling_grid", inf_cfg.get("sampling_grid", None))
@@ -3344,6 +3390,18 @@ class ModelTrainerBase(L.LightningModule):
                 f"all of {list(self.TOPOLOGY_KEYS)} are required together."
             )
         topology = topology or None
+        if topology is None and getattr(self, "_inf_topology_source", None) is not None:
+            # Rescaled onto THIS batch's generation length: element positions are expressed in
+            # residues on the target chain, so a reference built for one length is wrong for
+            # another. Same tensors for every sample in the batch.
+            runs, ref, structural = self._inf_topology_source
+            built = self._inf_topology_transform.assemble_reference(
+                runs, ref, structural, int(batch["nres"]), augment=False
+            )
+            topology = {
+                k: v[None].expand(int(batch["nsamples"]), *v.shape).contiguous().to(self.device)
+                for k, v in built.items()
+            }
 
         save_trajectory = bool(self.inf_cfg.get("save_trajectory", False))
         save_trajectory_gif = bool(self.inf_cfg.get("save_trajectory_gif", False))

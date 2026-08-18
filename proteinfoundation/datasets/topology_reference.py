@@ -167,20 +167,30 @@ class TopologyReferenceTransform(T.BaseTransform):
         j = int(torch.randint(cand.numel(), (1,), generator=self._generator))
         return int(cand[j])
 
-    def _build_reference(self, t_row: int, length: int, augment: bool) -> Dict[str, torch.Tensor]:
-        """The six tensors the model consumes, for index row ``t_row`` rescaled onto a
-        ``length``-residue query.
+    def assemble_reference(
+        self,
+        runs,
+        he_contact: torch.Tensor,
+        structural: torch.Tensor,
+        length: int,
+        augment: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        """The six tensors the model consumes, from raw run/contact/structural inputs.
 
-        ``augment=False`` skips the length perturbation AND consumes no RNG, which is what the
-        ground-truth (self-reference) path needs: it must describe the query exactly, and it runs
-        outside the dataloader where drawing from ``self._generator`` would be meaningless.
+        Public because the same assembly has to serve a reference read off a structure file (see
+        ``utils/topology_from_structure``) as serves one read out of the index: it carries the
+        truncation caps, the alphabet and the standardisation constants, and a second
+        implementation of any of those would silently drift from what the model was trained on.
+
+        ``augment=False`` skips the length perturbation AND consumes no RNG, which is what both
+        the ground-truth (self-reference) path and the structure-file path need: they must
+        describe their input exactly, and they run outside the dataloader where drawing from
+        ``self._generator`` would be meaningless.
         """
-        runs = self._runs_for(t_row)
-        he_contact = self._he_contact_for(t_row)
+        # The standardisation constants and the caps both live behind the lazy load, and an
+        # external caller has no reason to know that.
+        self._ensure_loaded()
         keep = [i for i, (t, _) in enumerate(runs) if t in (DSSP_HELIX, DSSP_STRAND)]
-        # The stored map was built from the unperturbed runs, so its axis must stay aligned with
-        # them even if augmentation changes element lengths (which never changes their count).
-        structural = self._he_structural_for(t_row, he_contact.shape[0])
         if he_contact.shape[0] != len(keep):
             he_contact = torch.zeros(len(keep), len(keep))
             structural = torch.zeros(len(keep), len(keep), len(STRUCTURAL_PAIR_FEATURES))
@@ -218,6 +228,15 @@ class TopologyReferenceTransform(T.BaseTransform):
             "topology_he_contact": he_contact if he_contact.numel() else torch.zeros(1, 1),
             "topology_he_feat": he_feat if he_feat.numel() else torch.zeros(1, 1, N_PAIR_FEATURES),
         }
+
+    def _build_reference(self, t_row: int, length: int, augment: bool) -> Dict[str, torch.Tensor]:
+        """``assemble_reference`` fed from index row ``t_row``."""
+        runs = self._runs_for(t_row)
+        he_contact = self._he_contact_for(t_row)
+        # The stored map was built from the unperturbed runs, so its axis must stay aligned with
+        # them even if augmentation changes element lengths (which never changes their count).
+        structural = self._he_structural_for(t_row, he_contact.shape[0])
+        return self.assemble_reference(runs, he_contact, structural, length, augment)
 
     def self_reference(self, stem: str, length: int) -> Optional[Dict[str, torch.Tensor]]:
         """The chain's OWN topology, unaugmented and never dropped.

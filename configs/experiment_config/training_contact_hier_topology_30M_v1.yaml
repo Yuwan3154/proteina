@@ -93,6 +93,12 @@ log:
   log_every_n_steps: 100
   log_structure_every_n_steps: 100
   checkpoint: True
+  # Selection metric for a contact-map model: top-L precision of the SAMPLED contact map
+  # against the ground truth, median over the chains the validation trajectory drew.
+  # top_k=5 because that draw is a different handful of chains every validation, so a
+  # single best-scoring step is as likely to be a lucky draw as a better model.
+  checkpoint_best_contact_precision: True
+  checkpoint_best_contact_save_top_k: 5
   checkpoint_every_n_steps: 50
   last_ckpt_every_n_steps: 50
 

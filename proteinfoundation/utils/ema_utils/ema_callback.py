@@ -11,6 +11,7 @@
 
 import contextlib
 import copy
+import logging
 import os
 import threading
 from typing import Any, Dict, Iterable, Optional
@@ -547,3 +548,44 @@ class EmaModelCheckpoint(ModelCheckpoint):
                     _os.remove(ema_filepath)
                 except OSError:
                     pass
+
+
+class CadencedEmaModelCheckpoint(EmaModelCheckpoint):
+    """An EmaModelCheckpoint whose monitored metric is only produced on SOME validations.
+
+    The validation sampling trajectory runs every ``tmscore_every_n_val_epochs`` validations, so
+    its metrics are simply absent in between. Lightning raises MisconfigurationException on an
+    absent monitor once a validation loop has run, which would turn that cadence into a crash.
+
+    Skipping silently would trade that crash for a worse failure -- a monitor that never appears
+    at all (exactly what happened to validation_sampling/tmscore_median, which needs coordinates
+    a contact-map model never produces) would then quietly save nothing for the whole run. So the
+    skips are counted and shouted about once they can no longer be explained by the cadence.
+    """
+
+    _warn_after_skips = 20
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._monitor_absent_skips = 0
+        self._warned_monitor_never_seen = False
+
+    def _save_topk_checkpoint(self, trainer, monitor_candidates) -> None:
+        if self.monitor is not None and self.monitor not in monitor_candidates:
+            self._monitor_absent_skips += 1
+            if (
+                not self._warned_monitor_never_seen
+                and not self.best_k_models
+                and self._monitor_absent_skips >= self._warn_after_skips
+            ):
+                self._warned_monitor_never_seen = True
+                logging.warning(
+                    "ModelCheckpoint(monitor=%r) has been skipped %d times and has never once "
+                    "seen its metric, so it has saved nothing. Either the metric is never "
+                    "computed for this model or the name is wrong. Available: %s",
+                    self.monitor,
+                    self._monitor_absent_skips,
+                    sorted(monitor_candidates),
+                )
+            return
+        super()._save_topk_checkpoint(trainer, monitor_candidates)
