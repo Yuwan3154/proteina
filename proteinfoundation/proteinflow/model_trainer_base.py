@@ -2860,7 +2860,13 @@ class ModelTrainerBase(L.LightningModule):
         )
         batches = []
         for b in loader:
-            batches.append(b if isinstance(b, dict) else b.to_dict())
+            d = b if isinstance(b, dict) else b.to_dict()
+            # The collate emits mask_dict, not mask; the training loop derives `mask` from it in
+            # extract_clean_sample (batch["mask_dict"]["coords"][..., 0, 0]) and _run_validation_
+            # trajectory reads batch["mask"] directly. Same derivation here, or the trajectory
+            # KeyErrors on the first validation.
+            d["mask"] = d["mask_dict"]["coords"][..., 0, 0]
+            batches.append(d)
         self._fixed_val_batches_cache = batches
         n = sum(int(b["mask"].shape[0]) for b in batches)
         logger.info(
