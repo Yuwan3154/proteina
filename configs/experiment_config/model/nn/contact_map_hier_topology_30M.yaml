@@ -45,6 +45,8 @@ block_featurizer: local_attn   # local_attn | conv; conv = no within-block atten
                                # leaving the level-1 pooling as a strided conv (v1 patchify)
 d_local: 64
 n_local_layers: 2
+conv_kernel_size: 7  # ConvNeXt default; only read when block_featurizer is conv_next. Depthwise,
+                     # so the cost is O(d_local * k^2), not O(d_local^2 * k^2).
 nheads_local: 2      # head_dim = d_local / nheads_local = 32. At 8 heads head_dim was 8,
                      # far below what tensor cores run efficiently, on the model's hottest path.
 
