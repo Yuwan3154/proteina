@@ -3307,6 +3307,8 @@ class ModelTrainerBase(L.LightningModule):
                 topo_cfg["structure_path"],
                 topo_cfg["index_path"],
                 chain=topo_cfg.get("chain", "all"),
+                contact_method=topo_cfg.get("contact_method", "frame2confind"),
+                frame2confind_checkpoint=topo_cfg.get("frame2confind_checkpoint", None),
                 rotlib_path=topo_cfg.get("rotlib_path", None),
                 confind_bin=topo_cfg.get("confind_bin", "confind"),
             )

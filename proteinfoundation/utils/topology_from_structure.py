@@ -35,21 +35,21 @@ from proteinfoundation.graphein_utils.graphein_utils import (
     read_pdb_to_dataframe,
 )
 from proteinfoundation.utils.confind_utils import confind_raw_contact_map
+from proteinfoundation.openfold_stub.np.residue_constants import resname_to_idx
 from proteinfoundation.utils.constants import PDB_TO_OPENFOLD_INDEX_TENSOR
 from proteinfoundation.utils.dssp_utils import compute_dssp_target
+from proteinfoundation.utils.frame2confind_utils import Frame2ConFindTransformPredictor
 
 # protein_to_pyg writes this into every coordinate slot it could not fill, and pdb_data.py
 # derives coord_mask by comparing against it. Same constant, same derivation.
 FILL_VALUE_COORDS = 1e-5
 
 
-def load_structure(
-    structure_path: str, chain: str = "all"
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """PDB/CIF -> (coords [L, 37, 3] in OpenFold atom order, coord_mask [L, 37], dssp [L]).
+def parse_structure(structure_path: str, chain: str = "all") -> "Data":
+    """PDB/CIF -> a graph shaped exactly like the training pipeline's, BEFORE its atom37 reorder.
 
-    Mirrors ``pdb_data.PDBDataset`` exactly: same parser, same fill value, same reorder into the
-    atom37 layout, and DSSP read from that layout (where O is index 4, not 3).
+    PDB ordering is not an oversight: ``graph_to_f2s_coords`` and ``write_graph_pdb`` both apply
+    the reorder themselves, so handing them atom37 coords would silently permute the atoms twice.
     """
     if not os.path.exists(structure_path):
         raise FileNotFoundError(structure_path)
@@ -61,11 +61,27 @@ def load_structure(
         keep_insertions=True,
         fill_value_coords=FILL_VALUE_COORDS,
     )
-    coords = torch.as_tensor(np.asarray(graph.coords, dtype=np.float32))
-    coord_mask = (coords != FILL_VALUE_COORDS)[..., 0]
-    coords = coords[:, PDB_TO_OPENFOLD_INDEX_TENSOR, :]
-    coord_mask = coord_mask[:, PDB_TO_OPENFOLD_INDEX_TENSOR]
+    graph.coords = torch.as_tensor(np.asarray(graph.coords, dtype=np.float32))
+    graph.coord_mask = (graph.coords != FILL_VALUE_COORDS)[..., 0]
+    graph.residue_type = torch.tensor(
+        [resname_to_idx[r] for r in graph.residues], dtype=torch.long
+    )
+    return graph
 
+
+def load_structure(structure_path: str, chain: str = "all"):
+    """PDB/CIF -> (coords [L, 37, 3] in OpenFold atom order, coord_mask [L, 37], dssp [L])."""
+    return atom37_and_dssp(parse_structure(structure_path, chain=chain))
+
+
+def atom37_and_dssp(graph):
+    """Graph in PDB atom order -> the atom37 view the topology featurisation expects, plus DSSP.
+
+    Mirrors ``pdb_data.PDBDataset`` exactly: same reorder, and DSSP read from the atom37 layout
+    (where O is index 4, not 3 -- reading index 3 there feeds CB to pydssp and returns all-loop).
+    """
+    coords = graph.coords[:, PDB_TO_OPENFOLD_INDEX_TENSOR, :]
+    coord_mask = graph.coord_mask[:, PDB_TO_OPENFOLD_INDEX_TENSOR]
     L = coords.shape[0]
     dssp = compute_dssp_target(
         coords[None],
@@ -75,8 +91,8 @@ def load_structure(
     )
     if dssp is None:
         raise ValueError(
-            f"{structure_path}: DSSP needs N/CA/C/O and the file resolves only "
-            f"{coords.shape[1]} atom slots -- a CA-only model cannot supply a topology."
+            f"DSSP needs N/CA/C/O and the structure resolves only {coords.shape[1]} atom slots -- "
+            "a CA-only model cannot supply a topology."
         )
     return coords, coord_mask, dssp[0]
 
@@ -85,6 +101,8 @@ def structure_to_topology_source(
     structure_path: str,
     index_path: str,
     chain: str = "all",
+    contact_method: str = "frame2confind",
+    frame2confind_checkpoint: Optional[str] = None,
     rotlib_path: Optional[str] = None,
     confind_bin: str = "confind",
     raw_contact_map: Optional[torch.Tensor] = None,
@@ -94,31 +112,39 @@ def structure_to_topology_source(
     Split out from the assembly because those three describe the structure while the assembly
     rescales them onto a target generation length -- one structure, many lengths.
 
-    ``raw_contact_map`` accepts an [L, L] map computed elsewhere (Frame2ConFind, say). Without it
-    the real ConFind binary runs, which needs ``rotlib_path``. Either way the map is thresholded
-    at the value stored IN THE INDEX, so a reference built here is binarised exactly like the
-    training ones.
+    ``contact_method`` defaults to ``frame2confind`` because that is what actually produced the
+    training data: ``contact_map_confind`` in the processed .pt files was backfilled with
+    Frame2ConFind on GPU, so the CPU ``confind`` binary is the OUT-of-distribution choice here
+    despite the field name. It is kept as an option. ``raw_contact_map`` accepts an [L, L] map
+    computed elsewhere and skips both.
+
+    Whichever produced it, the map is thresholded at the value stored IN THE INDEX, so a reference
+    built here is binarised exactly like the training ones.
     """
     index = torch.load(index_path, map_location="cpu", weights_only=False, mmap=True)
     threshold = float(index["contact_threshold"])
     min_len = int(index["min_len"])
 
-    coords, coord_mask, dssp = load_structure(structure_path, chain=chain)
+    graph = parse_structure(structure_path, chain=chain)
+    coords, coord_mask, dssp = atom37_and_dssp(graph)
     L = coords.shape[0]
 
     if raw_contact_map is None:
-        if rotlib_path is None:
-            raise ValueError(
-                "structure_to_topology_source needs either raw_contact_map or rotlib_path: the "
-                "training index was built from ConFind contacts, and a reference built from a "
-                "different contact definition is not the input the model was trained on."
+        if contact_method == "frame2confind":
+            predictor = Frame2ConFindTransformPredictor.get_or_create(
+                **({"checkpoint": frame2confind_checkpoint} if frame2confind_checkpoint else {})
             )
-        raw_contact_map = torch.as_tensor(
-            confind_raw_contact_map(
-                _graph_for_confind(structure_path, chain), rotlib_path, confind_bin=confind_bin
-            ),
-            dtype=torch.float32,
-        )
+            raw_contact_map = predictor.predict_graph(graph)
+        elif contact_method == "confind":
+            if rotlib_path is None:
+                raise ValueError("contact_method='confind' needs rotlib_path")
+            raw_contact_map = confind_raw_contact_map(
+                graph, rotlib_path, confind_bin=confind_bin
+            )
+        else:
+            raise ValueError(
+                f"contact_method must be 'frame2confind' or 'confind', got {contact_method!r}"
+            )
     raw_contact_map = torch.as_tensor(raw_contact_map, dtype=torch.float32)
     if raw_contact_map.shape != (L, L):
         raise ValueError(
@@ -132,18 +158,6 @@ def structure_to_topology_source(
     return runs, ref, structural
 
 
-def _graph_for_confind(structure_path: str, chain: str):
-    """ConFind needs side chains, so it re-reads the file rather than using the atom37 tensor."""
-    df = read_pdb_to_dataframe(path=structure_path)
-    return protein_to_pyg(
-        df=df.copy(),
-        path=structure_path,
-        chain_selection=chain,
-        keep_insertions=True,
-        fill_value_coords=FILL_VALUE_COORDS,
-    )
-
-
 def topology_reference_from_structure(
     structure_path: str,
     index_path: str,
@@ -151,6 +165,8 @@ def topology_reference_from_structure(
     chain: str = "all",
     max_topology_len: int = 128,
     max_topology_he_len: int = 64,
+    contact_method: str = "frame2confind",
+    frame2confind_checkpoint: Optional[str] = None,
     rotlib_path: Optional[str] = None,
     confind_bin: str = "confind",
     raw_contact_map: Optional[torch.Tensor] = None,
@@ -164,6 +180,8 @@ def topology_reference_from_structure(
         structure_path,
         index_path,
         chain=chain,
+        contact_method=contact_method,
+        frame2confind_checkpoint=frame2confind_checkpoint,
         rotlib_path=rotlib_path,
         confind_bin=confind_bin,
         raw_contact_map=raw_contact_map,
