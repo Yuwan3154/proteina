@@ -900,17 +900,18 @@ class ContactMapHierSiT(nn.Module):
         """
         if batch.get("topology_tokens") is not None:
             return batch
-        # Warn once per process. Nothing outside TopologyReferenceTransform produces these keys,
-        # and generate() rebuilds its batch from scratch without them, so a topology-conditioned
-        # model reaching here is sampling UNCONDITIONED. That is intended for length-based
-        # generation but silently wrong if the caller believed it was passing a topology, and the
-        # KeyError this guard replaced was previously the only signal.
+        # Warn once per process. A topology-conditioned model reaching here is sampling
+        # UNCONDITIONED, which is right for length-based generation but silently wrong if the
+        # caller believed it was passing a topology. generate() takes a `topology` argument and
+        # validation sampling fills it with each chain's own reference, so during a
+        # topology-conditioned validation this warning firing means that plumbing bailed out --
+        # its own log line says why.
         if not ContactMapHierSiT._warned_missing_topology:
             ContactMapHierSiT._warned_missing_topology = True
             logger.warning(
                 "topology_cond=True but the batch carries no topology_* keys; generating with an "
-                "unconditioned (MASK) reference. Only TopologyReferenceTransform emits them, and "
-                "generate() does not forward them."
+                "unconditioned (MASK) reference. Only TopologyReferenceTransform and generate()'s "
+                "`topology` argument supply them."
             )
         batch = dict(batch)
         mask_tok = torch.full((B, 1), TOPOLOGY_MASK_TOKEN, dtype=torch.long, device=device)
