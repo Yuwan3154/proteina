@@ -698,7 +698,10 @@ class ContactMapHierSiT(nn.Module):
         max_off_super = max(1, n_super_max - 1)
         max_off_block = max(1, n_super_max * self.super_factor - 1)
         self.rel_pos_super = RelPosBias2D(nheads_attn, max_off_super)
-        self.rel_pos_block = RelPosBias2D(nheads_attn, max_off_block)
+        # Only when block-level attention exists to consume it: an unused parameter makes DDP
+        # with find_unused_parameters=False raise, so this cannot merely be left dangling.
+        if self.n_block_layers > 0:
+            self.rel_pos_block = RelPosBias2D(nheads_attn, max_off_block)
 
         self.global_blocks = nn.ModuleList(
             [
@@ -745,10 +748,15 @@ class ContactMapHierSiT(nn.Module):
             # length at every level.
             self.pool_single_to_block = nn.Linear(self.block_size * self.d_single, self.d_block)
             self.pool_single_to_super = nn.Linear(self.super_factor * self.d_block, self.d_super)
-            self.unpool_single_super_to_block = nn.Linear(
-                self.d_super, self.super_factor * self.d_block
-            )
-            self.merge_single_block_skip = nn.Linear(2 * self.d_block, self.d_block)
+            # Block-level single track exists only to feed the block-level attention loop: the
+            # decoder derives its residue-level features from the PAIR track, so with
+            # n_block_layers=0 these would be computed and discarded, and their dangling
+            # parameters would make DDP raise under find_unused_parameters=False.
+            if self.n_block_layers > 0:
+                self.unpool_single_super_to_block = nn.Linear(
+                    self.d_super, self.super_factor * self.d_block
+                )
+                self.merge_single_block_skip = nn.Linear(2 * self.d_block, self.d_block)
             self.unpool_single_block_to_cell = nn.Linear(
                 self.d_block, self.block_size * self.d_single
             )
@@ -788,12 +796,16 @@ class ContactMapHierSiT(nn.Module):
             self.cross2d_super = CrossAttention2D(
                 self.d_super, self.d_topo, nheads_attn, max_off_super
             )
-            self.cross2d_block = CrossAttention2D(
-                self.d_block, self.d_topo, nheads_attn, max_off_block
-            )
+            # The block level gets a topology reference only if it has attention layers to use it.
+            # With n_block_layers=0 the reference is consumed once, at the coarsest level.
+            if self.n_block_layers > 0:
+                self.cross2d_block = CrossAttention2D(
+                    self.d_block, self.d_topo, nheads_attn, max_off_block
+                )
             if self.topology_reinject:
                 self.reinject_super = CrossAttention(self.d_super, self.d_topo, nheads_attn)
-                self.reinject_block = CrossAttention(self.d_block, self.d_topo, nheads_attn)
+                if self.n_block_layers > 0:
+                    self.reinject_block = CrossAttention(self.d_block, self.d_topo, nheads_attn)
             # The single track reaches the output head alongside the 2D cell features, so a
             # residue-level signal can influence its own row/column of the map.
             self.single_to_cell = nn.Linear(self.d_single, self.d_local, bias=False)
@@ -1080,17 +1092,23 @@ class ContactMapHierSiT(nn.Module):
         ).reshape(B, P1 * P1, self.d_block)
         block_tok = self.merge_block_skip(torch.cat([up, block_tok], dim=-1)) * block_mask[..., None]
 
-        bias_block = self.rel_pos_block(P1)
+        # Swin-style setting: with n_block_layers=0 all-to-all attention happens only at the
+        # coarsest level, so the [nheads, P1^2, P1^2] bias is never consumed and must not be built
+        # -- at P1=44 that tensor alone is 30M elements per layer.
+        bias_block = self.rel_pos_block(P1) if self.n_block_layers > 0 else None
         if not self.topology_cond:
             for blk in self.block_blocks:
                 block_tok = blk(block_tok, cond, block_mask, bias=bias_block)
         else:
             # The single track unpools and merges its own skip, mirroring the pair track exactly.
-            single_up = self.unpool_single_super_to_block(single_super).reshape(B, P1, self.d_block)
-            single_block = self.merge_single_block_skip(
-                torch.cat([single_up, single_block], dim=-1)
-            ) * single_mask_block[..., None]
-            if self.topology_reinject:
+            if self.n_block_layers > 0:
+                single_up = self.unpool_single_super_to_block(single_super).reshape(
+                    B, P1, self.d_block
+                )
+                single_block = self.merge_single_block_skip(
+                    torch.cat([single_up, single_block], dim=-1)
+                ) * single_mask_block[..., None]
+            if self.topology_reinject and self.n_block_layers > 0:
                 single_block = single_block + self.reinject_block(
                     single_block, topo, topo_mask,
                     q_pos=torch.arange(P1, device=device, dtype=torch.float32),
