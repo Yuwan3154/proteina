@@ -2729,6 +2729,10 @@ class ModelTrainerBase(L.LightningModule):
         "topology_he_pos",
         "topology_he_contact",
         "topology_he_feat",
+        # Un-rescaled own-chain midpoints, for a model that left-aligns query and reference
+        # instead of stretching the reference onto the query length.
+        "topology_pos_raw",
+        "topology_he_pos_raw",
     )
 
     def _find_topology_transform(self) -> Optional[TopologyReferenceTransform]:

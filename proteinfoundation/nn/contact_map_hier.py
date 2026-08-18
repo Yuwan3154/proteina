@@ -924,6 +924,8 @@ class ContactMapHierSiT(nn.Module):
         batch["topology_he_feat"] = torch.zeros(
             B, 1, 1, N_PAIR_FEATURES, dtype=torch.float32, device=device
         )
+        batch["topology_pos_raw"] = zeros.clone()
+        batch["topology_he_pos_raw"] = zeros.clone()
         return batch
 
     def forward(self, batch: Dict, force_compile: bool = False) -> Dict:

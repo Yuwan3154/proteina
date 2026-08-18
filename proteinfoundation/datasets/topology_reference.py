@@ -206,15 +206,22 @@ class TopologyReferenceTransform(T.BaseTransform):
 
         tokens = torch.tensor(self.alphabet.runs_to_tokens(runs), dtype=torch.long)
         pos = element_positions(runs, target_len=length)
+        # Un-rescaled midpoints: each element's own-chain residue index, origin 0, exactly like
+        # the query's own indexing. A model that LEFT-ALIGNS query and reference (rather than
+        # stretching the reference onto the query length) needs these, not the rescaled ones.
+        pos_raw = element_positions(runs, target_len=None)
         he_tokens = torch.tensor(
             [self.alphabet.token(*runs[i]) for i in keep], dtype=torch.long
         )
         he_pos = pos[keep] if len(keep) else torch.zeros(0, dtype=torch.float32)
 
+        he_pos_raw = pos_raw[keep] if len(keep) else torch.zeros(0, dtype=torch.float32)
         tokens = tokens[: self.max_topology_len]
         pos = pos[: self.max_topology_len]
+        pos_raw = pos_raw[: self.max_topology_len]
         k = min(len(keep), self.max_topology_he_len)
         he_tokens, he_pos = he_tokens[:k], he_pos[:k]
+        he_pos_raw = he_pos_raw[:k]
         he_contact = he_contact[:k, :k]
         he_feat = self._pair_features(he_contact, structural[:k, :k], runs, keep[:k])
 
@@ -225,6 +232,10 @@ class TopologyReferenceTransform(T.BaseTransform):
                 he_tokens if he_tokens.numel() else torch.full((1,), MASK_TOKEN, dtype=torch.long)
             ),
             "topology_he_pos": he_pos if he_pos.numel() else torch.zeros(1, dtype=torch.float32),
+            "topology_pos_raw": pos_raw if pos_raw.numel() else torch.zeros(1, dtype=torch.float32),
+            "topology_he_pos_raw": (
+                he_pos_raw if he_pos_raw.numel() else torch.zeros(1, dtype=torch.float32)
+            ),
             "topology_he_contact": he_contact if he_contact.numel() else torch.zeros(1, 1),
             "topology_he_feat": he_feat if he_feat.numel() else torch.zeros(1, 1, N_PAIR_FEATURES),
         }
@@ -277,6 +288,8 @@ class TopologyReferenceTransform(T.BaseTransform):
         graph.topology_pos = torch.zeros(1, dtype=torch.float32)
         graph.topology_he_tokens = torch.full((1,), MASK_TOKEN, dtype=torch.long)
         graph.topology_he_pos = torch.zeros(1, dtype=torch.float32)
+        graph.topology_pos_raw = torch.zeros(1, dtype=torch.float32)
+        graph.topology_he_pos_raw = torch.zeros(1, dtype=torch.float32)
         graph.topology_he_contact = torch.zeros(1, 1)
         graph.topology_he_feat = torch.zeros(1, 1, N_PAIR_FEATURES)
         return graph
