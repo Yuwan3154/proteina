@@ -2808,6 +2808,16 @@ class ModelTrainerBase(L.LightningModule):
             for k in self.TOPOLOGY_KEYS
         }
 
+    def _to_device_recursive(self, obj):
+        """Move every tensor in a nested batch structure onto this module's device."""
+        if torch.is_tensor(obj):
+            return obj.to(self.device)
+        if isinstance(obj, dict):
+            return {k: self._to_device_recursive(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)) and obj and torch.is_tensor(obj[0]):
+            return type(obj)(self._to_device_recursive(v) for v in obj)
+        return obj
+
     def _fixed_val_batches(self, val_sampling_cfg) -> Optional[List[dict]]:
         """Batches over a FIXED chain list, built with the val dataloader's own transforms.
 
@@ -2866,7 +2876,11 @@ class ModelTrainerBase(L.LightningModule):
             # trajectory reads batch["mask"] directly. Same derivation here, or the trajectory
             # KeyErrors on the first validation.
             d["mask"] = d["mask_dict"]["coords"][..., 0, 0]
-            batches.append(d)
+            # Lightning only auto-moves the batches its own dataloaders yield. These are built
+            # here, so nothing moves them: extract_clean_contact_map then mixes a cuda mask with
+            # a cpu contact_map and the metrics are silently dropped by its except-and-warn.
+            # Moved once at build time -- the set is fixed and small (~20 MB on device).
+            batches.append(self._to_device_recursive(d))
         self._fixed_val_batches_cache = batches
         n = sum(int(b["mask"].shape[0]) for b in batches)
         logger.info(
