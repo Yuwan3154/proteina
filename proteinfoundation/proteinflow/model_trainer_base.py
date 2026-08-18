@@ -2475,12 +2475,24 @@ class ModelTrainerBase(L.LightningModule):
                 "val_step_data: traj enter distributed",
                 f"world={world_size} per_rank={per_rank} total={per_rank * world_size}",
             )
-            self._run_validation_trajectory(
-                batch,
-                val_sampling_cfg,
-                nsamples=per_rank,
-                qualitative_only=False,
-            )
+            fixed = self._fixed_val_batches(val_sampling_cfg)
+            if fixed is not None:
+                # The whole fixed set, every time -- scoring a random slice of it would
+                # reintroduce exactly the run-to-run variation it exists to remove.
+                for fb in fixed:
+                    self._run_validation_trajectory(
+                        fb,
+                        val_sampling_cfg,
+                        nsamples=int(fb["mask"].shape[0]),
+                        qualitative_only=False,
+                    )
+            else:
+                self._run_validation_trajectory(
+                    batch,
+                    val_sampling_cfg,
+                    nsamples=per_rank,
+                    qualitative_only=False,
+                )
             self._diag_log("val_step_data: traj done distributed", "")
 
     @staticmethod
@@ -2795,6 +2807,56 @@ class ModelTrainerBase(L.LightningModule):
             k: self._stack_topology([r[k] for r in refs]).to(self.device)
             for k in self.TOPOLOGY_KEYS
         }
+
+    def _fixed_val_batches(self, val_sampling_cfg) -> Optional[List[dict]]:
+        """Batches over a FIXED chain list, built with the val dataloader's own transforms.
+
+        Validation sampling otherwise scores whichever chains the val sampler happens to yield,
+        and ``base_data.on_validation_epoch_start`` deliberately re-seeds that sampler by
+        ``global_step`` on every pass -- so the sampling metrics describe a different set of
+        proteins at every validation. That is fine for a qualitative panel and useless for
+        ranking checkpoints, which is what the best-contact-precision callback does.
+
+        The batches are built once and cached: the set is fixed, so re-reading it every
+        validation would only add I/O.
+        """
+        path = val_sampling_cfg.get("fixed_chain_list", None)
+        if not path:
+            return None
+        cached = getattr(self, "_fixed_val_batches_cache", None)
+        if cached is not None:
+            return cached
+        from proteinfoundation.datasets.pdb_data import PDBDataset
+        from proteinfoundation.utils.dense_padding_data_loader import DensePaddingDataLoader
+
+        dm = getattr(self.trainer, "datamodule", None)
+        if dm is None:
+            logger.warning("validation_sampling.fixed_chain_list set but no datamodule; ignoring.")
+            return None
+        with open(path) as fh:
+            stems = [ln.strip() for ln in fh if ln.strip()]
+        chunk = max(1, int(val_sampling_cfg.get("tmscore_n_samples", 4)))
+        ds = PDBDataset(
+            pdb_codes=[st.split("_", 1)[0] for st in stems],
+            chains=[st.split("_", 1)[1] if "_" in st else None for st in stems],
+            data_dir=str(dm.data_dir),
+            transform=dm.transform,
+            format=dm.format,
+            in_memory=False,
+            file_names=stems,
+            num_workers=0,
+        )
+        loader = DensePaddingDataLoader(ds, batch_size=chunk, shuffle=False, num_workers=0)
+        batches = []
+        for b in loader:
+            batches.append(b if isinstance(b, dict) else b.to_dict())
+        self._fixed_val_batches_cache = batches
+        n = sum(int(b["mask"].shape[0]) for b in batches)
+        logger.info(
+            f"validation_sampling: fixed chain set loaded from {path} -- {n} chains "
+            f"({len(stems)} requested) in {len(batches)} batches of {chunk}."
+        )
+        return batches
 
     def _run_validation_trajectory(
         self,

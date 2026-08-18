@@ -116,6 +116,13 @@ validation_sampling:
   # (canonical for structure prediction, prevents inflated scores from sequence-independent
   # re-alignment). 0 = USalign default (TMalign, sequence-independent — diagnostic only).
   tmscore_mode: 5
+  # FIXED chain set for the sampling metrics, so they are comparable across steps and
+  # can rank checkpoints. 32 chains, one per 25%-identity val cluster, chosen so no pair
+  # reaches TM>=0.5 (max within the set is 0.450) and the length range is covered.
+  # The val LOSS still runs over the whole val split; only sampling moves to this set.
+  # Cost: the whole set is scored each time the trajectory fires, so at 200 sampling
+  # steps that is ~80 s -- worth re-checking once the step sweep lands.
+  fixed_chain_list: /orcd/scratch/orcd/011/chenxiou/valset_analysis/val_fixed32.txt
 
 # ClusterSampler DDP fix is on by default (BaseLightningDataModule.cluster_sampler_v2=True).
 # To override per-dataset, set cluster_sampler_v2 / cluster_sampler_seed under
