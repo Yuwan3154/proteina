@@ -4,8 +4,11 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:l40s:1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=200G
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=100G
+# 200G made SLURM grant gres/gpu=2 for a gres/gpu=1 request (memory-driven over-allocation),
+# which silently consumed the whole per-user GPU cap and produced a 2-device RNG state that a
+# correct 1-GPU resume then could not restore.
 #SBATCH --time=6:00:00
 #SBATCH --output=/orcd/scratch/orcd/011/chenxiou/proteina_cmhier/logs/%x-%j.out
 #SBATCH --error=/orcd/scratch/orcd/011/chenxiou/proteina_cmhier/logs/%x-%j.err
