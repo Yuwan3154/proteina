@@ -28,8 +28,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from proteinfoundation.datasets.sse_topology import MASK_TOKEN as TOPOLOGY_MASK_TOKEN
-from proteinfoundation.datasets.sse_topology import N_PAIR_FEATURES, PAIR_FEATURE_NAMES
-from proteinfoundation.nn.contact_map_hier import PAIR_FEATURE_MODES
+from proteinfoundation.datasets.sse_topology import (
+    N_PAIR_FEATURES,
+    PAIR_FEATURE_MODES,
+    PAIR_FEATURE_NAMES,
+)
 from proteinfoundation.openfold_stub.model.pair_transition import PairTransition
 from proteinfoundation.openfold_stub.model.triangular_multiplicative_update import (
     TriangleMultiplicationIncoming,
@@ -75,18 +78,24 @@ class TriBlock(nn.Module):
         self.tri_out = TriangleMultiplicationOutgoing(c_z=dim, c_hidden=tri_hidden)
         self.tri_in = TriangleMultiplicationIncoming(c_z=dim, c_hidden=tri_hidden)
         self.transition = PairTransition(c_z=dim, n=transition_n)
-        # adaLN-Zero style gating on the time embedding: the block starts as identity, so depth
-        # can be added without destabilising early training.
+        # Time modulation, zero-initialised so the modulation (not the block) starts as a no-op:
+        # the scale below is 1 + cond(...), i.e. exactly 1 at init.
+        #
+        # It must NOT be a bare `tanh(cond) *` adaLN-Zero gate. OpenFold's triangle multiplication
+        # already zero-inits its own output projection, so the block output starts at zero; a gate
+        # that also starts at zero makes the product zero AND kills the gradient to both, and the
+        # entire trunk stays frozen for the whole run while the embeddings and output head learn
+        # around it. Caught by a CPU smoke test: 0 of the block tensors ever received gradient.
         self.cond = nn.Sequential(nn.SiLU(), nn.Linear(dim_cond, 3 * dim))
         nn.init.zeros_(self.cond[1].weight)
         nn.init.zeros_(self.cond[1].bias)
 
     def forward(self, z, pair_mask, cond):
-        g_out, g_in, g_tr = self.cond(cond)[:, None, None, :].chunk(3, dim=-1)
+        s_out, s_in, s_tr = self.cond(cond)[:, None, None, :].chunk(3, dim=-1)
         m = pair_mask[..., None]
-        z = z + g_out.tanh() * self.tri_out(z, mask=pair_mask) * m
-        z = z + g_in.tanh() * self.tri_in(z, mask=pair_mask) * m
-        z = z + g_tr.tanh() * self.transition(z, mask=pair_mask) * m
+        z = z + (1.0 + s_out) * self.tri_out(z, mask=pair_mask) * m
+        z = z + (1.0 + s_in) * self.tri_in(z, mask=pair_mask) * m
+        z = z + (1.0 + s_tr) * self.transition(z, mask=pair_mask) * m
         return z * m
 
 
@@ -211,7 +220,7 @@ class ContactMapTriSiT(nn.Module):
 def _pair_feature_indices(mode: str):
     """Which of the reference's element-pair channels this mode consumes.
 
-    Reuses ContactMapHierSiT's own mapping so the two architectures are fed the SAME channels for
+    Uses the shared mapping so both architectures are fed the SAME channels for
     the same `pair_ref_features` setting -- a second definition here would let the arms drift
     apart silently and make the comparison meaningless.
     """

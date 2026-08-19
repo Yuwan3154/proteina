@@ -66,6 +66,7 @@ from proteinfoundation.nn.alphafold3_pytorch_utils.modules import (
     Transition,
 )
 from proteinfoundation.datasets.sse_topology import (
+    PAIR_FEATURE_MODES,
     CIRCUIT_PAIR_FEATURES,
     N_PAIR_FEATURES,
     PAIR_FEATURE_NAMES,
@@ -81,16 +82,6 @@ from proteinfoundation.nn.protein_transformer import (
     PairReprUpdate,
     TransitionADALN,
 )
-
-# Which channels of the 2D SSE reference the pair track sees. "contact" is the original
-# behaviour (which elements touch, nothing more); the other three add the descriptions of HOW they
-# touch that sse_topology computes, and exist so the two can be compared empirically.
-PAIR_FEATURE_MODES: Dict[str, Tuple[str, ...]] = {
-    "contact": ("contact_max",),
-    "circuit": ("contact_max",) + CIRCUIT_PAIR_FEATURES,
-    "proximity": ("contact_max",) + PROXIMITY_PAIR_FEATURES,
-    "both": PAIR_FEATURE_NAMES,
-}
 
 # Cache of relative-position index grids, keyed by (P, max_offset, device).
 # Shared across layers and levels since the indices depend only on the geometry.

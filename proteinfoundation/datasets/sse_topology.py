@@ -108,6 +108,7 @@ class SSEAlphabet:
         return [self.token(t, n) for t, n in runs if t in self.types and n >= self.min_len]
 
 
+
 def dssp_to_runs(dssp: torch.Tensor, min_len: int = 1) -> List[Tuple[int, int]]:
     """Run-length-compress a per-residue DSSP assignment into (type, length) pairs.
 
@@ -283,6 +284,19 @@ CIRCUIT_PAIR_FEATURES = (
     "circuit_cross",
 )
 PROXIMITY_PAIR_FEATURES = ("contact_frac", "min_ca_dist", "mean_ca_dist", "seq_gap")
+
+# Which channels of the 2D SSE reference the pair track sees. "contact" is the original
+# behaviour (which elements touch, nothing more); the other three add the descriptions of HOW they
+# touch that sse_topology computes, and exist so the two can be compared empirically.
+PAIR_FEATURE_MODES: Dict[str, Tuple[str, ...]] = {
+    "contact": ("contact_max",),
+    "circuit": ("contact_max",) + CIRCUIT_PAIR_FEATURES,
+    "proximity": ("contact_max",) + PROXIMITY_PAIR_FEATURES,
+    "both": PAIR_FEATURE_NAMES,
+}
+
+# Kept here rather than in a model file so a model can import it without pulling in the
+# neural-network package, which imports cuequivariance and therefore needs a GPU driver present.
 
 CA_ATOM_INDEX = 1  # ATOM_NUMBERING order, which is what the stored .pt uses
 
