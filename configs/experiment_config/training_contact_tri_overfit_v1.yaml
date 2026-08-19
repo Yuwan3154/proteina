@@ -35,7 +35,10 @@ model:
     pair_ref_features: both
 
 # Dataset params
-dataset: pdb_train_contact-confind-topology_S25_max256_overfit2000
+# Separate dataset config ONLY so batch_size can be halved without touching the shared one:
+# the other two arms use it and the conv_next arm auto-chains, so an in-place edit would
+# silently change a running A/B at its next segment.
+dataset: pdb_train_contact-confind-topology_S25_max256_overfit2000_bs2
 dataset_config_subdir: pdb
 
 force_precision_f32: False
@@ -66,9 +69,9 @@ lora:
 opt:
   lr: 0.0001
   max_epochs: 500
-  accumulate_grad_batches: 8   # 2000 chains / batch 4 = 500 minibatches per epoch;
-                               # at 128 that is 4 optimizer steps an epoch and nothing
-                               # could overfit in the time available. 8 gives ~62.
+  accumulate_grad_batches: 16   # 2 x 16 = effective batch 32, matching the other two arms
+                                # (they use 4 x 8). 2000 chains / batch 2 = 1000 minibatches per
+                                # epoch, so still ~62 optimizer steps per epoch.
   # Validation cadence is expressed in optimizer steps. The legacy
   # `val_check_interval` was Lightning's minibatch counter, which conflated
   # accumulation; this knob is now multiplied by accumulate_grad_batches in
