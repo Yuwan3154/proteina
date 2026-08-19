@@ -69,9 +69,23 @@ python -c "import proteinfoundation; print('proteinfoundation from', proteinfoun
 # terminates instead of running forever.
 CHAIN="${CHAIN:-0}"
 if [ "$CHAIN" -gt 0 ]; then
+    # The chained segment must inherit THIS segment's placement, not the #SBATCH defaults above.
+    # They happen to match today, so a bare `sbatch` works -- but the identical omission in
+    # run_tri_train.sbatch sent three CLI-overridden segments to pi_so3/rtx_pro_6000, where they
+    # died on sm_120. TresPerNode is the REQUESTED gres, so a scheduler over-allocation
+    # (seen on this partition: req 1 -> alloc 2) does not propagate down the chain.
+    JOBINFO=$(scontrol show job "$SLURM_JOB_ID" | tr ' ' '\n')
+    CHAIN_GRES=$(printf '%s\n' "$JOBINFO" | sed -n 's|^TresPerNode=gres/||p')
+    CHAIN_TIME=$(printf '%s\n' "$JOBINFO" | sed -n 's|^TimeLimit=||p')
     CHAIN=$((CHAIN - 1)) FEAT="$FEAT" RUN="$RUN" NLOCAL="$NLOCAL" KERNEL="$KERNEL" \
-        sbatch --dependency=afterany:${SLURM_JOB_ID} "$REPO/run_topo_train.sbatch" \
-        && echo "[$(date)] queued next chain segment (CHAIN=$((CHAIN - 1)) remaining)"
+        sbatch --dependency=afterany:${SLURM_JOB_ID} \
+               --partition="$SLURM_JOB_PARTITION" \
+               --gres="$CHAIN_GRES" \
+               --cpus-per-task="${SLURM_CPUS_PER_TASK:-8}" \
+               --mem="${SLURM_MEM_PER_NODE}M" \
+               --time="$CHAIN_TIME" \
+               "$REPO/run_topo_train.sbatch" \
+        && echo "[$(date)] queued next chain segment on $SLURM_JOB_PARTITION $CHAIN_GRES $CHAIN_TIME (CHAIN=$((CHAIN - 1)) remaining)"
 fi
 
 # torchrun, not bare srun: train.py reads RANK/WORLD_SIZE/LOCAL_RANK, which srun does not set.
