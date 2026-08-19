@@ -38,7 +38,7 @@ model:
 # Separate dataset config ONLY so batch_size can be halved without touching the shared one:
 # the other two arms use it and the conv_next arm auto-chains, so an in-place edit would
 # silently change a running A/B at its next segment.
-dataset: pdb_train_contact-confind-topology_S25_max256_overfit2000_bs2
+dataset: pdb_train_contact-confind-topology_S25_max256_overfit2000_bs1
 dataset_config_subdir: pdb
 
 force_precision_f32: False
@@ -69,7 +69,7 @@ lora:
 opt:
   lr: 0.0001
   max_epochs: 500
-  accumulate_grad_batches: 16   # 2 x 16 = effective batch 32, matching the other two arms
+  accumulate_grad_batches: 32   # 1 x 32 = effective batch 32, matching the other two arms
                                 # (they use 4 x 8). 2000 chains / batch 2 = 1000 minibatches per
                                 # epoch, so still ~62 optimizer steps per epoch.
   # Validation cadence is expressed in optimizer steps. The legacy

@@ -48,9 +48,22 @@ nvidia-smi --query-gpu=index,name,memory.total --format=csv
 
 CHAIN="${CHAIN:-0}"
 if [ "$CHAIN" -gt 0 ]; then
+    # The chained segment must inherit THIS segment's placement, not the #SBATCH defaults
+    # above: a CLI-overridden launch (--partition=mit_normal_gpu --gres=gpu:l40s:1) silently
+    # reverted to pi_so3/rtx_pro_6000 on resubmission and three segments died on sm_120.
+    # TresPerNode is the REQUESTED gres, so a scheduler over-allocation does not propagate.
+    JOBINFO=$(scontrol show job "$SLURM_JOB_ID" | tr ' ' '\n')
+    CHAIN_GRES=$(printf '%s\n' "$JOBINFO" | sed -n 's|^TresPerNode=gres/||p')
+    CHAIN_TIME=$(printf '%s\n' "$JOBINFO" | sed -n 's|^TimeLimit=||p')
     CHAIN=$((CHAIN - 1)) CONFIG="$CONFIG" RUN="$RUN" \
-        sbatch --dependency=afterany:${SLURM_JOB_ID} "$REPO/run_tri_train.sbatch" \
-        && echo "[$(date)] queued next chain segment"
+        sbatch --dependency=afterany:${SLURM_JOB_ID} \
+               --partition="$SLURM_JOB_PARTITION" \
+               --gres="$CHAIN_GRES" \
+               --cpus-per-task="${SLURM_CPUS_PER_TASK:-4}" \
+               --mem="${SLURM_MEM_PER_NODE}M" \
+               --time="$CHAIN_TIME" \
+               "$REPO/run_tri_train.sbatch" \
+        && echo "[$(date)] queued next chain segment on $SLURM_JOB_PARTITION $CHAIN_GRES $CHAIN_TIME"
 fi
 
 exec torchrun --standalone --nproc_per_node=1 proteinfoundation/train.py \
