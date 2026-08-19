@@ -8,11 +8,17 @@ nn_class: ContactMapTriSiT   # dispatches Proteina's NN_REGISTRY
 # triangle multiplication carries information between query and reference through the same
 # i -> k -> j paths it uses within each.
 
-pair_dim: 256        # 19 blocks -> 28,926,465 params, counted from the module itself, against
-                     # 28.4M (local_attn) and the conv arm. Per block: 2 triangle updates
-                     # (~6*d^2 each), the 4x transition (8*d^2), and the FiLM projection.
-tri_hidden: 256      # c_hidden == c_z; equal dims are also what cuequivariance's fused kernel needs
-n_blocks: 19
+# Wide and shallow, deliberately. Triangle multiplication's dominant term is an N^3 einsum whose
+# cost is LINEAR in the hidden width, while parameters grow as width^2 -- so trading depth for
+# width buys parameters at a sub-linear runtime cost. At N = 256 + 64 = 320, 12x320 does 0.79x
+# the N^3 work of 19x256 and stores 0.79x the activations for the same parameter count.
+pair_dim: 320        # 12 blocks -> 27,793,729 params, counted from the module itself, against
+                     # 28.46M for the local_attn arm. Per block: 2 triangle updates (~6*d^2 each),
+                     # the 4x transition (8*d^2), and the FiLM projection.
+tri_hidden: 320      # sets the N^3 cost directly (it is the einsum's contracted width), so this is
+                     # the knob to turn first if runtime overshoots -- it need not equal pair_dim
+                     # here, since this model does not use cuequivariance's fused kernel.
+n_blocks: 12
 transition_n: 4      # AF2 Evoformer expansion factor
 dim_cond: 128
 
