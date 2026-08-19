@@ -78,24 +78,33 @@ class TriBlock(nn.Module):
         self.tri_out = TriangleMultiplicationOutgoing(c_z=dim, c_hidden=tri_hidden)
         self.tri_in = TriangleMultiplicationIncoming(c_z=dim, c_hidden=tri_hidden)
         self.transition = PairTransition(c_z=dim, n=transition_n)
-        # Time modulation, zero-initialised so the modulation (not the block) starts as a no-op:
-        # the scale below is 1 + cond(...), i.e. exactly 1 at init.
+        # AF2 convention, chosen and kept whole: the ONLY zero-init in each residual branch is
+        # OpenFold's own output projection (`init="final"`), which is already inside tri_out,
+        # tri_in and transition. Nothing multiplies their outputs.
         #
-        # It must NOT be a bare `tanh(cond) *` adaLN-Zero gate. OpenFold's triangle multiplication
-        # already zero-inits its own output projection, so the block output starts at zero; a gate
-        # that also starts at zero makes the product zero AND kills the gradient to both, and the
-        # entire trunk stays frozen for the whole run while the embeddings and output head learn
-        # around it. Caught by a CPU smoke test: 0 of the block tensors ever received gradient.
-        self.cond = nn.Sequential(nn.SiLU(), nn.Linear(dim_cond, 3 * dim))
-        nn.init.zeros_(self.cond[1].weight)
-        nn.init.zeros_(self.cond[1].bias)
+        # Time conditioning therefore modulates each sub-module's INPUT (FiLM scale+shift),
+        # never its output. Zero-initialised, so the modulation starts as the identity rather
+        # than as zero -- a multiplier of 0 on an output that is already 0 is what froze this
+        # trunk in the first place.
+        #
+        # The AF3 alternative would have been to keep an output gate and make it sigmoid(-2.0)
+        # = 0.119 like AdaptiveLayerNormOutputScale, and to remove OpenFold's zero-init from
+        # under it. Either discipline is fine; mixing the two is not, and AF2's is the one that
+        # comes for free with the OpenFold modules this block is built from.
+        self.mod = nn.Sequential(nn.SiLU(), nn.Linear(dim_cond, 6 * dim))
+        nn.init.zeros_(self.mod[1].weight)
+        nn.init.zeros_(self.mod[1].bias)
+
+    @staticmethod
+    def _film(x, scale, shift):
+        return x * (1.0 + scale) + shift
 
     def forward(self, z, pair_mask, cond):
-        s_out, s_in, s_tr = self.cond(cond)[:, None, None, :].chunk(3, dim=-1)
+        p = self.mod(cond)[:, None, None, :].chunk(6, dim=-1)
         m = pair_mask[..., None]
-        z = z + (1.0 + s_out) * self.tri_out(z, mask=pair_mask) * m
-        z = z + (1.0 + s_in) * self.tri_in(z, mask=pair_mask) * m
-        z = z + (1.0 + s_tr) * self.transition(z, mask=pair_mask) * m
+        z = z + self.tri_out(self._film(z, p[0], p[1]), mask=pair_mask) * m
+        z = z + self.tri_in(self._film(z, p[2], p[3]), mask=pair_mask) * m
+        z = z + self.transition(self._film(z, p[4], p[5]), mask=pair_mask) * m
         return z * m
 
 
