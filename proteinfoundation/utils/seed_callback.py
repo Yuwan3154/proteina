@@ -43,8 +43,20 @@ class SeedCallback(Callback):
         if "torch_random_state" in checkpoint:
             torch.set_rng_state(checkpoint["torch_random_state"])
         if "torch_cuda_random_state" in checkpoint and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all(checkpoint["torch_cuda_random_state"])
-            
+            # set_rng_state_all indexes torch.cuda.default_generators positionally, so a
+            # checkpoint saved with more visible devices than this process has raises
+            # IndexError and kills the resume. Restore per device instead.
+            saved = checkpoint["torch_cuda_random_state"]
+            n_dev = torch.cuda.device_count()
+            for idx in range(min(len(saved), n_dev)):
+                torch.cuda.set_rng_state(saved[idx], idx)
+            if len(saved) != n_dev:
+                print(
+                    f"CUDA RNG state was saved for {len(saved)} device(s) but this process "
+                    f"sees {n_dev}; restored {min(len(saved), n_dev)}, device 0 stream intact."
+                )
+
+
         print(f"Seeding rank {trainer.global_rank} with seed {rank_seed}")
         
     def on_train_start(self, trainer, pl_module):
