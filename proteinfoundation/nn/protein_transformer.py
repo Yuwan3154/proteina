@@ -25,14 +25,28 @@ from proteinfoundation.openfold_stub.model.triangular_multiplicative_update impo
     TriangleMultiplicationOutgoing,
 )
 from proteinfoundation.openfold_stub.utils.rigid_utils import Rigid
+import logging
+
 import proteinfoundation.openfold_stub.np.residue_constants as rc
 
-# Try to import cuequivariance for faster triangle multiplicative updates
+# Try to import cuequivariance for faster triangle multiplicative updates.
+#
+# Deliberately catching Exception, not ImportError: cuequivariance_ops probes the GPU at IMPORT
+# time (its CacheManager calls pynvml.nvmlInit()), so on a driver-less CPU node it raises
+# NVMLError_DriverNotLoaded, and on a GPU whose architecture its prebuilt kernels do not cover it
+# can fail in other non-ImportError ways. An optional accelerator must never decide whether this
+# module can be imported at all -- CUEQUIVARIANCE_AVAILABLE already gates every use of it, and
+# the code paths that matter here run without it.
 try:
     import cuequivariance_torch as cuet
     CUEQUIVARIANCE_AVAILABLE = True
-except ImportError:
+except Exception as _cueq_exc:  # noqa: BLE001 - see above
+    cuet = None
     CUEQUIVARIANCE_AVAILABLE = False
+    logging.getLogger(__name__).info(
+        "cuequivariance unavailable (%s: %s); falling back to the stock triangle "
+        "multiplicative update.", type(_cueq_exc).__name__, _cueq_exc
+    )
 
 from proteinfoundation.nn.feature_factory import FeatureFactory
 from proteinfoundation.nn.pair_bias_attn.pair_bias_attn import PairBiasAttention
