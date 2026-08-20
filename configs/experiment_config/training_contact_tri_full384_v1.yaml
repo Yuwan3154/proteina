@@ -3,7 +3,7 @@
 # degraded 2.4x while training loss stayed flat -- the subset is too small to learn a general
 # contact map, so the regime moved to the full split.
 # conv_next is ABANDONED: local_attn matched or beat it on every validation metric.
-run_name_: tri_full512
+run_name_: tri_full384
 
 hardware:
   ncpus_per_task_train_: 8
@@ -43,7 +43,7 @@ model:
 # Separate dataset config ONLY so batch_size can be halved without touching the shared one:
 # the other two arms use it and the conv_next arm auto-chains, so an in-place edit would
 # silently change a running A/B at its next segment.
-dataset: pdb_train_contact-confind-topology_S25_max512_purge-test_cutoff-190828
+dataset: pdb_train_contact-confind-topology_S25_max384_purge-test_cutoff-190828
 dataset_config_subdir: pdb
 
 force_precision_f32: False
@@ -74,7 +74,9 @@ lora:
 opt:
   lr: 0.0001
   max_epochs: 1000   # full dataset; the overfit runs peaked by epoch ~120
-  accumulate_grad_batches: 16   # 2 GPUs x batch 1 x 16 = effective batch 32,
+  accumulate_grad_batches: 16   # MEASURED: tri fits batch 1 ONLY on a 95 GB RTX PRO 6000
+                                #  (71.81 GB = 76% of card at L=384; batch 2 OOMs).
+                                #  2 GPUs x 1 x 16 = effective batch 32, matching every other arm.
                                 #  matching the overfit arms. Recompute as
                                 #  32 / (2 * batch_size) if a bigger batch fits.
                                 # (they use 4 x 8). 2000 chains / batch 2 = 1000 minibatches per
