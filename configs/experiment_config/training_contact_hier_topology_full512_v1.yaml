@@ -77,9 +77,9 @@ lora:
 opt:
   lr: 0.0001
   max_epochs: 1000   # full dataset; the overfit runs peaked by epoch ~120
-  accumulate_grad_batches: 16   # 2 GPUs x batch 1 x 16 = effective batch 32,
-                                #  matching the overfit arms. Recompute as
-                                #  32 / (2 * batch_size) if a bigger batch fits.
+  accumulate_grad_batches: 4    # MEASURED: hier at L=512 on a 44.4 GB L40S fits batch 6
+                                #  (96% of card) but batch 4 sits at 65%, so batch 4 is the
+                                #  headroom-safe choice. 2 GPUs x 4 x 4 = effective batch 32.
                                # at 128 that is 4 optimizer steps an epoch and nothing
                                # could overfit in the time available. 8 gives ~62.
   # Validation cadence is expressed in optimizer steps. The legacy
