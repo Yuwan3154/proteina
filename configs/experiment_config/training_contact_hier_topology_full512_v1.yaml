@@ -1,0 +1,175 @@
+# FULL dataset at max length 512, replacing the overfit-2000 regime.
+# Both overfit arms peaked on validation at epoch 63 (local_attn) / 119 (conv_next) and then
+# degraded 2.4x while training loss stayed flat -- the subset is too small to learn a general
+# contact map, so the regime moved to the full split.
+# conv_next is ABANDONED: local_attn matched or beat it on every validation metric.
+run_name_: localattn_full512
+
+hardware:
+  ncpus_per_task_train_: 8
+  ncpus_per_task_prepro_: 8
+  accelerator: gpu
+  ngpus_per_node_: 2
+  nnodes_: 1
+
+loss:
+  t_distribution:
+    name: logit-normal
+    p1: 0.0
+    p2: 1.0
+  loss_t_clamp: 0.9
+  use_aux_loss: True
+  aux_loss_t_lim: 0.3
+  thres_aux_2d_loss: 0.6
+  aux_loss_weight: 1.0
+  num_dist_buckets: 39
+  distogram_min_bin: 0.325
+  distogram_max_bin: 5.075
+
+defaults:
+  - model: contactflow
+  - override model/nn: contact_map_hier_topology_30M
+  - _self_
+
+model:
+  nn:
+    # All-to-all attention only at the coarsest level, per the Swin-style restructure. The arm
+    # under test (block_featurizer) is set on the command line so both arms share this file.
+    n_block_layers: 0
+    # A/B arm: this run sees every element-pair descriptor. The baseline arm
+    # (training_contact_hier_topology_30M_contact_v1) sets `contact` and differs in nothing else.
+    pair_ref_features: both
+    residue_type_emb_init_seq: True
+    residue_type_emb_cond_seq: True
+    residue_type_emb_init_pair: True
+    residue_type_emb_cond_pair: True
+    seq_emb_dim: 4
+
+# Dataset params
+dataset: pdb_train_contact-confind-topology_S25_max512_purge-test_cutoff-190828
+dataset_config_subdir: pdb
+
+force_precision_f32: False
+
+training:
+  self_cond: True
+  seq_cond: True
+  fold_cond: True
+  mask_T_prob: 0.5
+  mask_A_prob: 0.5
+  mask_C_prob: 0.5
+  fold_label_sample_ratio: [0.5, 0.1, 0.15, 0.25]
+  mask_seq_proportion: 0.1   # PROPORTIONAL per-residue random masking as augmentation: every
+                             # sample trains with 10% of its residues hidden, chosen fresh each
+                             # time. Deliberately NOT whole-sequence masking -- ProteinEBM's
+                             # drop_seq_prob hides the entire sequence for a fraction of samples,
+                             # a different regime. Matches the sibling contact configs.
+  finetune_seq_cond_lora_only: False
+  contact_map_coord_loss_weight: 0.0  # ContactMapHierSiT does not predict coordinates
+
+lora:
+  use: False
+  lora_alpha: 32.0
+  lora_dropout: 0.0
+  r: 0
+  train_bias: "none"
+
+opt:
+  lr: 0.0001
+  max_epochs: 1000   # full dataset; the overfit runs peaked by epoch ~120
+  accumulate_grad_batches: 16   # 2 GPUs x batch 1 x 16 = effective batch 32,
+                                #  matching the overfit arms. Recompute as
+                                #  32 / (2 * batch_size) if a bigger batch fits.
+                               # at 128 that is 4 optimizer steps an epoch and nothing
+                               # could overfit in the time available. 8 gives ~62.
+  # Validation cadence is expressed in optimizer steps. The legacy
+  # `val_check_interval` was Lightning's minibatch counter, which conflated
+  # accumulation; this knob is now multiplied by accumulate_grad_batches in
+  # train.py so a value of 1000 here = 1000 gradient updates between val runs.
+  val_check_interval_optim_steps: 25
+  limit_val_batches: 64  # batches per rank per validation. Unset walks all 8082
+                         # val chains, which dominates wall clock at a short cadence.
+  skip_nan_grad: False
+  grad_and_weight_analysis: False
+  dist_strategy: ddp
+  dist_backend: nccl   # measured +19% throughput over gloo on 2x L40S
+                       # (1.19 vs 1.00 minibatches/s/rank), no P2P hang
+  use_lr_warmup: True
+  warmup_steps: 1000
+  warmup_start_lr_ratio: 0.0
+  lr_scheduler_type: "cosine"
+
+log:
+  wandb_project: protein_transformer_big_runs
+  log_wandb: True
+  log_every_n_steps: 100
+  # Top-L precision of the SINGLE-STEP denoised map, logged for train and validation.
+  # Full de-novo sampling from noise on 25%-identity-held-out chains is the hardest
+  # possible setting and is not expected to work at this budget, so it says little about
+  # learning; this is the setting the loss is actually trained on. Same cadence as the
+  # other step logs -- it costs one topk per sample, so it is not run every step.
+  single_step_metrics_every_n_steps: 100
+  # The same single-step block also logs a t-binned split (tlow/tmid/thigh, equal thirds
+  # of the unit interval) and contact_precision_at_L_noisy_floor -- the precision of
+  # ranking pairs by the NOISY INPUT itself, which is the do-nothing baseline every
+  # learned number has to beat.
+  log_structure_every_n_steps: 100
+  # ⛔ Cannot be True for THIS architecture, and the reason is not the topology plumbing.
+  # It monitors validation_sampling/tmscore_median, which requires COORDINATES. TM-score is
+  # accumulated only when `coords is not None`, and coords come from either the NN
+  # (predict_coords) or _predict_structure_from_distogram (needs a distogram). ContactMapHierSiT
+  # returns only {contact_map_logits, contact_map_pred} -- no coords, no distogram -- so the
+  # monitored key is never logged and ModelCheckpoint raises on the first validation.
+  # Measured on run 20676811: 103/103 validations logged tm_total=0.
+  # Re-enable only once a contact-map -> structure step exists on the validation path.
+  checkpoint_best_tmscore_median: False
+  checkpoint: True
+  # Selection metric for a contact-map model: top-L precision of the SAMPLED contact map
+  # against the ground truth, median over the chains the validation trajectory drew.
+  # top_k=5 because that draw is a different handful of chains every validation, so a
+  # single best-scoring step is as likely to be a lucky draw as a better model.
+  checkpoint_best_contact_precision: True
+  checkpoint_best_contact_save_top_k: 5
+  checkpoint_every_n_steps: 50
+  last_ckpt_every_n_steps: 50
+
+validation_sampling:
+  # Sampling steps = ceil(1/dt). 200 was inherited from coordinate diffusion; a binary
+  # L x L contact map does not need that schedule, and at ~51 ms/step for a batch of 4
+  # the schedule was most of the validation cost. 50 steps cuts it 4x.
+  dt: 0.02
+  sampling_mode: sc
+  sc_scale_noise: 0.45
+  # Buffer the first N val batches each val epoch and run ONE batched full-trajectory
+  # inference (so all N samples share the trajectory's NN forward passes). Logs
+  # validation_sampling/tmscore_{mean,median,min,max} and rmsd_mean.
+  # Set tmscore_n_samples: 0 to disable. Bump tmscore_every_n_val_epochs to amortize cost.
+  tmscore_n_samples: 4
+  tmscore_every_n_val_epochs: 5
+  # USalign mode for predicted-vs-GT scoring. 5 = TMscore-style residue-index alignment
+  # (canonical for structure prediction, prevents inflated scores from sequence-independent
+  # re-alignment). 0 = USalign default (TMalign, sequence-independent — diagnostic only).
+  tmscore_mode: 5
+  # FIXED chain set for the sampling metrics, so they are comparable across steps and
+  # can rank checkpoints. 32 chains, one per 25%-identity val cluster, chosen so no pair
+  # reaches TM>=0.5 (max within the set is 0.450) and the length range is covered.
+  # The val LOSS still runs over the whole val split; only sampling moves to this set.
+  # Cost: the whole set is scored each time the trajectory fires, so at 200 sampling
+  # steps that is ~80 s -- worth re-checking once the step sweep lands.
+  # max256 variant: this dataset config pads/TRUNCATES at 256, and the ground-truth
+  # topology is built at the chain's FULL length, so a truncated chain would be
+  # conditioned on a topology describing residues it no longer has. Same construction,
+  # pool restricted to <=256 residues (57 of the 69 isolated ones qualify).
+  fixed_chain_list: /orcd/scratch/orcd/011/chenxiou/valset_analysis/val_fixed32_max256.txt
+
+# ClusterSampler DDP fix is on by default (BaseLightningDataModule.cluster_sampler_v2=True).
+# To override per-dataset, set cluster_sampler_v2 / cluster_sampler_seed under
+# `datamodule:` in the corresponding dataset_config yaml.
+
+seed: 42
+
+ema:
+  decay: 0.999
+  validate_original_weights: False
+  every_n_steps: 1
+  cpu_offload: False
