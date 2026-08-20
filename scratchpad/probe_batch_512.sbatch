@@ -19,6 +19,7 @@ set -uo pipefail
 
 REPO=/orcd/scratch/orcd/011/chenxiou/proteina_cmhier
 ARCH="${ARCH:?set ARCH to tri or hier}"
+export PROBE_L="${PROBE_L:-512}"
 ENVKIND="${ENVKIND:?set ENVKIND to sm120 or conda}"
 
 if [ "$ENVKIND" = "sm120" ]; then
@@ -42,30 +43,32 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 cd "$REPO"
 
 nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv,noheader
-ARCH="$ARCH" python - <<'PY'
+ARCH="$ARCH" PROBE_L="$PROBE_L" python - <<'PY'
 import os
 import torch
 
 ARCH = os.environ["ARCH"]
-L, T = 512, 64
+L, T = int(os.environ["PROBE_L"]), 64
 total = torch.cuda.get_device_properties(0).total_memory / 1024**3
 print(f"card: {torch.cuda.get_device_name(0)}  {total:.1f} GB  arch={torch.cuda.get_arch_list()[-2:]}")
 
+# Build from the REAL nn config, not hand-written kwargs: the first attempt died on
+# KeyError: 'enc_pair_update_every_n' because a hand-copied kwarg list drifts from the yaml.
+from omegaconf import OmegaConf
+
+CFG = {"tri": "contact_map_tri_30M", "hier": "contact_map_hier_topology_30M"}[ARCH]
+cfg = OmegaConf.load(f"configs/experiment_config/model/nn/{CFG}.yaml")
+kwargs = {k: v for k, v in OmegaConf.to_container(cfg, resolve=False).items()
+          if k not in ("name", "nn_class")}
+kwargs["max_topology_he_len"] = T
 if ARCH == "tri":
-    from proteinfoundation.nn.contact_map_tri import ContactMapTriSiT
-    model = ContactMapTriSiT(pair_dim=320, tri_hidden=320, n_blocks=12, transition_n=4,
-                             dim_cond=128, max_rel_pos=64, max_topology_he_len=T).cuda()
+    from proteinfoundation.nn.contact_map_tri import ContactMapTriSiT as Model
 else:
-    from proteinfoundation.nn.contact_map_hier import ContactMapHierSiT
-    model = ContactMapHierSiT(
-        token_dim=128, pair_repr_dim=64, dim_cond=128, n_enc_layers=4, nheads_enc=8,
-        block_size=12, super_factor=4, max_seq_len=512, block_featurizer="local_attn",
-        d_local=64, n_local_layers=2, nheads_local=2, d_block=192, d_super=192, nheads_dit=8,
-        d_cond_dit=128, mlp_ratio=4.0, n_global_layers=8, n_block_layers=4,
-        topology_cond=True, topology_vocab_size=65, max_topology_len=128, d_topo=64,
-        d_single=96, n_topo_layers=4, nheads_topo=8, topology_reinject=True,
-        pair_ref_features="both", contact_map_mode=True, contact_map_input_dim=1,
-        non_contact_value=0, predict_coords=False).cuda()
+    from proteinfoundation.nn.contact_map_hier import ContactMapHierSiT as Model
+    kwargs.pop("max_topology_he_len", None)
+    kwargs["cath_code_dir"] = os.environ["DATA_PATH"] + "/pdb_raw/"
+print("building %s from %s.yaml" % (Model.__name__, CFG))
+model = Model(**kwargs).cuda()
 
 print("params: %d" % sum(p.numel() for p in model.parameters()))
 opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
