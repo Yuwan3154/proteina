@@ -90,6 +90,13 @@ def attempt(B):
         "topology_he_feat": torch.randn(B, T, T, 10, device="cuda"),
         "topology_tokens": torch.randint(2, 60, (B, 128), device="cuda"),
         "topology_pos_raw": torch.rand(B, 128, device="cuda") * 400,
+        # Keys the hier model reads that the tri model does not; enumerated from
+        # contact_map_hier.py rather than guessed (a hand-listed set already cost two
+        # failed probes: enc_pair_update_every_n, then topology_pos).
+        "topology_pos": torch.rand(B, 128, device="cuda"),
+        "topology_he_pos": torch.rand(B, T, device="cuda"),
+        "topology_he_contact": (torch.rand(B, T, T, device="cuda") > 0.7).float(),
+        "x_t": torch.randn(B, L, 3, device="cuda"),
     }
     with torch.autocast("cuda", dtype=torch.bfloat16):
         out = model(batch)["contact_map_logits"]
