@@ -93,6 +93,12 @@ opt:
   grad_and_weight_analysis: False
   dist_strategy: ddp
   dist_backend: nccl   # measured +19% throughput over gloo on 2x L40S
+  # The manual init_process_group in train.py sets the collective timeout for the whole run and
+  # defaulted to torch's 600 s. The 2-GPU full512 run died on a 1-element allreduce at 600045 ms
+  # even though a controlled A/B (job 20867657) showed 400/400 allreduces pass on 2x L40S under
+  # nccl-default -- i.e. transport is healthy and something in startup simply exceeds 600 s.
+  # 3600 s is a diagnostic bound chosen to clear the observed failure by 6x, not a tuned value.
+  dist_timeout_s: 3600
                        # (1.19 vs 1.00 minibatches/s/rank), no P2P hang
   use_lr_warmup: True
   warmup_steps: 1000

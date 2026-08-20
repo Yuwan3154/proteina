@@ -8,6 +8,7 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+import datetime
 import os
 import sys
 import time
@@ -256,13 +257,26 @@ if __name__ == "__main__":
                 if _local_rank != -1 and torch.cuda.is_available():
                     torch.cuda.set_device(_local_rank)
                     device = torch.device(f"cuda:{_local_rank}")
+                    # This manual init runs BEFORE Lightning's DDPStrategy and therefore sets the
+                    # collective timeout for the whole run. Without an explicit value it takes
+                    # torch's 600 s default, not Lightning's 1800 s -- which is what killed the
+                    # 2-GPU full512 run: it died on a 1-element allreduce at exactly 600045 ms
+                    # while a controlled A/B proved NCCL transport on those same L40S is healthy.
+                    pg_timeout = datetime.timedelta(
+                        seconds=int(cfg_exp.opt.get("dist_timeout_s", 600))
+                    )
                     try:
-                        torch.distributed.init_process_group(backend="nccl", device_id=device)
-                        log_info(f"Initialized NCCL process group with device_id={device}")
+                        torch.distributed.init_process_group(
+                            backend="nccl", device_id=device, timeout=pg_timeout
+                        )
+                        log_info(
+                            f"Initialized NCCL process group with device_id={device} "
+                            f"timeout={pg_timeout}"
+                        )
                     except TypeError:
                         # Fallback for older PyTorch versions that don't support device_id
-                        torch.distributed.init_process_group(backend="nccl")
-                        log_info("Initialized NCCL process group without device_id (not supported)")
+                        torch.distributed.init_process_group(backend="nccl", timeout=pg_timeout)
+                        log_info(f"Initialized NCCL process group without device_id, timeout={pg_timeout}")
 
     # Set training precision
     precision = "32"
