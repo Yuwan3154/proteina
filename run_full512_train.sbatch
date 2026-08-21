@@ -82,6 +82,8 @@ fi
 
 EXTRA_OVERRIDES=""
 [ -n "${DIST_TIMEOUT_S:-}" ] && EXTRA_OVERRIDES="opt.dist_timeout_s=$DIST_TIMEOUT_S"
+# Arbitrary hydra overrides, for bisecting which callback issues the divergent barrier.
+EXTRA_OVERRIDES="$EXTRA_OVERRIDES ${OVERRIDES:-}"
 
 exec torchrun --standalone --nproc_per_node="$NGPU" proteinfoundation/train.py \
     --config_name "$CONFIG" \
