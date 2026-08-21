@@ -41,11 +41,6 @@ export TORCHINDUCTOR_CACHE_DIR=/orcd/scratch/orcd/011/chenxiou/torchinductor_cac
 export TRITON_CACHE_DIR=/orcd/scratch/orcd/011/chenxiou/triton_cache_full512
 mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$REPO/logs"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-# ⛔ 2-GPU DDP hangs here without this: a 1-element ALLREDUCE stalls until the 600 s NCCL
-# watchdog fires (seen on both 2x L40S node3507 and 2x RTX PRO 6000 node4007, step 0, every
-# time). Same failure already recorded for 2-GPU DDP on the A6000 host: broken PCIe P2P over
-# the 0<->1 host bridge. Disabling P2P routes the collective through host memory instead.
-export NCCL_P2P_DISABLE=1
 export PYTHONPATH=$REPO${PYTHONPATH:+:$PYTHONPATH}
 
 cd "$REPO"
