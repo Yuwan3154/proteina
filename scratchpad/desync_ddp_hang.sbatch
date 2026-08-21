@@ -48,8 +48,11 @@ cd "$REPO"
 ( for i in $(seq 1 110); do sleep 30; echo "[$(date +%H:%M:%S)] ${i}x30s alive" >> "$OUT/STATUS.txt"; done ) &
 WATCHER=$!
 
+# `-- torchrun` failed with "No python processes found": py-spy inspects the target the instant
+# it launches, and the torchrun console-script shim is not yet identifiable as Python. The module
+# form makes the immediate child unambiguously a Python interpreter.
 py-spy record --subprocesses --rate 2 --duration 780 --format raw --output "$OUT/pyspy_raw.txt" -- \
-  torchrun --standalone --nproc_per_node=2 proteinfoundation/train.py \
+  python -m torch.distributed.run --standalone --nproc_per_node=2 proteinfoundation/train.py \
     --config_name training_contact_hier_topology_full512_v1 \
     --ngpus_per_node 2 --nnodes 1 run_name_=desync_diag \
     opt.dist_timeout_s=600 || echo "wrapped run exited rc=$?"
