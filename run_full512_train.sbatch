@@ -48,7 +48,14 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # Both GPUs were measured at 100% utilisation while "stuck", which is the documented GIL-held-
 # inside-a-CUDA-API case, not a deadlock -- so the monitor is firing on a slow startup.
 # Matched to dist_timeout_s=3600 so the two limits cannot disagree.
-export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=3600
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${HEARTBEAT_S:-3600}"
+# FlightRecorder: off by default (0). The watchdog explicitly said "Stack trace of the failed
+# collective not found, potentially because FlightRecorder is disabled". Set NCCL_TRACE=2000 to
+# record the per-rank collective log and DIST_TIMEOUT_S=600 to make the dump arrive in ~10 min.
+# Dump path must be on shared FS -- compute-node /tmp is node-local and unreadable from login.
+export TORCH_NCCL_TRACE_BUFFER_SIZE="${NCCL_TRACE:-0}"
+export TORCH_NCCL_DEBUG_INFO_TEMP_FILE="$REPO/logs/nccl_trace/rank_"
+mkdir -p "$REPO/logs/nccl_trace"
 export PYTHONPATH=$REPO${PYTHONPATH:+:$PYTHONPATH}
 
 cd "$REPO"
@@ -73,8 +80,12 @@ if [ "$CHAIN" -gt 0 ]; then
         && echo "[$(date)] queued next chain segment on $SLURM_JOB_PARTITION $CHAIN_GRES $CHAIN_TIME (CHAIN=$((CHAIN - 1)) remaining)"
 fi
 
+EXTRA_OVERRIDES=""
+[ -n "${DIST_TIMEOUT_S:-}" ] && EXTRA_OVERRIDES="opt.dist_timeout_s=$DIST_TIMEOUT_S"
+
 exec torchrun --standalone --nproc_per_node="$NGPU" proteinfoundation/train.py \
     --config_name "$CONFIG" \
     --ngpus_per_node "$NGPU" \
     --nnodes 1 \
-    run_name_="$RUN"
+    run_name_="$RUN" \
+    $EXTRA_OVERRIDES
