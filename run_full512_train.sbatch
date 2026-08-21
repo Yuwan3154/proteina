@@ -41,6 +41,14 @@ export TORCHINDUCTOR_CACHE_DIR=/orcd/scratch/orcd/011/chenxiou/torchinductor_cac
 export TRITON_CACHE_DIR=/orcd/scratch/orcd/011/chenxiou/triton_cache_full512
 mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$REPO/logs"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# ⛔ SECOND, SEPARATE timeout. opt.dist_timeout_s governs the COLLECTIVE timeout; this one governs
+# ProcessGroupNCCL's heartbeat monitor of its own watchdog THREAD, defaults to 480 s, and hard-
+# aborts the process (SIGABRT, no Python traceback) 8 min later. Job 20873965 died exactly that
+# way at 19:23:34 with ZERO collective timeouts, after surviving the 600 s collective limit.
+# Both GPUs were measured at 100% utilisation while "stuck", which is the documented GIL-held-
+# inside-a-CUDA-API case, not a deadlock -- so the monitor is firing on a slow startup.
+# Matched to dist_timeout_s=3600 so the two limits cannot disagree.
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=3600
 export PYTHONPATH=$REPO${PYTHONPATH:+:$PYTHONPATH}
 
 cd "$REPO"
