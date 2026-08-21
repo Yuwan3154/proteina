@@ -48,11 +48,13 @@ cd "$REPO"
 ( for i in $(seq 1 110); do sleep 30; echo "[$(date +%H:%M:%S)] ${i}x30s alive" >> "$OUT/STATUS.txt"; done ) &
 WATCHER=$!
 
-# `-- torchrun` failed with "No python processes found": py-spy inspects the target the instant
-# it launches, and the torchrun console-script shim is not yet identifiable as Python. The module
-# form makes the immediate child unambiguously a Python interpreter.
-py-spy record --subprocesses --rate 2 --duration 780 --format raw --output "$OUT/pyspy_raw.txt" -- \
-  python -m torch.distributed.run --standalone --nproc_per_node=2 proteinfoundation/train.py \
+# py-spy REMOVED. It failed as a sibling (Permission Denied) and again as PARENT
+# ("No python processes found"), so ptrace looks disabled outright here rather than merely
+# scope-limited. TORCH_NCCL_DESYNC_DEBUG needs no ptrace at all and was the first-choice
+# instrument anyway; bundling the two is what kept failing.
+cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null | sed "s/^/ptrace_scope=/" || echo "ptrace_scope=unknown"
+
+torchrun --standalone --nproc_per_node=2 proteinfoundation/train.py \
     --config_name training_contact_hier_topology_full512_v1 \
     --ngpus_per_node 2 --nnodes 1 run_name_=desync_diag \
     opt.dist_timeout_s=600 || echo "wrapped run exited rc=$?"
