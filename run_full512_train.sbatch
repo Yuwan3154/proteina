@@ -69,7 +69,7 @@ if [ "$CHAIN" -gt 0 ]; then
     JOBINFO=$(scontrol show job "$SLURM_JOB_ID" | tr ' ' '\n')
     CHAIN_GRES=$(printf '%s\n' "$JOBINFO" | sed -n 's|^TresPerNode=gres/||p')
     CHAIN_TIME=$(printf '%s\n' "$JOBINFO" | sed -n 's|^TimeLimit=||p')
-    CHAIN=$((CHAIN - 1)) CONFIG="$CONFIG" RUN="$RUN" NGPU="$NGPU" \
+    CHAIN=$((CHAIN - 1)) CONFIG="$CONFIG" RUN="$RUN" NGPU="$NGPU" OVERRIDES="${OVERRIDES:-}" \
         sbatch --dependency=afterany:${SLURM_JOB_ID} \
                --partition="$SLURM_JOB_PARTITION" \
                --gres="$CHAIN_GRES" \
