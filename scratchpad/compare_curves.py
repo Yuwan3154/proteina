@@ -43,7 +43,8 @@ for run_id, label, color in RUNS:
     ys = pd.Series(y).rolling(SMOOTH, min_periods=5, center=True).median().values
     ax.plot(x, ys, color=color, lw=1.6, ls="--", label=f"{label.split('  ')[0]} val")
 ax.set_xlabel("epoch")
-ax.set_ylabel("total loss")
+ax.set_yscale("log")
+ax.set_ylabel("total loss (log)")
 ax.set_title("No train/val divergence in either arm", fontsize=11)
 ax.legend(frameon=False, fontsize=8)
 
@@ -70,7 +71,7 @@ for run_id, label, color in RUNS:
     ax.plot(x, ys, color=color, lw=2.0, label=label.split("  ")[0])
 ax.set_xlabel("epoch")
 ax.set_ylabel("precision@L (full sampling)")
-ax.set_title("Full sampling: local_attn rising, tri_mul flat", fontsize=11)
+ax.set_title("Full sampling: both rising, local_attn ahead", fontsize=11)
 ax.legend(frameon=False, fontsize=9)
 
 for ax in axes:
