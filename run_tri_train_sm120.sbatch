@@ -51,7 +51,7 @@ if [ "$CHAIN" -gt 0 ]; then
     JOBINFO=$(scontrol show job "$SLURM_JOB_ID" | tr ' ' '\n')
     CHAIN_GRES=$(printf '%s\n' "$JOBINFO" | sed -n 's|^TresPerNode=gres/||p')
     CHAIN_TIME=$(printf '%s\n' "$JOBINFO" | sed -n 's|^TimeLimit=||p')
-    CHAIN=$((CHAIN - 1)) CONFIG="$CONFIG" RUN="$RUN" NGPU="$NGPU" \
+    CHAIN=$((CHAIN - 1)) CONFIG="$CONFIG" RUN="$RUN" NGPU="$NGPU" OVERRIDES="${OVERRIDES:-}" \
         sbatch --dependency=afterany:${SLURM_JOB_ID} \
                --partition="$SLURM_JOB_PARTITION" \
                --gres="$CHAIN_GRES" \
@@ -62,8 +62,10 @@ if [ "$CHAIN" -gt 0 ]; then
         && echo "[$(date)] queued next chain segment on $SLURM_JOB_PARTITION $CHAIN_GRES $CHAIN_TIME"
 fi
 
+# unquoted on purpose: OVERRIDES is a space-separated list of hydra key=value pairs
 exec torchrun --standalone --nproc_per_node="$NGPU" proteinfoundation/train.py \
     --config_name "$CONFIG" \
     --ngpus_per_node "$NGPU" \
     --nnodes 1 \
-    run_name_="$RUN"
+    run_name_="$RUN" \
+    ${OVERRIDES:-}
