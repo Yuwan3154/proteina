@@ -843,7 +843,11 @@ if __name__ == "__main__":
         use_distributed_sampler=False,
         strategy=DDPStrategy(
             process_group_backend=cfg_exp.opt.get("dist_backend", "nccl"),
-            find_unused_parameters=False,
+            # Default False keeps every existing run byte-identical. Set True to test the
+            # 2-GPU local_attn hang: with False, DDP assumes every parameter gets a gradient
+            # each step, so a random per-sample gate that skips a submodule on one rank only
+            # makes the two reducers build different bucket sequences.
+            find_unused_parameters=bool(cfg_exp.opt.get("ddp_find_unused_parameters", False)),
             gradient_as_bucket_view=True,  # Memory optimization
             static_graph=False
         ) if cfg_exp.opt.dist_strategy == "ddp" else cfg_exp.opt.dist_strategy,
