@@ -2921,11 +2921,19 @@ class ModelTrainerBase(L.LightningModule):
         for name, vals in floor_per_bin.items():
             entries.append((f"contact_precision_at_L_noisy_floor_{name}", float(np.mean(vals))))
         for name, value in entries:
+            # sync_dist MUST stay False here. `entries` is data-dependent: `per_bin` /
+            # `floor_per_bin` only contain the t bins this rank's samples happened to land in,
+            # `floor` may be empty, and `if not overall` returns early. With sync_dist=True each
+            # entry becomes a collective (Lightning's _sync_ddp does barrier()+all_reduce), so
+            # two ranks drawing different t values issue DIFFERENT NUMBERS of collectives and
+            # DDP deadlocks in the barrier -- the 2-GPU hang, traced to these exact keys.
+            # Nothing is lost: the old cross-rank average was mis-weighted anyway, since it
+            # weighted each bin by the whole batch size rather than that bin's sample count.
             self.log(
                 f"{log_prefix}/{name}", value,
                 on_step=not val_step, on_epoch=True,
                 prog_bar=False, logger=True,
-                batch_size=mask.shape[0], sync_dist=True, add_dataloader_idx=False,
+                batch_size=mask.shape[0], sync_dist=False, add_dataloader_idx=False,
             )
 
     def _fixed_val_batches(self, val_sampling_cfg) -> Optional[List[dict]]:
