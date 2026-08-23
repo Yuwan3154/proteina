@@ -220,11 +220,20 @@ class ModelTrainerBase(L.LightningModule):
                         steps_per_epoch = len(train_dataloader)
                         max_epochs = self.trainer.max_epochs
                         accumulate_grad_batches = self.cfg_exp.opt.get("accumulate_grad_batches", 1)
-                        # Total steps = (steps_per_epoch / accumulate_grad_batches) * max_epochs
-                        total_steps = int((steps_per_epoch / accumulate_grad_batches) * max_epochs)
+                        # MUST divide by world_size. `len(train_dataloader)` is the WHOLE-DATASET
+                        # minibatch count, not this rank's share: the Trainer runs with
+                        # use_distributed_sampler=False and ClusterSampler partitions internally,
+                        # so len() is identical on 1 and 2 GPUs (measured: 3288 in both). Without
+                        # this the cosine LR horizon was 2x too long on any 2-GPU run -- 822,000
+                        # reported vs 411,000 optimizer steps actually taken to reach max_epochs.
+                        world_size = max(1, int(getattr(self.trainer, "world_size", 1) or 1))
+                        total_steps = int(
+                            (steps_per_epoch / world_size / accumulate_grad_batches) * max_epochs
+                        )
                         logger.info(f"Calculated total_training_steps = {total_steps} "
                                     f"(steps_per_epoch={steps_per_epoch}, max_epochs={max_epochs}, "
-                                    f"accumulate_grad_batches={accumulate_grad_batches})")
+                                    f"accumulate_grad_batches={accumulate_grad_batches}, "
+                                    f"world_size={world_size})")
 
                 # Fallback to config value or default
                 if total_steps is None:
