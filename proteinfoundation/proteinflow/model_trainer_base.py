@@ -43,6 +43,7 @@ from proteinfoundation.datasets.cath_utils import (
     load_cath_mapping,
 )
 from proteinfoundation.datasets.topology_reference import TopologyReferenceTransform
+from proteinfoundation.utils import logtrace
 from proteinfoundation.utils.dense_padding_data_loader import (
     FLOAT_PADDING_VALUE,
     NON_FLOAT_PADDING_VALUE,
@@ -120,11 +121,11 @@ class ModelTrainerBase(L.LightningModule):
         A conditional ``self.log(..., sync_dist=True)`` deadlocks DDP: Lightning's _sync_ddp
         issues barrier()+all_reduce(), so a rank that skips the call strands the others in the
         barrier. Diffing the two ranks' traces names the offending metric directly.
+        See proteinfoundation/utils/logtrace.py (unit tested in tests/test_logtrace.py).
         """
-        if os.environ.get("LOGTRACE") == "1":
-            r = self.trainer.global_rank if self._trainer is not None else -1
-            with open(f"logs/logtrace_rank{r}.txt", "a") as fh:  # cwd is the repo; /tmp is node-local
-                fh.write(f"{name}\tsync_dist={kwargs.get('sync_dist', False)}\n")
+        if logtrace.enabled():
+            rank = self.trainer.global_rank if self._trainer is not None else -1
+            logtrace.trace(rank, name, kwargs.get("sync_dist", False))
         return super().log(name, value, *args, **kwargs)
 
     def _create_optimizer(self, params, optimizer_type=None):
