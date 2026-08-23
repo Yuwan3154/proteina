@@ -113,6 +113,20 @@ class ModelTrainerBase(L.LightningModule):
         self._logged_val_traj_epoch = -1
         self._self_cond_copy_last_step = None
 
+
+    def log(self, name, value, *args, **kwargs):
+        """Trace every self.log call per rank when LOGTRACE=1.
+
+        A conditional ``self.log(..., sync_dist=True)`` deadlocks DDP: Lightning's _sync_ddp
+        issues barrier()+all_reduce(), so a rank that skips the call strands the others in the
+        barrier. Diffing the two ranks' traces names the offending metric directly.
+        """
+        if os.environ.get("LOGTRACE") == "1":
+            r = self.trainer.global_rank if self._trainer is not None else -1
+            with open(f"logs/logtrace_rank{r}.txt", "a") as fh:  # cwd is the repo; /tmp is node-local
+                fh.write(f"{name}\tsync_dist={kwargs.get('sync_dist', False)}\n")
+        return super().log(name, value, *args, **kwargs)
+
     def _create_optimizer(self, params, optimizer_type=None):
         """Create an optimizer instance based on the configured type.
 
