@@ -592,7 +592,12 @@ if __name__ == "__main__":
     from proteinfoundation.datasets.cluster_sampler_audit_callback import (
         ClusterSamplerAuditCallback,
     )
-    callbacks.append(ClusterSamplerAuditCallback())
+    # Gated for bisection: this callback issues two dist.all_gather calls on the first epoch.
+    # Default True keeps every existing run byte-identical.
+    if bool(cfg_exp.opt.get("cluster_sampler_audit", True)):
+        callbacks.append(ClusterSamplerAuditCallback())
+    else:
+        log_info("ClusterSamplerAuditCallback DISABLED -- bisection only")
 
     # Debug-only host-RAM leak tracker (off unless MEM_DEBUG=1 in the env).
     if os.environ.get("MEM_DEBUG"):
@@ -860,7 +865,10 @@ if __name__ == "__main__":
         enable_progress_bar=show_prog_bar,
         plugins=plugins,
         accumulate_grad_batches=cfg_exp.opt.accumulate_grad_batches,
-        num_sanity_val_steps=1,
+        # Configurable for bisection: the sanity check is the ONE validation that runs
+        # before training, and it is where on_validation_epoch_end_data's
+        # all_gather_object first fires. Default 1 is the previous hardcoded value.
+        num_sanity_val_steps=int(cfg_exp.opt.get("num_sanity_val_steps", 1)),
         # Cap validation work. Unset, Lightning walks the FULL val split (8082 chains here),
         # which at a short val cadence costs more wall clock than the training between
         # validations. Default 1.0 = every batch, so configs that omit it are unchanged.

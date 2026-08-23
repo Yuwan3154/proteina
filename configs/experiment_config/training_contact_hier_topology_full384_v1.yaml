@@ -96,6 +96,9 @@ opt:
   skip_nan_grad: False
   grad_and_weight_analysis: False
   dist_strategy: ddp
+  # Bisection knobs for the 2-GPU DDP hang. Both defaults reproduce prior behaviour exactly.
+  cluster_sampler_audit: True
+  num_sanity_val_steps: 1
   # Declared here (not just read with .get) because the config is struct-mode: hydra cannot
   # CREATE an absent key from the command line, only override a present one. False keeps the
   # 1-GPU arms byte-identical; True is the 2-GPU hang test/fix.
