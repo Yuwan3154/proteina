@@ -577,8 +577,14 @@ if __name__ == "__main__":
         callbacks.append(LogEpochTimeCallback())
         callbacks.append(LogSetpTimeCallback())
 
-    log_info(f"Using EMA with decay {cfg_exp.ema.decay}")
-    callbacks.append(EMA(**cfg_exp.ema))
+    # `enabled` gates the callback for bisection; it is not an EMA constructor arg, so it is
+    # popped out before the splat. Default True keeps every existing run byte-identical.
+    ema_kwargs = {k: v for k, v in dict(cfg_exp.ema).items() if k != "enabled"}
+    if bool(cfg_exp.ema.get("enabled", True)):
+        log_info(f"Using EMA with decay {cfg_exp.ema.decay}")
+        callbacks.append(EMA(**ema_kwargs))
+    else:
+        log_info("EMA DISABLED (ema.enabled=False) -- bisection only, not a production setting")
 
     # Runtime audit: verify the train ClusterSampler partitions clusters disjointly
     # across DDP ranks on the first epoch. Strict mode (raise on duplicates) can be
