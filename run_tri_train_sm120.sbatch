@@ -59,7 +59,7 @@ if [ "$CHAIN" -gt 0 ]; then
                --mem="${SLURM_MEM_PER_NODE}M" \
                --time="$CHAIN_TIME" \
                "$REPO/run_tri_train_sm120.sbatch" \
-        && echo "[$(date)] queued next chain segment on $SLURM_JOB_PARTITION $CHAIN_GRES $CHAIN_TIME"
+        && echo "[$(date)] queued next chain segment on $SLURM_JOB_PARTITION $CHAIN_GRES $CHAIN_TIME (CHAIN=$((CHAIN - 1)) remaining)"
 fi
 
 # unquoted on purpose: OVERRIDES is a space-separated list of hydra key=value pairs
