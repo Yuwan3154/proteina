@@ -20,7 +20,10 @@ set -uo pipefail
 
 PYG_INDEX=https://data.pyg.org/whl/torch-2.7.1+cu128.html
 module load cuda/12.8 2>/dev/null || module load cuda/12.6 2>/dev/null || true
-export CUE_HOST=engaging
+# activate.sh (line 40) HARD-REQUIRES this and aborts without it. 12.0 = sm_120 Blackwell,
+# the same value the earlier working sm_120 job used. Only needs to be SET for an import
+# test, but it must be set or activate.sh refuses.
+export CUE_HOST=engaging TORCH_CUDA_ARCH_LIST=12.0
 
 echo "=============== CONTROL: cu126 env (known-good wheel) ==============="
 ( set +u
