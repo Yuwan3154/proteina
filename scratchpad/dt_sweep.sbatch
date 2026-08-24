@@ -47,13 +47,18 @@ for STEPS in 50 100 150 200 400; do
   rm -rf "$REPO/store/$RUN"
   mkdir -p "$REPO/store/$RUN/checkpoints"
   cp "$REPO/store/$SRC/checkpoints/last.ckpt" "$REPO/store/$RUN/checkpoints/last.ckpt" || { echo "  no source ckpt"; continue; }
+  # Full output to a per-variant file FIRST. Piping straight into grep discards the exception
+  # and leaves an empty .err, which is exactly how the previous attempt hid its own failure.
+  VLOG="$REPO/logs/dtsweep_${RUN}.log"
   timeout 600 torchrun --standalone --nproc_per_node=1 proteinfoundation/train.py \
       --config_name "$CONFIG" --ngpus_per_node 1 --nnodes 1 \
       run_name_="$RUN" \
       validation_sampling.dt="${DT[$STEPS]}" \
       opt.max_epochs=1 \
-      log.checkpoint=False \
-      2>&1 | grep -E "fixed chain set loaded|traj: exit|val_end: gather|contact_precision|Error|Traceback" | head -40
+      log.checkpoint=False > "$VLOG" 2>&1
+  echo "  exit=$?  full log: $VLOG"
+  grep -E "fixed chain set loaded|traj: exit|val_end: gather" "$VLOG" | head -6
+  grep -E "^[A-Za-z_.]*Error|MisconfigurationException|^ValueError|^KeyError" "$VLOG" | head -4
   echo "  ---- variant $STEPS done ----"
 done
 echo "=== sweep complete ==="
