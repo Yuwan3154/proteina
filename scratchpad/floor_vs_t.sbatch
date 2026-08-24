@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=floorvt
+#SBATCH --job-name=floorvt2
 #SBATCH --partition=mit_quicktest
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=4
@@ -32,8 +32,10 @@ for run, lab in RUNS:
     print(f"=== {lab} ===  present: {[k.split('/')[-1] for k in have]}")
     if KT not in df.columns or KF not in df.columns:
         print("   cannot test: t or floor missing\n"); continue
-    sub = df[[KT, KF, KS]].apply(pd.to_numeric, errors="coerce").dropna()
-    print(f"   n={len(sub)}   t range [{sub[KT].min():.3f}, {sub[KT].max():.3f}]  mean t={sub[KT].mean():.3f}")
+    cols = [KT, KF, KS, "epoch"]
+    sub = df[cols].apply(pd.to_numeric, errors="coerce").dropna()
+    sub = sub[(sub["epoch"] >= 20) & (sub["epoch"] <= 38)]   # MATCHED epoch window (tri max = 38)
+    print(f"   [MATCHED epochs 20-38]  n={len(sub)}   t range [{sub[KT].min():.3f}, {sub[KT].max():.3f}]  mean t={sub[KT].mean():.3f}")
     # floor as a function of the RECORDED t -- this is the model-independent curve
     edges = np.arange(0.0, 1.0001, 0.1)
     print("     t-bin      n    floor(median)   signal(median)")
