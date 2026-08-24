@@ -28,7 +28,7 @@ for run_id, _, _, _, _ in RUNS:
     keep = [c for c in (["epoch", K_TRAIN_LOSS, K_VAL_LOSS, K_SS, K_FLOOR, K_SAMP]) if c in df.columns]
     data[run_id] = df[keep].apply(pd.to_numeric, errors="coerce")
 
-fig, axes = plt.subplots(1, 3, figsize=(16.5, 4.8))
+fig, axes = plt.subplots(1, 3, figsize=(15.0, 5.4))
 fig.patch.set_facecolor("white")
 
 
@@ -77,18 +77,26 @@ ax.set_ylabel("precision@L (full sampling)")
 ax.set_title("Full sampling: precision@L", fontsize=11)
 ax.legend(frameon=False, fontsize=8)
 
+tri_max_ep = float(data["tri_full384"]["epoch"].dropna().max())
+for ax in (axes[1], axes[2]):
+    ax.axvline(tri_max_ep, color="#B0B0B0", lw=1.0, ls="-.", zorder=0)
+    ax.annotate(f"tri stops here (ep {tri_max_ep:.0f})\ncompare LEFT of this line",
+                xy=(tri_max_ep, 0.02), xycoords=("data", "axes fraction"),
+                xytext=(6, 0), textcoords="offset points",
+                fontsize=7.5, color="#777777", va="bottom", ha="left")
+
 for ax in axes:
     ax.set_facecolor("white")
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
 
 fig.text(
-    0.5, -0.02,
+    0.5, -0.03,
     "BLUE vs ORANGE is a CONTROLLED comparison: identical max384 data, identical 4158-chain validation split, "
-    "identical effective batch 32, identical 13,152 chains/epoch.   GREY (max512) is REFERENCE ONLY -- a retired run on a "
-    "DIFFERENT 8082-chain validation split, so its absolute values are not comparable to the other two.   "
+    "identical effective batch 32, identical 13,152 chains/epoch.\nGREY (max512) is REFERENCE ONLY -- a retired run on a "
+    "DIFFERENT 8082-chain validation split, so its absolute values are not comparable to the other two.\n"
     f"Validation traces are {SMOOTH}-point rolling medians (validation logs ~18x/epoch).   "
-    "local_attn max384 carries two mid-run discontinuities: 1->2 GPU at ~epoch 3 and an LR-horizon correction "
+    "\nlocal_attn max384 carries two mid-run discontinuities: 1->2 GPU at ~epoch 3 and an LR-horizon correction "
     "(822k->411k cosine steps) at ~epoch 120; effective batch stayed 32 throughout.",
     ha="center", va="top", fontsize=8.0, color="#555555",
 )
