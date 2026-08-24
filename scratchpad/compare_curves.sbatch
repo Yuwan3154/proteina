@@ -18,6 +18,6 @@ conda activate cue_openfold
 set -u
 # refresh the cached history CSVs first so the figure is not plotted from a stale fetch
 export WANDB_SILENT=true
-export RUN_IDS="localattn_full512_1gpu,tri_full384"
+export RUN_IDS="localattn_full384,tri_full384,localattn_full512_1gpu"
 python /orcd/scratch/orcd/011/chenxiou/proteina_cmhier/scratchpad/live_curve_stats.py
 python /orcd/scratch/orcd/011/chenxiou/proteina_cmhier/scratchpad/compare_curves.py
