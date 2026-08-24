@@ -47,7 +47,7 @@ for STEPS in 50 100 150 200 400; do
   rm -rf "$REPO/store/$RUN"
   mkdir -p "$REPO/store/$RUN/checkpoints"
   cp "$REPO/store/$SRC/checkpoints/last.ckpt" "$REPO/store/$RUN/checkpoints/last.ckpt" || { echo "  no source ckpt"; continue; }
-  timeout 3000 torchrun --standalone --nproc_per_node=1 proteinfoundation/train.py \
+  timeout 600 torchrun --standalone --nproc_per_node=1 proteinfoundation/train.py \
       --config_name "$CONFIG" --ngpus_per_node 1 --nnodes 1 \
       run_name_="$RUN" \
       validation_sampling.dt="${DT[$STEPS]}" \
