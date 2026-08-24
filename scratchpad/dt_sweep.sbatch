@@ -51,7 +51,6 @@ for STEPS in 50 100 150 200 400; do
       --config_name "$CONFIG" --ngpus_per_node 1 --nnodes 1 \
       run_name_="$RUN" \
       validation_sampling.dt="${DT[$STEPS]}" \
-      opt.num_sanity_val_steps=1 \
       opt.max_epochs=1 \
       log.checkpoint=False \
       2>&1 | grep -E "fixed chain set loaded|traj: exit|val_end: gather|contact_precision|Error|Traceback" | head -40
