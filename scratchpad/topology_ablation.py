@@ -38,6 +38,8 @@ class BatchCapture:
         self.n_keep = n_keep
         self.batches = []
         self.n_calls = 0
+        self.n_dupes = 0
+        self._seen = set()
 
     def __call__(self, module, args, output):
         batch = args[0] if args else None
@@ -46,10 +48,19 @@ class BatchCapture:
             return
         if "contact_map" not in batch or len(self.batches) >= self.n_keep:
             return
+        # Self-conditioning forwards the SAME batch object twice per step. Keeping both listed
+        # every sample twice, which does not bias the mean but doubles the apparent n and would
+        # halve any error bar computed from it. Identity is safe here because we hold the
+        # reference, so the id cannot be recycled.
+        if id(batch) in self._seen:
+            self.n_dupes += 1
+            return
+        self._seen.add(id(batch))
         self.batches.append(batch)
 
     def report(self):
-        return f"hook fired {self.n_calls}x, kept {len(self.batches)} loss-path batches"
+        return (f"hook fired {self.n_calls}x, kept {len(self.batches)} DISTINCT loss-path "
+                f"batches ({self.n_dupes} self-conditioning duplicates dropped)")
 
 
 def main():
@@ -124,13 +135,25 @@ def main():
             print(f"{float(t[s]):7.3f} {int(mask[s].sum()):5d} {n_sse:6d} "
                   f"{pw:8.4f} {po:8.4f} {pw - po:+8.4f}  {dmap:9.5f}{flag}", flush=True)
             if n_sse > MASK_ONLY:
-                deltas.append(pw - po)
+                deltas.append((float(t[s]), pw - po))
     if deltas:
-        m = sum(deltas) / len(deltas)
-        n_pos = sum(1 for d in deltas if d > 0)
-        print(f"\n[{args.tag}] real-reference samples n={len(deltas)}  "
-              f"mean precision@L/5 gain from topology = {m:+.4f}  "
-              f"({n_pos}/{len(deltas)} improved)", flush=True)
+        def _summarise(label, rows):
+            if not rows:
+                print(f"[{args.tag}] {label}: no samples", flush=True)
+                return
+            ds = [d for _, d in rows]
+            m = sum(ds) / len(ds)
+            n_pos = sum(1 for d in ds if d > 0)
+            print(f"[{args.tag}] {label}: n={len(ds)}  mean precision@L/5 gain = {m:+.4f}  "
+                  f"({n_pos}/{len(ds)} improved)", flush=True)
+
+        print("", flush=True)
+        _summarise("ALL real-reference", deltas)
+        # Split at the midpoint of the unit interval. Above it c_t already carries most of the
+        # true map and precision@L/5 saturates at 1.0, leaving the metric no headroom to show an
+        # effect -- so a null there is uninformative, not evidence of no effect.
+        _summarise("t <  0.5 (c_t mostly noise)", [r for r in deltas if r[0] < 0.5])
+        _summarise("t >= 0.5 (c_t mostly signal)", [r for r in deltas if r[0] >= 0.5])
     else:
         print(f"\n[{args.tag}] no real-reference samples captured (all MASK dropout)", flush=True)
 
