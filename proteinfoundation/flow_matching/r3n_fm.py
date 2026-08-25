@@ -10,6 +10,8 @@
 
 
 import math
+
+from proteinfoundation.utils import sampletrace
 import os
 from typing import Callable, Dict, List, Literal, Optional, Tuple
 
@@ -1055,6 +1057,13 @@ class _ContactMapFlowMatcher:
                 - "distogram": Final distogram prediction (or None)
         """
         nsteps = math.ceil(1.0 / dt)
+        # Runtime evidence that YAML values actually arrive here (SAMPLETRACE=1; else a no-op).
+        sampletrace.record_args(
+            dt=dt, nsteps=nsteps, self_cond=bool(self_cond), sampling_mode=sampling_mode,
+            sc_scale_noise=sc_scale_noise, sc_scale_score=sc_scale_score,
+            schedule_mode=schedule_mode, schedule_p=schedule_p, gt_mode=gt_mode,
+            gt_p=gt_p, gt_clamp_val=(-1.0 if gt_clamp_val is None else gt_clamp_val),
+        )
         ts = self.get_schedule(mode=schedule_mode, nsteps=nsteps, p1=schedule_p)
         t_eval = ts[:-1]
         gt = self.get_gt(t=t_eval, mode=gt_mode, param=gt_p, clamp_val=gt_clamp_val)
@@ -1118,6 +1127,10 @@ class _ContactMapFlowMatcher:
 
                 if c_1_pred is None:
                     raise ValueError("Contact map prediction missing during contact map diffusion.")
+
+                # nn_in here is exactly what the network just received, so sc_present/sc_norm/
+                # sc_is_prev_pred are direct evidence about self-conditioning, not inference.
+                sampletrace.record_step(step, float(ts[step]), nn_in, c, c_1_pred)
 
                 # Accommodate last few steps
                 step_sampling_mode = sampling_mode

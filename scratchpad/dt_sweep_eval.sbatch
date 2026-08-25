@@ -22,6 +22,7 @@ set -u
 export CUDA_HOME=/orcd/software/core/001/pkg/cuda/13.0.1
 export SKIP_CONFIND_PRECOMPUTE=1 PYTHONPATH=$REPO${PYTHONPATH:+:$PYTHONPATH}
 export OMP_NUM_THREADS=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# SAMPLETRACE / SAMPLETRACE_EVERY are inherited from the submit env when set.
 
 ARM="${ARM:?set ARM=tri|la}"
 if [ "$ARM" = "tri" ]; then

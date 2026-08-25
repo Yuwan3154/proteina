@@ -28,6 +28,7 @@ from omegaconf import OmegaConf
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from proteinfoundation.proteinflow.proteina import Proteina
+from proteinfoundation.utils import sampletrace
 
 STEPS_TO_DT = {50: 0.02, 100: 0.01, 150: 1.0 / 150, 200: 0.005, 400: 0.0025}
 
@@ -38,6 +39,7 @@ def main():
     ap.add_argument("--ema_ckpt", required=True)
     ap.add_argument("--steps", type=int, nargs="+", default=[50, 100, 150, 200, 400])
     ap.add_argument("--tag", required=True)
+    ap.add_argument("--trace_dir", default="/orcd/scratch/orcd/011/chenxiou/proteina_cmhier/curves/traces")
     ap.add_argument("--sampling_mode", default=None,
                     help="sc (SDE, default from config) or vf (pure ODE: c_t + v*dt, no score term)")
     ap.add_argument("--sc_scale_noise", type=float, default=None,
@@ -104,7 +106,26 @@ def main():
             enable_checkpointing=False, enable_progress_bar=False,
             limit_val_batches=cfg_exp.opt.get("limit_val_batches", 64),
         )
+        sampletrace.reset()
         trainer.validate(model, datamodule=fresh_datamodule(), ckpt_path=None, verbose=False)
+        if sampletrace.enabled():
+            out = os.path.join(args.trace_dir, f"trace_{args.tag}_{steps}")
+            os.makedirs(args.trace_dir, exist_ok=True)
+            sampletrace.dump(out)
+            sm = sampletrace.summary()
+            st = sm["steps"]
+            # Runtime evidence, printed so it is in the job log even if the npz is lost.
+            print(f"[TRACE {args.tag} steps={steps}] effective args: {sm['args']}", flush=True)
+            if st:
+                n_sc = sum(1 for r in st if r["sc_present"])
+                n_prev = sum(1 for r in st if r["sc_is_prev_pred"])
+                print(f"[TRACE {args.tag} steps={steps}] recorded={len(st)} "
+                      f"sc_present={n_sc} sc_is_prev_pred={n_prev}", flush=True)
+                for r in st[:3] + st[-2:]:
+                    print(f"   step={r['step']:4d} t={r['t']:.4f} sc={r['sc_present']} "
+                          f"sc_norm={r['sc_norm']:.3f} is_prev={r['sc_is_prev_pred']} "
+                          f"pred_mean={r['pred_mean']:.4f} frac>0.5={r['pred_frac_gt_half']:.4f}",
+                          flush=True)
         # Read from callback_metrics, NOT from _validation_contact_results:
         # on_validation_epoch_end_data CLEARS that list at the end of the epoch, so it is always
         # empty by the time validate() returns. The logged metrics persist.
