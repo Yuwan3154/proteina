@@ -35,7 +35,10 @@ SNAP=/tmp/${ARM}_last_EMA_$$.ckpt
 cp "$REPO/store/$SRC/checkpoints/last-EMA.ckpt" "$SNAP"
 echo "[snapshot] $SNAP  $(stat -c %s "$SNAP") bytes"
 
+# REPEATS: 1 is right for ODE (vf), which is deterministic. Every sc point needs more than
+# one pass -- a single 32-chain mean carries ~0.02-0.04 of spread, comparable to the effects
+# being swept. Set it explicitly at submit time; there is no defensible default for sc.
 python scratchpad/dt_sweep_eval.py \
     --config_name "$CONFIG" --ema_ckpt "$SNAP" --tag "$ARM" \
-    --steps ${STEPS:-50 100 150 200} ${SAMPLER_ARGS:-}
+    --steps ${STEPS:-50 100 150 200} --repeats ${REPEATS:-1} ${SAMPLER_ARGS:-}
 rm -f "$SNAP"

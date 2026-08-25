@@ -17,6 +17,7 @@ while local_attn was the arm being tuned -- tri's step count has never been vali
 
 import argparse
 import os
+import statistics
 import sys
 
 import hydra
@@ -32,6 +33,15 @@ from proteinfoundation.utils import sampletrace
 
 STEPS_TO_DT = {50: 0.02, 100: 0.01, 150: 1.0 / 150, 200: 0.005, 400: 0.0025}
 
+# Reported for every sweep point. precision_at_L alone hid the separation-resolved split, which
+# is the part that actually distinguished the arms once conditioning was fixed.
+REPORT_KEYS = (
+    ("validation_sampling/contact_precision_at_L_mean", "prec@L"),
+    ("validation_sampling/contact_precision_at_L5_mean", "prec@L/5"),
+    ("validation_sampling/contact_medium_range_precision_at_L5_mean", "medium@L/5"),
+    ("validation_sampling/contact_long_range_precision_at_L5_mean", "long@L/5"),
+)
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -44,6 +54,11 @@ def main():
                     help="sc (SDE, default from config) or vf (pure ODE: c_t + v*dt, no score term)")
     ap.add_argument("--sc_scale_noise", type=float, default=None,
                     help="0 removes the injected noise but KEEPS the gt*score drift")
+    ap.add_argument("--repeats", type=int, default=1,
+                    help="Independent validate passes per point. SDE (sampling_mode=sc) draws "
+                         "fresh noise and is NOT seeded here, so a single pass carries ~0.02-0.04 "
+                         "of spread on a 32-chain mean -- comparable to the effects being swept. "
+                         "ODE (vf) is deterministic and needs only 1.")
     args = ap.parse_args()
 
     with hydra.initialize("../configs/experiment_config", version_base=hydra.__version__):
@@ -89,57 +104,75 @@ def main():
 
     for steps in args.steps:
         dt = STEPS_TO_DT[steps]
-        cfg_exp.validation_sampling.dt = dt
-        model.cfg_exp = cfg_exp
-        model._fixed_val_batches_cache = None      # rebuild per dt (cheap, keeps state clean)
-        model._val_pass_idx = 0
-        # A logger is MANDATORY here, not cosmetic: _run_validation_trajectory returns early
-        # via `if is_rank0 and (self.logger is None or not hasattr(self.logger, "experiment"))`,
-        # and that guard sits AFTER the qualitative_only check, so it gates the metric path too.
-        # CSVLogger satisfies hasattr(.,"experiment") but its writer has log_metrics, not log(),
-        # and on_validation_epoch_end_data calls `self.logger.experiment.log(payload)`.
-        # Offline WandB provides the right interface with no network and no run clutter.
-        wl = WandbLogger(project="dtsweep_probe", name=f"{args.tag}_{steps}",
-                         save_dir="/tmp/dtsweep_wandb", offline=True)
-        trainer = L.Trainer(
-            accelerator="gpu", devices=1, num_nodes=1, logger=wl,
-            enable_checkpointing=False, enable_progress_bar=False,
-            limit_val_batches=cfg_exp.opt.get("limit_val_batches", 64),
-        )
-        sampletrace.reset()
-        trainer.validate(model, datamodule=fresh_datamodule(), ckpt_path=None, verbose=False)
-        if sampletrace.enabled():
-            out = os.path.join(args.trace_dir, f"trace_{args.tag}_{steps}")
-            os.makedirs(args.trace_dir, exist_ok=True)
-            sampletrace.dump(out)
-            sm = sampletrace.summary()
-            st = sm["steps"]
-            # Runtime evidence, printed so it is in the job log even if the npz is lost.
-            print(f"[TRACE {args.tag} steps={steps}] effective args: {sm['args']}", flush=True)
-            if st:
-                n_sc = sum(1 for r in st if r["sc_present"])
-                n_prev = sum(1 for r in st if r["sc_is_prev_pred"])
-                print(f"[TRACE {args.tag} steps={steps}] recorded={len(st)} "
-                      f"sc_present={n_sc} sc_is_prev_pred={n_prev}", flush=True)
-                for r in st[:3] + st[-2:]:
-                    print(f"   step={r['step']:4d} t={r['t']:.4f} sc={r['sc_present']} "
-                          f"sc_norm={r['sc_norm']:.3f} is_prev={r['sc_is_prev_pred']} "
-                          f"pred_mean={r['pred_mean']:.4f} frac>0.5={r['pred_frac_gt_half']:.4f}",
-                          flush=True)
-        # Read from callback_metrics, NOT from _validation_contact_results:
-        # on_validation_epoch_end_data CLEARS that list at the end of the epoch, so it is always
-        # empty by the time validate() returns. The logged metrics persist.
-        cm = {k: float(v) for k, v in trainer.callback_metrics.items()}
-        mean = cm.get("validation_sampling/contact_precision_at_L_mean")
-        med = cm.get("validation_sampling/contact_precision_at_L_median")
-        nsamp = cm.get("validation_sampling/contact_n_samples")
-        if mean is not None:
-            print(f"RESULT {args.tag} steps={steps:4d} dt={dt:.6f} "
-                  f"n={nsamp} mean={mean:.4f} median={med:.4f}", flush=True)
-        else:
-            keys = sorted(k for k in cm if "contact" in k)
-            print(f"RESULT {args.tag} steps={steps:4d} dt={dt:.6f} NO METRIC; "
-                  f"contact keys present: {keys[:6]}", flush=True)
+        per_key = {k: [] for k, _ in REPORT_KEYS}
+        for rep in range(max(1, args.repeats)):
+            cfg_exp.validation_sampling.dt = dt
+            model.cfg_exp = cfg_exp
+            model._fixed_val_batches_cache = None  # rebuild per pass (cheap, keeps state clean)
+            model._val_pass_idx = 0
+            # A logger is MANDATORY here, not cosmetic: _run_validation_trajectory returns
+            # early via `if is_rank0 and (self.logger is None or not hasattr(self.logger,
+            # "experiment"))`, and that guard sits AFTER the qualitative_only check, so it gates
+            # the metric path too. CSVLogger satisfies hasattr(.,"experiment") but its writer has
+            # log_metrics, not log(), and on_validation_epoch_end_data calls
+            # `self.logger.experiment.log(payload)`. Offline WandB gives the right interface with
+            # no network and no run clutter.
+            wl = WandbLogger(project="dtsweep_probe", name=f"{args.tag}_{steps}_r{rep}",
+                             save_dir="/tmp/dtsweep_wandb", offline=True)
+            trainer = L.Trainer(
+                accelerator="gpu", devices=1, num_nodes=1, logger=wl,
+                enable_checkpointing=False, enable_progress_bar=False,
+                limit_val_batches=cfg_exp.opt.get("limit_val_batches", 64),
+            )
+            sampletrace.reset()
+            trainer.validate(model, datamodule=fresh_datamodule(), ckpt_path=None, verbose=False)
+            if sampletrace.enabled():
+                out = os.path.join(args.trace_dir, f"trace_{args.tag}_{steps}" + (f"_r{rep}" if args.repeats > 1 else ""))
+                os.makedirs(args.trace_dir, exist_ok=True)
+                sampletrace.dump(out)
+                sm = sampletrace.summary()
+                st = sm["steps"]
+                # Runtime evidence, printed so it is in the job log even if the npz is lost.
+                print(f"[TRACE {args.tag} steps={steps}] effective args: {sm['args']}", flush=True)
+                if st:
+                    n_sc = sum(1 for r in st if r["sc_present"])
+                    n_prev = sum(1 for r in st if r["sc_is_prev_pred"])
+                    print(f"[TRACE {args.tag} steps={steps}] recorded={len(st)} "
+                          f"sc_present={n_sc} sc_is_prev_pred={n_prev}", flush=True)
+                    for r in st[:3] + st[-2:]:
+                        print(f"   step={r['step']:4d} t={r['t']:.4f} sc={r['sc_present']} "
+                              f"sc_norm={r['sc_norm']:.3f} is_prev={r['sc_is_prev_pred']} "
+                              f"pred_mean={r['pred_mean']:.4f} frac>0.5={r['pred_frac_gt_half']:.4f}",
+                              flush=True)
+            # Read from callback_metrics, NOT from _validation_contact_results:
+            # on_validation_epoch_end_data CLEARS that list at the end of the epoch, so it is always
+            # empty by the time validate() returns. The logged metrics persist.
+            cm = {k: float(v) for k, v in trainer.callback_metrics.items()}
+            mean = cm.get("validation_sampling/contact_precision_at_L_mean")
+            med = cm.get("validation_sampling/contact_precision_at_L_median")
+            nsamp = cm.get("validation_sampling/contact_n_samples")
+            if mean is not None:
+                for k, _ in REPORT_KEYS:
+                    if cm.get(k) is not None:
+                        per_key[k].append(cm[k])
+                print(f"RESULT {args.tag} steps={steps:4d} dt={dt:.6f} rep={rep} "
+                      f"n={nsamp} mean={mean:.4f} median={med:.4f}", flush=True)
+            else:
+                keys = sorted(k for k in cm if "contact" in k)
+                print(f"RESULT {args.tag} steps={steps:4d} dt={dt:.6f} rep={rep} NO METRIC; "
+                      f"contact keys present: {keys[:6]}", flush=True)
+
+        # One line per sweep point carrying its own spread, so a dt-to-dt difference can be read
+        # against the measurement noise instead of against nothing.
+        for k, label in REPORT_KEYS:
+            vals = per_key[k]
+            if not vals:
+                continue
+            m = statistics.mean(vals)
+            sd_ = statistics.stdev(vals) if len(vals) > 1 else float("nan")
+            print(f"AGG {args.tag} steps={steps:4d} {label:<11s} "
+                  f"mean={m:.4f} sd={sd_:.4f} n={len(vals)} vals={[round(v, 4) for v in vals]}",
+                  flush=True)
 
 
 if __name__ == "__main__":
