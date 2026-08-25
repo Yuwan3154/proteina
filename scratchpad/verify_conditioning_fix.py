@@ -135,16 +135,25 @@ def decode_tokens(tokens):
     return out
 
 
-def as_plain_dict(batch):
+def as_plain_dict(batch, device=None):
     """A PyG Batch has no dict API, and both architectures read their inputs through
     ``batch[...]`` / ``batch.get(...)``, so a plain dict is an equally valid input and is the
-    only form a key can be removed from."""
+    only form a key can be removed from.
+
+    Deliberately goes through ``batch[k]`` rather than ``to_dict()``: ``to_dict()`` handed back
+    CPU tensors even though the model had just run on GPU, which crashed the ablation with a
+    device mismatch. ``batch[k]`` is the same accessor the model itself uses, so it yields the
+    tensors that were actually forwarded. The explicit ``.to(device)`` is then a no-op, kept
+    because an ablation must be guaranteed to run where the weights live.
+    """
     if isinstance(batch, dict):
-        return dict(batch)
-    if callable(getattr(batch, "to_dict", None)):
-        return dict(batch.to_dict())
-    ks = batch.keys() if callable(getattr(batch, "keys", None)) else getattr(batch, "keys", [])
-    return {k: batch[k] for k in ks}
+        d = dict(batch)
+    else:
+        ks = batch.keys() if callable(getattr(batch, "keys", None)) else getattr(batch, "keys", [])
+        d = {k: batch[k] for k in ks}
+    if device is not None:
+        d = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in d.items()}
+    return d
 
 
 def topology_ablation(model, batch, device):
@@ -155,7 +164,7 @@ def topology_ablation(model, batch, device):
     """
     was_training = model.nn.training
     model.nn.eval()
-    full = as_plain_dict(batch)
+    full = as_plain_dict(batch, device=device)
     stripped = {k: v for k, v in full.items() if not k.startswith("topology_")}
     with torch.no_grad():
         with_topo = model.nn(full)["contact_map_pred"]
