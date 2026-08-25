@@ -52,13 +52,25 @@ def case(fn):
         print(f"  FAIL  {fn.__name__}: {type(e).__name__}: {e}")
 
 
-def _tiny_tri():
-    """Small enough to forward on CPU; the (L+T)^2 grid is what makes the real model heavy."""
+def _tiny_tri(untangle_trunk=False):
+    """Small enough to forward on CPU; the (L+T)^2 grid is what makes the real model heavy.
+
+    ``untangle_trunk`` matters more than it looks. A FRESH ContactMapTriSiT is exactly the
+    identity through its blocks: TriBlock.mod is zero-init and OpenFold's tri_out / tri_in /
+    transition all carry ``init="final"`` zero-init output projections, so every residual branch
+    contributes zero. With the trunk inert, nothing crosses from the topology block into the
+    query-query block and a topology-influence test measures the initialisation, not the wiring.
+    Un-zeroing every all-zero parameter stands in for a trained model.
+    """
     torch.manual_seed(0)
     m = ContactMapTriSiT(
         pair_dim=16, tri_hidden=16, n_blocks=1, dim_cond=16,
         max_topology_he_len=4, max_rel_pos=8, topology_vocab_size=65,
     )
+    if untangle_trunk:
+        for p in m.parameters():
+            if torch.count_nonzero(p) == 0:
+                torch.nn.init.normal_(p, std=0.1)
     # The output head is zero-init, so an untrained model masks trivially and BUG 3 would look
     # fixed even without the fix. Give it a real bias so padded cells carry a nonzero constant.
     torch.nn.init.normal_(m.out.weight, std=0.5)
@@ -149,7 +161,7 @@ def t_both_arms_declare_topology_cond():
 
 def t_tri_output_changes_when_topology_is_supplied():
     """Runtime proof that the reference is consumed, not merely accepted."""
-    m = _tiny_tri()
+    m = _tiny_tri(untangle_trunk=True)
     torch.manual_seed(1)
     with_topo = _tiny_batch(with_topology=True)
     without = {k: v for k, v in with_topo.items() if not k.startswith("topology_")}
@@ -158,9 +170,21 @@ def t_tri_output_changes_when_topology_is_supplied():
     check(not torch.allclose(a, b), "supplying a topology reference must change the prediction")
 
 
+def t_fresh_tri_trunk_is_the_identity():
+    """Documents WHY the two tests above need untangle_trunk, so the next reader does not
+    'fix' a passing-by-accident test. At init every residual branch is zero, so the topology
+    cannot reach the query-query block at all."""
+    m = _tiny_tri(untangle_trunk=False)
+    with_topo = _tiny_batch(with_topology=True)
+    without = {k: v for k, v in with_topo.items() if not k.startswith("topology_")}
+    a = m(with_topo)["contact_map_logits"]
+    b = m(without)["contact_map_logits"]
+    check(torch.allclose(a, b), "at init the trunk is inert, so topology must NOT change the output")
+
+
 def t_tri_output_changes_when_topology_content_changes():
     """A different reference must give a different map, not just a different tensor shape."""
-    m = _tiny_tri()
+    m = _tiny_tri(untangle_trunk=True)
     b1 = _tiny_batch(with_topology=True)
     b2 = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in b1.items()}
     b2["topology_he_tokens"] = b2["topology_he_tokens"].clone()
