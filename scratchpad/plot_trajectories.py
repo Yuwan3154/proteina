@@ -24,6 +24,27 @@ ARMS = [("la", "local_attn"), ("tri", "tri_mul")]
 N_CHAINS = 4
 
 
+
+def _crop_valid(a, tol=1e-3):
+    """Crop the padded border.
+
+    Outside the mask the logits are unmasked, so sigmoid(0)=0.5 fills the padding with a
+    constant. The two arms pad to different extents (hier pads L up to a multiple of
+    block_size*super_factor; tri crops to L), so without cropping the arms are drawn on
+    different grids and cannot be compared. Detect the leading block whose rows/cols are not
+    all ~0.5 and keep it.
+    """
+    n = a.shape[-1]
+    row_const = np.all(np.abs(a - 0.5) < tol, axis=1)
+    col_const = np.all(np.abs(a - 0.5) < tol, axis=0)
+    valid = ~(row_const | col_const)
+    if not valid.any():
+        return a
+    last = int(np.max(np.nonzero(valid))) + 1
+    last = max(last, 8)
+    return a[:last, :last]
+
+
 def load(tag):
     npz = os.path.join(T, f"trace_{tag}_50_maps.npz")
     js = os.path.join(T, f"trace_{tag}_50.json")
@@ -71,6 +92,7 @@ for tag, label in ARMS:
             ax = axes[row, ci]
             m = maps[si]
             arr = m[ch] if m.ndim == 3 and m.shape[0] > ch else m
+            arr = _crop_valid(arr)
             ax.imshow(arr, cmap="magma", vmin=0.0, vmax=1.0, interpolation="nearest")
             ax.set_xticks([]); ax.set_yticks([])
             if ci == 0:
