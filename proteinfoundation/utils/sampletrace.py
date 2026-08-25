@@ -56,12 +56,19 @@ def record_step(step: int, t: float, nn_in: Dict[str, Any], c: Any, pred: Any) -
         sc_is_prev = bool(torch.equal(sc.float(), _PREV_PRED.float()))
     else:
         sc_is_prev = False
+    # Whether the topology reference actually reached the network on THIS step. An arm whose
+    # nn config omits topology_cond gets topology=None from the trainer and silently samples
+    # unconditioned; the count of valid elements is what distinguishes a real reference from
+    # the single MASK_TOKEN fallback.
+    he = nn_in.get("topology_he_tokens")
     _STEPS.append({
         "step": int(step),
         "t": float(t),
         "sc_present": bool(sc_present),
         "sc_norm": sc_norm,
         "sc_is_prev_pred": sc_is_prev,
+        "topo_present": he is not None,
+        "topo_n_valid": int((he > 0).sum().item()) if he is not None else 0,
         "c_norm": float(c.float().norm().item()) if c is not None else float("nan"),
         "pred_norm": float(pred.float().norm().item()) if pred is not None else float("nan"),
         "pred_mean": float(pred.float().mean().item()) if pred is not None else float("nan"),

@@ -113,6 +113,20 @@ def t_snapshots_gated_by_every(d):
     check(list(z["steps"]) == [0, 2, 4], f"expected steps 0,2,4 got {list(z['steps'])}")
 
 
+def t_topology_presence_recorded(d):
+    """An arm sampling UNCONDITIONED must be distinguishable from one holding a real reference.
+    The MASK fallback is a single valid element, so presence alone is not enough -- the count is."""
+    os.environ["SAMPLETRACE"] = "1"
+    real = torch.tensor([[5, 9, 12, -1]])
+    sampletrace.record_step(0, 0.0, {"topology_he_tokens": real}, torch.zeros(2, 2), torch.rand(2, 2))
+    sampletrace.record_step(1, 0.1, {"topology_he_tokens": torch.tensor([[1]])}, torch.zeros(2, 2), torch.rand(2, 2))
+    sampletrace.record_step(2, 0.2, {}, torch.zeros(2, 2), torch.rand(2, 2))
+    st = sampletrace.summary()["steps"]
+    check(st[0]["topo_present"] and st[0]["topo_n_valid"] == 3, "real reference: 3 valid elements")
+    check(st[1]["topo_present"] and st[1]["topo_n_valid"] == 1, "MASK fallback: 1 valid element")
+    check(not st[2]["topo_present"] and st[2]["topo_n_valid"] == 0, "absent: no topology at all")
+
+
 def t_reset_clears(d):
     os.environ["SAMPLETRACE"] = "1"
     sampletrace.record_step(0, 0.0, {}, torch.zeros(2, 2), torch.rand(2, 2))
