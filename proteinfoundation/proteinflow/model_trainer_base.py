@@ -2462,7 +2462,14 @@ class ModelTrainerBase(L.LightningModule):
         self._diag_log("val_step_data: post training_step", f"batch_idx={batch_idx}")
 
         val_sampling_cfg = self.cfg_exp.get("validation_sampling", None)
-        if not val_sampling_cfg or self.global_step <= 0:
+        # global_step <= 0 skips the trajectory during the step-0 sanity check, where the model
+        # is untrained and sampling is pure cost. Offline evaluation of LOADED weights via
+        # trainer.validate() also sits at global_step == 0, so it needs an explicit opt-out.
+        # Default False leaves every training run byte-identical.
+        _force_traj = bool(
+            val_sampling_cfg.get("force_trajectory_at_step0", False)
+        ) if val_sampling_cfg else False
+        if not val_sampling_cfg or (self.global_step <= 0 and not _force_traj):
             return
         if self._logged_val_traj_epoch == self.current_epoch:
             return  # already fired this epoch

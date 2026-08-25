@@ -51,6 +51,9 @@ def main():
     # reason about when _val_pass_idx is incremented (setting it to -1 fails: -1 % 5 == 4 in
     # Python, so the gate closes), force every_n = 1 so the condition holds for ANY pass index.
     cfg_exp.validation_sampling.tmscore_every_n_val_epochs = 1
+    # trainer.validate() runs at global_step == 0, where validation_step_data returns
+    # BEFORE any diag line. This opt-in is what lets the trajectory run for loaded weights.
+    cfg_exp.validation_sampling.force_trajectory_at_step0 = True
 
     ds_dir = f"../configs/datasets_config/{cfg_exp.dataset_config_subdir}"
     with hydra.initialize(ds_dir, version_base=hydra.__version__):
