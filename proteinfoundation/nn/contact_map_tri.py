@@ -220,6 +220,12 @@ class ContactMapTriSiT(nn.Module):
         logits = self.out(self.out_norm(z))[..., 0]
         logits = logits[:, :L, :L]
         logits = 0.5 * (logits + logits.transpose(1, 2))  # a contact map is symmetric by definition
+        # Padded cells carry a learned constant otherwise (LayerNorm of the masked-to-zero trunk
+        # output is the bias, not zero), which ContactMapHierSiT does not have. Loss and metrics
+        # both mask, so this changes no number -- it removes an asymmetry that made the two arms'
+        # padding render differently and be read as a modelling difference.
+        q_valid = mask.bool()
+        logits = logits * (q_valid[:, :, None] & q_valid[:, None, :]).to(logits.dtype)
         return {
             "contact_map_logits": logits,
             "contact_map_pred": torch.sigmoid(logits),

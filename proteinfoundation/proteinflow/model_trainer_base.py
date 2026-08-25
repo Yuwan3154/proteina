@@ -2739,6 +2739,17 @@ class ModelTrainerBase(L.LightningModule):
 
     def _use_variable_length_validation_sampling(self, val_sampling_cfg, min_l, max_l) -> bool:
         """Whether to sample a random length in [min_l, max_l] for validation trajectories."""
+        # A fixed chain set exists so the SAME chains at THEIR OWN lengths are scored every pass.
+        # Redrawing L overwrites each chain's mask, so the generated map and the ground truth it is
+        # scored against describe different proteins. Until now this was avoided only as a side
+        # effect of topology conditioning being active, so an arm without it silently redrew.
+        if val_sampling_cfg.get("fixed_chain_list"):
+            if val_sampling_cfg.get("variable_length_sampling", None) is True:
+                logger.warning(
+                    "validation_sampling: variable_length_sampling=True is ignored because "
+                    "fixed_chain_list is set; each chain keeps its own length."
+                )
+            return False
         flag = val_sampling_cfg.get("variable_length_sampling", None)
         if flag is False:
             return False

@@ -25,6 +25,11 @@ dim_cond: 128
 max_rel_pos: 64      # clip radius for the LEFT-ALIGNED relative position. Query residue i sits at
                      # i and reference element e at its own-chain midpoint, both from 0, so this
                      # radius has to cover query-to-element offsets as well as query-to-query.
+# Read by the TRAINER, not by ContactMapTriSiT (which consumes the reference unconditionally
+# whenever the keys are present). _build_self_reference_topology gates on it, so leaving it
+# absent made validation sampling pass topology=None and this arm generate UNCONDITIONED while
+# the hier arm generated on each chain's own ground-truth topology.
+topology_cond: True
 max_topology_he_len: 64
 topology_vocab_size: 65
 n_residue_types: 22
