@@ -50,7 +50,11 @@ def main():
     ds_dir = f"../configs/datasets_config/{cfg_exp.dataset_config_subdir}"
     with hydra.initialize(ds_dir, version_base=hydra.__version__):
         cfg_data = hydra.compose(config_name=cfg_exp.dataset)
-    datamodule = hydra.utils.instantiate(cfg_data.datamodule)
+
+    def fresh_datamodule():
+        # A datamodule instance cannot be reused across repeated trainer.validate() calls:
+        # re-setup trips "The truth value of a DataFrame is ambiguous". Build one per variant.
+        return hydra.utils.instantiate(cfg_data.datamodule)
 
     model = Proteina(cfg_exp, store_dir="/tmp/dtsweep_store")
     ck = torch.load(args.ema_ckpt, map_location="cpu", weights_only=False)
@@ -68,22 +72,27 @@ def main():
         cfg_exp.validation_sampling.dt = dt
         model.cfg_exp = cfg_exp
         model._fixed_val_batches_cache = None      # rebuild per dt (cheap, keeps state clean)
-        model._validation_contact_results = []
+        model._val_pass_idx = -1                   # so pass 0 clears the tmscore_every_n gate
         trainer = L.Trainer(
             accelerator="gpu", devices=1, num_nodes=1, logger=False,
             enable_checkpointing=False, enable_progress_bar=False,
             limit_val_batches=cfg_exp.opt.get("limit_val_batches", 64),
         )
-        trainer.validate(model, datamodule=datamodule, ckpt_path=None, verbose=False)
-        res = getattr(model, "_validation_contact_results", []) or []
-        vals = [r["contact_precision_at_L"] for r in res if "contact_precision_at_L" in r]
-        if vals:
-            import numpy as np
-            a = np.array(vals, dtype=float)
+        trainer.validate(model, datamodule=fresh_datamodule(), ckpt_path=None, verbose=False)
+        # Read from callback_metrics, NOT from _validation_contact_results:
+        # on_validation_epoch_end_data CLEARS that list at the end of the epoch, so it is always
+        # empty by the time validate() returns. The logged metrics persist.
+        cm = {k: float(v) for k, v in trainer.callback_metrics.items()}
+        mean = cm.get("validation_sampling/contact_precision_at_L_mean")
+        med = cm.get("validation_sampling/contact_precision_at_L_median")
+        nsamp = cm.get("validation_sampling/contact_n_samples")
+        if mean is not None:
             print(f"RESULT {args.tag} steps={steps:4d} dt={dt:.6f} "
-                  f"n={len(a):4d} mean={a.mean():.4f} median={np.median(a):.4f}", flush=True)
+                  f"n={nsamp} mean={mean:.4f} median={med:.4f}", flush=True)
         else:
-            print(f"RESULT {args.tag} steps={steps:4d} dt={dt:.6f} NO SAMPLES ACCUMULATED", flush=True)
+            keys = sorted(k for k in cm if "contact" in k)
+            print(f"RESULT {args.tag} steps={steps:4d} dt={dt:.6f} NO METRIC; "
+                  f"contact keys present: {keys[:6]}", flush=True)
 
 
 if __name__ == "__main__":
