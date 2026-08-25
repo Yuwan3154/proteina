@@ -36,5 +36,5 @@ echo "[snapshot] $SNAP  $(stat -c %s "$SNAP") bytes"
 
 python scratchpad/dt_sweep_eval.py \
     --config_name "$CONFIG" --ema_ckpt "$SNAP" --tag "$ARM" \
-    --steps ${STEPS:-50 100 150 200}
+    --steps ${STEPS:-50 100 150 200} ${SAMPLER_ARGS:-}
 rm -f "$SNAP"

@@ -38,6 +38,10 @@ def main():
     ap.add_argument("--ema_ckpt", required=True)
     ap.add_argument("--steps", type=int, nargs="+", default=[50, 100, 150, 200, 400])
     ap.add_argument("--tag", required=True)
+    ap.add_argument("--sampling_mode", default=None,
+                    help="sc (SDE, default from config) or vf (pure ODE: c_t + v*dt, no score term)")
+    ap.add_argument("--sc_scale_noise", type=float, default=None,
+                    help="0 removes the injected noise but KEEPS the gt*score drift")
     args = ap.parse_args()
 
     with hydra.initialize("../configs/experiment_config", version_base=hydra.__version__):
@@ -54,6 +58,12 @@ def main():
     # trainer.validate() runs at global_step == 0, where validation_step_data returns
     # BEFORE any diag line. This opt-in is what lets the trajectory run for loaded weights.
     cfg_exp.validation_sampling.force_trajectory_at_step0 = True
+    if args.sampling_mode is not None:
+        cfg_exp.validation_sampling.sampling_mode = args.sampling_mode
+    if args.sc_scale_noise is not None:
+        cfg_exp.validation_sampling.sc_scale_noise = args.sc_scale_noise
+    print(f"[sampler] mode={cfg_exp.validation_sampling.sampling_mode} "
+          f"sc_scale_noise={cfg_exp.validation_sampling.sc_scale_noise}", flush=True)
 
     ds_dir = f"../configs/datasets_config/{cfg_exp.dataset_config_subdir}"
     with hydra.initialize(ds_dir, version_base=hydra.__version__):
