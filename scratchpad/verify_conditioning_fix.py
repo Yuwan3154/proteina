@@ -81,11 +81,20 @@ class SingleStepCapture:
         self.n_keep = n_keep
         self.examples = []
         self.live_batch = None
+        self.n_calls = 0
+        self.n_with_gt = 0
 
     def __call__(self, module, args, output):
         batch = args[0] if args else None
-        if not isinstance(batch, dict) or "contact_map" not in batch:
+        self.n_calls += 1
+        # Duck-typed, NOT isinstance(batch, dict): the val dataloader yields a PyG Batch, so an
+        # isinstance check silently rejected every loss-path forward and captured nothing, while
+        # the trajectory's plain-dict nn_in passed and was discarded for lacking the GT map.
+        if batch is None or not hasattr(batch, "__contains__"):
             return
+        if "contact_map" not in batch:
+            return
+        self.n_with_gt += 1
         if len(self.examples) >= self.n_keep:
             return
         if self.live_batch is None:
@@ -98,13 +107,17 @@ class SingleStepCapture:
             "gt": batch["contact_map"][b].detach().float().cpu().numpy(),
             "pred": output["contact_map_pred"][b].detach().float().cpu().numpy(),
         }
-        he = batch.get("topology_he_tokens")
-        if he is not None:
+        # `in` rather than .get: a PyG Batch does not carry the dict API.
+        if "topology_he_tokens" in batch:
+            he = batch["topology_he_tokens"]
             rec["he_tokens"] = he[b].detach().cpu().numpy()
             rec["he_contact"] = (
                 batch["topology_he_feat"][b, :, :, CONTACT_MAX].detach().float().cpu().numpy()
             )
         self.examples.append(rec)
+
+    def report(self):
+        return f"hook fired {self.n_calls}x, {self.n_with_gt} carried a ground-truth map"
 
 
 def decode_tokens(tokens):
@@ -122,13 +135,30 @@ def decode_tokens(tokens):
     return out
 
 
+def as_plain_dict(batch):
+    """A PyG Batch has no dict API, and both architectures read their inputs through
+    ``batch[...]`` / ``batch.get(...)``, so a plain dict is an equally valid input and is the
+    only form a key can be removed from."""
+    if isinstance(batch, dict):
+        return dict(batch)
+    if callable(getattr(batch, "to_dict", None)):
+        return dict(batch.to_dict())
+    ks = batch.keys() if callable(getattr(batch, "keys", None)) else getattr(batch, "keys", [])
+    return {k: batch[k] for k in ks}
+
+
 def topology_ablation(model, batch, device):
-    """Does the reference change what the TRAINED model predicts? With vs without, same batch."""
+    """Does the reference change what the TRAINED model predicts? With vs without, same batch.
+
+    Both sides are fed a plain dict so the ONLY difference is the presence of the topology keys,
+    not the container type.
+    """
     was_training = model.nn.training
     model.nn.eval()
+    full = as_plain_dict(batch)
+    stripped = {k: v for k, v in full.items() if not k.startswith("topology_")}
     with torch.no_grad():
-        with_topo = model.nn(batch)["contact_map_pred"]
-        stripped = {k: v for k, v in batch.items() if not k.startswith("topology_")}
+        with_topo = model.nn(full)["contact_map_pred"]
         without = model.nn(stripped)["contact_map_pred"]
     if was_training:
         model.nn.train()
@@ -211,6 +241,7 @@ def main():
     sd = ck["state_dict"] if "state_dict" in ck else ck
     missing, unexpected = model.load_state_dict(sd, strict=False)
     print(f"[EMA load] {args.ema_ckpt} missing={len(missing)} unexpected={len(unexpected)}", flush=True)
+    print(f"[EMA load] epoch={ck.get('epoch')} global_step={ck.get('global_step')}", flush=True)
 
     cap = SingleStepCapture(args.n_dump)
     handle = model.nn.register_forward_hook(cap)
@@ -245,6 +276,7 @@ def main():
         print(f"\n[TRACE {args.tag}] no steps recorded (SAMPLETRACE unset?)", flush=True)
 
     # ── (2) sanity dump ─────────────────────────────────────────────────────────────────────
+    print(f"\n[dump] {cap.report()}", flush=True)
     if not cap.examples:
         print("[dump] NO single-step forwards captured", flush=True)
         return
