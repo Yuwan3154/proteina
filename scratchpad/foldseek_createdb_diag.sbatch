@@ -19,7 +19,7 @@ rm -rf "$D"; mkdir -p "$D/gz" "$D/plain"
 # Four variants, to separate "cannot read gzipped mmCIF" from "cannot take a path list".
 # Both are plausible and they need different fixes, so guessing would risk another 254k-entry
 # build that yields nothing.
-for e in 200l 101m 102l; do
+for e in 4jgo 200l 101m; do   # 4jgo is multi-chain: 4jgo_A and 4jgo_B are both in the train split
   p="$RAW/${e:1:2}/${e}.cif.gz"
   [ -f "$p" ] || { echo "missing $p"; continue; }
   cp "$p" "$D/gz/"
@@ -36,7 +36,7 @@ probe () {   # $1 = label, $2 = input argument
   "$FS" createdb "$2" "$out" 2>&1 | tail -3
   n=$(wc -l < "${out}.index" 2>/dev/null || echo 0)
   echo ">>> $1 : ${n} entries"
-  if [ "$n" -gt 0 ]; then echo ">>> $1 : first ids: $(cut -f1 "${out}.lookup" 2>/dev/null | head -4 | tr '\n' ' ')"; fi
+  if [ "$n" -gt 0 ]; then echo ">>> $1 : first ids: $(cut -f2 "${out}.lookup" 2>/dev/null | head -4 | tr '\n' ' ')"; fi
 }
 
 probe gz_dir    "$D/gz"
