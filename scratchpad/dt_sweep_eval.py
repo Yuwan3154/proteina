@@ -47,6 +47,10 @@ def main():
     cfg_exp.hardware.nnodes_ = 1
     cfg_exp.log.log_wandb = False          # read results from stdout, not wandb
     cfg_exp.log.checkpoint = False
+    # The trajectory is gated by `self._val_pass_idx % every_n != 0 -> return`. Rather than
+    # reason about when _val_pass_idx is incremented (setting it to -1 fails: -1 % 5 == 4 in
+    # Python, so the gate closes), force every_n = 1 so the condition holds for ANY pass index.
+    cfg_exp.validation_sampling.tmscore_every_n_val_epochs = 1
 
     ds_dir = f"../configs/datasets_config/{cfg_exp.dataset_config_subdir}"
     with hydra.initialize(ds_dir, version_base=hydra.__version__):
@@ -73,7 +77,7 @@ def main():
         cfg_exp.validation_sampling.dt = dt
         model.cfg_exp = cfg_exp
         model._fixed_val_batches_cache = None      # rebuild per dt (cheap, keeps state clean)
-        model._val_pass_idx = -1                   # so pass 0 clears the tmscore_every_n gate
+        model._val_pass_idx = 0
         # A logger is MANDATORY here, not cosmetic: _run_validation_trajectory returns early
         # via `if is_rank0 and (self.logger is None or not hasattr(self.logger, "experiment"))`,
         # and that guard sits AFTER the qualitative_only check, so it gates the metric path too.
