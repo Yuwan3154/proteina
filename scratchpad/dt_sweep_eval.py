@@ -22,6 +22,7 @@ import sys
 import hydra
 import lightning as L
 import torch
+from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -73,8 +74,16 @@ def main():
         model.cfg_exp = cfg_exp
         model._fixed_val_batches_cache = None      # rebuild per dt (cheap, keeps state clean)
         model._val_pass_idx = -1                   # so pass 0 clears the tmscore_every_n gate
+        # A logger is MANDATORY here, not cosmetic: _run_validation_trajectory returns early
+        # via `if is_rank0 and (self.logger is None or not hasattr(self.logger, "experiment"))`,
+        # and that guard sits AFTER the qualitative_only check, so it gates the metric path too.
+        # CSVLogger satisfies hasattr(.,"experiment") but its writer has log_metrics, not log(),
+        # and on_validation_epoch_end_data calls `self.logger.experiment.log(payload)`.
+        # Offline WandB provides the right interface with no network and no run clutter.
+        wl = WandbLogger(project="dtsweep_probe", name=f"{args.tag}_{steps}",
+                         save_dir="/tmp/dtsweep_wandb", offline=True)
         trainer = L.Trainer(
-            accelerator="gpu", devices=1, num_nodes=1, logger=False,
+            accelerator="gpu", devices=1, num_nodes=1, logger=wl,
             enable_checkpointing=False, enable_progress_bar=False,
             limit_val_batches=cfg_exp.opt.get("limit_val_batches", 64),
         )
