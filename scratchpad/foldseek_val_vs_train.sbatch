@@ -57,6 +57,14 @@ if [ ! -e "$W/targetDB" ]; then
   done < "$W/train_entries.txt"
   echo "[target] entries: $n_have present, $n_gone absent"
   "$FS" createdb "$W/train_cif_paths.txt" "$W/targetDB"
+  n_tgt=$("$FS" createdb --help >/dev/null 2>&1; wc -l < "$W/targetDB.index" 2>/dev/null || echo 0)
+  echo "[target] targetDB entries: $n_tgt"
+  if [ "$n_tgt" -lt 1000 ]; then
+    echo "!! targetDB has $n_tgt entries from $n_have mmCIF paths -- the build did not work."
+    echo "!! Candidates: this foldseek build may not read gzipped mmCIF, or may not accept a"
+    echo "!! newline-delimited path list as input. Diagnose before rerunning the search."
+    exit 4
+  fi
 fi
 
 # ── search: TM mode ──────────────────────────────────────────────────────────────────────────
@@ -74,5 +82,10 @@ echo "[hits] $(wc -l < "$W/hits.tsv") rows"
 cut -f2 "$W/hits.tsv" | sed 's/\.pdb$//;s/\.cif$//' | sort -u > "$W/hit_targets.txt"
 sort -u "$V/splits/train_chain_ids.txt" > "$W/train_sorted.txt"
 echo "[sanity] hit targets: $(wc -l < "$W/hit_targets.txt")"
-echo "[sanity] of which in the training list: $(comm -12 "$W/hit_targets.txt" "$W/train_sorted.txt" | wc -l)"
-echo "  ^ if this is ~0 the ID conventions disagree and the result means NOTHING"
+n_match=$(comm -12 "$W/hit_targets.txt" "$W/train_sorted.txt" | wc -l)
+echo "[sanity] of which in the training list: $n_match"
+if [ "$n_match" -eq 0 ]; then
+  echo "!! ZERO training hits. Either the target DB is empty or the ID conventions disagree."
+  echo "!! This is NOT evidence of no leakage. Failing so it cannot be read as a result."
+  exit 3
+fi
