@@ -16,3 +16,5 @@ conda deactivate 2>/dev/null; conda activate cue_openfold
 set -u
 cd /orcd/scratch/orcd/011/chenxiou/proteina_cmhier
 python tests/test_tri_conditioning_fixes.py
+echo "=== sampletrace (topo_present/topo_n_valid added for the fix verification) ==="
+python tests/test_sampletrace.py
