@@ -40,5 +40,5 @@ echo "[snapshot] $SNAP  $(stat -c %s "$SNAP") bytes"
 # being swept. Set it explicitly at submit time; there is no defensible default for sc.
 python scratchpad/dt_sweep_eval.py \
     --config_name "$CONFIG" --ema_ckpt "$SNAP" --tag "$ARM" \
-    --steps ${STEPS:-50 100 150 200} --repeats ${REPEATS:-1} ${SAMPLER_ARGS:-}
+    --steps ${STEPS:-50 100 150 200} --repeats ${REPEATS:-1} ${SEED_BASE:+--seed_base $SEED_BASE} ${SAMPLER_ARGS:-}
 rm -f "$SNAP"

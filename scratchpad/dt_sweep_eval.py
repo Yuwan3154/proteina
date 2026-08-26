@@ -54,6 +54,11 @@ def main():
                     help="sc (SDE, default from config) or vf (pure ODE: c_t + v*dt, no score term)")
     ap.add_argument("--sc_scale_noise", type=float, default=None,
                     help="0 removes the injected noise but KEEPS the gt*score drift")
+    ap.add_argument("--seed_base", type=int, default=None,
+                    help="Seed repeat r with seed_base + r. Makes each sc pass REPRODUCIBLE and, "
+                         "more importantly, EXTENSIBLE: a later run with the same seed_base and a "
+                         "higher --repeats reproduces the earlier passes exactly and adds genuinely "
+                         "new draws, so samples accumulate instead of being thrown away.")
     ap.add_argument("--repeats", type=int, default=1,
                     help="Independent validate passes per point. SDE (sampling_mode=sc) draws "
                          "fresh noise and is NOT seeded here, so a single pass carries ~0.02-0.04 "
@@ -110,6 +115,8 @@ def main():
             model.cfg_exp = cfg_exp
             model._fixed_val_batches_cache = None  # rebuild per pass (cheap, keeps state clean)
             model._val_pass_idx = 0
+            if args.seed_base is not None:
+                L.seed_everything(args.seed_base + rep, workers=True)
             # A logger is MANDATORY here, not cosmetic: _run_validation_trajectory returns
             # early via `if is_rank0 and (self.logger is None or not hasattr(self.logger,
             # "experiment"))`, and that guard sits AFTER the qualitative_only check, so it gates

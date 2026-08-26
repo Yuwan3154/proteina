@@ -85,11 +85,21 @@ echo "[hits] $(wc -l < "$W/hits.tsv") rows"
 
 # A silent ID-convention mismatch would look exactly like "no leakage", so the overlap between the
 # hit targets and the training list is checked LOUDLY before any conclusion is drawn.
-cut -f2 "$W/hits.tsv" | sed 's/\.pdb$//;s/\.cif$//' | sort -u > "$W/hit_targets.txt"
+# ⛔ foldseek names an entry <entry>_<chain> ONLY when it has MULTIPLE chains; single-chain
+# structures keep the BARE entry id (measured, job 21251300: "101m 200l 4jgo_A 4jgo_B"). The split
+# uses <entry>_<chain> for EVERY chain, so exact-string matching would silently drop every
+# single-chain training structure -- UNDER-reporting leakage, biased toward single-chain proteins,
+# which is the wrong direction to err on this question. Match both ways and report both.
+cut -f2 "$W/hits.tsv" | sed 's/\.pdb$//;s/\.cif$//;s/\.gz$//' | sort -u > "$W/hit_targets.txt"
 sort -u "$V/splits/train_chain_ids.txt" > "$W/train_sorted.txt"
+cut -d_ -f1 "$W/train_sorted.txt" | sort -u > "$W/train_entries_sorted.txt"
+cut -d_ -f1 "$W/hit_targets.txt"   | sort -u > "$W/hit_entries.txt"
+n_exact=$(comm -12 "$W/hit_targets.txt" "$W/train_sorted.txt" | wc -l)
+n_entry=$(comm -12 "$W/hit_entries.txt" "$W/train_entries_sorted.txt" | wc -l)
 echo "[sanity] hit targets: $(wc -l < "$W/hit_targets.txt")"
-n_match=$(comm -12 "$W/hit_targets.txt" "$W/train_sorted.txt" | wc -l)
-echo "[sanity] of which in the training list: $n_match"
+echo "[match] exact chain-level: $n_exact"
+echo "[match] entry-level (permissive => CONSERVATIVE for a leakage audit): $n_entry"
+n_match=$n_entry
 if [ "$n_match" -eq 0 ]; then
   echo "!! ZERO training hits. Either the target DB is empty or the ID conventions disagree."
   echo "!! This is NOT evidence of no leakage. Failing so it cannot be read as a result."
