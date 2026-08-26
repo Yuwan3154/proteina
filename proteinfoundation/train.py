@@ -51,6 +51,7 @@ from proteinfoundation.utils.lora_utils import replace_lora_layers
 from proteinfoundation.utils.metric_utils import (
     transform_global_percentage_to_mask_dropout,
 )
+from lightning.pytorch.callbacks import LearningRateMonitor
 from proteinfoundation.utils.seed_callback import SeedCallback
 from proteinfoundation.utils.training_analysis_utils import (
     GradAndWeightAnalysisCallback,
@@ -576,6 +577,13 @@ if __name__ == "__main__":
         )
         callbacks.append(LogEpochTimeCallback())
         callbacks.append(LogSetpTimeCallback())
+        # The learning rate was never recorded anywhere in the run history, which left an
+        # unexplained +16% rise in localattn_full384's TRAIN loss (epochs ~268-300) untestable:
+        # with a cosine schedule over max_epochs=1000 an LR anomaly is the leading suspect and
+        # there was no way to see it. Lightning's own monitor is used rather than a hand-rolled
+        # self.log so it covers every param group and both step and epoch granularity.
+        # Sits inside the `log_wandb` branch because it requires a logger to write to.
+        callbacks.append(LearningRateMonitor(logging_interval="step", log_momentum=False))
 
     # `enabled` gates the callback for bisection; it is not an EMA constructor arg, so it is
     # popped out before the splat. Default True keeps every existing run byte-identical.
