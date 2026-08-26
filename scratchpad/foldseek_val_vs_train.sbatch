@@ -36,7 +36,9 @@ fi
 "$FS" version || { echo "foldseek unavailable"; exit 1; }
 
 # ── query: the 32 fixed validation chains ────────────────────────────────────────────────────
-if [ ! -e "$W/queryDB" ]; then
+n_q=$(wc -l < "$W/queryDB.index" 2>/dev/null || echo 0)
+if [ "$n_q" -lt 1 ]; then
+  rm -f "$W/queryDB"*
   mkdir -p "$W/query_pdbs"
   n_missing=0
   while read -r id; do
@@ -51,7 +53,10 @@ fi
 # ── target: the mmCIF entries backing the TRAINING chains ────────────────────────────────────
 # foldseek emits ONE ENTRY PER CHAIN from an mmCIF, named <entry>_<chain>, matching the split's
 # convention -- so no manual chain extraction. PDB shards by characters 2-3 of the ID.
-if [ ! -e "$W/targetDB" ]; then
+n_existing=$(wc -l < "$W/targetDB.index" 2>/dev/null || echo 0)
+if [ "$n_existing" -lt 1000 ]; then
+  echo "[target] existing targetDB has $n_existing entries -- rebuilding from scratch"
+  rm -f "$W/targetDB"*
   cut -d_ -f1 "$V/splits/train_chain_ids.txt" | sort -u > "$W/train_entries.txt"
   : > "$W/train_cif_paths.txt"
   n_have=0; n_gone=0
