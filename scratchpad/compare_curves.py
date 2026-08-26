@@ -16,6 +16,16 @@ RUNS = [
 ]
 SMOOTH = 25  # rolling window used for the ~18x/epoch validation traces
 
+# ⛔ tri's validation_sampling history has a MEASUREMENT DISCONTINUITY, not a training one.
+# Until 2026-08-25 the tri arm sampled with NO topology conditioning and at a RANDOM redrawn
+# length (contact_map_tri_30M.yaml never declared topology_cond, so
+# _build_self_reference_topology returned None and the trainer fell through to the variable-length
+# branch). Everything before the fix measured a different, much harder task. Its last pre-fix EMA
+# checkpoint was epoch 40 (read off the checkpoint itself in job 21222196), so that is the
+# boundary. Drawing one continuous line across it would show a ~5x jump that reads as the model
+# improving when it is the metric changing.
+TRI_FIX_EPOCH = 40.0
+
 K_TRAIN_LOSS = "train/loss_epoch"
 K_VAL_LOSS = "validation_loss/loss_epoch"
 K_SS = "validation_loss/contact_precision_at_L_single_step"
@@ -69,6 +79,20 @@ ax = axes[2]
 for run_id, label, color, ls, lw in RUNS:
     df = data[run_id]
     x, y = xy(df, K_SAMP)
+    if run_id == "tri_full384":
+        pre, post = x < TRI_FIX_EPOCH, x >= TRI_FIX_EPOCH
+        # Pre-fix points are kept rather than deleted -- hiding them would erase the reason the
+        # comparison changed -- but drawn faint and labelled so they cannot be read as performance.
+        ax.plot(x[pre], y[pre], color=color, lw=1.0, ls=":", alpha=0.35,
+                label="tri_mul (pre-fix: UNCONDITIONED, random length)")
+        ax.plot(x[post], y[post], color=color, lw=0.9, alpha=0.28)
+        yp = pd.Series(y[post]).rolling(5, min_periods=2, center=True).median().values
+        ax.plot(x[post], yp, color=color, lw=lw, label=label + " (conditioned)")
+        ax.axvline(TRI_FIX_EPOCH, color=color, lw=1.0, ls="--", alpha=0.55)
+        ax.annotate("conditioning fixed", xy=(TRI_FIX_EPOCH, ax.get_ylim()[1]),
+                    xytext=(3, -8), textcoords="offset points",
+                    fontsize=7, color=color, rotation=90, va="top")
+        continue
     ax.plot(x, y, color=color, lw=0.9, ls=ls, alpha=0.28)
     ys = pd.Series(y).rolling(5, min_periods=2, center=True).median().values
     ax.plot(x, ys, color=color, lw=lw, ls=ls, label=label)
