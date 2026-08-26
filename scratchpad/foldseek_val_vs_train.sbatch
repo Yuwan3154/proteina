@@ -56,7 +56,13 @@ if [ ! -e "$W/targetDB" ]; then
     else n_gone=$((n_gone + 1)); fi
   done < "$W/train_entries.txt"
   echo "[target] entries: $n_have present, $n_gone absent"
-  "$FS" createdb "$W/train_cif_paths.txt" "$W/targetDB"
+  # ⛔ MEASURED (diag job 21237409): this foldseek build reads gzipped mmCIF fine, but a
+  # newline-delimited PATH LIST yields 0 entries -- gz_dir 3, gz_list 0, plain_dir 3, plain_list 0.
+  # Directories work, so pass the raw shard dirs as arguments. Symlinking 254k files into one
+  # directory is not an option: it breaks the <=1024-files-per-directory rule.
+  # This admits every entry in raw/, not only training ones, so hits are filtered against the
+  # training chain list AFTER the search -- which the sanity block below already does.
+  "$FS" createdb "$RAW"/*/ "$W/targetDB"
   n_tgt=$("$FS" createdb --help >/dev/null 2>&1; wc -l < "$W/targetDB.index" 2>/dev/null || echo 0)
   echo "[target] targetDB entries: $n_tgt"
   if [ "$n_tgt" -lt 1000 ]; then
