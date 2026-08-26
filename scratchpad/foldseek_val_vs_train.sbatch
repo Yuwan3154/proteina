@@ -1,10 +1,15 @@
 #!/bin/bash
 #SBATCH --job-name=fsvaltrain
-#SBATCH --partition=mit_preemptable
+# Partition LIST, not two racing submissions: two jobs would share $W and $TMP and corrupt each
+# other's databases. SLURM starts this wherever a slot frees first. 12:00:00 is mit_normal's cap
+# (preemptable allows 2 days); requesting more would make the job ineligible for mit_normal and
+# defeat the point. A wall-clock stop is cheap here -- the tmp dir survives and an identical
+# rerun resumes.
+#SBATCH --partition=mit_normal,mit_preemptable
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
-#SBATCH --time=2-00:00:00
+#SBATCH --time=12:00:00
 #SBATCH --requeue
 #SBATCH --output=/orcd/scratch/orcd/011/chenxiou/proteina_cmhier/logs/%x-%j.out
 #SBATCH --error=/orcd/scratch/orcd/011/chenxiou/proteina_cmhier/logs/%x-%j.err
