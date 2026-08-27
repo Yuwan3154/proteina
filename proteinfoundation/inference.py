@@ -46,6 +46,7 @@ from proteinfoundation.metrics.metric_factory import (
     GenerationMetricFactory,
     generation_metric_from_list,
 )
+from proteinfoundation.prediction_pipeline.conditioning_paths import conditioning_label
 from proteinfoundation.proteinflow.proteina import Proteina
 from proteinfoundation.utils.ff_utils.pdb_utils import mask_cath_code_by_level, write_prot_to_pdb
 
@@ -486,7 +487,12 @@ def _compute_root_path(config_name, conditioning_mode, pt_name):
     """Per-protein output dir: inference/{config}/{seq_cond|seq_cath_cond|unconditional_cond|cath_only_cond|legacy}/{protein}/"""
     root_path = f"./inference/{config_name}"
     if conditioning_mode == "seq":
-        root_path = os.path.join(root_path, "seq_cond")
+        # conditioning_paths is the single source of truth and appends `_segment` when
+        # PROTEINA_SEGMENT_MODE=joint. Hardcoding "seq_cond" here wrote samples to a dir
+        # no downstream stage reads, and the miss was silent: the EBM/af2rank
+        # completeness checks return True on an empty sample glob, so both reported
+        # "complete" and the run exited 0 having scored nothing.
+        root_path = os.path.join(root_path, conditioning_label("seq"))
     elif conditioning_mode == "seq_cath":
         root_path = os.path.join(root_path, "seq_cath_cond")
     elif conditioning_mode == "unconditional":
