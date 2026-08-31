@@ -121,7 +121,10 @@ fig.text(
     "DIFFERENT 8082-chain validation split, so its absolute values are not comparable to the other two.\n"
     f"Validation traces are {SMOOTH}-point rolling medians (validation logs ~18x/epoch).   "
     "\nlocal_attn max384 carries two mid-run discontinuities: 1->2 GPU at ~epoch 3 and an LR-horizon correction "
-    "(822k->411k cosine steps) at ~epoch 120; effective batch stayed 32 throughout.",
+    "(822k->411k cosine steps) at ~epoch 120; effective batch stayed 32 throughout."
+    # Without this the blue curve's end reads as convergence, which it is not.
+    "\nARMS ARE NO LONGER CONTEMPORANEOUS: local_attn STOPPED 2026-08-27 at epoch 386 because its launcher's chain "
+    "budget ran out (not a crash, not a convergence decision); tri_mul is still training.",
     ha="center", va="top", fontsize=8.0, color="#555555",
 )
 fig.tight_layout()
