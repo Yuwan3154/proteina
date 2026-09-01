@@ -119,7 +119,7 @@ def main(args):
                 distogram_probs=None,
                 residue_type=aatype.unsqueeze(0).to(infer.device),
                 mask=rmask.unsqueeze(0).to(infer.device),
-                template_mode="full_template",
+                template_mode=args.template_mode,
                 template_mmcif_path=cif,
                 template_chain_id=chain,
                 kalign_binary_path=kalign,
@@ -141,7 +141,8 @@ def main(args):
             np.savez_compressed(os.path.join(conf_dir, f"{vid}_{tag}_s0.npz"),
                                 plddt=plddt_per_res, pae=pae)
             row = {"id": vid, "sample": 0, "model": model_name, "n_res": n_res,
-                   "template_cif": cif, "template_chain": chain, "pdb": out_pdb, **scores}
+                   "template_mode": args.template_mode, "template_cif": cif,
+                   "template_chain": chain, "pdb": out_pdb, **scores}
             with open(out_jsonl, "a") as f:
                 f.write(json.dumps(row) + "\n")
             print(f"[{tag} {ei + 1}/{len(files)}] {vid}: L={n_res} "
@@ -159,6 +160,13 @@ if __name__ == "__main__":
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--params_dir", required=True)
     ap.add_argument("--model_name", default="model_1_ptm")
+    ap.add_argument("--template_mode", default="full_template",
+                    choices=["full_template", "full_template_zero_coords"],
+                    help="full_template_zero_coords is MISNAMED in openfold_inference: the coords are "
+                         "kept, it zeroes the template unit-vector and torsion-angle channels -- i.e. "
+                         "exactly the channel set distogram_only forces. Running both decomposes the "
+                         "distogram-vs-template gap into 'binned distogram vs exact coords' and "
+                         "'zeroed geometry channels'.")
     ap.add_argument("--recycles", type=int, default=None)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--limit", type=int, default=None)
