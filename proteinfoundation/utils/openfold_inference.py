@@ -705,14 +705,21 @@ class OpenFoldTemplateInference(nn.Module):
         )
         msa_features = make_dummy_msa_feats(sequence)
         template_seq = sequence
+        # ⛔ HHBLITS order, NOT restype_order_with_x. The feature pipeline unconditionally applies
+        # data_transforms.fix_templates_aatype, which permutes template_aatype through
+        # MAP_HHBLITS_AATYPE_TO_OUR_AATYPE -- i.e. it ASSUMES the one-hot was built in HHBLITS
+        # order, exactly as the genuine template path does (openfold/data/templates.py: 
+        # sequence_to_onehot(seq, HHBLITS_AA_TO_ID)). Building it in our own order here meant the
+        # permutation scrambled it: measured 6/40 identity between the template sequence AF2 saw
+        # and the query, so the aatype half of the template pair features (44 of 88 channels) plus
+        # the template single/angle row carried a WRONG sequence.
         template_aatype_one_hot = rc.sequence_to_onehot(
             sequence=template_seq,
-            mapping=rc.restype_order_with_x,
+            mapping=rc.HHBLITS_AA_TO_ID,
             map_unknown_to_x=True,
         ).astype(np.float32)
-        template_aatype = np.zeros(
-            (1, num_res, len(rc.restypes_with_x_and_gap)), dtype=np.float32
-        )
+        n_cls = len(rc.restypes_with_x_and_gap)
+        template_aatype = np.zeros((1, num_res, n_cls), dtype=np.float32)
         template_aatype[..., : template_aatype_one_hot.shape[-1]] = template_aatype_one_hot[None, ...]
         mask_f = mask.astype(np.float32)
         template_features = {
