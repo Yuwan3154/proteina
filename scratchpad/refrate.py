@@ -55,12 +55,22 @@ def main():
                     return found
         return None
 
-    # The transform is composed onto the DATAMODULE (base_data.py:100), not the dataset.
-    tr = (_find_topology_transform(getattr(dm, "transform", None))
-          or _find_topology_transform(getattr(dl.dataset, "transform", None)))
-    print(f"[transform] {'found' if tr is not None else 'NOT found -- route attribution skipped'}", flush=True)
-    if tr is not None:
-        tr._ensure_loaded()
+    # Read the index FILE; the live transform object is not reachable from dm or the dataset.
+    data_dir = os.environ["DATA_PATH"] + "/pdb_train"
+    idx = torch.load(os.path.join(data_dir, "topology_index.pt"), map_location="cpu",
+                     weights_only=False, mmap=True)
+    id_to_row = {str(v): i for i, v in enumerate(idx["ids"])}
+    print(f"[index] {len(id_to_row)} chains", flush=True)
+
+    def has_candidates(row):
+        """Would _pick_template have had a different-sequence mate to choose from?"""
+        cl = int(idx["cluster_of"][row])
+        lo, hi = int(idx["members_offset"][cl]), int(idx["members_offset"][cl + 1])
+        members = idx["members_flat"][lo:hi]
+        if members.numel() <= 1:
+            return False
+        own = idx["seq_hash"][row]
+        return int((idx["seq_hash"][members.long()] != own).sum()) > 0
 
     seen = present = empty = self_ref = 0
     routes = Counter()
@@ -78,27 +88,15 @@ def main():
             if r != p:
                 continue
             self_ref += 1
-            if tr is None:
-                continue
-            row = tr._id_to_row.get(str(p))
+            row = id_to_row.get(str(p))
             if row is None:
                 routes["query not in index"] += 1
-                continue
-            idx = tr._index
-            cl = int(idx["cluster_of"][row])
-            lo, hi = int(idx["members_offset"][cl]), int(idx["members_offset"][cl + 1])
-            members = idx["members_flat"][lo:hi]
-            if members.numel() <= 1:
-                routes["(a) singleton cluster"] += 1
+            elif has_candidates(row):
+                # The picker had real alternatives yet the emitted id equals the query: this
+                # cannot come from _pick_template, which returns self only 1.7% of the time.
+                routes["HAD candidates -- unexplained"] += 1
             else:
-                own = idx["seq_hash"][row]
-                cand = members[idx["seq_hash"][members.long()] != own]
-                if cand.numel() == 0:
-                    routes["(a) all mates share seq_hash"] += 1
-                else:
-                    # A different-sequence mate existed, so the picker DID choose one; landing on
-                    # self means route (b) -- the pick had no usable runs and was reverted.
-                    routes["(b) picked template had NO runs"] += 1
+                routes["no different-seq mate (expected)"] += 1
 
     print(f"\nsplit={SPLIT}  batches={min(N_BATCHES, i + 1)}  samples={seen}")
     print(f"  reference present : {present}  ({present / max(seen, 1):.1%})")

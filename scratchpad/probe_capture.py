@@ -84,16 +84,57 @@ def main():
     nn = model.nn
     max_rel = int(nn.max_rel_pos)
     grab = {}
+    stash = []
 
-    def pre_hook(_mod, inp):
+    def z_pre_hook(_mod, inp):
         # out_norm's input is the final z, [B, N, N, dim], after all 12 TriBlocks.
         grab["z"] = inp[0].detach()
 
-    h = nn.out_norm.register_forward_pre_hook(pre_hook)
+    def nn_pre_hook(_mod, inp):
+        # ⛔ `contact_map_t` is built by the TRAINER's noising step, not by the dataloader, so the
+        # nn cannot be called on a raw batch. Hooking the real validate pass is what makes the
+        # captured features the ones the model actually computes.
+        grab["batch"] = inp[0]
+
+    def nn_post_hook(_mod, _inp, _out):
+        b = grab.get("batch")
+        z = grab.get("z")
+        if b is None or z is None:
+            return
+        if "keys_printed" not in grab:
+            grab["keys_printed"] = True
+            print(f"[nn batch keys] {sorted(k for k in b)}", flush=True)
+        refs = b.get("topology_ref_id")
+        pids = b.get("protein_id")
+        if refs is None or pids is None:
+            grab["missing_ids"] = True
+            return
+        mask = b["mask"]
+        he_pos_raw = b["topology_he_pos_raw"]
+        he_tokens = b["topology_he_tokens"]
+        Lpad = mask.shape[1]
+        for k in range(len(pids)):
+            r, p = str(refs[k]), str(pids[k])
+            if not r or r == p:
+                continue
+            Lv = int(mask[k].sum())
+            Tv = int((he_tokens[k] > 0).sum())
+            if Lv == 0 or Tv == 0:
+                continue
+            # Slice inside the hook: a whole z is 128 MB, the QT block is ~15 MB.
+            feat = z[k, :Lv, Lpad:Lpad + Tv, :].to(torch.float16).cpu()
+            i_idx = torch.arange(Lv, dtype=torch.float32)
+            off = (i_idx[:, None] - he_pos_raw[k, :Tv].float().cpu()[None, :]).round().long()
+            off = off.clamp(-max_rel, max_rel) + max_rel
+            stash.append({"feat": feat, "off": off, "query": p, "ref": r, "L": Lv, "T": Tv})
+
+    h1 = nn.out_norm.register_forward_pre_hook(z_pre_hook)
+    h2 = nn.register_forward_pre_hook(nn_pre_hook)
+    h3 = nn.register_forward_hook(nn_post_hook)
 
     dm = hydra.utils.instantiate(cfg_data.datamodule)
-    dm.setup("fit")
-    dl = dm.val_dataloader()
+    # ⛔ Do NOT call dm.setup() here. trainer.validate() calls it again, and pdb_data.py:1584
+    # does `if not self.df_data:` on an already-populated DataFrame -> "truth value is ambiguous".
     # Read the index FILE, not the live transform object: the object is reachable from neither
     # dm.transform nor dl.dataset.transform, and the file has everything needed.
     data_dir = os.environ["DATA_PATH"] + "/pdb_train"
@@ -111,83 +152,58 @@ def main():
     print(f"[index] {len(id_to_row)} chains", flush=True)
 
     os.makedirs(args.out, exist_ok=True)
+
+    import lightning as L
+    trainer = L.Trainer(
+        accelerator="gpu" if dev == "cuda" else "cpu", devices=1, num_nodes=1, logger=False,
+        enable_checkpointing=False, enable_progress_bar=False,
+        limit_val_batches=args.max_batches,
+    )
+    trainer.validate(model, datamodule=dm, ckpt_path=None, verbose=False)
+    for h in (h1, h2, h3):
+        h.remove()
+
+    if grab.get("missing_ids"):
+        print("FAIL: the batch reaching model.nn carries no protein_id/topology_ref_id", flush=True)
+        return 5
+    print(f"[stash] {len(stash)} cross-chain samples captured", flush=True)
+
     kept = 0
-    skipped = {"empty": 0, "self": 0, "no_runs": 0, "gt_error": 0, "no_alignment": 0}
-
-    for bi, batch in enumerate(dl):
-        if kept >= args.n_samples or bi >= args.max_batches:
+    skipped = {"no_runs": 0, "gt_error": 0, "no_alignment": 0}
+    for item in stash:
+        if kept >= args.n_samples:
             break
-        refs = [str(r) for r in batch["topology_ref_id"]]
-        pids = [str(p) for p in batch["protein_id"]]
-        usable = [k for k, (r, p) in enumerate(zip(refs, pids)) if r and r != p]
-        for k, (r, p) in enumerate(zip(refs, pids)):
-            if not r:
-                skipped["empty"] += 1
-            elif r == p:
-                skipped["self"] += 1
-        if not usable:
+        q, r, Tv = item["query"], item["ref"], item["T"]
+        rrow = id_to_row.get(r)
+        if rrow is None:
+            skipped["no_runs"] += 1
             continue
-
-        dev_batch = {k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in batch.items()}
-        with torch.no_grad():
-            model.nn(dev_batch)
-        z = grab.get("z")
-        if z is None:
+        runs = runs_for(rrow)
+        if not runs:
+            skipped["no_runs"] += 1
             continue
-
-        mask = batch["mask"]
-        he_pos_raw = batch["topology_he_pos_raw"]
-        he_tokens = batch["topology_he_tokens"]
-        N = z.shape[1]
-        Lpad = mask.shape[1]
-        Tpad = N - Lpad
-
-        for k in usable:
-            if kept >= args.n_samples:
-                break
-            q, r = pids[k], refs[k]
-            rrow = id_to_row.get(r)
-            if rrow is None:
-                skipped["no_runs"] += 1
-                continue
-            runs = runs_for(rrow)
-            if not runs:
-                skipped["no_runs"] += 1
-                continue
-            try:
-                gq = load_graph(processed, q, manifest)
-                gr = load_graph(processed, r, manifest)
-                with tempfile.TemporaryDirectory() as td:
-                    A, Q = build_alignment(gq, gr, runs, Tpad, td)
-            except Exception as e:  # noqa: BLE001
-                skipped["gt_error"] += 1
+        try:
+            gq = load_graph(processed, q, manifest)
+            gr = load_graph(processed, r, manifest)
+            with tempfile.TemporaryDirectory() as td:
+                A, Q = build_alignment(gq, gr, runs, Tv, td)
+        except Exception as e:  # noqa: BLE001
+            skipped["gt_error"] += 1
+            if skipped["gt_error"] <= 5:
                 print(f"  [gt] {q}->{r}: {type(e).__name__}: {e}", flush=True)
-                continue
-            if Q == 0:
-                skipped["no_alignment"] += 1
-                continue
-
-            Lv = int(mask[k].sum())
-            Tv = int((he_tokens[k] > 0).sum())
-            if Lv == 0 or Tv == 0:
-                continue
-            # Only real residues/elements; padded rows carry a learned constant, not information.
-            feat = z[k, :Lv, Lpad:Lpad + Tv, :].to(torch.float16).cpu()
-            i_idx = torch.arange(Lv, dtype=torch.float32)
-            off = (i_idx[:, None] - he_pos_raw[k, :Tv][None, :]).round().long()
-            off = off.clamp(-max_rel, max_rel) + max_rel
-            gt = A[:Lv, :Tv].clone()
-            if int(gt.sum()) == 0:
-                skipped["no_alignment"] += 1
-                continue
-            torch.save(
-                {"feat": feat, "off": off, "gt": gt, "query": q, "ref": r,
-                 "L": Lv, "T": Tv, "Q": int((gt.sum(dim=1) > 0).sum())},
-                os.path.join(args.out, f"s{kept:05d}.pt"),
-            )
-            kept += 1
-            if kept % 20 == 0:
-                print(f"  kept {kept}/{args.n_samples}", flush=True)
+            continue
+        gt = A[: item["L"], : Tv].clone()
+        if int(gt.sum()) == 0:
+            skipped["no_alignment"] += 1
+            continue
+        torch.save(
+            {"feat": item["feat"], "off": item["off"], "gt": gt, "query": q, "ref": r,
+             "L": item["L"], "T": Tv, "Q": int((gt.sum(dim=1) > 0).sum())},
+            os.path.join(args.out, f"s{kept:05d}.pt"),
+        )
+        kept += 1
+        if kept % 20 == 0:
+            print(f"  kept {kept}/{args.n_samples}", flush=True)
 
     h.remove()
     print(f"\nkept={kept}  skipped={skipped}", flush=True)

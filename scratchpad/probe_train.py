@@ -119,14 +119,25 @@ def main():
     n_off = int(max(int(s["off"].max()) for s in samples)) + 1
     dev = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Split by chain. Deterministic: sorted by query id, every 1/test_frac-th to test.
-    samples.sort(key=lambda s: s["query"])
+    # ⛔ Split by UNIQUE QUERY CHAIN, not by sample index. The same query recurs across samples
+    # (the sampler can draw it more than once with a different reference), so an index split puts
+    # the same chain on both sides and the probe can memorise it. A first attempt did exactly that
+    # -- 31 chains overlapped -- and inflated the probe score.
+    queries = sorted({s["query"] for s in samples})
     stride = max(int(1 / args.test_frac), 2)
-    test = [s for i, s in enumerate(samples) if i % stride == 0]
-    train = [s for i, s in enumerate(samples) if i % stride != 0]
-    print(f"samples={len(samples)} train={len(train)} test={len(test)} dim={dim} n_off={n_off}")
-    print(f"chains overlap train/test: "
-          f"{len({s['query'] for s in train} & {s['query'] for s in test})} (must be 0)")
+    test_q = {q for i, q in enumerate(queries) if i % stride == 0}
+    test = [s for s in samples if s["query"] in test_q]
+    train = [s for s in samples if s["query"] not in test_q]
+    overlap = len({s["query"] for s in train} & {s["query"] for s in test})
+    print(f"samples={len(samples)} unique_queries={len(queries)} "
+          f"train={len(train)} test={len(test)} dim={dim} n_off={n_off}")
+    print(f"chains overlap train/test: {overlap} (must be 0)")
+    if overlap != 0:
+        print("FAIL: query-chain leakage between train and test", flush=True)
+        return 3
+    if not train or not test:
+        print("FAIL: an empty split", flush=True)
+        return 4
 
     qs = torch.tensor([float(s["Q"]) for s in samples])
     ls = torch.tensor([float(s["L"]) for s in samples])
