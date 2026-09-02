@@ -112,10 +112,25 @@ def main():
     ap.add_argument("--epochs", type=int, default=8)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--folds", type=int, default=5)
+    ap.add_argument("--dedupe", action="store_true")
     args = ap.parse_args()
 
     samples = load_samples(args.data)
     assert samples, f"no samples in {args.data}"
+    if args.dedupe:
+        # Self-conditioning forwards the same batch twice per step, so the same (query, reference)
+        # pair can be captured twice -- with DIFFERENT features (the second forward receives the
+        # model's own prediction as contact_map_sc), so this is near-duplication, not duplication.
+        # Keeping both gives those chains double weight; --dedupe keeps the first forward only.
+        seen, kept = set(), []
+        for x in samples:
+            k = (x["query"], x["ref"])
+            if k in seen:
+                continue
+            seen.add(k)
+            kept.append(x)
+        print(f"[dedupe] {len(samples)} forwards -> {len(kept)} distinct (query, ref) pairs")
+        samples = kept
     dim = samples[0]["feat"].shape[-1]
     n_off = int(max(int(s["off"].max()) for s in samples)) + 1
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -128,13 +143,19 @@ def main():
     print(f"samples={len(samples)} unique_queries={len(queries)} dim={dim} n_off={n_off}")
     qs = torch.tensor([float(s["Q"]) for s in samples])
     ls = torch.tensor([float(s["L"]) for s in samples])
-    print(f"Q/L: mean={float((qs / ls).mean()):.1%}  Q median={int(qs.median())}\n")
+    cells = sum(int(x["L"]) * int(x["T"]) for x in samples)
+    pos = sum(int(x["gt"].sum()) for x in samples)
+    print(f"Q/L: mean={float((qs / ls).mean()):.1%}  Q median={int(qs.median())}")
+    print(f"cells: {cells:,} total  positives: {pos:,} ({pos/max(cells,1):.2%})  "
+          f"L median={int(ls.median())}  T median={int(torch.tensor([float(x['T']) for x in samples]).median())}")
+    print(f"params: floor={n_off}  probe={dim+1}  both={dim+n_off+1}\n")
 
     # K-FOLD over chains. One split gave a single number with no error bar; folds give a spread, and
     # the spread is what says whether probe-minus-floor is bigger than run-to-run variation.
     K = args.folds
     folds = [{q for i, q in enumerate(queries) if i % K == k} for k in range(K)]
     per_mode = {m: [] for m in ("floor", "probe", "both")}
+    per_train = {m: [] for m in ("floor", "probe", "both")}
     for k in range(K):
         test_q = folds[k]
         test = [s for s in samples if s["query"] in test_q]
@@ -149,16 +170,24 @@ def main():
         print(f"  --- fold {k + 1}/{K}: train={len(train)} test={len(test)} chains_overlap=0 ---", flush=True)
         for mode in ("floor", "probe", "both"):
             m = fit(train, mode, n_off, dim, args.epochs, args.lr, dev, quiet=True)
+            # Evaluate on TRAIN as well as TEST: with a 320-parameter head on millions of cells
+            # overfitting is unlikely, but that should be measured rather than asserted.
+            tr_mean, _, tr_n = evaluate(m, train, mode, n_off, dev)
             mean, med, n = evaluate(m, test, mode, n_off, dev)
             per_mode[mode].append(mean)
-            print(f"      {mode:6s} mean={mean:.4f} median={med:.4f} n={n}", flush=True)
+            per_train[mode].append(tr_mean)
+            print(f"      {mode:6s} train={tr_mean:.4f} (n={tr_n})  test={mean:.4f} "
+                  f"median={med:.4f} (n={n})   gap={tr_mean - mean:+.4f}", flush=True)
 
     print("\n=== precision@Q, {}-fold over held-out chains ===".format(K))
     summ = {}
     for mode in ("floor", "probe", "both"):
         t = torch.tensor(per_mode[mode])
+        tr = torch.tensor(per_train[mode])
         summ[mode] = (float(t.mean()), float(t.std()))
-        print(f"  {mode:6s} mean={t.mean():.4f}  sd={t.std():.4f}  folds={list(round(float(x),4) for x in t)}")
+        print(f"  {mode:6s} TEST mean={t.mean():.4f} sd={t.std():.4f} | TRAIN mean={tr.mean():.4f} "
+              f"| train-test gap={float(tr.mean() - t.mean()):+.4f}")
+        print(f"         test folds={list(round(float(x),4) for x in t)}")
     d = summ["probe"][0] - summ["floor"][0]
     # Propagate both spreads rather than quoting the gap as if it were exact.
     sd = (summ["probe"][1] ** 2 + summ["floor"][1] ** 2) ** 0.5
