@@ -278,6 +278,15 @@ class TopologyReferenceTransform(T.BaseTransform):
         if not self._runs_for(t_row):
             t_row = row
 
+        # The alignment probe's USalign ground truth has to know WHICH chain the reference came
+        # from, and the six topology_* tensors do not identify it. Augmentation perturbs element
+        # lengths, so the probe must read the reference's TRUE runs back out of the index by this
+        # id rather than trusting the tensors below.
+        # Self-reference (the 6.66% with no different-sequence cluster-mate) is detectable by
+        # comparing this against protein_id, so it needs no second attribute -- and a str is the
+        # only non-tensor type already proven to survive the collate.
+        graph.topology_ref_id = str(self._index["ids"][t_row])
+
         for key, value in self._build_reference(t_row, L, augment=True).items():
             setattr(graph, key, value)
         return graph
@@ -292,6 +301,8 @@ class TopologyReferenceTransform(T.BaseTransform):
         graph.topology_he_pos_raw = torch.zeros(1, dtype=torch.float32)
         graph.topology_he_contact = torch.zeros(1, 1)
         graph.topology_he_feat = torch.zeros(1, 1, N_PAIR_FEATURES)
+        # Always present, so the key set does not vary across graphs in a batch.
+        graph.topology_ref_id = ""
         return graph
 
     def __repr__(self) -> str:
