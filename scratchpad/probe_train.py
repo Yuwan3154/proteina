@@ -52,7 +52,7 @@ def load_samples(d):
     return out
 
 
-def fit(samples, mode, n_off, dim, epochs, lr, dev):
+def fit(samples, mode, n_off, dim, epochs, lr, dev, quiet=False):
     if mode == "floor":
         model = torch.nn.Embedding(n_off, 1)
         torch.nn.init.zeros_(model.weight)
@@ -83,7 +83,8 @@ def fit(samples, mode, n_off, dim, epochs, lr, dev):
             opt.step()
             tot += float(loss)
             nb += 1
-        print(f"    [{mode}] epoch {ep + 1}/{epochs} loss={tot / max(nb, 1):.4f}", flush=True)
+        if not quiet:
+            print(f"    [{mode}] epoch {ep + 1}/{epochs} loss={tot / max(nb, 1):.4f}", flush=True)
     return model
 
 
@@ -110,7 +111,7 @@ def main():
     ap.add_argument("--data", required=True)
     ap.add_argument("--epochs", type=int, default=8)
     ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--test_frac", type=float, default=0.3)
+    ap.add_argument("--folds", type=int, default=5)
     args = ap.parse_args()
 
     samples = load_samples(args.data)
@@ -124,38 +125,44 @@ def main():
     # the same chain on both sides and the probe can memorise it. A first attempt did exactly that
     # -- 31 chains overlapped -- and inflated the probe score.
     queries = sorted({s["query"] for s in samples})
-    stride = max(int(1 / args.test_frac), 2)
-    test_q = {q for i, q in enumerate(queries) if i % stride == 0}
-    test = [s for s in samples if s["query"] in test_q]
-    train = [s for s in samples if s["query"] not in test_q]
-    overlap = len({s["query"] for s in train} & {s["query"] for s in test})
-    print(f"samples={len(samples)} unique_queries={len(queries)} "
-          f"train={len(train)} test={len(test)} dim={dim} n_off={n_off}")
-    print(f"chains overlap train/test: {overlap} (must be 0)")
-    if overlap != 0:
-        print("FAIL: query-chain leakage between train and test", flush=True)
-        return 3
-    if not train or not test:
-        print("FAIL: an empty split", flush=True)
-        return 4
-
+    print(f"samples={len(samples)} unique_queries={len(queries)} dim={dim} n_off={n_off}")
     qs = torch.tensor([float(s["Q"]) for s in samples])
     ls = torch.tensor([float(s["L"]) for s in samples])
     print(f"Q/L: mean={float((qs / ls).mean()):.1%}  Q median={int(qs.median())}\n")
 
-    results = {}
-    for mode in ("floor", "probe", "both"):
-        print(f"  --- {mode} ---", flush=True)
-        m = fit(train, mode, n_off, dim, args.epochs, args.lr, dev)
-        results[mode] = evaluate(m, test, mode, n_off, dev)
+    # K-FOLD over chains. One split gave a single number with no error bar; folds give a spread, and
+    # the spread is what says whether probe-minus-floor is bigger than run-to-run variation.
+    K = args.folds
+    folds = [{q for i, q in enumerate(queries) if i % K == k} for k in range(K)]
+    per_mode = {m: [] for m in ("floor", "probe", "both")}
+    for k in range(K):
+        test_q = folds[k]
+        test = [s for s in samples if s["query"] in test_q]
+        train = [s for s in samples if s["query"] not in test_q]
+        overlap = len({s["query"] for s in train} & {s["query"] for s in test})
+        if overlap != 0:
+            print(f"FAIL: fold {k} leaks {overlap} chains", flush=True)
+            return 3
+        if not train or not test:
+            print(f"FAIL: fold {k} empty", flush=True)
+            return 4
+        print(f"  --- fold {k + 1}/{K}: train={len(train)} test={len(test)} chains_overlap=0 ---", flush=True)
+        for mode in ("floor", "probe", "both"):
+            m = fit(train, mode, n_off, dim, args.epochs, args.lr, dev, quiet=True)
+            mean, med, n = evaluate(m, test, mode, n_off, dev)
+            per_mode[mode].append(mean)
+            print(f"      {mode:6s} mean={mean:.4f} median={med:.4f} n={n}", flush=True)
 
-    print("\n=== precision@Q on held-out chains ===")
+    print("\n=== precision@Q, {}-fold over held-out chains ===".format(K))
+    summ = {}
     for mode in ("floor", "probe", "both"):
-        mean, med, n = results[mode]
-        print(f"  {mode:6s} mean={mean:.4f}  median={med:.4f}  n={n}")
-    fm = results["floor"][0]
-    pm = results["probe"][0]
-    print(f"\n  probe - floor = {pm - fm:+.4f}")
+        t = torch.tensor(per_mode[mode])
+        summ[mode] = (float(t.mean()), float(t.std()))
+        print(f"  {mode:6s} mean={t.mean():.4f}  sd={t.std():.4f}  folds={list(round(float(x),4) for x in t)}")
+    d = summ["probe"][0] - summ["floor"][0]
+    # Propagate both spreads rather than quoting the gap as if it were exact.
+    sd = (summ["probe"][1] ** 2 + summ["floor"][1] ** 2) ** 0.5
+    print(f"\n  probe - floor = {d:+.4f}  (combined sd {sd:.4f})")
     print("  ^ this difference, not the probe number, is the answer to "
           "'has the trunk already learned to realign'")
     return 0

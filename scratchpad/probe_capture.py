@@ -55,9 +55,13 @@ def find_transform(obj, depth=0):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config_name", default="training_contact_tri_full384_v1")
-    ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--ckpt", default="")
     ap.add_argument("--out", required=True)
     ap.add_argument("--n_samples", type=int, default=200)
+    # ⛔ CONTROL: skip the checkpoint entirely. A linear probe on RANDOM features can score well on
+    # its own, and this repo's own tests note the tri trunk is near-identity at init -- so without
+    # this control we cannot say the trained probe result reflects anything LEARNED.
+    ap.add_argument("--random_init", action="store_true")
     ap.add_argument("--max_batches", type=int, default=4000)
     args = ap.parse_args()
 
@@ -73,11 +77,14 @@ def main():
         cfg_data = hydra.compose(config_name=cfg_exp.dataset)
 
     model = Proteina(cfg_exp, store_dir="/tmp/probe_store")
-    ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    sd = ck["state_dict"] if "state_dict" in ck else ck
-    missing, unexpected = model.load_state_dict(sd, strict=False)
-    assert not missing and not unexpected, f"partial load {len(missing)}/{len(unexpected)}"
-    print(f"[load] epoch={ck.get('epoch')} step={ck.get('global_step')} clean", flush=True)
+    if args.random_init:
+        print("[load] RANDOM INIT -- no checkpoint loaded (control arm)", flush=True)
+    else:
+        ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+        sd = ck["state_dict"] if "state_dict" in ck else ck
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        assert not missing and not unexpected, f"partial load {len(missing)}/{len(unexpected)}"
+        print(f"[load] epoch={ck.get('epoch')} step={ck.get('global_step')} clean", flush=True)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(dev).eval()
 
