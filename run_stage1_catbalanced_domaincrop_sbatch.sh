@@ -100,6 +100,14 @@ export DIAG_DATALOADER=1
 export TORCHINDUCTOR_CACHE_DIR=/orcd/compute/so3/001/chenxi/torchinductor_cache
 export TRITON_CACHE_DIR=/orcd/compute/so3/001/chenxi/triton_cache
 mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
+# ⛔⛔ THE CORRUPTION FIX. Lightning's atomic checkpoint save writes a temp file and RENAMES it into
+# place; a rename is only atomic WITHIN one filesystem. The checkpoints dir is on fstor018 (orcd
+# scratch) while the default TMPDIR is /tmp (tmpfs), so every save was a CROSS-DEVICE rename and the
+# atomicity guarantee silently did not hold -- which is how the preemption at 2026-07-24T01:53 left
+# last.ckpt truncated to 0 bytes and took the run down for two months. Keeping TMPDIR on the same
+# filesystem as the checkpoints makes the rename a real rename again.
+export TMPDIR="$REPO/store/$RUN/checkpoints/.tmp"
+mkdir -p "$TMPDIR"
 # >>> in-RAM packed dataset (2026-06-27): mmap the single blob on the data disk (roundtrip-validated,
 # fork-safe). Unsetting PACK_PATH reverts to per-file disk mode via the (re-pointed) symlinks.
 export PACK_PATH=/orcd/data/so3/001/chenxi/pdb_dFS_combined_pack/combined.pack
