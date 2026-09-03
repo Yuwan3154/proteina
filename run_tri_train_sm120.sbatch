@@ -38,6 +38,9 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_TH
 export TORCHINDUCTOR_CACHE_DIR=/orcd/scratch/orcd/011/chenxiou/torchinductor_cache_sm120
 export TRITON_CACHE_DIR=/orcd/scratch/orcd/011/chenxiou/triton_cache_sm120
 mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$REPO/logs"
+# Lightning's atomic ckpt save renames a temp file and a cross-device rename is not atomic (see 07dbb58); it also made wandb copy rather than rename, which is what hit EDQUOT on 2026-09-02.
+export TMPDIR="$REPO/store/$RUN/checkpoints/.tmp"
+mkdir -p "$TMPDIR"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH=$REPO${PYTHONPATH:+:$PYTHONPATH}
 
