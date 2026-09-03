@@ -10,6 +10,7 @@
 
 
 import io
+import json
 import math
 import os
 import random
@@ -2811,6 +2812,33 @@ class ModelTrainerBase(L.LightningModule):
             )
         return torch.stack(out, dim=0)
 
+    def _topology_reference_map(self) -> Dict[str, str]:
+        """Optional {query stem -> reference stem} map for validation sampling.
+
+        Conditioning a chain on ANOTHER chain's topology is the "can it realise a topology it did
+        not come from" experiment; without this the only option is each chain's own topology. The
+        map is read from ``validation_sampling.topology_reference_map`` (a JSON path) and cached.
+        """
+        cached = getattr(self, "_topology_reference_map_cache", None)
+        if cached is not None:
+            return cached
+        path = self.cfg_exp.validation_sampling.get("topology_reference_map", None)
+        if not path:
+            self._topology_reference_map_cache = {}
+            return {}
+        with open(path) as fh:
+            m = json.load(fh)
+        assert isinstance(m, dict) and all(
+            isinstance(k, str) and isinstance(v, str) for k, v in m.items()
+        ), f"topology_reference_map must be a flat str->str JSON object: {path}"
+        logger.info(
+            f"validation_sampling: topology_reference_map loaded from {path} -- "
+            f"{len(m)} chains conditioned on another chain's topology "
+            f"({sum(1 for k, v in m.items() if k == v)} map to themselves)."
+        )
+        self._topology_reference_map_cache = m
+        return m
+
     def _build_self_reference_topology(
         self, batch, nsamples: int, mask: Tensor
     ) -> Optional[Dict[str, Tensor]]:
@@ -2841,14 +2869,24 @@ class ModelTrainerBase(L.LightningModule):
                 f"(got {type(stems).__name__}); sampling UNCONDITIONED."
             )
             return None
+        ref_map = self._topology_reference_map()
         refs = []
         for s in range(nsamples):
             stem = str(stems[s])
-            ref = transform.self_reference(stem, int(mask[s].sum()))
+            src = ref_map.get(stem, stem) if ref_map else stem
+            if ref_map and stem not in ref_map:
+                logger.warning(
+                    f"validation_sampling: topology_reference_map is set but has no entry for "
+                    f"{stem}; that chain would silently fall back to its OWN topology, which is a "
+                    "different experiment. Sampling UNCONDITIONED instead."
+                )
+                return None
+            ref = transform.self_reference(src, int(mask[s].sum()))
             if ref is None:
                 logger.warning(
-                    f"validation_sampling: {stem} is absent from the topology index; "
-                    "sampling UNCONDITIONED."
+                    f"validation_sampling: {src} is absent from the topology index"
+                    + (f" (reference for {stem})" if src != stem else "")
+                    + "; sampling UNCONDITIONED."
                 )
                 return None
             refs.append(ref)
