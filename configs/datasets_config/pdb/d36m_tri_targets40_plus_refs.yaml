@@ -84,7 +84,7 @@ datamodule:
   datasplitter:
     _target_: "proteinfoundation.datasets.pdb_data.PDBDataSplitter"
     data_dir: /orcd/scratch/orcd/011/chenxiou/d36m_tri_data/ # Directory where the dataset is stored
-    train_val_test: [0.0, 1.0, 0.0] # D36m is an eval set: every chain goes to val
+    train_val_test: [0.8, 0.2, 0.0] # BOTH splits must be non-empty: the index builder resolves paths through dm.train_ds, and trainer.validate() needs a val batch to fire. Membership is irrelevant -- the index covers every split, and _fixed_val_batches ignores the split entirely.
     split_type: "sequence_similarity" # Split sequences by sequence similarity clustering, other option is "random"
     split_sequence_similarity: 0.25 # Clustering at 25% sequence similarity (argument is ignored if split_type!="sequence_similarity")
     overwrite_sequence_clusters: False # Previous clusterings at same sequence similarity are reused and not overwritten (argument is ignored if split_type!="sequence_similarity")
