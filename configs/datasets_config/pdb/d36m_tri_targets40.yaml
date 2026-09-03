@@ -1,0 +1,94 @@
+# D36m: the 40 bad_afdb targets that fit tri's 384 training length, as a VAL-only eval set.
+# Derived from pdb_train_contact-confind-topology_S25_max384_purge-test_cutoff-190828.yaml;
+# only data_dir, the topology index, the split and the topology AUGMENTATION differ.
+# drop/mutate/sigma are 0 so the reference is EXACTLY the one selected -- not a perturbed or
+# randomly-dropped cluster-mate. Retrieval must not intervene in a controlled comparison.
+# max384 variant of the contact-confind-topology full split, for the triangle arm ONLY.
+# The tri model's cost is an N^3 einsum over the joint (L+T) grid, so it cannot reach the 512
+# the local_attn arm trains at: batch 1 at L=512 does not fit in 95 GB.
+datamodule:
+  _target_: "proteinfoundation.datasets.pdb_data.PDBLightningDataModule"
+  data_dir: /orcd/scratch/orcd/011/chenxiou/d36m_tri_data/ # Directory where the dataset is stored
+  in_memory: False
+  format: "cif" # format for file download
+  overwrite: False # Whether to overwrite existing dataset files and reprocess the raw data
+  regenerate_missing: True # When True, regenerate only missing .pt files (e.g. after purge_invalid_pt_files)
+  # arguments for BaseLightningDataModule class
+  batch_padding: True # whether we want a sparse PyG batch or a padded dense batch
+  sampling_mode: "cluster-random" # sample randomly inside each sequence similarity cluster during training
+  cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/  # For CATH index conversion when fold_cond
+  multilabel_mode: "sample"  # sample | average | sum | transformer
+  transforms: 
+    - _target_: "proteinfoundation.datasets.transforms.GlobalRotationTransform" # Transforms to apply to dataset examples
+    - _target_: "proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform"
+    - _target_: "proteinfoundation.datasets.transforms.CATHLabelTransform" # activate for fold-conditional training
+      root_dir: ${oc.env:DATA_PATH}/cathdata/ # Root directory for CATH labels
+    - _target_: "proteinfoundation.datasets.transforms.CATHToIndicesTransform"  # Convert CATH strings to indices for model
+      cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/
+    - _target_: "proteinfoundation.datasets.transforms.DSSPTargetTransform"  # 3-state secondary structure for DSSP aux loss
+    - _target_: "proteinfoundation.datasets.transforms.ContactMapTransform"  # Required for contact_map_mode training
+      contact_method: confind  # Expects precomputed contact_map_confind in processed .pt files
+      confind_rotamer_lib: ${oc.env:DATA_PATH}/rotlibs
+      confind_contact_threshold: 0.01
+    - _target_: "proteinfoundation.datasets.topology_reference.TopologyReferenceTransform"
+      # Retrieves a same-cluster chain with a DIFFERENT sequence as the topology reference,
+      # falling back to the query's own topology for the 6.66% of chains with no such mate.
+      index_path: /orcd/scratch/orcd/011/chenxiou/d36m_tri_data/topology_index.pt
+      max_topology_len: 128          # covers the element-count distribution; see plan for percentiles
+      max_topology_he_len: 64        # helix/strand axis of the 2D SSE-by-SSE reference
+      sigma_frac: 0.0                # D36m: no augmentation
+      mutate_prob: 0.0               # D36m: no perturbation, the reference is exact
+      drop_prob: 0.0                 # D36m: never drop the reference
+                                     # Retrieval alone never produces this case: with
+                                     # self_fallback the chains that have no different-sequence
+                                     # mate still get a topology (their own), so without an
+                                     # explicit drop 0% of samples would ever train unconditioned.
+      self_fallback: True
+      min_len: 1                     # 1-residue elements are kept: 16.87% of all elements
+    - _target_: "proteinfoundation.datasets.transforms.PaddingTransform"
+      max_size: 384
+  batch_size: 1 # MEASURED on a 95 GB RTX PRO 6000: the tri model fits batch 1 only, at every
+                # length tried. At L=384 (grid N=384+64=448) peak is 71.81 GB = 76% of the card;
+                # batch 2 OOMs. L=448 fits at 99% and L=480 OOMs outright, which is why the
+                # length is 384 and not the 448/480 originally considered.
+  num_workers: 8 # Number of workers for dataloader
+  pin_memory: True # Pin memory for dataloader
+  prefetch_factor: 2 # Prefetch factor for dataloader
+
+  dataselector:
+    _target_: "proteinfoundation.datasets.pdb_data.PDBDataSelector"
+    data_dir: /orcd/scratch/orcd/011/chenxiou/d36m_tri_data/ # Directory where the dataset is stored
+    fraction: 1 # Fraction of dataset to use
+    molecule_type: "protein" # Type of molecule for which to select
+    experiment_types: ["diffraction", "EM"] # other options are "NMR" and "other"
+    min_length: 50 # Exclude peptides of length smaller than 50
+    max_length: 384 # Exclude polypeptides greater than length 384
+    oligomeric_min: null
+    oligomeric_max: null 
+    best_resolution: 0.0  # Include only proteins with resolution >= 0.0
+    worst_resolution: 5.0 # Include only proteins with resolution <= 5.0
+    has_ligands: [] # Include only proteins containing the ligand `ZN`
+    remove_ligands: [] # Exclude specific ligands from any available protein-ligand complexes
+    remove_non_standard_residues: True # Include only proteins containing standard amino acid residues
+    remove_pdb_unavailable: True # Include only proteins that are available to download
+    # NEW FEATURE 1: Release date cutoff (format: YYYY-MM-DD)
+    max_deposition_date: "2019-08-28" # Only include structures deposited on or before this date
+    # NOTE: exclude_ids moved to datasplitter for cluster-aware exclusion
+    exclude_ids: []  # Use exclude_ids_from_file in datasplitter (rosetta_decoys.txt)
+
+  datasplitter:
+    _target_: "proteinfoundation.datasets.pdb_data.PDBDataSplitter"
+    data_dir: /orcd/scratch/orcd/011/chenxiou/d36m_tri_data/ # Directory where the dataset is stored
+    train_val_test: [0.0, 1.0, 0.0] # D36m is an eval set: every chain goes to val
+    split_type: "sequence_similarity" # Split sequences by sequence similarity clustering, other option is "random"
+    split_sequence_similarity: 0.25 # Clustering at 25% sequence similarity (argument is ignored if split_type!="sequence_similarity")
+    overwrite_sequence_clusters: False # Previous clusterings at same sequence similarity are reused and not overwritten (argument is ignored if split_type!="sequence_similarity")
+    # NEW FEATURE 2: Cluster-aware exclusion
+    # For sequence_similarity split: entire clusters containing these IDs will be excluded
+    # For random split: only the specified IDs will be excluded
+    exclude_ids: []  # Inline IDs excluded from train, distributed to val/test
+    exclude_ids_from_file: null
+    # Unusable structures removed from EVERY split (per-chain, not cluster-aware, not
+    # redistributed to val/test): 46 chains that model one sequence position twice, plus one
+    # fragmented CA trace cg2all could not reconstruct.
+    drop_ids_from_file: null
