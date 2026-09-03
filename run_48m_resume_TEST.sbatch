@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=cb_dc_s1_48m_h200   # DEFAULT = H200 tier; per-tier submits OVERRIDE --job-name/--gres on the CLI
+#SBATCH --job-name=cbdc_resume_test   # DEFAULT = H200 tier; per-tier submits OVERRIDE --job-name/--gres on the CLI
 #SBATCH --partition=mit_preemptable
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:h200:4              # DEFAULT = H200; overridden per-tier on the sbatch CLI
 #SBATCH --cpus-per-task=20             # 4 ranks x 4 workers + 4 main; lean (training reads pre-processed .pt)
 #SBATCH --mem=400G                     # h200 default (overridden per-tier in _submit_tier/submit_tiered.sh: h100/l40s=300G). mmap is RECLAIMABLE; non-mmap working set ~50GB; 300-400G gives ample page-cache headroom. Was 768G but blocked scheduling on mix nodes (node5105 H200 has only 747GB total).
-#SBATCH --time=2-00:00:00              # 2-day MAX (mit_preemptable cap=48h)
+#SBATCH --time=2:00:00              # 2-day MAX (mit_preemptable cap=48h)
 #SBATCH --output=/home/chenxiou/proteina/store/dssp_contact_48M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined/slurm/%x-%j.out
 #SBATCH --error=/home/chenxiou/proteina/store/dssp_contact_48M_udlm_pb_v2_stage1_catbalanced_domaincrop_combined/slurm/%x-%j.err
 #SBATCH --no-requeue                   # mit_preemptable auto-requeues preempted jobs by default (Requeue=1); without
@@ -67,8 +67,10 @@ _submit_tier() {  # $1=tier  $2=gres  $3=begin ; anti-dup: skip if ANOTHER job o
 }
 # ESCALATE = start a fresh round: H200 now, H100 +6h (--begin gates the broadening). No L40S tier.
 escalate() {
-  _submit_tier h200 gpu:h200:4 now
-  _submit_tier h100 gpu:h100:4 now+6hours
+  # TEST BUILD: escalation is DISABLED. The production script submits a fresh 2-day H200 job and a
+  # +6h H100 job whenever a job ends; a short test would therefore launch the real production run
+  # as a side effect. Nothing here submits anything.
+  echo "[$(date)] TEST BUILD: escalate() suppressed (would have submitted h200 now + h100 +6h)"
 }
 
 ESCALATED=0
