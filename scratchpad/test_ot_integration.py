@@ -87,7 +87,10 @@ for mode in ("sinkhorn", "fgw"):
     cfg = dict(BASE)
     cfg["ot_align"] = dict(enabled=True, mode=mode, eps=0.1, n_iter=10, n_outer=3)
     m = ContactMapTriSiT(**cfg)
+    # Both of these are zero-initialised by design, so a fresh model has an all-zero gradient
+    # everywhere upstream of `out`. Un-zero them or this check measures nothing.
     torch.nn.init.normal_(m.ot_align.project.weight, std=0.05)
+    torch.nn.init.normal_(m.out.weight, std=0.05)
     m(batch)["contact_map_logits"].square().mean().backward()
     gp = m.ot_align.project.weight.grad
     gq = m.ot_align.q_proj.weight.grad
@@ -96,6 +99,16 @@ for mode in ("sinkhorn", "fgw"):
     check(f"{mode}: gradient reaches the cost projection",
           gq is not None and bool((gq.abs() > 0).any()),
           f"|grad q_proj| = {gq.abs().max():.3e}" if gq is not None else "None")
+
+# 3b. Guard the premise of check 3: with `out` left zero-initialised, EVERY trunk gradient is
+# zero, so the check above would pass vacuously if it forgot to un-zero it.
+cfg = dict(BASE)
+cfg["ot_align"] = dict(enabled=True, mode="sinkhorn", eps=0.1, n_iter=10)
+m = ContactMapTriSiT(**cfg)
+torch.nn.init.normal_(m.ot_align.project.weight, std=0.05)
+m(batch)["contact_map_logits"].square().mean().backward()
+check("premise: zero-init `out` really does zero every upstream gradient",
+      float(m.ot_align.project.weight.grad.abs().max()) == 0.0)
 
 # 4. Degenerate case: no topology reference at all must not produce NaN.
 nb = make_batch(seed=3)
