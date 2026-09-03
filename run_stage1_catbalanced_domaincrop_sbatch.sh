@@ -106,8 +106,15 @@ mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
 # atomicity guarantee silently did not hold -- which is how the preemption at 2026-07-24T01:53 left
 # last.ckpt truncated to 0 bytes and took the run down for two months. Keeping TMPDIR on the same
 # filesystem as the checkpoints makes the rename a real rename again.
-export TMPDIR="$REPO/store/$RUN/checkpoints/.tmp"
+# AF_UNIX sun_path is 108 bytes and python appends ~32 for the DataLoader worker socket. The old
+# path resolved to 113 chars, so it was over the limit BEFORE the socket name and could never work:
+# every worker->parent batch handoff raised OSError: AF_UNIX path too long, and because that fails
+# in the feeder thread it HANGS rather than crashing -- i.e. this run's long-standing
+# "DataLoader timed out after 300 seconds". rename() atomicity needs the same DEVICE, not the same
+# directory, so a short dir on the same filesystem keeps the corruption fix above intact.
+export TMPDIR=/orcd/scratch/orcd/011/chenxiou/.tmp
 mkdir -p "$TMPDIR"
+[ ${#TMPDIR} -le 70 ] || { echo "FATAL: TMPDIR ${#TMPDIR} chars > 70: $TMPDIR"; exit 78; }
 # >>> in-RAM packed dataset (2026-06-27): mmap the single blob on the data disk (roundtrip-validated,
 # fork-safe). Unsetting PACK_PATH reverts to per-file disk mode via the (re-pointed) symlinks.
 export PACK_PATH=/orcd/data/so3/001/chenxi/pdb_dFS_combined_pack/combined.pack
