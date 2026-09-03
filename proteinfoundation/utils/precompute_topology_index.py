@@ -134,6 +134,14 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=0, help="debug: only index N chains")
     parser.add_argument("--workers", type=int, default=32)
     parser.add_argument("--skip-log", default="", help="write every skipped chain id and reason")
+    parser.add_argument(
+        "--stats-from", default="",
+        help="Take pair_feature_mean/std from this existing index instead of computing them over "
+             "this dataset. REQUIRED for a small evaluation index: the transform standardises the "
+             "reference with whatever constants the loaded index carries, so an index built over a "
+             "few dozen chains silently rescales the conditioning away from what the model was "
+             "trained with.",
+    )
     args = parser.parse_args()
 
     cfg_path = os.path.join(
@@ -289,6 +297,21 @@ def main() -> None:
         "min_len": args.min_len,
         "contact_threshold": args.contact_threshold,
     }
+    if args.stats_from:
+        src = torch.load(args.stats_from, map_location="cpu", weights_only=False)
+        assert list(src["pair_feature_names"]) == list(out["pair_feature_names"]), (
+            "--stats-from index has different pair features: "
+            f"{src['pair_feature_names']} vs {out['pair_feature_names']}"
+        )
+        own_mean, own_std = out["pair_feature_mean"], out["pair_feature_std"]
+        out["pair_feature_mean"] = src["pair_feature_mean"].float()
+        out["pair_feature_std"] = src["pair_feature_std"].float()
+        out["stats_from"] = str(args.stats_from)
+        drift = (own_mean - out["pair_feature_mean"]).abs() / out["pair_feature_std"].clamp(min=1e-6)
+        print(f"standardisation taken from {args.stats_from}; this dataset's own constants would "
+              f"have differed by up to {float(drift.max()):.3f} sigma "
+              f"(per channel: {[round(float(x), 3) for x in drift]})")
+
     torch.save(out, args.out)
     print(f"wrote {args.out}")
 
