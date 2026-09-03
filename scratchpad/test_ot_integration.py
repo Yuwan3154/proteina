@@ -83,32 +83,58 @@ for mode in ("sinkhorn", "fgw"):
           f"max |delta| = {delta:.3e}")
 
 # 3. Backward works through the in-place query-reference injection.
+#
+# ⛔ This CANNOT be measured on a freshly built model. Every residual branch in TriBlock ends in
+# OpenFold's zero-initialised output projection (contact_map_tri.py:80-82) and `out` is zero-init
+# too, so at initialisation each block is exactly the identity: nothing travels from the
+# query-reference block into the query-query block that `out` reads, and every upstream gradient
+# is exactly 0. Perturbing the zero-inits is what a single optimiser step would do anyway.
+def unfreeze_(model, std=0.02):
+    """Break every all-zero parameter, so the trunk conducts the way a trained one does."""
+    n = 0
+    with torch.no_grad():
+        for _, prm in model.named_parameters():
+            if float(prm.abs().max()) == 0.0:
+                prm.normal_(0.0, std)
+                n += 1
+    return n
+
+
 for mode in ("sinkhorn", "fgw"):
     cfg = dict(BASE)
     cfg["ot_align"] = dict(enabled=True, mode=mode, eps=0.1, n_iter=10, n_outer=3)
     m = ContactMapTriSiT(**cfg)
-    # Both of these are zero-initialised by design, so a fresh model has an all-zero gradient
-    # everywhere upstream of `out`. Un-zero them or this check measures nothing.
-    torch.nn.init.normal_(m.ot_align.project.weight, std=0.05)
-    torch.nn.init.normal_(m.out.weight, std=0.05)
+    n_unfrozen = unfreeze_(m)
     m(batch)["contact_map_logits"].square().mean().backward()
     gp = m.ot_align.project.weight.grad
     gq = m.ot_align.q_proj.weight.grad
-    check(f"{mode}: backward through the injection", gp is not None and bool((gp.abs() > 0).any()),
+    check(f"{mode}: backward through the injection ({n_unfrozen} zero-inits broken)",
+          gp is not None and bool((gp.abs() > 0).any()),
           f"|grad project| = {gp.abs().max():.3e}" if gp is not None else "None")
     check(f"{mode}: gradient reaches the cost projection",
           gq is not None and bool((gq.abs() > 0).any()),
           f"|grad q_proj| = {gq.abs().max():.3e}" if gq is not None else "None")
+    if mode == "fgw":
+        ga = m.ot_align.alpha_logit.grad
+        check("fgw: gradient reaches learned alpha", ga is not None and bool(ga.abs() > 0),
+              f"|grad alpha| = {ga.abs().item():.3e}" if ga is not None else "None")
 
-# 3b. Guard the premise of check 3: with `out` left zero-initialised, EVERY trunk gradient is
-# zero, so the check above would pass vacuously if it forgot to un-zero it.
+# 3a. The substantive wiring claim: in a conducting trunk the injection must actually MOVE the
+# output, i.e. the query-reference block really does reach the query-query block `out` reads.
 cfg = dict(BASE)
 cfg["ot_align"] = dict(enabled=True, mode="sinkhorn", eps=0.1, n_iter=10)
-m = ContactMapTriSiT(**cfg)
-torch.nn.init.normal_(m.ot_align.project.weight, std=0.05)
-m(batch)["contact_map_logits"].square().mean().backward()
-check("premise: zero-init `out` really does zero every upstream gradient",
-      float(m.ot_align.project.weight.grad.abs().max()) == 0.0)
+torch.manual_seed(77)
+m = ContactMapTriSiT(**cfg).eval()
+unfreeze_(m)
+with torch.no_grad():
+    torch.nn.init.zeros_(m.ot_align.project.weight)
+    torch.nn.init.zeros_(m.ot_align.project.bias)
+    off = m(batch)["contact_map_logits"].clone()
+    torch.nn.init.normal_(m.ot_align.project.weight, std=0.05)
+    on = m(batch)["contact_map_logits"]
+moved = (on - off).abs().max().item()
+check("injection propagates QT -> QQ and changes the output", moved > 1e-6,
+      f"max |delta| = {moved:.3e}")
 
 # 4. Degenerate case: no topology reference at all must not produce NaN.
 nb = make_batch(seed=3)
