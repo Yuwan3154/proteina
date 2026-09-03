@@ -33,6 +33,7 @@ from proteinfoundation.datasets.sse_topology import (
     PAIR_FEATURE_MODES,
     PAIR_FEATURE_NAMES,
 )
+from proteinfoundation.nn.ot_alignment import OTAlignmentHead
 from proteinfoundation.openfold_stub.model.pair_transition import PairTransition
 from proteinfoundation.openfold_stub.model.triangular_multiplicative_update import (
     TriangleMultiplicationIncoming,
@@ -153,6 +154,12 @@ class ContactMapTriSiT(nn.Module):
             TriBlock(self.dim, self.tri_hidden, self.transition_n, self.dim_cond)
             for _ in range(self.n_blocks)
         )
+        # Off unless a config asks for it, so the baseline arm stays bit-identical.
+        ot_cfg = dict(kwargs.get("ot_align") or {})
+        self.ot_align = None
+        if ot_cfg.pop("enabled", False):
+            self.ot_align = OTAlignmentHead(dim=self.dim, **ot_cfg)
+
         self.out_norm = nn.LayerNorm(self.dim)
         self.out = nn.Linear(self.dim, 1)
         nn.init.zeros_(self.out.weight)
@@ -195,16 +202,20 @@ class ContactMapTriSiT(nn.Module):
 
         # Sequence identity enters as a 2D outer sum -- there is no 1D track to put it on.
         rtype = batch.get("residue_type")
+        q_feat = None
         if rtype is not None:
             e = self.seq_emb(rtype.long().clamp(min=0))
+            q_feat = e  # the only per-token query features tri has; the OT head reads them
             e = F.pad(e, (0, 0, 0, T))
             z = z + e[:, :, None, :] + e[:, None, :, :]
         te = self.topo_emb(he_tokens.clamp(min=0)) * he_valid[..., None]
+        r_feat = te
         te = F.pad(te, (0, 0, L, 0))
         z = z + te[:, :, None, :] + te[:, None, :, :]
 
         # Per-cell scalar inputs, placed into their own blocks and zero elsewhere.
         cm_sc = batch.get("contact_map_sc")
+        has_sc = cm_sc is not None
         if cm_sc is None:
             cm_sc = torch.zeros_like(cm_t)
         cells = z.new_zeros(B, N, N, 2 + len(self.pair_feat_idx))
@@ -212,6 +223,22 @@ class ContactMapTriSiT(nn.Module):
         cells[:, :L, :L, 1] = cm_sc
         cells[:, L:, L:, 2:] = he_feat[..., self.pair_feat_idx].to(z.dtype)
         z = (z + self.cell_in(cells)) * pair_mask[..., None]
+
+        if self.ot_align is not None:
+            # Built from the self-conditioned map where available: the topology reference only
+            # helps at t < 0.5, which is exactly where c_t is noisiest.
+            inj = self.ot_align(
+                q_feat=q_feat if q_feat is not None else z.new_zeros(B, L, self.dim),
+                r_feat=r_feat,
+                c_q=(cm_sc if has_sc else cm_t).to(z.dtype),
+                c_r=he_feat[..., 0].to(z.dtype),
+                q_mask=mask.bool(),
+                r_mask=he_valid,
+                he_pos=he_pos,
+            )
+            z[:, :L, L:] = z[:, :L, L:] + inj
+            z[:, L:, :L] = z[:, L:, :L] + inj.transpose(1, 2)
+            z = z * pair_mask[..., None]
 
         cond = self.cond_mlp(self.time_emb(batch["t"]))
         for blk in self.blocks:
