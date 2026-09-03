@@ -154,6 +154,25 @@ with torch.no_grad():
     out = m(nb2)["contact_map_logits"]
 check("all-invalid reference stays finite", bool(torch.isfinite(out).all()))
 
+# 6. The shipped YAML must actually build the head -- this is what catches a key renamed in one
+# place and not the other, which no dict-literal test can see.
+import yaml
+
+cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "configs",
+                        "experiment_config", "model", "nn", "contact_map_tri_30M_ot.yaml")
+raw = yaml.safe_load(open(cfg_path))
+raw.pop("name", None)
+raw.pop("nn_class", None)
+raw["n_blocks"] = 2
+raw["pair_dim"] = raw["tri_hidden"] = 64
+raw["dim_cond"] = 32
+m = ContactMapTriSiT(**raw).eval()
+check("shipped YAML builds the OT head", m.ot_align is not None,
+      f"mode={getattr(m.ot_align, 'mode', None)} eps={getattr(m.ot_align, 'eps', None)}")
+with torch.no_grad():
+    out = m(batch)["contact_map_logits"]
+check("shipped YAML forward is finite", bool(torch.isfinite(out).all()))
+
 print()
 print("ALL PASS" if not FAILS else "FAILURES: " + ", ".join(FAILS))
 sys.exit(1 if FAILS else 0)

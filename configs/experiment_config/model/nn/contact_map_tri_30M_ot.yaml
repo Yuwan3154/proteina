@@ -1,0 +1,75 @@
+name: contact_map_tri_30M_ot
+nn_class: ContactMapTriSiT   # dispatches Proteina's NN_REGISTRY
+
+# ── Deliberately the opposite design to contact_map_hier_topology_30M ────────────────────────
+# No 1D single track, no attention, no hierarchy: one pair representation, updated only by
+# triangle multiplicative updates plus the AF2 Evoformer transition. The topology reference is
+# CONCATENATED onto the token axis rather than cross-attended, so the grid is (L+T) x (L+T) and
+# triangle multiplication carries information between query and reference through the same
+# i -> k -> j paths it uses within each.
+
+# Wide and shallow, deliberately. Triangle multiplication's dominant term is an N^3 einsum whose
+# cost is LINEAR in the hidden width, while parameters grow as width^2 -- so trading depth for
+# width buys parameters at a sub-linear runtime cost. At N = 256 + 64 = 320, 12x320 does 0.79x
+# the N^3 work of 19x256 and stores 0.79x the activations for the same parameter count.
+pair_dim: 320        # 12 blocks -> 27,793,729 params, counted from the module itself, against
+                     # 28.46M for the local_attn arm. Per block: 2 triangle updates (~6*d^2 each),
+                     # the 4x transition (8*d^2), and the FiLM projection.
+tri_hidden: 320      # sets the N^3 cost directly (it is the einsum's contracted width), so this is
+                     # the knob to turn first if runtime overshoots -- it need not equal pair_dim
+                     # here, since this model does not use cuequivariance's fused kernel.
+n_blocks: 12
+transition_n: 4      # AF2 Evoformer expansion factor
+dim_cond: 128
+
+max_rel_pos: 64      # clip radius for the LEFT-ALIGNED relative position. Query residue i sits at
+                     # i and reference element e at its own-chain midpoint, both from 0, so this
+                     # radius has to cover query-to-element offsets as well as query-to-query.
+# Read by the TRAINER, not by ContactMapTriSiT (which consumes the reference unconditionally
+# whenever the keys are present). _build_self_reference_topology gates on it, so leaving it
+# absent made validation sampling pass topology=None and this arm generate UNCONDITIONED while
+# the hier arm generated on each chain's own ground-truth topology.
+topology_cond: True
+max_topology_he_len: 64
+topology_vocab_size: 65
+n_residue_types: 22
+
+pair_ref_features: both   # same channel selection as the hier arms, read from their own mapping
+                          # so the three models are fed identical reference features
+
+contact_map_mode: True
+contact_map_input_dim: 1
+non_contact_value: 0
+predict_coords: False
+
+# ── OT alignment head ─────────────────────────────────────────────────────────────────────────
+# The ONLY difference from contact_map_tri_30M. max_rel_pos above clips the query-to-element
+# offset at 64, and with L up to 384 against own-chain midpoints most pairs exceed it, so the
+# offset is not representable and every such cell collapses onto one saturated embedding. This
+# head adds a soft coupling pi in R^{LxT} alongside that embedding on the query-reference block.
+#
+# The injection is zero-initialised, so at step 0 this config is NUMERICALLY IDENTICAL to
+# contact_map_tri_30M -- that is what makes the ablation attributable to the coupling alone.
+ot_align:
+  enabled: True
+  mode: sinkhorn        # sinkhorn | fgw
+  eps: 0.1              # ⛔ assumes the max-normalised cost the head applies. OTKE (ICLR 2021),
+                        # the closest published geometry (a protein task, n x 50 coupling), uses
+                        # 0.5/K=10; BPA (ICML 2024) 0.1; ASOT (CVPR 2024) 0.07. Sweep
+                        # {0.05, 0.1, 0.2, 0.5}. Nothing supports eps < ~0.01 for a layer that
+                        # must produce gradients.
+  n_iter: 10            # K. Saturates by 4-8 in BPA Tab. 6; K scales roughly as 1/eps.
+  n_outer: 10           # fgw only: BCD outer iterations (GWL uses 30, FUGW 10).
+  alpha_init: 0.5       # fgw only, and LEARNED thereafter (TFGW, NeurIPS 2022). POT's default.
+                        # ⛔ alpha weights the STRUCTURE term, not the feature term.
+  cost_dim: 64
+
+  # ⚠️ OFF by default. Su & Hua's lambda1=50 / lambda2=0.1 / delta=1 are RELEASED-CODE defaults
+  # under a cost normalisation the paper never states, so they are not portable to our scale --
+  # against a max-normalised cost in [0,1], lambda1=50 would simply dominate it. Turn this on
+  # only as a deliberate swept arm, not as a default.
+  order_preserving: False
+  lambda1: 50.0
+  lambda2: 0.1
+  delta: 1.0
+  index_mode: rank      # rank | raw
