@@ -101,8 +101,23 @@ def _normalised_index(
 
     `rank` uses each element's ORDER among the valid elements; `raw` uses its own-chain midpoint
     scaled by the largest valid midpoint. Order preservation is a statement about order, so `rank`
-    is the faithful reading -- and it avoids describing positions on a different length scale from
-    the reference's own pair features, which is the incoherence that ruled out `topology_he_pos`.
+    is the faithful reading.
+
+    ⚠️ Do NOT read this as "the 2026-08-27 objection to `topology_he_pos` does not apply here". Only
+    half of it is avoided. This prior does not rewrite the reference's PAIR FEATURES into query
+    coordinates, so it escapes the specific incoherence that was objected to -- features and
+    positions are not put on different length scales. But BOTH index modes are uniform
+    fraction-along-chain maps, so the uniform-stretch assumption that MOTIVATED that objection is
+    still imported here, just as a soft bias on the coupling rather than as a hard encoding.
+
+    ⛔⛔ And unlike the fused-GW mixing weight, it is not self-attenuating. `alpha` is an
+    `nn.Parameter`, so a model that finds the relational term unhelpful can drive it to 0 and recover
+    the feature-only solution on its own. `lambda1`/`lambda2`/`delta` are plain floats. Where the
+    uniform-stretch assumption is wrong for a given query/reference pair there is no parameter with
+    which to back away from it -- the trunk can only route around it. Since this prior is also the
+    ONLY source of query-index dependence in `sinkhorn` mode (at `lambda1 -> 0` the cost collapses
+    back to `f(aatype_i, token_e)`, at most `n_residue_types` distinct rows), that mode's entire
+    positional capability is bought with an assumption the model cannot unlearn.
     """
     assert index_mode in ("rank", "raw"), index_mode
     B, L = q_mask.shape
