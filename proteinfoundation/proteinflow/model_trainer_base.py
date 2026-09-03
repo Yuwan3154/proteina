@@ -3432,10 +3432,49 @@ class ModelTrainerBase(L.LightningModule):
                     )
                     if metrics_s is not None:
                         self._validation_contact_results.append(metrics_s)
+                    dump_dir = val_sampling_cfg.get("contact_dump_dir", None)
+                    if dump_dir:
+                        self._dump_contact_sample(
+                            dump_dir, batch, s, c_logits_pred[s], c_1_gt_full[s],
+                            mask[s], metrics_s,
+                        )
         self._diag_log(
             "traj: exit",
             f"elapsed={time.time() - _traj_t0:.2f}s nsamples={nsamples}",
         )
+
+    def _dump_contact_sample(self, dump_dir, batch, s, logits, gt, mask_1d, metrics):
+        """Write one sampled contact map to disk, so samples outlive the run that made them.
+
+        The aggregate metric is all validation ever kept, but a sampled map is the artefact any
+        downstream consumer needs. Files are keyed by chain AND a per-chain counter: listing a stem
+        k times in fixed_chain_list yields k samples of it, and a stem-only name would leave one
+        file where k were generated.
+        """
+        stems = batch.get("protein_id") or batch.get("id")
+        stem = str(stems[s]) if isinstance(stems, (list, tuple)) and len(stems) > s else f"idx{s}"
+        m = mask_1d.bool()
+        L = int(m.sum())
+        # PaddingTransform pads at the END, so valid residues are a contiguous prefix. Assert it
+        # rather than assume: a non-prefix mask would make the [:L, :L] crop silently wrong.
+        assert bool(m[:L].all()) and not bool(m[L:].any()), (
+            f"{stem}: mask is not a contiguous prefix; a [:L,:L] crop would be wrong"
+        )
+        if not hasattr(self, "_contact_dump_counter") or self._contact_dump_counter is None:
+            self._contact_dump_counter = {}
+        k = self._contact_dump_counter.get(stem, 0)
+        self._contact_dump_counter[stem] = k + 1
+
+        os.makedirs(dump_dir, exist_ok=True)
+        prob = torch.sigmoid(logits.detach().float())[:L, :L].cpu().numpy()
+        gt_c = gt.detach().float()[:L, :L].cpu().numpy()
+        path = os.path.join(dump_dir, f"{stem}_s{k:02d}.npz")
+        np.savez_compressed(path, contact_prob=prob, contact_gt=gt_c,
+                            L=np.int32(L), stem=stem, sample_index=np.int32(k))
+        with open(os.path.join(dump_dir, "samples.jsonl"), "a") as fh:
+            fh.write(json.dumps({"stem": stem, "sample_index": k, "L": L,
+                                 "file": os.path.basename(path),
+                                 "metrics": metrics or {}}) + "\n")
 
     @staticmethod
     def _compute_contact_map_metrics(
