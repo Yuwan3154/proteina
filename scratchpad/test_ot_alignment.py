@@ -130,6 +130,37 @@ he_pos = torch.rand(B, T) * 300.0
 op_raw = order_preserving_cost(q_mask, r_mask, he_pos, 50.0, 0.1, 1.0, "raw")
 check("order-preserving: index_mode='raw' finite", bool(torch.isfinite(op_raw).all()))
 
+# 8. REGRESSION: the order-preserving terms composed THROUGH sinkhorn.
+# The original tests checked order_preserving_cost's values in isolation and never ran a coupling
+# with it enabled, which is exactly how the overflow shipped: the terms enter NEGATIVELY, so the
+# summed cost left [0,1] and exp(-cost/eps) overflowed to inf, giving nan in the pi product.
+# Measured before the fix: nan at lambda1=50 AND at lambda1=10.
+for lam in (50.0, 10.0, 1.0, 0.1):
+    head = OTAlignmentHead(dim=16, mode="sinkhorn", eps=0.1, n_iter=10,
+                           order_preserving=True, lambda1=lam, lambda2=0.1)
+    q_feat, r_feat = torch.randn(B, L, 16), torch.randn(B, T, 16)
+    pi = head.coupling(q_feat=q_feat, r_feat=r_feat, c_q=c_q, c_r=c_r,
+                       q_mask=q_mask, r_mask=r_mask)
+    check(f"order-preserving lambda1={lam:g}: pi is finite", bool(torch.isfinite(pi).all()))
+    check(f"order-preserving lambda1={lam:g}: marginals hold",
+          torch.allclose(pi.sum(2), mu, atol=1e-4),
+          f"max err {(pi.sum(2) - mu).abs().max():.2e}")
+
+# 8b. Same for fgw, whose GW term is non-negative in exact arithmetic but is worth pinning.
+for lam in (50.0, 1.0):
+    head = OTAlignmentHead(dim=16, mode="fgw", eps=0.1, n_iter=10, n_outer=3,
+                           order_preserving=True, lambda1=lam, lambda2=0.1)
+    pi = head.coupling(q_feat=torch.randn(B, L, 16), r_feat=torch.randn(B, T, 16),
+                       c_q=c_q, c_r=c_r, q_mask=q_mask, r_mask=r_mask)
+    check(f"fgw + order-preserving lambda1={lam:g}: pi is finite", bool(torch.isfinite(pi).all()))
+
+# 8c. The shift really is free: a constant added to the cost must not move pi.
+base = max_normalise(torch.rand(B, L, T), mask)
+pi_a = sinkhorn(base, mask, mu, nu, eps=0.1, n_iter=200)
+pi_b = sinkhorn(base + 3.7, mask, mu, nu, eps=0.1, n_iter=200)
+check("sinkhorn is invariant to a constant cost shift (justifies the min-shift)",
+      torch.allclose(pi_a, pi_b, atol=1e-6), f"max diff {(pi_a - pi_b).abs().max():.2e}")
+
 print()
 print(f"{'ALL PASS' if not FAILS else 'FAILURES: ' + ', '.join(FAILS)}")
 sys.exit(1 if FAILS else 0)

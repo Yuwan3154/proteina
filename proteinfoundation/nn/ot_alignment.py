@@ -46,6 +46,28 @@ def max_normalise(cost: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return cost / peak
 
 
+def unit_range_normalise(cost: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Affinely map each sample's valid entries onto [0, 1].
+
+    Needed whenever a term can make the cost NEGATIVE. `max_normalise` only bounds the positive
+    side, so `exp(-cost/eps)` OVERFLOWS on a negative cost -- at the published lambda1=50 the cost
+    reaches about -50 and exp(500) is inf, which then gives nan in the pi product. Underflow was the
+    only direction this module originally reasoned about.
+
+    The SHIFT is free: Sinkhorn's fixed point is unchanged by adding a constant to the cost, because
+    exp(-(C+k)/eps) is a global rescale of the kernel and the scalars are absorbed into u and v. The
+    subsequent divide by the range is the same deliberate choice `max_normalise` makes -- it is what
+    keeps a published eps meaningful -- and it bounds the exponent to 1/eps.
+    """
+    neg_inf = cost.masked_fill(~mask, float("inf"))
+    lo = neg_inf.amin(dim=(-2, -1), keepdim=True)
+    lo = torch.where(torch.isfinite(lo), lo, torch.zeros_like(lo))
+    shifted = cost - lo
+    hi = shifted.masked_fill(~mask, float("-inf")).amax(dim=(-2, -1), keepdim=True)
+    hi = torch.where(torch.isfinite(hi) & (hi.abs() > TINY), hi, torch.ones_like(hi))
+    return shifted / hi
+
+
 def sinkhorn(
     cost: torch.Tensor,
     mask: torch.Tensor,
@@ -58,6 +80,10 @@ def sinkhorn(
 
     Log-domain is deliberately not used: fp32 exp() goes subnormal at cost/eps > 87.3, and on a
     max-normalised cost the worst case here is 1/0.05 = 20.
+
+    ⛔ That reasoning covers UNDERFLOW only, and a NEGATIVE cost overflows instead -- exp(+500) is
+    inf. Every caller must therefore hand this a cost already mapped into [0,1]; use
+    `unit_range_normalise` rather than `max_normalise` whenever any term can go negative.
     """
     gibbs = torch.exp(-cost / eps) * mask
     u = mu.clone()
@@ -245,6 +271,9 @@ class OTAlignmentHead(nn.Module):
             cost = cost + order_preserving_cost(
                 q_mask, r_mask, he_pos, self.lambda1, self.lambda2, self.delta, self.index_mode
             )
+            # ⛔ MANDATORY: the order terms enter NEGATIVELY, so the sum leaves [0,1] and
+            # exp(-cost/eps) overflows. Measured nan at lambda1=50 AND at 10, finite at 1.0.
+            cost = unit_range_normalise(cost, mask)
         cost = cost.masked_fill(~mask, 0.0)
 
         if self.mode == "sinkhorn":

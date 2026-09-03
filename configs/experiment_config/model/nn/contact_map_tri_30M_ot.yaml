@@ -66,8 +66,12 @@ ot_align:
 
   # ⚠️ OFF by default. Su & Hua's lambda1=50 / lambda2=0.1 / delta=1 are RELEASED-CODE defaults
   # under a cost normalisation the paper never states, so they are not portable to our scale --
-  # against a max-normalised cost in [0,1], lambda1=50 would simply dominate it. Turn this on
-  # only as a deliberate swept arm, not as a default.
+  # against a max-normalised cost in [0,1], lambda1=50 simply dominates it. Turn this on only as a
+  # deliberate swept arm, not as a default.
+  # ⛔ Until 2026-09-03 these values produced nan, not just a mis-scaled cost: the order terms enter
+  # NEGATIVELY, so the summed cost left [0,1] and exp(-cost/eps) OVERFLOWED (nan measured at
+  # lambda1=50 and at 10). Fixed by unit_range_normalise on the combined cost; the shift is free
+  # because Sinkhorn's fixed point is invariant to a constant cost offset. Still needs re-tuning.
   order_preserving: False
   lambda1: 50.0
   lambda2: 0.1
