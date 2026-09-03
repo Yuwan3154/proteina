@@ -39,8 +39,13 @@ export TORCHINDUCTOR_CACHE_DIR=/orcd/scratch/orcd/011/chenxiou/torchinductor_cac
 export TRITON_CACHE_DIR=/orcd/scratch/orcd/011/chenxiou/triton_cache_sm120
 mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$REPO/logs"
 # Lightning's atomic ckpt save renames a temp file and a cross-device rename is not atomic (see 07dbb58); it also made wandb copy rather than rename, which is what hit EDQUOT on 2026-09-02.
-export TMPDIR="$REPO/store/$RUN/checkpoints/.tmp"
+# AF_UNIX sun_path is 108 bytes and python appends ~32 for the DataLoader worker socket, so a long
+# TMPDIR makes every worker->parent batch handoff fail and the run HANG (reads as a dataloader
+# timeout, not a path error). Same device as the checkpoints is what the corruption fix needs; being
+# UNDER the checkpoints dir was never required and is what blew the limit. Fail fast, never silently.
+export TMPDIR=/orcd/scratch/orcd/011/chenxiou/.tmp
 mkdir -p "$TMPDIR"
+[ ${#TMPDIR} -le 70 ] || { echo "FATAL: TMPDIR ${#TMPDIR} chars > 70: $TMPDIR"; exit 78; }
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH=$REPO${PYTHONPATH:+:$PYTHONPATH}
 
