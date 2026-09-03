@@ -5,11 +5,12 @@ a single output value at initialisation, because the injection is zero-initialis
 exactly true, any later difference is not attributable to the coupling.
 """
 
+import os
 import sys
 
 import torch
 
-sys.path.insert(0, "/orcd/scratch/orcd/011/chenxiou/proteina_cmhier")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from proteinfoundation.datasets.sse_topology import N_PAIR_FEATURES
 from proteinfoundation.nn.contact_map_tri import ContactMapTriSiT
