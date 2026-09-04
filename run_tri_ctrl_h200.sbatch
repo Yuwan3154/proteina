@@ -10,6 +10,11 @@
 #SBATCH --output=/orcd/scratch/orcd/011/chenxiou/proteina_ot/logs/%x-%j.out
 #SBATCH --error=/orcd/scratch/orcd/011/chenxiou/proteina_ot/logs/%x-%j.err
 #SBATCH --requeue
+# Requeue REOPENS the log files, truncating them by default -- a preempted job silently destroys
+# the history of its own earlier attempts. That is how the warm-start confirmation for 21901071 was
+# lost, and how `grep -c "queued next chain segment"` returns 1 for a job that queued three.
+# Append keeps every attempt in one file.
+#SBATCH --open-mode=append
 #SBATCH --signal=B:USR1@60
 #
 # Triangle arm on RTX PRO 6000 (Blackwell, sm_120). Differs from run_tri_train.sbatch ONLY in the
