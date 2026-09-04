@@ -55,6 +55,13 @@ nvidia-smi --query-gpu=index,name,compute_cap,memory.total --format=csv
 python -c "import torch; print('torch', torch.__version__, '| arch', torch.cuda.get_arch_list())"
 
 CHAIN="${CHAIN:-0}"
+# Resubmit THIS launcher. The original chained "$REPO/run_tri_train_sm120.sbatch" unconditionally,
+# so a derived launcher's successors silently came back as the tri BASELINE script -- wrong job name
+# and wrong TORCH_CUDA_ARCH_LIST -- and only looked healthy because CONFIG/RUN ride through the
+# environment and --partition/--gres are passed explicitly.
+# Named literally, not via $0/BASH_SOURCE: SLURM executes a spool copy of the script, so those
+# resolve to a path that is deleted when the job ends.
+CHAIN_SELF="$REPO/run_tri_ot_h200.sbatch"
 if [ "$CHAIN" -gt 0 ]; then
     JOBINFO=$(scontrol show job "$SLURM_JOB_ID" | tr ' ' '\n')
     CHAIN_GRES=$(printf '%s\n' "$JOBINFO" | sed -n 's|^TresPerNode=gres/||p')
@@ -66,7 +73,8 @@ if [ "$CHAIN" -gt 0 ]; then
                --cpus-per-task="${SLURM_CPUS_PER_TASK:-8}" \
                --mem="${SLURM_MEM_PER_NODE}M" \
                --time="$CHAIN_TIME" \
-               "$REPO/run_tri_train_sm120.sbatch" \
+               --job-name="$SLURM_JOB_NAME" \
+               "$CHAIN_SELF" \
         && echo "[$(date)] queued next chain segment on $SLURM_JOB_PARTITION $CHAIN_GRES $CHAIN_TIME (CHAIN=$((CHAIN - 1)) remaining)"
 fi
 
