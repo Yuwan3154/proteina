@@ -151,7 +151,17 @@ def main():
     print("7. smooth_lddt bounds")
     perfect = smooth_lddt(xg, xg, mk)
     far = smooth_lddt(xg, xg + 50.0 * torch.randn_like(xg), mk)
-    r.append(check(f"identical structures -> ~0 loss ({perfect.item():.4f})", perfect.item() < 0.05))
+    # ⛔ The floor is NOT zero and that is not a bug. AF3's smooth LDDT (SI Alg. 27) sums four
+    # sigmoids that do not saturate at delta=0:
+    #   0.25*(sigmoid(0.5)+sigmoid(1)+sigmoid(2)+sigmoid(4)) = 0.804082
+    # so a perfect structure scores 1 - 0.804082 = 0.195918. Protenix computes the identical
+    # quantity (model/loss.py SmoothLDDTLoss) and returns 1 - lddt as the loss (:159). Asserting
+    # "~0" here would be asserting against AF3's own definition.
+    floor = 1.0 - 0.25 * sum(
+        torch.sigmoid(torch.tensor(t)).item() for t in (0.5, 1.0, 2.0, 4.0)
+    )
+    r.append(check(f"identical -> the analytic floor {floor:.4f} (got {perfect.item():.4f})",
+                   abs(perfect.item() - floor) < 0.01))
     r.append(check(f"scrambled -> near 1 ({far.item():.4f})", far.item() > 0.8))
     r.append(check("bounded [0,1]", bool((perfect >= 0).all() and (far <= 1.0).all())))
 
