@@ -183,6 +183,22 @@ def main():
     r.append(check(f"weight {aux['edm_weight'].item():.6f} == {want:.6f}",
                    abs(aux["edm_weight"].item() - want) < 1e-6))
 
+    print("10. bf16 autocast (the regime training actually runs in)")
+    # ⛔ This section exists because the CPU-only checks above ALL passed while the code was broken
+    # under autocast: torch.linalg.det has no BFloat16 kernel, and autocast re-downcasts fp32 tensors
+    # handed to einsum, so a .float() cast on the covariance was silently undone. Only a benchmark on
+    # a real GPU caught it. Exercise the same path here, on whatever device is available.
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    amp_dtype = torch.bfloat16
+    xg2 = torch.randn(2, 10, 3, device=dev)
+    mk2 = torch.ones(2, 10, device=dev)
+    with torch.autocast(device_type=dev.type, dtype=amp_dtype):
+        a2 = weighted_rigid_align(xg2.to(amp_dtype), xg2.to(amp_dtype), mk2, mk2)
+        l2, _ = diffusion_loss(xg2.to(amp_dtype), xg2, torch.full((2,), 4.0, device=dev), mk2)
+    r.append(check(f"weighted_rigid_align survives autocast on {dev.type}",
+                   torch.isfinite(a2).all().item()))
+    r.append(check("diffusion_loss survives autocast", torch.isfinite(l2).all().item()))
+
     print()
     print(f"{sum(r)}/{len(r)} checks pass")
     return 0 if all(r) else 3

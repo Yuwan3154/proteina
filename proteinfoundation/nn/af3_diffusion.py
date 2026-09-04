@@ -251,17 +251,26 @@ def weighted_rigid_align(x, x_gt, weights, mask):
     ⛔ AF3 aligns the GROUND TRUTH to the prediction, not the other way round, and detaches the
     result -- the alignment must not carry gradient into the model.
     """
-    w = (weights * mask)[..., None]
-    wsum = w.sum(dim=1, keepdim=True).clamp_min(1e-8)
-    xc = x - (x * w).sum(dim=1, keepdim=True) / wsum
-    gc = x_gt - (x_gt * w).sum(dim=1, keepdim=True) / wsum
-    cov = torch.einsum("bni,bnj->bij", w * gc, xc).float()
-    u, _, vt = torch.linalg.svd(cov)
-    # Reflection guard: force det(R) = +1 so the alignment is a rotation, never a mirror.
-    d = torch.sign(torch.linalg.det(torch.einsum("bij,bjk->bik", u, vt)))
-    diag = torch.diag_embed(torch.stack([torch.ones_like(d), torch.ones_like(d), d], dim=-1))
-    rot = torch.einsum("bij,bjk,bkl->bil", u, diag, vt)
-    return (torch.einsum("bni,bij->bnj", gc, rot) + (x * w).sum(dim=1, keepdim=True) / wsum).detach()
+    # ⛔ fp32 ONLY, and autocast must be disabled explicitly rather than relying on a .float() cast.
+    # Under torch.autocast(bf16), autocast intercepts einsum/matmul and re-downcasts fp32 inputs, so
+    # casting `cov` alone is not enough: the u @ vt einsum below comes back bf16 and
+    # torch.linalg.det then dies with "lu_factor_cusolver not implemented for 'BFloat16'".
+    # Kabsch is an SVD; it wants full precision regardless.
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        xf, gf = x.float(), x_gt.float()
+        w = (weights * mask)[..., None].float()
+        wsum = w.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        centre = (xf * w).sum(dim=1, keepdim=True) / wsum
+        xc = xf - centre
+        gc = gf - (gf * w).sum(dim=1, keepdim=True) / wsum
+        cov = torch.einsum("bni,bnj->bij", w * gc, xc)
+        u, _, vt = torch.linalg.svd(cov)
+        # Reflection guard: force det(R) = +1 so the alignment is a rotation, never a mirror.
+        d = torch.sign(torch.linalg.det(torch.einsum("bij,bjk->bik", u, vt)))
+        diag = torch.diag_embed(torch.stack([torch.ones_like(d), torch.ones_like(d), d], dim=-1))
+        rot = torch.einsum("bij,bjk,bkl->bil", u, diag, vt)
+        out = torch.einsum("bni,bij->bnj", gc, rot) + centre
+    return out.to(x.dtype).detach()
 
 
 def smooth_lddt(x, x_gt, mask, cutoff: float = 15.0):
