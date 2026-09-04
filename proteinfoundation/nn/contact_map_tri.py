@@ -179,6 +179,20 @@ class ContactMapTriSiT(nn.Module):
                 nn.Linear(self.dim, int(self.num_buckets_predict_pair)),
             )
 
+        # Structure head. Absent => None, and the arm is bit-identical to the contact-only model.
+        # Built lazily by name to keep the import cycle out of module scope (structure_head imports
+        # TriBlock from here).
+        sh_cfg = dict(kwargs.get("structure_head") or {})
+        self.structure_head = None
+        self.freeze_trunk = bool(sh_cfg.pop("freeze_trunk", False))
+        if sh_cfg.pop("enabled", False):
+            from proteinfoundation.nn.structure_head import StructureHead
+            self.structure_head = StructureHead(
+                dim=self.dim, tri_hidden=self.tri_hidden, transition_n=self.transition_n,
+                dim_cond=self.dim_cond, n_residue_types=int(kwargs.get("n_residue_types", 22)),
+                **sh_cfg,
+            )
+
         self.out_norm = nn.LayerNorm(self.dim)
         self.out = nn.Linear(self.dim, 1)
         nn.init.zeros_(self.out.weight)
@@ -277,6 +291,16 @@ class ContactMapTriSiT(nn.Module):
             "contact_map_logits": logits,
             "contact_map_pred": torch.sigmoid(logits),
         }
+
+        if self.structure_head is not None:
+            out.update(
+                self.structure_head(
+                    z_full=z, L=L, mask=q_valid.to(z.dtype), cond=cond,
+                    residue_type=rtype,
+                    x_gt=batch.get("x_1_ca"),
+                    run_rollout=bool(batch.get("run_rollout", False)),
+                )
+            )
 
         if self.dist_head is not None:
             # Query block only: the trunk's grid is (L+T) wide, but the distogram target is the
