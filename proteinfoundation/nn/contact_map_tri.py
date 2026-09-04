@@ -134,7 +134,14 @@ class ContactMapTriSiT(nn.Module):
         self.contact_map_mode = True
         self.contact_map_input_dim = int(kwargs.get("contact_map_input_dim", 1))
         self.non_contact_value = int(kwargs.get("non_contact_value", 0))
-        self.predict_coords = False
+        # None, not False, and the distinction is load-bearing: model_trainer_base tests
+        # `predict_coords is False` (identity) in two places, and a False here made TRI ALONE flip
+        # predict_from_dist on as soon as a distogram existed, landing in
+        # _predict_structure_from_distogram whose two backends both `raise NotImplementedError`.
+        # ContactMapHierSiT and ContactMapDiT already use None; this makes the three arms agree.
+        # Structure-from-distogram remains reachable, but only when a config asks for it via
+        # predict_structure_from_distogram, instead of switching itself on for one arm.
+        self.predict_coords = None
 
         self.seq_emb = nn.Embedding(int(kwargs.get("n_residue_types", 22)), self.dim)
         self.topo_emb = nn.Embedding(
@@ -159,6 +166,18 @@ class ContactMapTriSiT(nn.Module):
         self.ot_align = None
         if ot_cfg.pop("enabled", False):
             self.ot_align = OTAlignmentHead(dim=self.dim, **ot_cfg)
+
+        # Distogram head. `num_buckets_predict_pair` is the key protein_transformer already uses for
+        # this, and it MUST equal loss.num_dist_buckets -- proteina.py asserts the two match. Absent
+        # => no head and no `pair_logits`, so the auxiliary distogram loss stays inactive and the
+        # baseline arm is unchanged.
+        self.num_buckets_predict_pair = kwargs.get("num_buckets_predict_pair", None)
+        self.dist_head = None
+        if self.num_buckets_predict_pair is not None:
+            self.dist_head = nn.Sequential(
+                nn.LayerNorm(self.dim),
+                nn.Linear(self.dim, int(self.num_buckets_predict_pair)),
+            )
 
         self.out_norm = nn.LayerNorm(self.dim)
         self.out = nn.Linear(self.dim, 1)
@@ -252,11 +271,23 @@ class ContactMapTriSiT(nn.Module):
         # both mask, so this changes no number -- it removes an asymmetry that made the two arms'
         # padding render differently and be read as a modelling difference.
         q_valid = mask.bool()
-        logits = logits * (q_valid[:, :, None] & q_valid[:, None, :]).to(logits.dtype)
-        return {
+        q_pair = (q_valid[:, :, None] & q_valid[:, None, :])
+        logits = logits * q_pair.to(logits.dtype)
+        out = {
             "contact_map_logits": logits,
             "contact_map_pred": torch.sigmoid(logits),
         }
+
+        if self.dist_head is not None:
+            # Query block only: the trunk's grid is (L+T) wide, but the distogram target is the
+            # query's own CA-CA distances, so the reference rows/columns must not be fed to a loss
+            # that will index them as query residues.
+            pair_logits = self.dist_head(z[:, :L, :L])
+            # A distance matrix is symmetric, matching how the contact logits above are handled.
+            pair_logits = 0.5 * (pair_logits + pair_logits.transpose(1, 2))
+            out["pair_logits"] = pair_logits * q_pair[..., None].to(pair_logits.dtype)
+
+        return out
 
 
 def _pair_feature_indices(mode: str):
