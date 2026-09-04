@@ -30,7 +30,17 @@ for spec in "tri_ot_fgw:run_tri_ot_h200.sbatch" "tri_ctrl:run_tri_ctrl_h200.sbat
 
     # Count this arm's live jobs by NAME. Safe now that the chain passes --job-name through;
     # before that fix successors came back as "tri_sm120" and would have been invisible here.
-    ALIVE=$(squeue -u "$USER" -h -o '%j %t' | awk -v n="$NAME" '$1 == n && ($2 == "R" || $2 == "PD")' | wc -l)
+    # ⛔⛔ Gate on squeue's EXIT CODE, not on its output. Piping a FAILED squeue into `wc -l` yields
+    # 0, which is indistinguishable from "this arm has no jobs" -- so a transient controller outage
+    # would make the watchdog conclude the arm is dead and relaunch it ALONGSIDE the one still
+    # running, two processes writing one last.ckpt. Observed for real on 2026-09-04, when
+    # `scontrol ping` reported "Slurmctld(primary) at slurm001 is DOWN" and squeue began timing out.
+    # A query we could not answer is NOT evidence of absence.
+    if ! SQ=$(squeue -u "$USER" -h -o '%j %t' 2>/dev/null); then
+        say "$NAME: SKIP -- squeue failed (controller unreachable); making no decision this tick"
+        continue
+    fi
+    ALIVE=$(printf '%s\n' "$SQ" | awk -v n="$NAME" '$1 == n && ($2 == "R" || $2 == "PD")' | wc -l)
     if [ "$ALIVE" -gt 0 ]; then
         say "$NAME: OK ($ALIVE alive)"
         continue
