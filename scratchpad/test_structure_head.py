@@ -29,7 +29,7 @@ BASE = dict(
     topology_cond=True, max_topology_he_len=T, topology_vocab_size=T + 1, n_residue_types=22,
     pair_ref_features="both", contact_map_mode=True, contact_map_input_dim=1, non_contact_value=0,
 )
-SH = dict(enabled=True, mode="diffusion", c_s=32, c_z=16,
+SH = dict(enabled=True, mode="diffusion", c_s=32, c_z=None,
           diffusion=dict(c_token=32, n_blocks=2, n_heads=4, c_noise_embedding=16))
 
 
@@ -85,6 +85,8 @@ def main():
     r.append(check("denoised finite", torch.isfinite(out["x_denoised"]).all().item()))
     r.append(check("padded residues zeroed",
                    (out["x_denoised"][1, L - 3:].abs().sum() == 0).item()))
+    r.append(check(f"c_z defaults to the trunk dim {DIM} (not AF3's 128)",
+                   m.structure_head.c_z == DIM))
     r.append(check("distogram symmetric",
                    torch.allclose(out["structure_pair_logits"],
                                   out["structure_pair_logits"].transpose(1, 2), atol=1e-6)))
@@ -110,7 +112,7 @@ def main():
     print("4. EDM preconditioning limits (AF3 / Karras)")
     sh = m.structure_head.structure
     s = torch.randn(B, L, 32)
-    z = torch.randn(B, L, L, 16)
+    z = torch.randn(B, L, L, DIM)
     x = torch.randn(B, L, 3)
     with torch.no_grad():
         tiny = sh.denoise(x, torch.full((B,), 1e-6), s, z, batch["mask"])

@@ -30,7 +30,9 @@ BASE = dict(
     topology_cond=True, max_topology_he_len=64, topology_vocab_size=65, n_residue_types=22,
     pair_ref_features="both", contact_map_mode=True, contact_map_input_dim=1, non_contact_value=0,
 )
-SH = dict(enabled=True, mode="diffusion", c_s=384, c_z=128,
+# d_z = the trunk's own pair width (320), d_s = 384. Random init, so nothing has to match an
+# external checkpoint's shape -- which is why c_z is 320 here rather than AF3's 128.
+SH = dict(enabled=True, mode="diffusion", c_s=384, c_z=320,
           diffusion=dict(c_token=768, n_blocks=24, n_heads=16))
 
 

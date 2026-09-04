@@ -62,7 +62,7 @@ class StructureHead(nn.Module):
         dim_cond: int,
         mode: str = "diffusion",
         c_s: int = 384,
-        c_z: int = 128,
+        c_z: Optional[int] = None,   # None => the trunk's own pair width (see below)
         n_blocks_tri: int = 2,
         num_dist_buckets: int = 39,
         n_residue_types: int = 22,
@@ -73,6 +73,13 @@ class StructureHead(nn.Module):
         assert mode in ("diffusion", "ipa"), mode
         self.mode = mode
         self.dim = dim
+        # ⭐ Default c_z to the TRUNK's own pair width (320), not AF3's 128. AF3 uses 128 because its
+        # Pairformer emits 128 and its released weights are that shape; we train from random init, so
+        # there is no checkpoint to match and no reason to squeeze the trunk's representation through
+        # a 320->128 bottleneck before the structure head ever sees it. Set it explicitly to depart.
+        if c_z is None:
+            c_z = dim
+        self.c_s, self.c_z = c_s, c_z
 
         self.tri_blocks = nn.ModuleList(
             TriBlock(dim, tri_hidden, transition_n, dim_cond) for _ in range(n_blocks_tri)
@@ -82,6 +89,9 @@ class StructureHead(nn.Module):
         self.dist_head = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, num_dist_buckets))
 
         self.single_from_pair = SingleFromPair(dim, c_s, n_residue_types)
+        # Kept even when c_z == dim: the LayerNorm matters (the trunk's z is masked-to-zero on padded
+        # cells and unnormalised in scale), and the Linear lets the head re-mix the trunk's channels
+        # for its own purpose. It is no longer a width bottleneck, which is the point.
         self.pair_proj = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, c_z, bias=False))
 
         if mode == "diffusion":
