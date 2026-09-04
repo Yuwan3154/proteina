@@ -62,6 +62,18 @@ CHAIN="${CHAIN:-0}"
 # Named literally, not via $0/BASH_SOURCE: SLURM executes a spool copy of the script, so those
 # resolve to a path that is deleted when the job ends.
 CHAIN_SELF="$REPO/run_tri_ot_h200.sbatch"
+# ⛔⛔ Submit a successor AT MOST ONCE per job id. A preempted job is requeued under the SAME
+# SLURM_JOB_ID and re-runs this script from the top, so without this guard every preemption queues
+# ANOTHER successor -- and they all carry --dependency=afterany on the same id, so they would all
+# become eligible together and train the same RUN into the same store dir concurrently. Two
+# processes writing one last.ckpt is how this project produced a 0-byte checkpoint before.
+# Observed live on 2026-09-04: 21944570 was preempted once and had queued both 21950636 and
+# 21969672 against itself.
+CHAIN_MARK="$REPO/.chain_submitted.${SLURM_JOB_ID:-none}"
+if [ "$CHAIN" -gt 0 ] && [ -e "$CHAIN_MARK" ]; then
+    echo "[$(date)] successor already queued for job $SLURM_JOB_ID (requeue detected); not queueing another"
+    CHAIN=0
+fi
 if [ "$CHAIN" -gt 0 ]; then
     JOBINFO=$(scontrol show job "$SLURM_JOB_ID" | tr ' ' '\n')
     CHAIN_GRES=$(printf '%s\n' "$JOBINFO" | sed -n 's|^TresPerNode=gres/||p')
@@ -75,6 +87,7 @@ if [ "$CHAIN" -gt 0 ]; then
                --time="$CHAIN_TIME" \
                --job-name="$SLURM_JOB_NAME" \
                "$CHAIN_SELF" \
+        && touch "$CHAIN_MARK" \
         && echo "[$(date)] queued next chain segment on $SLURM_JOB_PARTITION $CHAIN_GRES $CHAIN_TIME (CHAIN=$((CHAIN - 1)) remaining)"
 fi
 
