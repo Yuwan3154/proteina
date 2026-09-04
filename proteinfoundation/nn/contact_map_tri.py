@@ -196,7 +196,39 @@ class ContactMapTriSiT(nn.Module):
         self.out_norm = nn.LayerNorm(self.dim)
         self.out = nn.Linear(self.dim, 1)
         nn.init.zeros_(self.out.weight)
+        if self.freeze_trunk:
+            self._freeze_trunk()
         nn.init.zeros_(self.out.bias)
+
+    def _freeze_trunk(self) -> int:
+        """Freeze everything except the structure head. Returns the number of frozen parameters.
+
+        ⭐ `requires_grad_(False)` is sufficient on its own -- no `torch.no_grad()` wrapper needed.
+        With every trunk parameter frozen and the batch not requiring grad, autograd builds no graph
+        through the trunk and so retains none of its activations. That is where the ~75x memory
+        saving comes from (12 blocks x ~50 N^2 c is 71.8 GB trained vs ~1 GB frozen at L=384), and it
+        is why freezing, unlike merely detaching, changes what fits on a card.
+        ⛔ Also `.eval()` the trunk: its dropout would otherwise keep injecting noise into a
+        representation we have decided not to train.
+        """
+        n = 0
+        for name, p in self.named_parameters():
+            if not name.startswith("structure_head"):
+                p.requires_grad_(False)
+                n += p.numel()
+        for name, mod in self.named_children():
+            if name != "structure_head":
+                mod.eval()
+        return n
+
+    def train(self, mode: bool = True):
+        """Keep a frozen trunk in eval mode even when Lightning calls .train() on the whole model."""
+        super().train(mode)
+        if getattr(self, "freeze_trunk", False):
+            for name, mod in self.named_children():
+                if name != "structure_head":
+                    mod.eval()
+        return self
 
     def forward(self, batch: Dict, force_compile: bool = False) -> Dict:
         cm_t = batch["contact_map_t"]
