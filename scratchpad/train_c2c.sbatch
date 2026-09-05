@@ -72,6 +72,9 @@ echo "$SLURM_JOB_ID" > "$LOCK/jobid"
 trap 'rm -rf "$LOCK"' EXIT
 echo "[lock] held by $SLURM_JOB_ID on $(hostname)"
 
+# The successor must ask for the SAME card this job actually landed on -- we queue against
+# rtx_pro_6000 / h200 / h100 at once, so a hardcoded gres would migrate the chain to another card.
+GRES="${GRES:-gpu:rtx_pro_6000:2}"
 CHAIN="${CHAIN:-0}"
 CHAIN_SELF="$REPO/scratchpad/train_c2c.sbatch"
 CHAIN_MARK="/orcd/scratch/orcd/011/chenxiou/c2c_store/.chain_submitted.${SLURM_JOB_ID:-none}"
@@ -80,10 +83,10 @@ if [ "$CHAIN" -gt 0 ] && [ -e "$CHAIN_MARK" ]; then
     CHAIN=0
 fi
 if [ "$CHAIN" -gt 0 ]; then
-    CHAIN=$((CHAIN - 1)) DEVICES="${DEVICES:-2}" ACCUM="${ACCUM:-16}" \
+    CHAIN=$((CHAIN - 1)) DEVICES="${DEVICES:-2}" ACCUM="${ACCUM:-24}" NDIFF="${NDIFF:-8}" GRES="$GRES" \
         sbatch --dependency=afterany:${SLURM_JOB_ID} \
                --partition="$SLURM_JOB_PARTITION" \
-               --gres=gpu:rtx_pro_6000:2 \
+               --gres="$GRES" \
                --time=06:00:00 \
                --job-name="$SLURM_JOB_NAME" \
                "$CHAIN_SELF" \
@@ -99,8 +102,8 @@ fi
 # prefers, and it is the pattern the working tri launcher already uses
 # (run_tri_train_sm120.sbatch:74 with ntasks-per-node=1).
 torchrun --standalone --nproc_per_node="${DEVICES:-2}" \
-    scratchpad/train_c2c.py --devices "${DEVICES:-2}" --accum "${ACCUM:-16}" \
-    --n_diff "${NDIFF:-48}" ${EXTRA:-}
+    scratchpad/train_c2c.py --devices "${DEVICES:-2}" --accum "${ACCUM:-24}" \
+    --n_diff "${NDIFF:-8}" ${EXTRA:-}
 rc=$?
 echo "C2C_EXIT=$rc"
 exit $rc
