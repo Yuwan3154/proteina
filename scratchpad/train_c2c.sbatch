@@ -89,7 +89,7 @@ if [ "$CHAIN" -gt 0 ] && [ -e "$CHAIN_MARK" ]; then
     CHAIN=0
 fi
 if [ "$CHAIN" -gt 0 ]; then
-    CHAIN=$((CHAIN - 1)) DEVICES="${DEVICES:-2}" ACCUM="${ACCUM:-24}" NDIFF="${NDIFF:-8}" GRES="$GRES" \
+    CHAIN=$((CHAIN - 1)) DEVICES="${DEVICES:-2}" ACCUM="${ACCUM:-8}" NDIFF="${NDIFF:-8}" LR="${LR:-0.0006}" GRES="$GRES" \
         sbatch --dependency=afterany:${SLURM_JOB_ID} \
                --partition="$SLURM_JOB_PARTITION" \
                --gres="$GRES" \
@@ -108,8 +108,8 @@ fi
 # prefers, and it is the pattern the working tri launcher already uses
 # (run_tri_train_sm120.sbatch:74 with ntasks-per-node=1).
 torchrun --standalone --nproc_per_node="${DEVICES:-2}" \
-    scratchpad/train_c2c.py --devices "${DEVICES:-2}" --accum "${ACCUM:-24}" \
-    --n_diff "${NDIFF:-8}" ${EXTRA:-}
+    scratchpad/train_c2c.py --devices "${DEVICES:-2}" --accum "${ACCUM:-8}" \
+    --n_diff "${NDIFF:-8}" --lr "${LR:-0.0006}" ${EXTRA:-}
 rc=$?
 echo "C2C_EXIT=$rc"
 exit $rc
