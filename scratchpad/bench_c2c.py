@@ -12,6 +12,8 @@ import time
 
 import torch
 
+FP32 = [False]
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from proteinfoundation.datasets.atom_features import N_REF_FEATS, atom14_features
@@ -43,7 +45,7 @@ def run(model, B, L, dev, iters=6):
     for i in range(iters):
         torch.cuda.synchronize()
         t0 = time.time()
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=not FP32[0]):
             out = model(batch)
         loss = diffusion_loss(out["x_denoised"], batch["atom_pos"], out["sigma"],
                               batch["atom_mask"])[0].mean()
@@ -62,10 +64,12 @@ def main():
     ap.add_argument("--lengths", type=int, nargs="+", default=[384])
     ap.add_argument("--batches", type=int, nargs="+", default=[1])
     ap.add_argument("--ndiff", type=int, nargs="+", default=[1, 4, 8, 16, 32, 48])
+    ap.add_argument("--fp32", action="store_true", help="measure the fp32 path")
     args = ap.parse_args()
 
+    FP32[0] = args.fp32
     dev = "cuda"
-    print(torch.cuda.get_device_name(0), flush=True)
+    print(f"{torch.cuda.get_device_name(0)}  precision={'fp32' if args.fp32 else 'bf16'}", flush=True)
     print(f"{'L':>5} {'B':>3} {'ndiff':>6} {'s/iter':>9} {'peak GiB':>9}")
     for L in args.lengths:
         for B in args.batches:
