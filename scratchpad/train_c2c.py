@@ -93,7 +93,11 @@ def main():
         enable_progress_bar=False,
         limit_train_batches=8 if args.smoke else 1.0,
         limit_val_batches=4 if args.smoke else 64,
-        val_check_interval=args.val_every if not args.smoke else 8,
+        # ⛔ val_check_interval counts TRAINING MICRO-BATCHES, not optimizer steps. With
+        # accum=128 a bare `10` validated every 10 micro-batches -- 64 val batches plus two
+        # 200-step rollouts for every 10, which measured out at ~87% of all compute and left
+        # the run at 4 optimizer steps after 47 minutes. Multiply by accum to get steps.
+        val_check_interval=(args.val_every * args.accum) if not args.smoke else 8,
         max_steps=16 if args.smoke else -1,
         default_root_dir=args.store,
     )
