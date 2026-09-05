@@ -112,7 +112,12 @@ class AttentionPairBias(nn.Module):
         self.out_scale = nn.Linear(c_s, c_a)
         nn.init.zeros_(self.out_scale.weight)
         nn.init.constant_(self.out_scale.bias, bias_init)
-        nn.init.zeros_(self.to_out.weight)
+        # ⛔ to_out is NOT zero-initialised. The adaptive gate above already damps this branch to
+        # sigmoid(-2.0) ~ 0.12 at init, which is the whole point of AF3's -2.0 bias. Zeroing the
+        # weight on top of that makes the branch exactly zero, and since z reaches the loss ONLY
+        # through this attention bias, it severs the gradient to z entirely -- the tri blocks and
+        # the contact embedding then never learn. Protenix agrees: zero_init = not has_s
+        # (transformer.py:94), so with conditioning present, as here, they do not zero-init.
 
     def forward(self, a, s, z, mask):
         B, L, _ = a.shape
@@ -144,7 +149,8 @@ class ConditionedTransitionBlock(nn.Module):
         self.out_scale = nn.Linear(c_s, c_a)
         nn.init.zeros_(self.out_scale.weight)
         nn.init.constant_(self.out_scale.bias, bias_init)
-        nn.init.zeros_(self.to_out.weight)
+        # Not zero-initialised, for the same reason as AttentionPairBias above: the -2.0 gate is
+        # already the damping mechanism, and a zero weight on top of it only severs gradients.
 
     def forward(self, a, s):
         h = self.to_ab(self.adaln(a, s))
