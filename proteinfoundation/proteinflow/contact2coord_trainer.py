@@ -28,8 +28,14 @@ WARMUP_STEPS = 1000
 DECAY_EVERY = 50_000
 DECAY_FACTOR = 0.95
 GRAD_CLIP = 10.0
-# Distogram bins: the repo's existing convention, matching loss.num_dist_buckets elsewhere.
-DIST_MIN, DIST_MAX, DIST_BINS = 0.325, 5.075, 39
+# Distogram bins, in ANGSTROM -- the unit batch["coords"] actually carries (measured: median
+# consecutive CA-CA = 3.81 in a real batch, and residue_constants' ref_pos agrees at N-CA = 1.46).
+# ⛔ These were 0.325/5.075, copied from the repo's experiment configs whose comments read
+# "3.25A in nm". Against Angstrom data every real CA-CA distance (3.8 to ~66) lands past 5.075, so
+# bucketize returned the overflow bin for essentially EVERY pair: a constant target, a head that
+# learned to always predict bin 38, and a cross-entropy of 0.018 that looked like fast convergence
+# and was actually a dead loss. Same physical boundaries the repo intends, correct unit.
+DIST_MIN, DIST_MAX, DIST_BINS = 3.25, 50.75, 39
 
 
 class ContactToCoordTrainer(L.LightningModule):

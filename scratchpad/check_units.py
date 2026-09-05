@@ -81,6 +81,19 @@ def main():
     batch_unit = "ANGSTROM" if 3.0 < bstep < 4.5 else ("NANOMETRE" if 0.30 < bstep < 0.45 else "???")
     print(f"  => batch coords are {batch_unit}")
 
+    print("\n=== distogram bin occupancy on this batch ===")
+    # The loss can be dead without ever erroring: if every pair falls in one bucket the target is
+    # constant and the cross-entropy converges to ~0 while teaching the head nothing.
+    d = torch.cdist(bca, bca)
+    for name, lo, hi in [("nm bounds 0.325-5.075", 0.325, 5.075),
+                         ("A  bounds 3.25-50.75", 3.25, 50.75)]:
+        edges = torch.linspace(lo, hi, 38)
+        tgt = torch.bucketize(d, edges)
+        occ = torch.bincount(tgt.reshape(-1), minlength=39).float()
+        frac_top = (occ[-1] / occ.sum()).item()
+        print(f"  {name}: {int((occ > 0).sum())}/39 bins used, "
+              f"{frac_top*100:.1f}% of pairs in the overflow bin")
+
     print("\n=== verdict ===")
     print(f"  ref_pos={ref_unit}  file coords={data_unit}  BATCH coords={batch_unit}")
     data_unit = batch_unit          # the batch is what the model trains on
