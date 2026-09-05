@@ -75,7 +75,14 @@ def main():
         default_root_dir=args.store,
     )
     dm = hydra.utils.instantiate(cfg_data.datamodule)
-    trainer.fit(model, datamodule=dm)
+    # ⛔ Resume across chain segments. mit_normal_gpu caps wall-clock at 6 h, so a 24 h run is four
+    # segments; without this each one would silently restart from scratch and the run would never
+    # progress past six hours no matter how many segments completed.
+    last = os.path.join(args.store, args.name, "last.ckpt")
+    resume = last if (os.path.exists(last) and not args.smoke) else None
+    if resume:
+        print(f"[resume] {resume}", flush=True)
+    trainer.fit(model, datamodule=dm, ckpt_path=resume)
 
     if args.smoke:
         # Gate on the artefact: a run that trained on degenerate data still exits 0.

@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:h200:2
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=200G
-#SBATCH --time=1-00:00:00
+#SBATCH --time=06:00:00
 #SBATCH --requeue
 #SBATCH --open-mode=append
 #SBATCH --output=/orcd/scratch/orcd/011/chenxiou/c2c_store/logs/%x-%j.out
@@ -37,6 +37,36 @@ mkdir -p "$TMPDIR" /orcd/scratch/orcd/011/chenxiou/c2c_store/logs
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+
+# ── self-chaining, mit_normal_gpu caps wall-clock at 6 h ───────────────────────────────────────
+# Carries every fix earned on the tri launcher this session:
+#  - resubmit THIS script via CHAIN_SELF, named literally (SLURM runs a spool COPY, so $0 and
+#    BASH_SOURCE point at a path that dies with the job);
+#  - pass --job-name through, or successors come back under the wrong name and become invisible to
+#    any check that matches by name;
+#  - submit AT MOST ONCE per job id. A preempted job is requeued under the SAME SLURM_JOB_ID and
+#    re-runs this script from the top, so without the marker every preemption queues ANOTHER
+#    successor -- and they all carry --dependency=afterany on the same id, so they would start
+#    CONCURRENTLY and train one run into one checkpoint directory from several processes.
+CHAIN="${CHAIN:-0}"
+CHAIN_SELF="$REPO/scratchpad/train_c2c.sbatch"
+CHAIN_MARK="/orcd/scratch/orcd/011/chenxiou/c2c_store/.chain_submitted.${SLURM_JOB_ID:-none}"
+if [ "$CHAIN" -gt 0 ] && [ -e "$CHAIN_MARK" ]; then
+    echo "[$(date)] successor already queued for $SLURM_JOB_ID (requeue); not queueing another"
+    CHAIN=0
+fi
+if [ "$CHAIN" -gt 0 ]; then
+    CHAIN=$((CHAIN - 1)) DEVICES="${DEVICES:-2}" ACCUM="${ACCUM:-16}" \
+        sbatch --dependency=afterany:${SLURM_JOB_ID} \
+               --partition="$SLURM_JOB_PARTITION" \
+               --gres=gpu:h200:2 \
+               --time=06:00:00 \
+               --job-name="$SLURM_JOB_NAME" \
+               "$CHAIN_SELF" \
+        && touch "$CHAIN_MARK" \
+        && echo "[$(date)] queued next c2c segment (CHAIN=$((CHAIN - 1)) remaining)"
+fi
+
 python scratchpad/train_c2c.py --devices "${DEVICES:-2}" --accum "${ACCUM:-16}" ${EXTRA:-}
 rc=$?
 echo "C2C_EXIT=$rc"
