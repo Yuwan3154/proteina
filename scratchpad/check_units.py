@@ -57,8 +57,35 @@ def main():
     data_unit = "ANGSTROM" if 3.0 < med < 4.5 else ("NANOMETRE" if 0.30 < med < 0.45 else "???")
     print(f"  => coords are {data_unit}   (consecutive CA-CA is 3.80 A = 0.380 nm)")
 
+    print("\n=== batch['coords'], AS THE MODEL SEES IT ===")
+    # ⛔ The .pt on disk is not the answer: proteina's own configs bin the distogram at
+    # 0.325-5.075 with the comment "3.25A in nm", which only makes sense if something between the
+    # file and the batch rescales. Pull one real batch through the actual datamodule and measure.
+    import hydra
+    from omegaconf import OmegaConf
+    ds = "pdb_train_contact-confind-topology_S25_max384_purge-test_cutoff-190828"
+    with hydra.initialize("../configs/datasets_config/pdb", version_base=hydra.__version__):
+        cfg = hydra.compose(config_name=ds)
+    OmegaConf.set_struct(cfg, False)
+    cfg.datamodule.num_workers = 0
+    dm = hydra.utils.instantiate(cfg.datamodule)
+    dm.setup("fit")
+    batch = next(iter(dm.train_dataloader()))
+    bc = batch["coords"]
+    bmask = batch["mask_dict"]["coords"][..., 0, 0].bool()
+    bca = bc[0][bmask[0]][:, 1, :]
+    bstep = (bca[1:] - bca[:-1]).norm(dim=-1).median().item()
+    print(f"  coords shape {tuple(bc.shape)}, {int(bmask[0].sum())} real residues")
+    print(f"  median consecutive CA-CA = {bstep:.4f}")
+    batch_unit = "ANGSTROM" if 3.0 < bstep < 4.5 else ("NANOMETRE" if 0.30 < bstep < 0.45 else "???")
+    print(f"  => batch coords are {batch_unit}")
+
     print("\n=== verdict ===")
-    print(f"  ref_pos={ref_unit}  coords={data_unit}")
+    print(f"  ref_pos={ref_unit}  file coords={data_unit}  BATCH coords={batch_unit}")
+    data_unit = batch_unit          # the batch is what the model trains on
+    ref_unit_mismatch = ref_unit != batch_unit
+    if ref_unit_mismatch:
+        print("  ⛔ ref_pos and batch coords disagree -- the encoder mixes both.")
     if ref_unit != data_unit:
         print("  ⛔ MISMATCH: the two geometry sources are in different units.")
     if data_unit == "NANOMETRE":
