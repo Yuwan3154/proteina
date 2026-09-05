@@ -29,5 +29,5 @@ mkdir -p "$TMPDIR"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
-python scratchpad/bench_c2c.py --lengths ${LENGTHS:-384} --batches ${BATCHES:-1 2 4 8}
+python scratchpad/bench_c2c.py --lengths ${LENGTHS:-384} --batches ${BATCHES:-1} ${BENCH_ARGS:-}
 echo "BENCH_EXIT=$?"
