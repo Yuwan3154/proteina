@@ -84,12 +84,15 @@ def main():
     check("blocked kernel == explicit per-block reference", d < 1e-9, f"max|diff|={d:.2e}")
 
     # ---- locality: an atom far outside block 0's window must not move block 0's output ----
-    far = ap - 1                       # last atom; block 0's window is keys 0..79
+    far = 150                          # a REAL atom (A=200); block 0's window is keys 0..79
     in_window = set(kidx[0][kvalid[0]].tolist())
     check("far atom really is outside block 0's window", far not in in_window,
           f"window={min(in_window)}..{max(in_window)}")
     a2 = a.clone()
-    a2[:, far] += 10.0
+    # ⛔ Random noise, not a constant offset: adaLN starts with a LayerNorm, which is exactly
+    # invariant to adding the same value to every channel, so `+= 10.0` is a silent no-op and the
+    # control half of this test would pass vacuously.
+    a2[:, far] += torch.randn(c_a, dtype=torch.float64)
     with torch.no_grad():
         moved = mod(a2, a2, pair, key_mask, qidx, kidx)
     delta_blk0 = (moved[:, :N_QUERIES] - fast[:, :N_QUERIES]).abs().max().item()
@@ -130,10 +133,32 @@ def main():
     check("decoder zeroes masked atoms", float(upd[1, -20:].abs().max()) == 0.0)
 
     # ---- gradients reach every sub-module ----
+    # AdaLN is zero-init on to_gamma.weight and to_beta.weight (AF3's adaLN-zero), so at step 0 the
+    # conditioning path s->output has zero slope and `norm_s`'s own affine params are the one
+    # legitimate exception. They are NOT dead: to_gamma/to_beta receive gradient immediately, and
+    # once they move off zero the conditioning path opens. Both halves are asserted below rather
+    # than exempted, because "zero grad at init" is exactly what a genuinely severed path looks
+    # like and the two must be told apart.
     upd.sum().backward()
-    dead = [n for n, p in list(enc.named_parameters()) + list(dec.named_parameters())
-            if p.grad is None or p.grad.abs().max() == 0]
-    check("every encoder+decoder parameter receives gradient", not dead, str(dead[:4]))
+    params = list(enc.named_parameters()) + list(dec.named_parameters())
+    dead = [n for n, p in params if p.grad is None or p.grad.abs().max() == 0]
+    expected = [n for n in dead if n.endswith(("adaln.norm_s.weight", "adaln.norm_s.bias"))]
+    check("only adaLN norm_s params are zero-grad at init", sorted(dead) == sorted(expected),
+          str([n for n in dead if n not in expected][:4]))
+    gates = [n for n, p in params if n.endswith(("to_gamma.weight", "to_beta.weight"))]
+    live = [n for n, p in params
+            if n in gates and p.grad is not None and p.grad.abs().max() > 0]
+    check("the adaLN gates themselves DO receive gradient", len(live) == len(gates),
+          f"{len(live)}/{len(gates)}")
+
+    opt = torch.optim.SGD(list(enc.parameters()) + list(dec.parameters()), lr=1e-2)
+    opt.step()
+    enc.zero_grad(); dec.zero_grad()
+    a_tok2, q_atom2 = enc(torch.randn(B, A2, 8), torch.randn(B, A2, 3), a2t, s, z, am,
+                          noisy_pos=torch.randn(B, A2, 3))
+    dec(a_tok2, q_atom2, a2t, am, torch.randn(B, L, L, c_ap)).sum().backward()
+    still_dead = [n for n, p in params if p.grad is None or p.grad.abs().max() == 0]
+    check("after one step EVERY parameter receives gradient", not still_dead, str(still_dead[:4]))
 
     print(f"\n{len(PASS)}/{len(PASS) + len(FAIL)} passed")
     return 1 if FAIL else 0
