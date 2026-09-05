@@ -291,7 +291,7 @@ def smooth_lddt(x, x_gt, mask, cutoff: float = 15.0):
     return 1.0 - (eps * pair).sum(dim=(1, 2)) / pair.sum(dim=(1, 2)).clamp_min(1e-8)
 
 
-def diffusion_loss(x_denoised, x_gt, sigma, mask, use_smooth_lddt: bool = True):
+def diffusion_loss(x_denoised, x_gt, sigma, mask, use_smooth_lddt: bool = True):  # noqa: C901
     """SI 3.7.1 Eqs. 2-6, CA-only.
 
     ⛔ EDM WEIGHT: the SI prints (t_hat + sigma_data)^2 as the denominator, but BOTH faithful
@@ -302,14 +302,30 @@ def diffusion_loss(x_denoised, x_gt, sigma, mask, use_smooth_lddt: bool = True):
     The per-atom type weights w_l (alpha_dna=alpha_rna=5, alpha_ligand=10, SI Eq. 4) are all 1 here:
     this is a protein CA-only model, so every token is the base case.
     """
-    weights = mask
-    x_gt_aligned = weighted_rigid_align(x_denoised, x_gt, weights, mask)
-    err = ((x_denoised - x_gt_aligned) ** 2).sum(-1)
-    mse = (err * mask).sum(1) / mask.sum(1).clamp_min(1e-8) / 3.0     # 1/3 prefactor, SI Eq. 3
-    w = (sigma ** 2 + SIGMA_DATA ** 2) / (sigma * SIGMA_DATA) ** 2
-    loss = w * mse
-    if use_smooth_lddt:
-        # Added OUTSIDE the noise-level factor and unweighted (SI Eq. 6). On in initial training,
-        # off from fine-tuning 1 onward (SI 5.2).
-        loss = loss + smooth_lddt(x_denoised, x_gt_aligned, mask)
+    # ⛔ THE WHOLE LOSS RUNS IN fp32, autocast explicitly disabled. Not a stylistic choice:
+    #  - the EDM weight (sigma^2 + sd^2)/(sigma*sd)^2 spans ~5 orders of magnitude over the training
+    #    noise distribution, and bf16 carries ~3 decimal digits;
+    #  - smooth_lddt sums four sigmoids over an L^2 pair grid, where bf16 accumulation error grows
+    #    with L;
+    #  - weighted_rigid_align is an SVD, and torch.linalg.det has no bf16 CUDA kernel at all.
+    # ⭐ Protenix reaches the same conclusion independently: configs_base.py:137-144 sets
+    #   skip_amp = {"sample_diffusion": True, "sample_diffusion_training": True, "loss": True}
+    # i.e. bf16 for the network, fp32 for the loss and for diffusion sampling. AF3's own
+    # diffusion_head.py:250-267 likewise casts activations and both trunk conditioning tensors back
+    # to float32 inside its bfloat16 context.
+    with torch.autocast(device_type=x_denoised.device.type, enabled=False):
+        x_denoised = x_denoised.float()
+        x_gt = x_gt.float()
+        sigma = sigma.float()
+        mask = mask.float()
+        weights = mask
+        x_gt_aligned = weighted_rigid_align(x_denoised, x_gt, weights, mask)
+        err = ((x_denoised - x_gt_aligned) ** 2).sum(-1)
+        mse = (err * mask).sum(1) / mask.sum(1).clamp_min(1e-8) / 3.0   # 1/3 prefactor, SI Eq. 3
+        w = (sigma ** 2 + SIGMA_DATA ** 2) / (sigma * SIGMA_DATA) ** 2
+        loss = w * mse
+        if use_smooth_lddt:
+            # Added OUTSIDE the noise-level factor and unweighted (SI Eq. 6). On in initial
+            # training, off from fine-tuning 1 onward (SI 5.2).
+            loss = loss + smooth_lddt(x_denoised, x_gt_aligned, mask)
     return loss, {"mse": mse.detach(), "edm_weight": w.detach()}
