@@ -43,6 +43,9 @@ def main():
     # AF3's diffusion mini-batch (SI Alg. 20); Protenix ships 48. Capped here by measured VRAM.
     ap.add_argument("--n_diff", type=int, default=48)
     ap.add_argument("--lr", type=float, default=None)
+    # Warm start from a specific checkpoint's WEIGHTS. Ignored once last.ckpt exists, so a chained
+    # successor resumes normally instead of warm-starting again and discarding the segment.
+    ap.add_argument("--init_from", default=None)
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
     MODEL_CFG["n_diffusion_samples"] = args.n_diff
@@ -97,6 +100,18 @@ def main():
     resume = last if (os.path.exists(last) and not args.smoke) else None
     if resume:
         print(f"[resume] {resume}", flush=True)
+    elif args.init_from:
+        # ⛔ WEIGHTS ONLY, deliberately not ckpt_path=. A full resume restores the optimizer AND
+        # the scheduler, and Lightning's load_state_dict overwrites the param_group lr with the
+        # checkpointed one -- so `--lr` would be silently ignored and we would resume straight back
+        # into the rate that just blew up. Fresh optimizer, fresh warmup, good weights.
+        # (No EMA to worry about here: ContactToCoordTrainer keeps none, so state_dict IS the model.
+        # That is why the usual "warm start needs the EMA weights" caveat does not apply.)
+        sd = torch.load(args.init_from, map_location="cpu", weights_only=False)
+        assert "ema" not in sd, "checkpoint carries EMA weights; state_dict would be the wrong ones"
+        missing, unexpected = model.load_state_dict(sd["state_dict"], strict=True)
+        print(f"[warm-start] weights from {args.init_from} "
+              f"(step {sd.get('global_step')}), fresh optimizer at lr={model.lr}", flush=True)
     trainer.fit(model, datamodule=dm, ckpt_path=resume)
 
     if args.smoke:

@@ -109,7 +109,8 @@ fi
 # (run_tri_train_sm120.sbatch:74 with ntasks-per-node=1).
 torchrun --standalone --nproc_per_node="${DEVICES:-2}" \
     scratchpad/train_c2c.py --devices "${DEVICES:-2}" --accum "${ACCUM:-8}" \
-    --n_diff "${NDIFF:-8}" --lr "${LR:-0.0006}" ${EXTRA:-}
+    --n_diff "${NDIFF:-8}" --lr "${LR:-0.0006}" \
+    ${INIT_FROM:+--init_from "$INIT_FROM"} ${EXTRA:-}
 rc=$?
 echo "C2C_EXIT=$rc"
 exit $rc
