@@ -20,7 +20,7 @@ from proteinfoundation.nn.contact2coord import ContactToCoord
 
 MODEL_CFG = dict(
     c_s=384, c_z=128, c_token=768, c_atom=128, c_atompair=16,
-    n_blocks=24, n_heads=16, n_tri_blocks=2, tri_hidden=128, transition_n=2,
+    n_blocks=24, n_heads=16, n_tri_blocks=4, tri_hidden=128, transition_n=2,
     atom_blocks=3, atom_heads=4,
 )
 

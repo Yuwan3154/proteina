@@ -26,7 +26,7 @@ from proteinfoundation.proteinflow.contact2coord_trainer import GRAD_CLIP, Conta
 # AF3 widths and depth throughout (SI Alg. 23); user directive 2026-09-04 fixed depth at 24.
 MODEL_CFG = dict(
     c_s=384, c_z=128, c_token=768, c_atom=128, c_atompair=16,
-    n_blocks=24, n_heads=16, n_tri_blocks=2, tri_hidden=128, transition_n=2,
+    n_blocks=24, n_heads=16, n_tri_blocks=4, tri_hidden=128, transition_n=2,
     atom_blocks=3, atom_heads=4,
 )
 
@@ -46,6 +46,7 @@ def main():
     # Warm start from a specific checkpoint's WEIGHTS. Ignored once last.ckpt exists, so a chained
     # successor resumes normally instead of warm-starting again and discarding the segment.
     ap.add_argument("--init_from", default=None)
+    ap.add_argument("--precision", default="bf16-mixed")
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
     MODEL_CFG["n_diffusion_samples"] = args.n_diff
@@ -80,7 +81,7 @@ def main():
     trainer = L.Trainer(
         accelerator="gpu", devices=args.devices, num_nodes=1,
         strategy="ddp" if args.devices > 1 else "auto",
-        precision="bf16-mixed",          # ⛔ the LOSS forces fp32 internally; see af3_diffusion
+        precision=args.precision,        # ⛔ the LOSS is fp32 internally regardless; see af3_diffusion
         max_epochs=-1,
         accumulate_grad_batches=args.accum,
         gradient_clip_val=GRAD_CLIP,     # AF3 SI §5.6, global norm 10
@@ -105,8 +106,6 @@ def main():
         # the scheduler, and Lightning's load_state_dict overwrites the param_group lr with the
         # checkpointed one -- so `--lr` would be silently ignored and we would resume straight back
         # into the rate that just blew up. Fresh optimizer, fresh warmup, good weights.
-        # (No EMA to worry about here: ContactToCoordTrainer keeps none, so state_dict IS the model.
-        # That is why the usual "warm start needs the EMA weights" caveat does not apply.)
         sd = torch.load(args.init_from, map_location="cpu", weights_only=False)
         # ⛔ Prefer the EMA weights when the checkpoint has them. state_dict is the raw,
         # unaveraged model -- warm-starting from it would discard the averaging and start from a

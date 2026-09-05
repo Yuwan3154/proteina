@@ -13,6 +13,7 @@ cd /orcd/scratch/orcd/011/chenxiou/proteina_sh
 submit () {   # $1 partition, $2 gres
     GRES="$2" CHAIN=4 \
     LR="${LR:-}" NDIFF="${NDIFF:-}" ACCUM="${ACCUM:-}" INIT_FROM="${INIT_FROM:-}" \
+    PRECISION="${PRECISION:-}" \
         sbatch --partition="$1" --gres="$2" --time=06:00:00 \
                --job-name=c2c scratchpad/train_c2c.sbatch | sed "s/$/  [$1 $2]/"
 }
