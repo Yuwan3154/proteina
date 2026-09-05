@@ -101,10 +101,16 @@ class AtomAttentionDecoder(nn.Module):
             DiffusionTransformerBlock(c_atom, c_atom, c_atompair, n_heads) for _ in range(n_blocks)
         )
         self.norm = nn.LayerNorm(c_atom)
+        # ⛔ NOT zero-initialised, and that is deliberate. A zero output projection makes the
+        # backward through it `grad @ W.T = 0`, so EVERY upstream module -- the token transformer,
+        # the atom encoder, the tri blocks, the contact embedding -- receives exactly zero gradient
+        # until this layer itself moves off zero. Measured: 15/19 gate checks, with four sub-modules
+        # at 0.000e+00 grad while only the decoder learned.
+        # Protenix does not zero-init here either: its AtomAttentionDecoder.linear_no_bias_out is a
+        # plain LinearNoBias (transformer.py:988), and its `zero_init` flag is reserved for
+        # has_s=False attention blocks (transformer.py:94), which this is not. Standard init, and
+        # the EDM output scaling c_out = sigma/sqrt(1+r^2) keeps the early update small anyway.
         self.to_pos = nn.Linear(c_atom, 3, bias=False)
-        # Zero-init so the module starts as the identity on coordinates and the EDM skip connection
-        # carries the first steps, rather than injecting noise before anything is learned.
-        nn.init.zeros_(self.to_pos.weight)
 
     def forward(self, a_token, q_atom, atom_to_token, atom_mask, pair):
         idx = atom_to_token.clamp(min=0)

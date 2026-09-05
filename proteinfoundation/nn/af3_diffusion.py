@@ -191,10 +191,13 @@ class AF3DiffusionHead(nn.Module):
             DiffusionTransformerBlock(c_token, c_s, c_z, n_heads) for _ in range(n_blocks)
         )
         self.norm_out = nn.LayerNorm(c_token)
+        # ⛔ NOT zero-initialised. A zero output projection is appealing (the head starts as the
+        # pure EDM skip, D = c_skip * x) but it makes the backward through it `grad @ W.T = 0`, so
+        # every upstream module gets exactly zero gradient until this layer moves off zero. The
+        # same choice in the atom decoder was caught by a gradient-reach gate showing four
+        # sub-modules at 0.000e+00. Protenix does not zero-init its equivalent output projection.
+        # The EDM scaling c_out = sigma/sqrt(1+r^2) already keeps the early update small.
         self.to_coords = nn.Linear(c_token, 3, bias=False)
-        # Zero-init the coordinate readout so the head starts as the pure EDM skip connection
-        # (D = c_skip * x) instead of injecting noise into the very first optimizer steps.
-        nn.init.zeros_(self.to_coords.weight)
 
     def _f_forward(self, r_noisy, sigma, s, z, mask):
         """F_theta(c_in * x, c_noise(sigma)) -- the raw network, before EDM output scaling."""
