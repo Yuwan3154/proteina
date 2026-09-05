@@ -138,10 +138,11 @@ def main():
     it = iter(dm.val_dataloader())
     batches = []
     for _ in range(args.structures):
-        raw = next(it)
-        batches.append(mod._prepare(
-            {k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in raw.items()}
-            if isinstance(raw, dict) else raw, train=False))
+        # ⛔ _prepare on the CPU batch, THEN move. The raw batch nests tensors under
+        # mask_dict["coords"], so a shallow {k: v.to(dev)} leaves the mask on CPU and the first
+        # embedding lookup dies with a cuda:0/cpu mismatch. _prepare returns a flat dict.
+        b = mod._prepare(next(it), train=False)
+        batches.append({k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in b.items()})
     print(f"{len(batches)} structures x {args.copies} noise copies "
           f"= {len(batches)*args.copies} backward passes", flush=True)
 
