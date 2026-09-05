@@ -68,6 +68,7 @@ def main():
         cfg = hydra.compose(config_name=ds)
     OmegaConf.set_struct(cfg, False)
     cfg.datamodule.num_workers = 0
+    cfg.datamodule.prefetch_factor = None      # torch rejects prefetch_factor with 0 workers
     dm = hydra.utils.instantiate(cfg.datamodule)
     dm.setup("fit")
     batch = next(iter(dm.train_dataloader()))
