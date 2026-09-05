@@ -47,6 +47,10 @@ def main():
     # successor resumes normally instead of warm-starting again and discarding the segment.
     ap.add_argument("--init_from", default=None)
     ap.add_argument("--precision", default="bf16-mixed")
+    # ⛔ Monitoring cadence must scale with step COST. At the reference effective batch a
+    # step takes ~144 s, so the old every-500-steps validation would first fire after 20 h
+    # -- we would see nothing at all before the window closed.
+    ap.add_argument("--val_every", type=int, default=500)
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
     MODEL_CFG["n_diffusion_samples"] = args.n_diff
@@ -73,7 +77,7 @@ def main():
     os.makedirs(args.store, exist_ok=True)
     ckpt_cb = ModelCheckpoint(
         dirpath=os.path.join(args.store, args.name), monitor="val/loss", mode="min",
-        save_top_k=3, save_last=True, every_n_train_steps=500,
+        save_top_k=3, save_last=True, every_n_train_steps=args.val_every,
     )
     logger = WandbLogger(project="contact2coord", name=args.name,
                          save_dir=args.store, offline=args.smoke)
@@ -89,7 +93,7 @@ def main():
         enable_progress_bar=False,
         limit_train_batches=8 if args.smoke else 1.0,
         limit_val_batches=4 if args.smoke else 64,
-        val_check_interval=500 if not args.smoke else 8,
+        val_check_interval=args.val_every if not args.smoke else 8,
         max_steps=16 if args.smoke else -1,
         default_root_dir=args.store,
     )
