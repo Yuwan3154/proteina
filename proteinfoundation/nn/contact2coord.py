@@ -194,15 +194,26 @@ class ContactToCoord(nn.Module):
         """SI Alg. 18. Defaults to the 20-step mini-rollout; pass 200 for full inference."""
         B, A = atom_mask.shape
         dev = s.device
+        # ⛔ EVERY step is masked, and the centring uses a MASKED mean. Padding is not a small
+        # detail here: at L=224 in a 384-padded batch, 42% of the A=5376 atom slots are padding.
+        # The previous version centred with `x.mean(dim=1)` over ALL slots and never masked the
+        # denoiser output inside the loop, so noise on padded slots pulled the centre of mass every
+        # step and fed back through x. Only the FINAL return was masked, which hides it from shape
+        # checks while corrupting the trajectory. Symptom: sampled Rg wandering between 0.20x and
+        # 8.76x of native across checkpoints while the distance-matrix correlation stayed at
+        # 0.90-0.98 -- right shape, uncontrolled scale, which is exactly what a drifting centre does.
+        m = atom_mask[..., None]
+        nreal = atom_mask.sum(dim=1, keepdim=True).clamp_min(1.0)[..., None]
         sig = noise_schedule(torch.linspace(0.0, 1.0, n_steps + 1, device=dev))
-        x = sig[0] * torch.randn(B, A, 3, device=dev)
+        x = sig[0] * torch.randn(B, A, 3, device=dev) * m
         for i in range(n_steps):
             s_prev, s_cur = sig[i], sig[i + 1]
-            x = x - x.mean(dim=1, keepdim=True)
+            x = (x - (x * m).sum(dim=1, keepdim=True) / nreal) * m
             gamma = 0.8 if s_cur > 1.0 else 0.0
             t_hat = s_prev * (gamma + 1.0)
-            x_noisy = x + 1.003 * torch.sqrt((t_hat ** 2 - s_prev ** 2).clamp_min(0)) * torch.randn_like(x)
+            x_noisy = x + 1.003 * torch.sqrt((t_hat ** 2 - s_prev ** 2).clamp_min(0)) \
+                * torch.randn_like(x) * m
             d = self.denoise(x_noisy, t_hat.expand(B), s, z, mask,
-                             ref_feats, ref_pos, atom_to_token, atom_mask)
-            x = x_noisy + 1.5 * (s_cur - t_hat) * (x_noisy - d) / t_hat
-        return x * atom_mask[..., None]
+                             ref_feats, ref_pos, atom_to_token, atom_mask) * m
+            x = (x_noisy + 1.5 * (s_cur - t_hat) * (x_noisy - d) / t_hat) * m
+        return x * m
