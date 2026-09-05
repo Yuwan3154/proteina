@@ -60,20 +60,25 @@ def run(model, B, L, dev, iters=6):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--lengths", type=int, nargs="+", default=[384])
-    ap.add_argument("--batches", type=int, nargs="+", default=[1, 2, 4])
+    ap.add_argument("--batches", type=int, nargs="+", default=[1])
+    ap.add_argument("--ndiff", type=int, nargs="+", default=[1, 4, 8, 16, 32, 48])
     args = ap.parse_args()
 
     dev = "cuda"
     print(torch.cuda.get_device_name(0), flush=True)
-    model = ContactToCoord(**MODEL_CFG, n_ref_feats=N_REF_FEATS).to(dev)
-    n = sum(p.numel() for p in model.parameters())
-    print(f"{n/1e6:.2f} M params, {MODEL_CFG['n_blocks']} diffusion blocks\n", flush=True)
-    print(f"{'L':>5} {'B':>3} {'s/iter':>9} {'s/sample':>10} {'peak GiB':>9}")
+    print(f"{'L':>5} {'B':>3} {'ndiff':>6} {'s/iter':>9} {'peak GiB':>9}")
     for L in args.lengths:
         for B in args.batches:
-            torch.cuda.empty_cache()
-            t, mem = run(model, B, L, dev)
-            print(f"{L:>5} {B:>3} {t:>9.3f} {t/B:>10.3f} {mem:>9.2f}", flush=True)
+            for nd in args.ndiff:
+                torch.cuda.empty_cache()
+                cfg = dict(MODEL_CFG, n_diffusion_samples=nd)
+                model = ContactToCoord(**cfg, n_ref_feats=N_REF_FEATS).to(dev)
+                try:
+                    t, mem = run(model, B, L, dev)
+                    print(f"{L:>5} {B:>3} {nd:>6} {t:>9.3f} {mem:>9.2f}", flush=True)
+                except torch.OutOfMemoryError:
+                    print(f"{L:>5} {B:>3} {nd:>6} {'OOM':>9} {'-':>9}", flush=True)
+                del model
 
 
 if __name__ == "__main__":

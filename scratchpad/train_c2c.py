@@ -40,8 +40,12 @@ def main():
     ap.add_argument("--devices", type=int, default=2)
     ap.add_argument("--accum", type=int, default=16)
     ap.add_argument("--batch_size", type=int, default=1)
+    # AF3's diffusion mini-batch (SI Alg. 20); Protenix ships 48. Capped here by measured VRAM.
+    ap.add_argument("--n_diff", type=int, default=48)
+    ap.add_argument("--lr", type=float, default=None)
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
+    MODEL_CFG["n_diffusion_samples"] = args.n_diff
 
     ds_dir = f"../configs/datasets_config/{args.subdir}"
     with hydra.initialize(ds_dir, version_base=hydra.__version__):
@@ -54,9 +58,13 @@ def main():
     print(f"[batch] per-rank {args.batch_size} x accum {args.accum} x {args.devices} ranks "
           f"= effective {args.batch_size * args.accum * args.devices}", flush=True)
 
-    model = ContactToCoordTrainer(model_cfg=MODEL_CFG)
+    dump_dir = os.path.join(args.store, args.name, "samples")
+    kw = {"lr": args.lr} if args.lr is not None else {}
+    model = ContactToCoordTrainer(model_cfg=MODEL_CFG, dump_dir=dump_dir, **kw)
     n_par = sum(p.numel() for p in model.parameters())
-    print(f"[model] {n_par/1e6:.2f} M parameters, {MODEL_CFG['n_blocks']} diffusion blocks", flush=True)
+    print(f"[model] {n_par/1e6:.2f} M parameters, {MODEL_CFG['n_blocks']} diffusion blocks, "
+          f"n_diffusion_samples={args.n_diff}, lr={model.lr}", flush=True)
+    print(f"[dump] validation structures -> {dump_dir}", flush=True)
 
     os.makedirs(args.store, exist_ok=True)
     ckpt_cb = ModelCheckpoint(

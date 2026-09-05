@@ -3,7 +3,7 @@
 #SBATCH --partition=mit_normal_gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:h200:2
+#SBATCH --gres=gpu:rtx_pro_6000:2
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=200G
 #SBATCH --time=06:00:00
@@ -48,6 +48,30 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 #    re-runs this script from the top, so without the marker every preemption queues ANOTHER
 #    successor -- and they all carry --dependency=afterany on the same id, so they would start
 #    CONCURRENTLY and train one run into one checkpoint directory from several processes.
+# ── single-writer lock ─────────────────────────────────────────────────────────────────────────
+# We queue the SAME run against several partitions and card types at once (rtx_pro_6000 / h200 /
+# h100) and take whichever is scheduled first. Without a lock, two of them starting would train two
+# processes into ONE checkpoint directory. mkdir is atomic on POSIX, so it is the lock.
+LOCK=/orcd/scratch/orcd/011/chenxiou/c2c_store/.run.lock
+if ! mkdir "$LOCK" 2>/dev/null; then
+    HOLDER=$(cat "$LOCK/jobid" 2>/dev/null)
+    ST=$(squeue -h -j "$HOLDER" -o %T 2>/dev/null); RC=$?
+    # ⛔ Gate on the EXIT CODE. A failed squeue returns an empty string, which reads exactly like
+    # "that job is gone" and would have both jobs take the lock and train into the same directory.
+    if [ "$RC" -ne 0 ]; then
+        echo "[lock] squeue failed (rc=$RC); refusing to judge whether $HOLDER is alive. Exiting."
+        exit 0
+    fi
+    if [ -n "$ST" ]; then
+        echo "[lock] job $HOLDER is $ST and holds the run; this duplicate exits cleanly."
+        exit 0
+    fi
+    echo "[lock] stale lock from $HOLDER (no longer queued); taking it."
+fi
+echo "$SLURM_JOB_ID" > "$LOCK/jobid"
+trap 'rm -rf "$LOCK"' EXIT
+echo "[lock] held by $SLURM_JOB_ID on $(hostname)"
+
 CHAIN="${CHAIN:-0}"
 CHAIN_SELF="$REPO/scratchpad/train_c2c.sbatch"
 CHAIN_MARK="/orcd/scratch/orcd/011/chenxiou/c2c_store/.chain_submitted.${SLURM_JOB_ID:-none}"
@@ -59,7 +83,7 @@ if [ "$CHAIN" -gt 0 ]; then
     CHAIN=$((CHAIN - 1)) DEVICES="${DEVICES:-2}" ACCUM="${ACCUM:-16}" \
         sbatch --dependency=afterany:${SLURM_JOB_ID} \
                --partition="$SLURM_JOB_PARTITION" \
-               --gres=gpu:h200:2 \
+               --gres=gpu:rtx_pro_6000:2 \
                --time=06:00:00 \
                --job-name="$SLURM_JOB_NAME" \
                "$CHAIN_SELF" \
@@ -75,7 +99,8 @@ fi
 # prefers, and it is the pattern the working tri launcher already uses
 # (run_tri_train_sm120.sbatch:74 with ntasks-per-node=1).
 torchrun --standalone --nproc_per_node="${DEVICES:-2}" \
-    scratchpad/train_c2c.py --devices "${DEVICES:-2}" --accum "${ACCUM:-16}" ${EXTRA:-}
+    scratchpad/train_c2c.py --devices "${DEVICES:-2}" --accum "${ACCUM:-16}" \
+    --n_diff "${NDIFF:-48}" ${EXTRA:-}
 rc=$?
 echo "C2C_EXIT=$rc"
 exit $rc

@@ -8,6 +8,7 @@ self-conditioning that have no meaning here.
 """
 
 import math
+import os
 from typing import Any, Dict
 
 import lightning as L
@@ -16,8 +17,9 @@ import torch.nn.functional as F
 
 from proteinfoundation.datasets.atom_features import N_REF_FEATS, atom14_features
 from proteinfoundation.datasets.contact_augment import augment_contacts
-from proteinfoundation.nn.af3_diffusion import diffusion_loss
+from proteinfoundation.nn.af3_diffusion import FULL_INFERENCE_STEPS, diffusion_loss
 from proteinfoundation.nn.contact2coord import ContactToCoord
+from proteinfoundation.utils.c2c_dump import dump_sample
 
 # AF3 SI §5.3 Eq. 15
 ALPHA_DIFFUSION = 4.0
@@ -40,11 +42,13 @@ DIST_MIN, DIST_MAX, DIST_BINS = 3.25, 50.75, 39
 
 class ContactToCoordTrainer(L.LightningModule):
     def __init__(self, model_cfg: Dict[str, Any], aug_rate: float = 0.1,
-                 aug_mode: str = "balanced", lr: float = BASE_LR):
+                 aug_mode: str = "balanced", lr: float = BASE_LR,
+                 dump_dir: str = None, n_dump: int = 2):
         super().__init__()
         self.save_hyperparameters()
         self.model = ContactToCoord(**model_cfg, n_ref_feats=N_REF_FEATS)
         self.aug_rate, self.aug_mode, self.lr = aug_rate, aug_mode, lr
+        self.dump_dir, self.n_dump = dump_dir, n_dump
 
     # ── batch adaptation ──────────────────────────────────────────────────────────────────────
     def _prepare(self, batch, train: bool):
@@ -101,11 +105,17 @@ class ContactToCoordTrainer(L.LightningModule):
     def _step(self, batch, train: bool):
         b = self._prepare(batch, train)
         out = self.model(b)
-        dl, aux = diffusion_loss(out["x_denoised"], b["atom_pos"], out["sigma"], b["atom_mask"])
+        # x_gt_rep/atom_mask_rep are the structure repeated once per diffusion noise sample.
+        dl, aux = diffusion_loss(out["x_denoised"], out["x_gt_rep"], out["sigma"],
+                                 out["atom_mask_rep"])
         dg = self._distogram_loss(out["pair_logits"], b["atom_pos"], b["aatype"], b["mask"])
         loss = ALPHA_DIFFUSION * dl.mean() + ALPHA_DISTOGRAM * dg.mean()
+        # ⭐ rmsd is the interpretable one: diffusion_loss builds mse as
+        # sum_atoms||dx||^2 / n_atoms / 3 (SI Eq. 3's 1/3 prefactor), so RMSD = sqrt(3*mse) in
+        # ANGSTROM. It is a DENOISING rmsd at the sampled noise level, not a generation rmsd.
         return loss, {"diffusion": dl.mean(), "distogram": dg.mean(),
-                      "mse": aux["mse"].mean(), "sigma": out["sigma"].mean()}
+                      "mse": aux["mse"].mean(), "sigma": out["sigma"].mean(),
+                      "rmsd": (3.0 * aux["mse"]).sqrt().mean()}
 
     def training_step(self, batch, _):
         loss, logs = self._step(batch, True)
@@ -113,13 +123,34 @@ class ContactToCoordTrainer(L.LightningModule):
         self.log("train/loss", loss, prog_bar=True)
         return loss
 
-    def validation_step(self, batch, _):
+    def validation_step(self, batch, batch_idx):
         # ⛔ No augmentation at validation: the metric must describe the model on real contact maps,
         # not on corrupted ones, or it cannot be compared against anything.
         loss, logs = self._step(batch, False)
         self.log_dict({f"val/{k}": v for k, v in logs.items()}, sync_dist=True)
         self.log("val/loss", loss, prog_bar=True, sync_dist=True)
+        if self.dump_dir and batch_idx < self.n_dump and self.global_rank == 0:
+            self._dump_structures(batch, batch_idx)
         return loss
+
+    @torch.no_grad()
+    def _dump_structures(self, batch, batch_idx):
+        """Full-rollout sample -> PDB + distance matrices, so quality has a visual readout."""
+        b = self._prepare(batch, train=False)
+        s, z, _ = self.model.encode(b["contacts"], b["aatype"], b["mask"])
+        coords = self.model.rollout(s, z, b["mask"], b["ref_feats"], b["ref_pos"],
+                                    b["atom_to_token"], b["atom_mask"],
+                                    n_steps=FULL_INFERENCE_STEPS)
+        L = b["mask"].shape[1]
+        gen14 = coords.reshape(-1, L, 14, 3)[0]
+        gt14 = b["atom_pos"].reshape(-1, L, 14, 3)[0]
+        out_dir = os.path.join(self.dump_dir, f"step{self.global_step:07d}")
+        name = f"val{batch_idx:02d}"
+        mad = dump_sample(out_dir, name, gen14, gt14, b["aatype"][0], b["mask"][0],
+                          b["contacts"][0])
+        # Mean |d_gen - d_gt| over CA pairs: alignment-free, so a bad superposition cannot
+        # flatter it, and directly comparable in Angstrom to the denoising rmsd.
+        self.log("val/dist_mae_sampled", mad, sync_dist=False, rank_zero_only=True)
 
     def configure_optimizers(self):
         opt = torch.optim.Adam(self.parameters(), lr=self.lr, betas=(0.9, 0.95), eps=1e-8)

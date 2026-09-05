@@ -60,9 +60,12 @@ class ContactToCoord(nn.Module):
         num_dist_buckets: int = 39,
         n_ref_feats: int = 8,
         c_noise_embedding: int = 256,
+        n_diffusion_samples: int = 48,
     ):
         super().__init__()
         self.c_s, self.c_z, self.c_token, self.c_atom = c_s, c_z, c_token, c_atom
+        # AF3's diffusion mini-batch (SI Alg. 20); Protenix ships 48 (configs_base.py:122).
+        self.n_diffusion_samples = n_diffusion_samples
 
         # ── inputs ────────────────────────────────────────────────────────────────────────────
         # The contact map enters as a 2-way embedding rather than a scalar: a contact and a
@@ -157,12 +160,30 @@ class ContactToCoord(nn.Module):
         x_gt = batch.get("atom_pos")
         if x_gt is not None:
             # Single-step denoising of noised ground truth -- SI 3.7.1. NOT the mini-rollout.
-            sigma = sample_noise_level((x_gt.shape[0],), x_gt.device, x_gt.dtype)
-            x_noisy = x_gt + torch.randn_like(x_gt) * sigma[:, None, None]
+            # ⛔ Each structure is expanded into n_diffusion_samples INDEPENDENTLY noised copies
+            # that share one trunk pass. This is AF3's diffusion mini-batch (SI Alg. 20) and it is
+            # not optional decoration: Protenix ships diffusion_batch_size=48
+            # (configs_base.py:122, consumed at protenix.py:802 as N_sample, producing
+            # "[..., N_sample=48, N_atom, 3]"), and the published lr=1.8e-3 is calibrated for a
+            # gradient averaged over that many noise draws. Training with one draw per structure
+            # makes the diffusion gradient ~sqrt(48) noisier at the same lr -- which is exactly
+            # how the first real run diverged (val/loss 3.82 -> 5.99 -> 7.10 at steps 500/1000/
+            # 1500, turning the moment the 1000-step warmup handed over full lr).
+            B, A, _ = x_gt.shape
+            n = self.n_diffusion_samples
+            sigma = sample_noise_level((B, n), x_gt.device, x_gt.dtype)      # [B, n]
+            x_rep = x_gt[:, None].expand(B, n, A, 3).reshape(B * n, A, 3)
+            sig_flat = sigma.reshape(B * n)
+            x_noisy = x_rep + torch.randn_like(x_rep) * sig_flat[:, None, None]
+            # The trunk runs ONCE; only the diffusion module sees the expanded batch.
+            rep = lambda t: t.repeat_interleave(n, dim=0)
             out["x_denoised"] = self.denoise(
-                x_noisy, sigma, s, z, mask, ref_feats, ref_pos, atom_to_token, atom_mask
-            ) * atom_mask[..., None]
-            out["sigma"] = sigma
+                x_noisy, sig_flat, rep(s), rep(z), rep(mask), rep(ref_feats), rep(ref_pos),
+                rep(atom_to_token), rep(atom_mask)
+            ) * rep(atom_mask)[..., None]
+            out["atom_mask_rep"] = rep(atom_mask)
+            out["x_gt_rep"] = x_rep
+            out["sigma"] = sig_flat
         if run_rollout or x_gt is None:
             out["coords"] = self.rollout(s, z, mask, ref_feats, ref_pos, atom_to_token, atom_mask)
         return out
