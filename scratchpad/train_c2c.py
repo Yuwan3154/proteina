@@ -108,9 +108,17 @@ def main():
         # (No EMA to worry about here: ContactToCoordTrainer keeps none, so state_dict IS the model.
         # That is why the usual "warm start needs the EMA weights" caveat does not apply.)
         sd = torch.load(args.init_from, map_location="cpu", weights_only=False)
-        assert "ema" not in sd, "checkpoint carries EMA weights; state_dict would be the wrong ones"
-        missing, unexpected = model.load_state_dict(sd["state_dict"], strict=True)
-        print(f"[warm-start] weights from {args.init_from} "
+        # ⛔ Prefer the EMA weights when the checkpoint has them. state_dict is the raw,
+        # unaveraged model -- warm-starting from it would discard the averaging and start from a
+        # set of weights nothing was ever measured on.
+        if "ema" in sd:
+            model.model.load_state_dict(
+                {k: v for k, v in sd["ema"]["params"].items()}, strict=True)
+            src = f"EMA params (decay {sd['ema'].get('decay')})"
+        else:
+            model.load_state_dict(sd["state_dict"], strict=True)
+            src = "state_dict (no EMA in this checkpoint)"
+        print(f"[warm-start] {src} from {args.init_from} "
               f"(step {sd.get('global_step')}), fresh optimizer at lr={model.lr}", flush=True)
     trainer.fit(model, datamodule=dm, ckpt_path=resume)
 

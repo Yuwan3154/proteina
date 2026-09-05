@@ -30,6 +30,8 @@ WARMUP_STEPS = 1000
 DECAY_EVERY = 50_000
 DECAY_FACTOR = 0.95
 GRAD_CLIP = 10.0
+# Weight EMA decay: Protenix `train_demo.sh --ema_decay 0.999`.
+EMA_DECAY = 0.999
 # Distogram bins, in ANGSTROM -- the unit batch["coords"] actually carries (measured: median
 # consecutive CA-CA = 3.81 in a real batch, and residue_constants' ref_pos agrees at N-CA = 1.46).
 # ⛔ These were 0.325/5.075, copied from the repo's experiment configs whose comments read
@@ -43,12 +45,21 @@ DIST_MIN, DIST_MAX, DIST_BINS = 3.25, 50.75, 39
 class ContactToCoordTrainer(L.LightningModule):
     def __init__(self, model_cfg: Dict[str, Any], aug_rate: float = 0.1,
                  aug_mode: str = "balanced", lr: float = BASE_LR,
-                 dump_dir: str = None, n_dump: int = 2):
+                 dump_dir: str = None, n_dump: int = 2, ema_decay: float = EMA_DECAY):
         super().__init__()
         self.save_hyperparameters()
         self.model = ContactToCoord(**model_cfg, n_ref_feats=N_REF_FEATS)
         self.aug_rate, self.aug_mode, self.lr = aug_rate, aug_mode, lr
         self.dump_dir, self.n_dump = dump_dir, n_dump
+        # ⛔ Weight EMA. Every AF3 replica with training code keeps one and VALIDATES ON IT;
+        # we had neither, so every val number so far was measured on raw weights. Diffusion
+        # models bounce hard late in training, which is exactly the shape we saw: val/diffusion
+        # doubling while val/distogram (the trunk, read through z) stayed flat.
+        # decay 0.999 = Protenix train_demo.sh --ema_decay 0.999.
+        # eval-on-EMA + restore = OpenFold3 core/runners/model_runner.py:137 and :125.
+        self.ema_decay = ema_decay
+        self._ema = None
+        self._cached = None
 
     # ── batch adaptation ──────────────────────────────────────────────────────────────────────
     def _prepare(self, batch, train: bool):
@@ -151,6 +162,52 @@ class ContactToCoordTrainer(L.LightningModule):
         # Mean |d_gen - d_gt| over CA pairs: alignment-free, so a bad superposition cannot
         # flatter it, and directly comparable in Angstrom to the denoising rmsd.
         self.log("val/dist_mae_sampled", mad, sync_dist=False, rank_zero_only=True)
+
+    # ── weight EMA ────────────────────────────────────────────────────────────────────────────
+    def _ema_init(self):
+        if self._ema is None:
+            self._ema = {k: v.detach().clone().float()
+                         for k, v in self.model.state_dict().items()}
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        # ⛔ Only on real optimizer steps. Updating every micro-batch would advance the EMA
+        # accumulate_grad_batches times faster than intended and silently change its horizon.
+        # (OpenFold3 guards this identically, model_runner.py:121-125.)
+        acc = self.trainer.accumulate_grad_batches
+        if (batch_idx + 1) % acc != 0 and not self.trainer.is_last_batch:
+            return
+        self._ema_init()
+        d = self.ema_decay
+        with torch.no_grad():
+            for k, v in self.model.state_dict().items():
+                if self._ema[k].is_floating_point():
+                    self._ema[k].mul_(d).add_(v.detach().float(), alpha=1.0 - d)
+                else:
+                    self._ema[k].copy_(v.detach())      # ints (buffers) are not averaged
+
+    def on_validation_start(self):
+        """Swap in the EMA weights for validation, exactly as OpenFold3 does."""
+        if self._ema is None or self._cached is not None:
+            return
+        self._cached = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
+        self.model.load_state_dict({k: v.to(self._cached[k].dtype) for k, v in self._ema.items()})
+
+    def on_validation_end(self):
+        if self._cached is not None:
+            self.model.load_state_dict(self._cached)
+            self._cached = None
+
+    def on_save_checkpoint(self, checkpoint):
+        # ⛔ Stored under "ema"/"params" deliberately: that is the key path every downstream
+        # reader in this project expects, and an offline eval or warm start that reads
+        # state_dict instead would silently score the UNAVERAGED model.
+        if self._ema is not None:
+            checkpoint["ema"] = {"params": {k: v.cpu() for k, v in self._ema.items()},
+                                 "decay": self.ema_decay}
+
+    def on_load_checkpoint(self, checkpoint):
+        if "ema" in checkpoint:
+            self._ema = {k: v.clone().float() for k, v in checkpoint["ema"]["params"].items()}
 
     def configure_optimizers(self):
         opt = torch.optim.Adam(self.parameters(), lr=self.lr, betas=(0.9, 0.95), eps=1e-8)
