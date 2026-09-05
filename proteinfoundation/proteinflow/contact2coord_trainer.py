@@ -62,10 +62,20 @@ class ContactToCoordTrainer(L.LightningModule):
 
     @staticmethod
     def _atom37_to_atom14(coords37, aatype):
+        """Gather the 14 dense slots out of the 37 sparse ones.
+
+        ⛔ The constant is UPPERCASE. residue_constants carries both conventions -- lowercase
+        `restype_atom14_mask` and `restype_atom14_rigid_group_positions` exist, but the atom14<->37
+        index tables are only published as RESTYPE_ATOM14_TO_ATOM37 / RESTYPE_ATOM37_TO_ATOM14
+        (protein_transformer.py:894-909 registers exactly these). Guessing the lowercase form
+        raised AttributeError on the first real batch.
+        ⭐ Gather, not scatter: protein_transformer.py:905 notes that scattering lets dummy indices
+        overwrite N/CA/C, which is why OpenFold converts this direction by gather.
+        """
         from proteinfoundation.openfold_stub.np import residue_constants as rc
-        idx = torch.as_tensor(rc.restype_atom14_to_atom37, device=coords37.device)[
-            aatype.long().clamp(0, 20)
-        ]                                                   # [B, L, 14]
+        idx = torch.as_tensor(
+            rc.RESTYPE_ATOM14_TO_ATOM37, device=coords37.device, dtype=torch.long
+        )[aatype.long().clamp(0, 20)]                       # [B, L, 14]
         return torch.gather(coords37, 2, idx[..., None].expand(-1, -1, -1, 3))
 
     # ── losses ────────────────────────────────────────────────────────────────────────────────
