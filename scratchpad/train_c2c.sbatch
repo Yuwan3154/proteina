@@ -69,8 +69,14 @@ if ! mkdir "$LOCK" 2>/dev/null; then
     echo "[lock] stale lock from $HOLDER (no longer queued); taking it."
 fi
 echo "$SLURM_JOB_ID" > "$LOCK/jobid"
-trap 'rm -rf "$LOCK"' EXIT
-echo "[lock] held by $SLURM_JOB_ID on $(hostname)"
+# ⛔ Guard on BASHPID, not a bare trap. bash runs an EXIT trap when a COMMAND SUBSTITUTION
+# subshell exits, so a plain `trap 'rm -rf $LOCK' EXIT` is destroyed by the very next $(...) --
+# observed: the $(hostname) on the line below deleted the lock ~0.1 s after it was taken, while
+# the job kept running. $$ does not help: it stays the parent PID inside subshells. BASHPID does.
+LOCK_PID=$BASHPID
+trap '[ "$BASHPID" = "$LOCK_PID" ] && rm -rf "$LOCK"' EXIT
+HOSTN=$(hostname)
+echo "[lock] held by $SLURM_JOB_ID on $HOSTN"
 
 # The successor must ask for the SAME card this job actually landed on -- we queue against
 # rtx_pro_6000 / h200 / h100 at once, so a hardcoded gres would migrate the chain to another card.
