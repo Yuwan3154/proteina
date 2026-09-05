@@ -134,11 +134,11 @@ class ContactToCoord(nn.Module):
         for blk in self.blocks:
             a_token = blk(a_token, s_cond, z, mask)
 
-        idx = atom_to_token.clamp(min=0)
-        atom_pair = self.pair_to_atompair(z)[
-            torch.arange(z.shape[0], device=z.device)[:, None, None], idx[:, :, None], idx[:, None, :]
-        ]
-        return self.atom_dec(a_token, q_atom, atom_to_token, atom_mask, atom_pair)
+        # The decoder blocks the token pair itself; densifying it to [B,A,A,c] here was 925 MB at
+        # L=384 and is exactly what the blocked layout exists to avoid.
+        return self.atom_dec(
+            a_token, q_atom, atom_to_token, atom_mask, self.pair_to_atompair(z)
+        )
 
     def denoise(self, x_noisy, sigma, s, z, mask, ref_feats, ref_pos, atom_to_token, atom_mask):
         b = sigma[:, None, None]
