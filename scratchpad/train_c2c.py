@@ -39,6 +39,7 @@ def main():
     ap.add_argument("--name", default="c2c_v1")
     ap.add_argument("--devices", type=int, default=2)
     ap.add_argument("--accum", type=int, default=16)
+    ap.add_argument("--batch_size", type=int, default=1)
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
 
@@ -46,6 +47,12 @@ def main():
     with hydra.initialize(ds_dir, version_base=hydra.__version__):
         cfg_data = hydra.compose(config_name=args.dataset)
     OmegaConf.set_struct(cfg_data, False)
+    # ⛔ Override here, never in the yaml: tri_sm120 reads the same file, and its batch_size=1 is a
+    # real measurement for THAT model (71.8 GB at L=384). It says nothing about this one.
+    # Effective batch = batch_size * accum * devices; keep it fixed when raising batch_size.
+    cfg_data.datamodule.batch_size = args.batch_size
+    print(f"[batch] per-rank {args.batch_size} x accum {args.accum} x {args.devices} ranks "
+          f"= effective {args.batch_size * args.accum * args.devices}", flush=True)
 
     model = ContactToCoordTrainer(model_cfg=MODEL_CFG)
     n_par = sum(p.numel() for p in model.parameters())
