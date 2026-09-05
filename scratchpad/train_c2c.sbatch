@@ -67,7 +67,15 @@ if [ "$CHAIN" -gt 0 ]; then
         && echo "[$(date)] queued next c2c segment (CHAIN=$((CHAIN - 1)) remaining)"
 fi
 
-python scratchpad/train_c2c.py --devices "${DEVICES:-2}" --accum "${ACCUM:-16}" ${EXTRA:-}
+# ⛔ torchrun, not bare python, and --ntasks-per-node stays 1. Lightning's SLURMEnvironment
+# validates devices against SLURM_NTASKS_PER_NODE and aborts with
+#   "You set devices=2 ... but --ntasks-per-node=1 does not match"
+# Raising ntasks to 2 is the wrong fix: sbatch would still run this script once, and Lightning would
+# then expect srun to have spawned the peers. torchrun sets the torchelastic variables Lightning
+# prefers, and it is the pattern the working tri launcher already uses
+# (run_tri_train_sm120.sbatch:74 with ntasks-per-node=1).
+torchrun --standalone --nproc_per_node="${DEVICES:-2}" \
+    scratchpad/train_c2c.py --devices "${DEVICES:-2}" --accum "${ACCUM:-16}" ${EXTRA:-}
 rc=$?
 echo "C2C_EXIT=$rc"
 exit $rc
