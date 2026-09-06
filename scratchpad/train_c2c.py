@@ -51,6 +51,7 @@ def main():
     # step takes ~144 s, so the old every-500-steps validation would first fire after 20 h
     # -- we would see nothing at all before the window closed.
     ap.add_argument("--val_every", type=int, default=500)
+    ap.add_argument("--warmup", type=int, default=1000)
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
     MODEL_CFG["n_diffusion_samples"] = args.n_diff
@@ -68,10 +69,11 @@ def main():
 
     dump_dir = os.path.join(args.store, args.name, "samples")
     kw = {"lr": args.lr} if args.lr is not None else {}
+    kw["warmup_steps"] = args.warmup
     model = ContactToCoordTrainer(model_cfg=MODEL_CFG, dump_dir=dump_dir, **kw)
     n_par = sum(p.numel() for p in model.parameters())
     print(f"[model] {n_par/1e6:.2f} M parameters, {MODEL_CFG['n_blocks']} diffusion blocks, "
-          f"n_diffusion_samples={args.n_diff}, lr={model.lr}", flush=True)
+          f"n_diffusion_samples={args.n_diff}, lr={model.lr}, warmup={model.warmup_steps}", flush=True)
     print(f"[dump] validation structures -> {dump_dir}", flush=True)
 
     os.makedirs(args.store, exist_ok=True)

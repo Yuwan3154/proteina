@@ -45,12 +45,18 @@ DIST_MIN, DIST_MAX, DIST_BINS = 3.25, 50.75, 39
 class ContactToCoordTrainer(L.LightningModule):
     def __init__(self, model_cfg: Dict[str, Any], aug_rate: float = 0.1,
                  aug_mode: str = "balanced", lr: float = BASE_LR,
-                 dump_dir: str = None, n_dump: int = 2, ema_decay: float = EMA_DECAY):
+                 dump_dir: str = None, n_dump: int = 2, ema_decay: float = EMA_DECAY,
+                 warmup_steps: int = WARMUP_STEPS):
         super().__init__()
         self.save_hyperparameters()
         self.model = ContactToCoord(**model_cfg, n_ref_feats=N_REF_FEATS)
         self.aug_rate, self.aug_mode, self.lr = aug_rate, aug_mode, lr
         self.dump_dir, self.n_dump = dump_dir, n_dump
+        # ⛔ Denominated in STEPS, so its meaning changes with the batch. At 2048
+        # pairs/step the reference's 1000 steps is 2.05M pairs of warmup and takes
+        # 38.6 h; our earlier runs warmed over 128k pairs. Set it to keep the DATA
+        # budget comparable, not the step count.
+        self.warmup_steps = warmup_steps
         # ⛔ Weight EMA. Every AF3 replica with training code keeps one and VALIDATES ON IT;
         # we had neither, so every val number so far was measured on raw weights. Diffusion
         # models bounce hard late in training, which is exactly the shape we saw: val/diffusion
@@ -213,7 +219,7 @@ class ContactToCoordTrainer(L.LightningModule):
         opt = torch.optim.Adam(self.parameters(), lr=self.lr, betas=(0.9, 0.95), eps=1e-8)
 
         def lr_lambda(step):
-            warm = min(1.0, (step + 1) / WARMUP_STEPS)      # AF3: 1000-step linear warmup
+            warm = min(1.0, (step + 1) / self.warmup_steps)
             return warm * (DECAY_FACTOR ** (step / DECAY_EVERY))   # then x0.95 every 5e4
 
         sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
