@@ -62,7 +62,9 @@ def main():
     m = ContactToCoord(**CFG).eval()
     with torch.no_grad():
         out = m(dict(batch))
-    r.append(check(f"x_denoised [B,{A},3]", tuple(out["x_denoised"].shape) == (B, A, 3)))
+    n_d = m.n_diffusion_samples
+    r.append(check(f"x_denoised is [B*n_diff={B * n_d},{A},3], got {tuple(out['x_denoised'].shape)}",
+                   tuple(out["x_denoised"].shape) == (B * n_d, A, 3)))
     r.append(check("pair_logits [B,L,L,39]", tuple(out["pair_logits"].shape) == (B, L, L, 39)))
     r.append(check("finite", torch.isfinite(out["x_denoised"]).all().item()))
     r.append(check("padded atoms are exactly zero",
@@ -86,7 +88,7 @@ def main():
     print("4. gradients reach every major sub-module")
     m2 = ContactToCoord(**CFG).train()
     o = m2(dict(batch))
-    loss, _ = diffusion_loss(o["x_denoised"], batch["atom_pos"], o["sigma"], batch["atom_mask"])
+    loss, _ = diffusion_loss(o["x_denoised"], o["x_gt_rep"], o["sigma"], o["atom_mask_rep"])
     loss.mean().backward()
     groups = {"tri_blocks": 0.0, "atom_enc": 0.0, "blocks": 0.0, "atom_dec": 0.0,
               "contact_emb": 0.0, "dist_head": 0.0}
