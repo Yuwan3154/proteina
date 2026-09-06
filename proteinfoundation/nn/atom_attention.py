@@ -70,12 +70,18 @@ class LocalAtomAttention(nn.Module):
     over N_KEYS keys instead of every atom in the chain.
     """
 
-    def __init__(self, c_a: int, c_s: int, c_z: int, n_heads: int, bias_init: float = -2.0):
+    def __init__(self, c_a: int, c_s: int, c_z: int, n_heads: int, bias_init: float = -2.0,
+                 qk_norm: bool = True):
         super().__init__()
         assert c_a % n_heads == 0, (c_a, n_heads)
         self.n_heads = n_heads
         self.c_head = c_a // n_heads
         self.adaln = AdaLN(c_a, c_s)
+        # QK-LayerNorm over the head dim -- same rationale as AttentionPairBias. The atom track
+        # needs it at least as much: its softmax is over only N_KEYS=128 keys, so saturation from
+        # growing logits arrives sooner than in the token track.
+        self.q_norm = nn.LayerNorm(self.c_head) if qk_norm else nn.Identity()
+        self.k_norm = nn.LayerNorm(self.c_head) if qk_norm else nn.Identity()
         self.to_q = nn.Linear(c_a, c_a)
         self.to_k = nn.Linear(c_a, c_a, bias=False)
         self.to_v = nn.Linear(c_a, c_a, bias=False)
@@ -97,8 +103,8 @@ class LocalAtomAttention(nn.Module):
 
         a_n = self.adaln(a, s)
         q, k, v = self.to_q(a_n), self.to_k(a_n), self.to_v(a_n)
-        qb = q[:, qidx].view(B, NB, Q, H, D).permute(0, 1, 3, 2, 4).reshape(B * NB, H, Q, D)
-        kb = k[:, kidx].view(B, NB, K, H, D).permute(0, 1, 3, 2, 4).reshape(B * NB, H, K, D)
+        qb = self.q_norm(q[:, qidx].view(B, NB, Q, H, D)).permute(0, 1, 3, 2, 4).reshape(B * NB, H, Q, D)
+        kb = self.k_norm(k[:, kidx].view(B, NB, K, H, D)).permute(0, 1, 3, 2, 4).reshape(B * NB, H, K, D)
         vb = v[:, kidx].view(B, NB, K, H, D).permute(0, 1, 3, 2, 4).reshape(B * NB, H, K, D)
 
         bias = self.to_bias(self.norm_z(pair)).permute(0, 1, 4, 2, 3)      # [B, NB, H, Q, K]

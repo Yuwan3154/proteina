@@ -94,12 +94,22 @@ class AttentionPairBias(nn.Module):
     so this is the load-bearing connection between the contact model and the coordinates.
     """
 
-    def __init__(self, c_a: int, c_s: int, c_z: int, n_heads: int, bias_init: float = -2.0):
+    def __init__(self, c_a: int, c_s: int, c_z: int, n_heads: int, bias_init: float = -2.0,
+                 qk_norm: bool = True):
         super().__init__()
         assert c_a % n_heads == 0, (c_a, n_heads)
         self.n_heads = n_heads
         self.c_head = c_a // n_heads
         self.adaln = AdaLN(c_a, c_s)
+        # ⭐ QK-LayerNorm over the HEAD dimension, before the dot product. The known failure it
+        # prevents is attention-logit growth: ||q|| and ||k|| drift up during training, the logits
+        # grow, softmax saturates toward one-hot, gradients through the attention vanish and the
+        # block degrades -- which matches our symptom (the diffusion module degrades while the
+        # trunk, read through the distogram, stays healthy). Normalising q and k bounds the logit
+        # magnitude regardless of activation scale. Wortsman et al. 2023, "Small-scale proxies for
+        # large-scale Transformer training instabilities"; also ViT-22B (Dehghani et al. 2023).
+        self.q_norm = nn.LayerNorm(self.c_head) if qk_norm else nn.Identity()
+        self.k_norm = nn.LayerNorm(self.c_head) if qk_norm else nn.Identity()
         self.to_q = nn.Linear(c_a, c_a)
         self.to_k = nn.Linear(c_a, c_a, bias=False)
         self.to_v = nn.Linear(c_a, c_a, bias=False)
@@ -122,8 +132,8 @@ class AttentionPairBias(nn.Module):
     def forward(self, a, s, z, mask):
         B, L, _ = a.shape
         a_n = self.adaln(a, s)
-        q = self.to_q(a_n).view(B, L, self.n_heads, self.c_head).transpose(1, 2)
-        k = self.to_k(a_n).view(B, L, self.n_heads, self.c_head).transpose(1, 2)
+        q = self.q_norm(self.to_q(a_n).view(B, L, self.n_heads, self.c_head)).transpose(1, 2)
+        k = self.k_norm(self.to_k(a_n).view(B, L, self.n_heads, self.c_head)).transpose(1, 2)
         v = self.to_v(a_n).view(B, L, self.n_heads, self.c_head).transpose(1, 2)
 
         bias = self.to_bias(self.norm_z(z)).permute(0, 3, 1, 2)          # [B, H, L, L]
