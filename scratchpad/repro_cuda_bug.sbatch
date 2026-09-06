@@ -41,7 +41,19 @@ export SKIP_CONFIND_PRECOMPUTE=1 PYTHONPATH=$REPO${PYTHONPATH:+:$PYTHONPATH}
 export TMPDIR=/orcd/scratch/orcd/011/chenxiou/.tmp
 mkdir -p "$TMPDIR"
 [ ${#TMPDIR} -le 70 ] || { echo "FATAL: TMPDIR too long"; exit 78; }
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# ⭐ expandable_segments is a LEADING SUSPECT for the 2-GPU illegal access. It changes the CUDA
+# allocator to virtual-memory-backed expandable segments, which has documented interactions with
+# NCCL (which registers buffers for IPC/RDMA); a segment being remapped under a registered buffer
+# gives exactly this signature -- deterministic, multi-GPU only, surfacing on a later free.
+# Single-GPU has run 6300 steps clean with identical per-GPU shapes, which fits.
+# ALLOC_CONF=none unsets it entirely for the one-variable test.
+if [ "${ALLOC_CONF:-expandable}" = "none" ]; then
+    unset PYTORCH_CUDA_ALLOC_CONF
+    echo "PYTORCH_CUDA_ALLOC_CONF: UNSET (expandable_segments disabled)"
+else
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    echo "PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF"
+fi
 
 export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-1}"
 export TORCH_USE_CUDA_DSA=1
