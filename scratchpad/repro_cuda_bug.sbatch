@@ -59,7 +59,7 @@ mkdir -p "$STORE"
 torchrun --standalone --nproc_per_node=2 \
     scratchpad/train_c2c.py --devices 2 --accum 8 --n_diff 8 \
     --lr 0.0006 --precision bf16-mixed --val_every 100 --warmup 1000 \
-    --store "$STORE" --name c2c_repro
+    --store "$STORE" --name c2c_repro --n_dump "${NDUMP:-2}"
 rc=$?
 echo "REPRO_EXIT=$rc"
 exit $rc

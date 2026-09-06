@@ -52,6 +52,10 @@ def main():
     # -- we would see nothing at all before the window closed.
     ap.add_argument("--val_every", type=int, default=500)
     ap.add_argument("--warmup", type=int, default=1000)
+    # 0 disables validation structure dumping entirely. The dump runs on RANK 0 ONLY
+    # and logs a metric no other rank logs, so it is the prime suspect for the 2-GPU
+    # illegal-memory-access: it makes the ranks issue different CUDA/NCCL work.
+    ap.add_argument("--n_dump", type=int, default=2)
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
     MODEL_CFG["n_diffusion_samples"] = args.n_diff
@@ -70,11 +74,14 @@ def main():
     dump_dir = os.path.join(args.store, args.name, "samples")
     kw = {"lr": args.lr} if args.lr is not None else {}
     kw["warmup_steps"] = args.warmup
-    model = ContactToCoordTrainer(model_cfg=MODEL_CFG, dump_dir=dump_dir, **kw)
+    model = ContactToCoordTrainer(model_cfg=MODEL_CFG,
+                                  dump_dir=(dump_dir if args.n_dump > 0 else None),
+                                  n_dump=args.n_dump, **kw)
     n_par = sum(p.numel() for p in model.parameters())
     print(f"[model] {n_par/1e6:.2f} M parameters, {MODEL_CFG['n_blocks']} diffusion blocks, "
           f"n_diffusion_samples={args.n_diff}, lr={model.lr}, warmup={model.warmup_steps}", flush=True)
-    print(f"[dump] validation structures -> {dump_dir}", flush=True)
+    print(f"[dump] validation structures -> "
+          f"{dump_dir if args.n_dump > 0 else 'DISABLED (n_dump=0)'}", flush=True)
 
     os.makedirs(args.store, exist_ok=True)
     ckpt_cb = ModelCheckpoint(
