@@ -163,11 +163,16 @@ class ContactToCoordTrainer(L.LightningModule):
         gt14 = b["atom_pos"].reshape(-1, L, 14, 3)[0]
         out_dir = os.path.join(self.dump_dir, f"step{self.global_step:07d}")
         name = f"val{batch_idx:02d}"
-        mad = dump_sample(out_dir, name, gen14, gt14, b["aatype"][0], b["mask"][0],
-                          b["contacts"][0])
+        mad, chir = dump_sample(out_dir, name, gen14, gt14, b["aatype"][0], b["mask"][0],
+                                b["contacts"][0])
         # Mean |d_gen - d_gt| over CA pairs: alignment-free, so a bad superposition cannot
         # flatter it, and directly comparable in Angstrom to the denoising rmsd.
         self.log("val/dist_mae_sampled", mad, sync_dist=False, rank_zero_only=True)
+        # ⭐ 1.0 = native handedness everywhere; ~0.0 = globally MIRRORED; ~0.5 = scrambled.
+        # The only logged metric that can see a mirror image -- every distance-based one is blind
+        # to it, and 4/8 and 5/8 of sampled chains were measured mirrored.
+        if chir == chir:                      # NaN check without importing math
+            self.log("val/chirality_agree", chir, sync_dist=False, rank_zero_only=True)
 
     # ── weight EMA ────────────────────────────────────────────────────────────────────────────
     def _ema_init(self):

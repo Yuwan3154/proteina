@@ -23,6 +23,44 @@ def _atom14_names(aa_idx: int):
     return aa3, rc.restype_name_to_atom14_names.get(aa3, [""] * 14)
 
 
+def chirality_signs(coords14, aatype, mask):
+    """Per-residue handedness at the CA stereocentre: sign of (N-CA) x (C-CA) . (CB-CA).
+
+    ⭐ Why this metric exists. A contact map is CHIRALITY-BLIND -- reflection preserves every
+    pairwise distance -- so the distogram loss, smooth-lDDT and dist_mae all score a perfect mirror
+    image as perfect. Measured on real samples: 4/8 and 5/8 generated chains were mirrored, sitting
+    at 11-14 A CA-RMSD while their distance MAE was 1.0-2.1 A. Nothing we logged could see it.
+
+    Glycine has no CB (atom14 slot 4 empty) and is excluded -- it has no stereocentre.
+    Returns the raw signs; the CALLER compares against the native's own signs rather than assuming
+    a convention, so the metric cannot be wrong-way-round.
+    """
+    from proteinfoundation.openfold_stub.np import residue_constants as rc
+    a14 = torch.as_tensor(rc.restype_atom14_mask, device=coords14.device,
+                          dtype=coords14.dtype)[aatype.long().clamp(0, 20)]
+    sel = (mask > 0.5) & (a14[:, 4] > 0.5)          # slot 4 is CB
+    if int(sel.sum()) == 0:
+        return coords14.new_zeros(0)
+    n, ca = coords14[sel, 0], coords14[sel, 1]
+    c, cb = coords14[sel, 2], coords14[sel, 4]
+    trip = (torch.cross(n - ca, c - ca, dim=-1) * (cb - ca)).sum(-1)
+    return torch.sign(trip)
+
+
+def chirality_agreement(coords_gen14, coords_gt14, aatype, mask):
+    """Fraction of stereocentres whose handedness matches the NATIVE's.
+
+    1.0 = same handedness throughout; ~0.0 = globally MIRRORED; ~0.5 = scrambled/no stereochemistry.
+    Comparing against the native rather than a hard-coded sign means an inverted convention on my
+    side cannot flip the conclusion.
+    """
+    sg = chirality_signs(coords_gen14, aatype, mask)
+    st = chirality_signs(coords_gt14, aatype, mask)
+    if sg.numel() == 0 or sg.numel() != st.numel():
+        return float("nan")
+    return float((sg == st).float().mean())
+
+
 def write_atom14_pdb(path, coords14, aatype, mask):
     """coords14 [L,14,3] Angstrom, aatype [L] long, mask [L]."""
     lines, serial = [], 1
@@ -68,4 +106,5 @@ def dump_sample(out_dir, name, coords_gen14, coords_gt14, aatype, mask, contacts
     # A single scalar that is directly comparable to the training rmsd: how far the sampled
     # distance matrix is from the true one, which needs no alignment and so cannot be flattered
     # by a bad superposition.
-    return float(np.abs(d_gen - d_gt).mean())
+    chir = chirality_agreement(coords_gen14, coords_gt14, aatype, mask)
+    return float(np.abs(d_gen - d_gt).mean()), chir
