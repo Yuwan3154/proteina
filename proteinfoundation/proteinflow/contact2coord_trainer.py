@@ -174,6 +174,16 @@ class ContactToCoordTrainer(L.LightningModule):
         if self._ema is None:
             self._ema = {k: v.detach().clone().float()
                          for k, v in self.model.state_dict().items()}
+            return
+        # ⛔ On RESUME the EMA comes back from the checkpoint on CPU (on_save_checkpoint stores it
+        # with .cpu() so the file is loadable without a GPU), while the model is on cuda. The
+        # update below is IN-PLACE mul_/add_, which does not promote across devices -- it raises
+        # "Expected all tensors to be on the same device". This killed two chain handoffs at
+        # ~2 min each while the fresh run went 6 h clean, because the fresh path builds the EMA
+        # from an already-on-device state_dict and never crosses devices.
+        dev = next(self.model.parameters()).device
+        if next(iter(self._ema.values())).device != dev:
+            self._ema = {k: v.to(dev) for k, v in self._ema.items()}
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         # ⛔ Only on real optimizer steps. Updating every micro-batch would advance the EMA

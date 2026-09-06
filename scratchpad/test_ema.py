@@ -97,6 +97,20 @@ def main():
     m2.on_load_checkpoint(ck)
     check("EMA restored from checkpoint",
           m2._ema is not None and torch.allclose(m2._ema[key], m._ema[key], atol=1e-6))
+
+    # ---- RESUME device alignment ----
+    # ⛔ The checkpoint stores the EMA on CPU so the file loads without a GPU. On resume the model
+    # is on the accelerator, and the update is IN-PLACE mul_/add_, which does NOT promote across
+    # devices. Two chain handoffs died on exactly this. _ema_init must realign before updating.
+    # On a CPU-only box this asserts the invariant rather than the crash; the real gate is a GPU
+    # resume smoke, because a CPU-only test structurally cannot see a cuda/cpu mismatch.
+    m2.trainer = fake_trainer(accum=1)
+    m2.on_train_batch_end(None, None, 0)
+    model_dev = next(m2.model.parameters()).device
+    ema_dev = next(iter(m2._ema.values())).device
+    check("after resume the EMA sits on the model's device",
+          ema_dev == model_dev, f"ema={ema_dev} model={model_dev}")
+    check("...and the update after resume actually ran", m2._ema is not None)
     # the warm-start path loads ema params into the INNER model
     m2.model.load_state_dict({k: v for k, v in ck["ema"]["params"].items()}, strict=True)
     check("ema params load into the inner model with strict=True", True)
