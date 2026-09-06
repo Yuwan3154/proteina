@@ -25,9 +25,13 @@ def main():
         print(f"\n{len(best)} saved checkpoints, by monitored score:")
         for path, score in sorted(best.items(), key=lambda kv: str(kv[0])):
             print(f"  {str(path).split('/')[-1]:<28s} {float(score):.4f}")
+        def _f(v):
+            # current_score is None until the first monitored validation completes; float(None)
+            # raises and killed this script mid-report once.
+            return "n/a" if v is None else f"{float(v):.4f}"
         print(f"  best      = {str(cb.get('best_model_path','')).split('/')[-1]} "
-              f"({float(cb.get('best_model_score', float('nan'))):.4f})")
-        print(f"  last seen = {float(cb.get('current_score', float('nan'))):.4f}")
+              f"({_f(cb.get('best_model_score'))})")
+        print(f"  last seen = {_f(cb.get('current_score'))}")
 
     for i, og in enumerate(d.get("optimizer_states", [{}])):
         lrs = {g.get("lr") for g in og.get("param_groups", [])}
