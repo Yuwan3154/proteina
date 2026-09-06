@@ -66,7 +66,7 @@ def main():
     r.append(check("pair_logits [B,L,L,39]", tuple(out["pair_logits"].shape) == (B, L, L, 39)))
     r.append(check("finite", torch.isfinite(out["x_denoised"]).all().item()))
     r.append(check("padded atoms are exactly zero",
-                   float(out["x_denoised"][batch["atom_mask"] == 0].abs().sum()) == 0.0))
+                   float(out["x_denoised"][out["atom_mask_rep"] == 0].abs().sum()) == 0.0))
     r.append(check("distogram symmetric",
                    torch.allclose(out["pair_logits"], out["pair_logits"].transpose(1, 2), atol=1e-5)))
 

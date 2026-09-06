@@ -51,8 +51,10 @@ def reference_local_attn(mod, a, s, pair, key_mask, qidx, kidx):
             if not km.any():
                 km = torch.ones_like(km)
             for h in range(H):
-                qh = q[b, qidx[nb], h * D:(h + 1) * D].double()          # [Q, D]
-                kh = k[b, kidx[nb], h * D:(h + 1) * D].double()          # [K, D]
+                # ⛔ Apply the SAME QK-norm the fast path applies, or this reference is
+                # comparing normed q/k against un-normed and the equivalence test is meaningless.
+                qh = mod.q_norm(q[b, qidx[nb], h * D:(h + 1) * D]).double()   # [Q, D]
+                kh = mod.k_norm(k[b, kidx[nb], h * D:(h + 1) * D]).double()   # [K, D]
                 vh = v[b, kidx[nb], h * D:(h + 1) * D].double()
                 sc = qh @ kh.T / (D ** 0.5) + bias[b, nb, :, :, h].double()
                 sc = sc.masked_fill(~km[None, :], float("-inf"))
