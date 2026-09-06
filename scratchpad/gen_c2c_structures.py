@@ -40,12 +40,19 @@ MODEL_CFG = dict(
 )
 
 
-def kabsch_rmsd(a, b):
-    """CA-RMSD after optimal superposition. a, b: [L, 3]."""
+def kabsch_rmsd(a, b, allow_reflection=False):
+    """CA-RMSD after optimal superposition. a, b: [L, 3].
+
+    allow_reflection=True permits an IMPROPER rotation (det = -1), i.e. it superimposes the mirror
+    image. A structure with correct pairwise distances but the wrong HANDEDNESS has a large proper
+    RMSD and a small improper one -- reflection preserves every distance exactly, so a contact map
+    (or any distance-only readout) cannot distinguish the two. Comparing the pair is the decisive
+    test for a mirrored fold.
+    """
     a = a - a.mean(0, keepdims=True)
     b = b - b.mean(0, keepdims=True)
     u, _, vt = np.linalg.svd(a.T @ b)
-    d = np.sign(np.linalg.det(u @ vt))
+    d = 1.0 if allow_reflection else np.sign(np.linalg.det(u @ vt))
     rot = u @ np.diag([1.0, 1.0, d]) @ vt
     return float(np.sqrt((((a @ rot) - b) ** 2).sum(-1).mean()))
 
@@ -57,13 +64,16 @@ def usalign_tm(gen_pdb, gt_pdb, usalign):
                              capture_output=True, text=True, timeout=300).stdout
     except (OSError, subprocess.SubprocessError):
         return None
-    vals = []
+    # ⛔ Read the value normalised by the TRUE NATIVE (Structure_2 = the gt file), never max() of
+    # the two -- max() inflates ~1.5-2x and has burned this project three times. The earlier
+    # startswith("TM-score=") parse returned n/a for every chain: USalign indents these lines.
+    import re
     for line in out.splitlines():
-        if line.startswith("TM-score=") and "Structure_2" in line:
-            # ⛔ Read the value normalised by the TRUE NATIVE (Structure_2 = the gt file), never
-            # max() of the two -- that inflates by ~1.5-2x and has burned this project 3x.
-            vals.append(float(line.split("TM-score=")[1].split()[0]))
-    return vals[0] if vals else None
+        if "TM-score=" in line and "Structure_2" in line:
+            m = re.search(r"TM-score=\s*([0-9.]+)", line)
+            if m:
+                return float(m.group(1))
+    return None
 
 
 def main():
@@ -99,7 +109,8 @@ def main():
     print(f"[load] {src} from {args.ckpt} @ step {ck.get('global_step')}", flush=True)
     model = model.to(dev).eval()
 
-    print(f"\n{'chain':>10} {'L':>5} {'ca_rmsd_A':>10} {'tm':>7} {'dist_mae_A':>11} {'rg_ratio':>9}")
+    print(f"\n{'chain':>10} {'L':>5} {'ca_rmsd_A':>10} {'mirror_rmsd':>11} {'tm':>7} "
+          f"{'dist_mae_A':>11} {'rg_ratio':>9} {'verdict':>7}")
     rows = []
     it = iter(dm.val_dataloader())
     for i in range(args.n):
@@ -121,6 +132,7 @@ def main():
         ca_g = gen14[keep][:, 1, :].float().cpu().numpy()
         ca_t = gt14[keep][:, 1, :].float().cpu().numpy()
         rmsd = kabsch_rmsd(ca_g, ca_t)
+        rmsd_mir = kabsch_rmsd(ca_g, ca_t, allow_reflection=True)
         dg = np.linalg.norm(ca_g[:, None] - ca_g[None], axis=-1)
         dt = np.linalg.norm(ca_t[:, None] - ca_t[None], axis=-1)
         iu = np.triu_indices(len(ca_g), 1)
@@ -128,14 +140,19 @@ def main():
         rg = float(np.sqrt((dg ** 2).sum() / (2 * len(ca_g) ** 2)) /
                    np.sqrt((dt ** 2).sum() / (2 * len(ca_t) ** 2)))
         tm = usalign_tm(gp, tp, args.usalign)
-        rows.append((name, int(keep.sum()), rmsd, tm, mae, rg))
-        print(f"{name:>10} {int(keep.sum()):>5} {rmsd:>10.2f} "
-              f"{('%.3f' % tm) if tm is not None else '  n/a':>7} {mae:>11.2f} {rg:>9.2f}",
-              flush=True)
+        mirrored = rmsd_mir < 0.5 * rmsd and rmsd > 4.0
+        rows.append((name, int(keep.sum()), rmsd, rmsd_mir, tm, mae, rg, mirrored))
+        print(f"{name:>10} {int(keep.sum()):>5} {rmsd:>10.2f} {rmsd_mir:>11.2f} "
+              f"{('%.3f' % tm) if tm is not None else '  n/a':>7} {mae:>11.2f} {rg:>9.2f} "
+              f"{'MIRROR' if mirrored else '':>7}", flush=True)
 
     print(f"\nwrote {2*len(rows)} PDBs to {args.out}")
-    print("⚠️ These are GENERATION numbers (full reverse diffusion from noise), not the denoising")
-    print("   val/rmsd. TM>0.5 is the usual 'same fold' threshold; random pairs sit near 0.17-0.3.")
+    n_mir = sum(1 for r in rows if r[7])
+    print(f"⚠️ GENERATION numbers (full reverse diffusion from noise), not the denoising val/rmsd.")
+    print(f"   TM>0.5 is the usual 'same fold' threshold; random pairs sit near 0.17-0.3.")
+    print(f"⭐ MIRRORED (correct distances, wrong handedness): {n_mir}/{len(rows)}.")
+    print("   A contact map is chirality-blind -- reflection preserves every pairwise distance --")
+    print("   so distance-only metrics (dist_mae, distogram, smooth_lddt) CANNOT see this failure.")
     return 0
 
 
