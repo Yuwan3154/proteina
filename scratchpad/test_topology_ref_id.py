@@ -40,7 +40,8 @@ def main():
         return 2
 
     def make(**kw):
-        t = TopologyReferenceTransform(index_path=idx_path, drop_prob=0.0, seed=0, **kw)
+        kw.setdefault("drop_prob", 0.0)          # caller may override; do not pass it twice
+        t = TopologyReferenceTransform(index_path=idx_path, seed=0, **kw)
         t._ensure_loaded()
         return t
 
