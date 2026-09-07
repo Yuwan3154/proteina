@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=datachir
+#SBATCH --job-name=coordcen
 #SBATCH --partition=mit_quicktest
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -17,9 +17,6 @@ export DATA_PATH=/orcd/pool/006/chenxiou/proteina/data
 export TMPDIR=/orcd/scratch/orcd/011/chenxiou/.tmp
 mkdir -p "$TMPDIR"
 cd /orcd/scratch/orcd/011/chenxiou/proteina_sh
-echo "=== TRAIN split ==="
-python scratchpad/check_training_data_chirality.py --n "${NCHAIN:-60}" --split train
-echo
-echo "=== VAL split ==="
-python scratchpad/check_training_data_chirality.py --n "${NCHAIN:-60}" --split val
+echo "=== coordinate centering / EDM scale ==="
+python scratchpad/check_coord_centering.py --n 40
 echo "DATACHIR_EXIT=$?"
