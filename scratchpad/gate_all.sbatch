@@ -28,7 +28,10 @@ python scratchpad/test_local_attention.py;         R4=$?
 python scratchpad/test_qk_norm.py;                 R5=$?
 python scratchpad/test_diffusion_batch_alignment.py; R6=$?
 python scratchpad/test_warmstart_load.py;          R7=$?
+python scratchpad/test_centre_random_augmentation.py; R8=$?
+python scratchpad/test_handedness_metrics.py;      R9=$?
+python scratchpad/test_contact_augment.py;         R10=$?
 
 echo
-echo "RESULTS refoff=$R1 chir=$R2 c2c=$R3 local=$R4 qk=$R5 diffalign=$R6 warmstart=$R7"
-if [ $((R1+R2+R3+R4+R5+R6+R7)) -eq 0 ]; then echo "ALL GREEN"; else echo "SOMETHING FAILED"; fi
+echo "RESULTS refoff=$R1 chir=$R2 c2c=$R3 local=$R4 qk=$R5 diffalign=$R6 warmstart=$R7 centreaug=$R8 hand=$R9 cmaug=$R10"
+if [ $((R1+R2+R3+R4+R5+R6+R7+R8+R9+R10)) -eq 0 ]; then echo "ALL GREEN"; else echo "SOMETHING FAILED"; fi
