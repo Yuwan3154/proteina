@@ -51,7 +51,7 @@ def main():
 
         aatype = raw["residue_type"].long()
         res_mask = md[..., 0, 0].float()
-        _, _, _, amask = atom14_features(aatype, res_mask)          # residue-TYPE mask
+        _, _, _, amask, _ = atom14_features(aatype, res_mask)          # residue-TYPE mask
         pos14 = ContactToCoordTrainer._atom37_to_atom14(raw["coords"].float(), aatype)
         B, L, _, _ = pos14.shape
         amask = amask.reshape(B, L, 14)

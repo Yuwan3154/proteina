@@ -75,14 +75,14 @@ class ContactToCoordTrainer(L.LightningModule):
         if train and self.aug_rate > 0:
             contacts = augment_contacts(contacts, mask, self.aug_rate, self.aug_mode)
 
-        ref_feats, ref_pos, a2t, amask = atom14_features(aatype, mask)
+        ref_feats, ref_pos, a2t, amask, ruid = atom14_features(aatype, mask)
         # coords arrive as atom37; gather the atom14 slots so the target matches the model's layout.
         coords = batch["coords"].float()
         atom_pos = self._atom37_to_atom14(coords, aatype) if coords.shape[-2] == 37 else coords
         B, L, _, _ = atom_pos.shape
         return {
             "contacts": contacts, "aatype": aatype, "mask": mask,
-            "ref_feats": ref_feats, "ref_pos": ref_pos,
+            "ref_feats": ref_feats, "ref_pos": ref_pos, "ref_space_uid": ruid,
             "atom_to_token": a2t, "atom_mask": amask,
             "atom_pos": atom_pos.reshape(B, L * 14, 3) * amask[..., None],
         }
@@ -156,7 +156,7 @@ class ContactToCoordTrainer(L.LightningModule):
         b = self._prepare(batch, train=False)
         s, z, _ = self.model.encode(b["contacts"], b["aatype"], b["mask"])
         coords = self.model.rollout(s, z, b["mask"], b["ref_feats"], b["ref_pos"],
-                                    b["atom_to_token"], b["atom_mask"],
+                                    b["atom_to_token"], b["atom_mask"], b["ref_space_uid"],
                                     n_steps=FULL_INFERENCE_STEPS)
         L = b["mask"].shape[1]
         gen14 = coords.reshape(-1, L, 14, 3)[0]

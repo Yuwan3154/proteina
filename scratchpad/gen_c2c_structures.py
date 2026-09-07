@@ -119,7 +119,8 @@ def main():
         with torch.no_grad():
             s, z, _ = model.model.encode(b["contacts"], b["aatype"], b["mask"])
             coords = model.model.rollout(s, z, b["mask"], b["ref_feats"], b["ref_pos"],
-                                         b["atom_to_token"], b["atom_mask"], n_steps=args.steps)
+                                         b["atom_to_token"], b["atom_mask"], b["ref_space_uid"],
+                                         n_steps=args.steps)
         L = b["mask"].shape[1]
         keep = b["mask"][0].bool()
         gen14 = coords.reshape(-1, L, 14, 3)[0]

@@ -32,10 +32,11 @@ def make_batch(B, L, dev):
     mask = torch.ones(B, L, device=dev)
     contacts = (torch.rand(B, L, L, device=dev) < 0.05).float()
     contacts = ((contacts + contacts.transpose(1, 2)) > 0).float()
-    ref_feats, ref_pos, a2t, amask = atom14_features(aatype, mask)
+    ref_feats, ref_pos, a2t, amask, ruid = atom14_features(aatype, mask)
     atom_pos = torch.randn(B, L * 14, 3, device=dev) * 16.0 * amask[..., None]
     return {"contacts": contacts, "aatype": aatype, "mask": mask, "ref_feats": ref_feats,
-            "ref_pos": ref_pos, "atom_to_token": a2t, "atom_mask": amask, "atom_pos": atom_pos}
+            "ref_pos": ref_pos, "atom_to_token": a2t, "atom_mask": amask,
+            "ref_space_uid": ruid, "atom_pos": atom_pos}
 
 
 def run(model, B, L, dev, iters=6):

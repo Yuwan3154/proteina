@@ -22,7 +22,7 @@ N_REF_FEATS = 4 + 3 + 1   # element one-hot (4) + idealised position (3) + slot 
 
 
 def _build_tables():
-    """[21, 14] element index, [21, 14] mask, [21, 14, 3] idealised positions."""
+    """[21, 14] element index, [21, 14] mask, [21, 14, 3] idealised positions, [21, 14] group."""
     elem = torch.zeros(21, 14, dtype=torch.long)
     for r, resname3 in enumerate(rc.restypes + ["UNK"]):
         name3 = rc.restype_1to3.get(resname3, "UNK") if len(resname3) == 1 else resname3
@@ -34,10 +34,12 @@ def _build_tables():
             elem[r, a] = _ELEMENTS.index(e) if e in _ELEMENTS else 0
     mask = torch.as_tensor(rc.restype_atom14_mask, dtype=torch.float32)
     pos = torch.as_tensor(rc.restype_atom14_rigid_group_positions, dtype=torch.float32)
-    return elem, mask, pos
+    group = torch.as_tensor(rc.restype_atom14_to_rigid_group, dtype=torch.long)
+    return elem, mask, pos, group
 
 
-_ELEM_TABLE, _MASK_TABLE, _POS_TABLE = _build_tables()
+_ELEM_TABLE, _MASK_TABLE, _POS_TABLE, _GROUP_TABLE = _build_tables()
+N_RIGID_GROUPS = 8
 
 
 def atom14_features(aatype: torch.Tensor, mask: torch.Tensor):
@@ -48,6 +50,16 @@ def atom14_features(aatype: torch.Tensor, mask: torch.Tensor):
         ref_pos       [B, L*14, 3]   idealised local-frame positions
         atom_to_token [B, L*14]      which residue each atom belongs to
         atom_mask     [B, L*14]      1 where the slot is a real atom of a real residue
+        ref_space_uid [B, L*14]      which atoms share ONE reference coordinate frame
+
+    ⛔ ref_space_uid is (residue, rigid_group), not just residue. AF3 defines it as "which
+    reference positions live in the same reference space" (`features.py:1769-1777`) and keys it on
+    (chain_id, res_id) because a CCD conformer is one coherent 3D structure. Ours is NOT: these are
+    `restype_atom14_rigid_group_positions`, i.e. each atom in the frame of its OWN chi group, so
+    residue-level grouping would still mix frames. Measured: only 541/1505 (35.9%) of intra-residue
+    atom pairs share a frame; lysine's nine atoms all sit ~1.5 A from CA (real NZ is ~6.3 A).
+    ⭐ The chirality tetrahedron survives this: N/CA/C/CB are in group 0 for every residue type, and
+    the CA signed volume is positive (+2.485..+2.667) across all 19 non-glycine types.
     """
     B, L = aatype.shape
     dev = aatype.device
@@ -67,9 +79,12 @@ def atom14_features(aatype: torch.Tensor, mask: torch.Tensor):
         dim=-1,
     )
     tok = torch.arange(L, device=dev)[None, :, None].expand(B, L, 14)
+    grp = _GROUP_TABLE.to(dev)[a]                       # [B, L, 14]
+    uid = tok * N_RIGID_GROUPS + grp
     return (
         feats.reshape(B, L * 14, -1) * amask.reshape(B, L * 14, 1),
         apos.reshape(B, L * 14, 3) * amask.reshape(B, L * 14, 1),
         tok.reshape(B, L * 14),
         amask.reshape(B, L * 14),
+        uid.reshape(B, L * 14),
     )

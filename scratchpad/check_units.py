@@ -29,7 +29,7 @@ def main():
     print("=== ref_pos, from residue_constants ===")
     aatype = torch.zeros(1, 4, dtype=torch.long)          # ALA
     mask = torch.ones(1, 4)
-    _, ref_pos, _, _ = atom14_features(aatype, mask)
+    _, ref_pos, _, _, _ = atom14_features(aatype, mask)
     r = ref_pos.reshape(1, 4, 14, 3)[0, 0]
     n_ca = (r[0] - r[1]).norm().item()
     ca_c = (r[1] - r[2]).norm().item()

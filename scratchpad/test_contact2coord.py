@@ -28,11 +28,11 @@ def make_batch(seed=0):
     c = (torch.rand(B, L, L, generator=g) < 0.05).float()
     c = torch.triu(c, 1)
     c = (c + c.transpose(1, 2)) * (mask[:, :, None] * mask[:, None, :])
-    ref_feats, ref_pos, a2t, amask = atom14_features(aatype, mask)
+    ref_feats, ref_pos, a2t, amask, ruid = atom14_features(aatype, mask)
     return {
         "contacts": c, "aatype": aatype, "mask": mask,
         "ref_feats": ref_feats, "ref_pos": ref_pos,
-        "atom_to_token": a2t, "atom_mask": amask,
+        "atom_to_token": a2t, "atom_mask": amask, "ref_space_uid": ruid,
         "atom_pos": torch.randn(B, L * 14, 3, generator=g) * 5.0 * amask[..., None],
     }
 
@@ -109,7 +109,8 @@ def main():
     with torch.no_grad():
         co = m.rollout(*m.encode(batch["contacts"], batch["aatype"], batch["mask"])[:2],
                        batch["mask"], batch["ref_feats"], batch["ref_pos"],
-                       batch["atom_to_token"], batch["atom_mask"], n_steps=3)
+                       batch["atom_to_token"], batch["atom_mask"], batch["ref_space_uid"],
+                       n_steps=3)
     r.append(check(f"rollout [B,{A},3] finite", tuple(co.shape) == (B, A, 3)
                    and torch.isfinite(co).all().item()))
     r.append(check("rollout zeroes padded atoms",

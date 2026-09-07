@@ -126,13 +126,15 @@ class ContactToCoord(nn.Module):
         return s, z, pair_logits
 
     # ── EDM-preconditioned denoiser over ATOMS ────────────────────────────────────────────────
-    def _f_forward(self, r_noisy, sigma, s, z, mask, ref_feats, ref_pos, atom_to_token, atom_mask):
+    def _f_forward(self, r_noisy, sigma, s, z, mask, ref_feats, ref_pos, atom_to_token, atom_mask,
+                   ref_space_uid):
         c_noise = torch.log(sigma / SIGMA_DATA) / 4.0
         n = self.to_noise_s(self.norm_noise(self.fourier(c_noise)))
         s_cond = self.norm_s(s) + n[:, None, :]
 
         a_token, q_atom = self.atom_enc(
-            ref_feats, ref_pos, atom_to_token, s_cond, z, atom_mask, noisy_pos=r_noisy
+            ref_feats, ref_pos, atom_to_token, s_cond, z, atom_mask, noisy_pos=r_noisy,
+            ref_space_uid=ref_space_uid,
         )
         for blk in self.blocks:
             a_token = blk(a_token, s_cond, z, mask)
@@ -143,10 +145,12 @@ class ContactToCoord(nn.Module):
             a_token, q_atom, atom_to_token, atom_mask, self.pair_to_atompair(z)
         )
 
-    def denoise(self, x_noisy, sigma, s, z, mask, ref_feats, ref_pos, atom_to_token, atom_mask):
+    def denoise(self, x_noisy, sigma, s, z, mask, ref_feats, ref_pos, atom_to_token, atom_mask,
+                ref_space_uid):
         b = sigma[:, None, None]
         r_noisy = x_noisy / torch.sqrt(SIGMA_DATA ** 2 + b ** 2)
-        upd = self._f_forward(r_noisy, sigma, s, z, mask, ref_feats, ref_pos, atom_to_token, atom_mask)
+        upd = self._f_forward(r_noisy, sigma, s, z, mask, ref_feats, ref_pos, atom_to_token,
+                              atom_mask, ref_space_uid)
         ratio = b / SIGMA_DATA
         return x_noisy / (1.0 + ratio ** 2) + upd * b / torch.sqrt(1.0 + ratio ** 2)
 
@@ -154,6 +158,7 @@ class ContactToCoord(nn.Module):
         contacts, aatype, mask = batch["contacts"], batch["aatype"], batch["mask"]
         ref_feats, ref_pos = batch["ref_feats"], batch["ref_pos"]
         atom_to_token, atom_mask = batch["atom_to_token"], batch["atom_mask"]
+        ref_space_uid = batch["ref_space_uid"]
         s, z, pair_logits = self.encode(contacts, aatype, mask)
         out = {"pair_logits": pair_logits}
 
@@ -179,17 +184,18 @@ class ContactToCoord(nn.Module):
             rep = lambda t: t.repeat_interleave(n, dim=0)
             out["x_denoised"] = self.denoise(
                 x_noisy, sig_flat, rep(s), rep(z), rep(mask), rep(ref_feats), rep(ref_pos),
-                rep(atom_to_token), rep(atom_mask)
+                rep(atom_to_token), rep(atom_mask), rep(ref_space_uid)
             ) * rep(atom_mask)[..., None]
             out["atom_mask_rep"] = rep(atom_mask)
             out["x_gt_rep"] = x_rep
             out["sigma"] = sig_flat
         if run_rollout or x_gt is None:
-            out["coords"] = self.rollout(s, z, mask, ref_feats, ref_pos, atom_to_token, atom_mask)
+            out["coords"] = self.rollout(s, z, mask, ref_feats, ref_pos, atom_to_token, atom_mask,
+                                         ref_space_uid)
         return out
 
     @torch.no_grad()
-    def rollout(self, s, z, mask, ref_feats, ref_pos, atom_to_token, atom_mask,
+    def rollout(self, s, z, mask, ref_feats, ref_pos, atom_to_token, atom_mask, ref_space_uid,
                 n_steps: int = MINI_ROLLOUT_STEPS):
         """SI Alg. 18. Defaults to the 20-step mini-rollout; pass 200 for full inference."""
         B, A = atom_mask.shape
@@ -214,6 +220,6 @@ class ContactToCoord(nn.Module):
             x_noisy = x + 1.003 * torch.sqrt((t_hat ** 2 - s_prev ** 2).clamp_min(0)) \
                 * torch.randn_like(x) * m
             d = self.denoise(x_noisy, t_hat.expand(B), s, z, mask,
-                             ref_feats, ref_pos, atom_to_token, atom_mask) * m
+                             ref_feats, ref_pos, atom_to_token, atom_mask, ref_space_uid) * m
             x = (x_noisy + 1.5 * (s_cur - t_hat) * (x_noisy - d) / t_hat) * m
         return x * m

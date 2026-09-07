@@ -143,7 +143,18 @@ class AtomAttentionEncoder(nn.Module):
         super().__init__()
         self.c_atom, self.has_coords = c_atom, has_coords
         self.ref_proj = nn.Linear(n_ref_feats, c_atom)
-        self.pair_proj = nn.Linear(3, c_atompair)          # from reference offset vectors
+        # AF3 SI Alg. 5 / `atom_cross_attention.py:288-313` builds the atom-pair track from THREE
+        # reference terms, not one: the signed offset, the invariant 1/(1+d^2), and the validity
+        # mask itself -- then a residual 3-layer MLP. Offsets and distances are gated by
+        # offsets_valid; the mask embedding is not (its whole content is the gate).
+        self.pair_proj = nn.Linear(3, c_atompair)
+        self.dist_proj = nn.Linear(1, c_atompair)
+        self.valid_proj = nn.Linear(1, c_atompair)
+        self.pair_mlp = nn.Sequential(
+            nn.ReLU(), nn.Linear(c_atompair, c_atompair),
+            nn.ReLU(), nn.Linear(c_atompair, c_atompair),
+            nn.ReLU(), nn.Linear(c_atompair, c_atompair),
+        )
         self.s_to_atom = nn.Linear(c_s, c_atom, bias=False)
         self.z_to_atompair = nn.Linear(c_z, c_atompair, bias=False)
         if has_coords:
@@ -153,7 +164,8 @@ class AtomAttentionEncoder(nn.Module):
         )
         self.to_token = nn.Linear(c_atom, c_token, bias=False)
 
-    def forward(self, ref_feats, ref_pos, atom_to_token, s, z, atom_mask, noisy_pos=None):
+    def forward(self, ref_feats, ref_pos, atom_to_token, s, z, atom_mask, noisy_pos=None,
+                ref_space_uid=None):
         """ref_feats [B,A,F], ref_pos [B,A,3], atom_to_token [B,A] long, s [B,L,c_s],
         z [B,L,L,c_z], atom_mask [B,A]. Returns (a_token [B,L,c_token], q_atom [B,A,c_atom])."""
         B, A, _ = ref_pos.shape
@@ -170,8 +182,17 @@ class AtomAttentionEncoder(nn.Module):
         mp = _pad_atoms(atom_mask[..., None], ap)[..., 0]
         ip = _pad_atoms(idx[..., None], ap)[..., 0]
 
-        p = self.pair_proj(rp[:, qidx][:, :, :, None, :] - rp[:, kidx][:, :, None, :, :])
+        # ⛔ Offsets are only meaningful between atoms sharing a reference frame. Without this gate
+        # the projection subtracts coordinates expressed in DIFFERENT rigid-group frames, which is
+        # most of the 128-key window -- garbage the model has to learn to ignore.
+        up = _pad_atoms(ref_space_uid[..., None], ap)[..., 0]
+        valid = (up[:, qidx][:, :, :, None] == up[:, kidx][:, :, None, :]).to(rp.dtype)[..., None]
+        off = rp[:, qidx][:, :, :, None, :] - rp[:, kidx][:, :, None, :, :]
+        p = self.pair_proj(off) * valid
+        p = p + self.dist_proj(1.0 / (1.0 + off.pow(2).sum(-1, keepdim=True))) * valid
+        p = p + self.valid_proj(valid)
         p = p + gather_blocked_pair(self.z_to_atompair(z), ip, qidx, kidx)
+        p = p + self.pair_mlp(p)
         key_mask = mp.bool()[:, kidx] & kvalid[None]
         for blk in self.blocks:
             qp = blk(qp, qp, p, key_mask, qidx, kidx)

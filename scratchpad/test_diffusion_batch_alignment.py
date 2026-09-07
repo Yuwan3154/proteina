@@ -68,11 +68,11 @@ def main():
     aatype = torch.randint(0, 20, (B, Lr))
     mask = torch.ones(B, Lr)
     mask[2, -2:] = 0.0                       # a distinguishable per-structure mask
-    ref_feats, ref_pos, a2t, amask = atom14_features(aatype, mask)
+    ref_feats, ref_pos, a2t, amask, ruid = atom14_features(aatype, mask)
     atom_pos = torch.arange(B, dtype=torch.float32)[:, None, None].expand(B, Lr * 14, 3).contiguous()
     batch = {"contacts": torch.zeros(B, Lr, Lr), "aatype": aatype, "mask": mask,
              "ref_feats": ref_feats, "ref_pos": ref_pos, "atom_to_token": a2t,
-             "atom_mask": amask, "atom_pos": atom_pos}
+             "atom_mask": amask, "ref_space_uid": ruid, "atom_pos": atom_pos}
     out = m(batch)
 
     check("x_gt_rep has B*n rows", out["x_gt_rep"].shape[0] == B * n,
