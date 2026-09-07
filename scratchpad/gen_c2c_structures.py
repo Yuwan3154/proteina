@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from proteinfoundation.nn.af3_diffusion import FULL_INFERENCE_STEPS
 from proteinfoundation.proteinflow.contact2coord_trainer import ContactToCoordTrainer
-from proteinfoundation.utils.c2c_dump import write_atom14_pdb
+from proteinfoundation.utils.c2c_dump import chirality_agreement, write_atom14_pdb
 
 MODEL_CFG = dict(
     c_s=384, c_z=128, c_token=768, c_atom=128, c_atompair=16,
@@ -110,7 +110,7 @@ def main():
     model = model.to(dev).eval()
 
     print(f"\n{'chain':>10} {'L':>5} {'ca_rmsd_A':>10} {'mirror_rmsd':>11} {'tm':>7} "
-          f"{'dist_mae_A':>11} {'rg_ratio':>9} {'verdict':>7}")
+          f"{'dist_mae_A':>11} {'rg_ratio':>9} {'chir':>7} {'verdict':>7}")
     rows = []
     it = iter(dm.val_dataloader())
     for i in range(args.n):
@@ -140,14 +140,29 @@ def main():
         rg = float(np.sqrt((dg ** 2).sum() / (2 * len(ca_g) ** 2)) /
                    np.sqrt((dt ** 2).sum() / (2 * len(ca_t) ** 2)))
         tm = usalign_tm(gp, tp, args.usalign)
+        # ⭐ THE decisive diagnostic. A mirrored chain can fail two very different ways:
+        #   chir ~ 0.0 -> literal reflection, the CA stereocentres are INVERTED (all-D).
+        #                A per-residue chirality term would kill it outright.
+        #   chir ~ 1.0 -> residues are correctly L but the FOLD is mirrored. A local term
+        #                cannot see that at all; it needs dense frame-based (FAPE-like)
+        #                pressure, which is exactly what AF3 dropped from AF2.
+        chir = chirality_agreement(gen14, gt14, b['aatype'][0], b['mask'][0])
         mirrored = rmsd_mir < 0.5 * rmsd and rmsd > 4.0
-        rows.append((name, int(keep.sum()), rmsd, rmsd_mir, tm, mae, rg, mirrored))
+        rows.append((name, int(keep.sum()), rmsd, rmsd_mir, tm, mae, rg, mirrored, chir))
         print(f"{name:>10} {int(keep.sum()):>5} {rmsd:>10.2f} {rmsd_mir:>11.2f} "
               f"{('%.3f' % tm) if tm is not None else '  n/a':>7} {mae:>11.2f} {rg:>9.2f} "
-              f"{'MIRROR' if mirrored else '':>7}", flush=True)
+              f"{chir:>7.3f} {'MIRROR' if mirrored else '':>7}", flush=True)
 
     print(f"\nwrote {2*len(rows)} PDBs to {args.out}")
     n_mir = sum(1 for r in rows if r[7])
+    mir_chir = [r[8] for r in rows if r[7]]
+    if mir_chir:
+        import statistics
+        m = statistics.mean(mir_chir)
+        print(f"\n⭐ chirality_agree over the MIRRORED chains: mean {m:.3f} "
+              f"(min {min(mir_chir):.3f}, max {max(mir_chir):.3f})")
+        print("   ~0.0 => literal reflection (inverted stereocentres): a per-residue chirality loss fixes it.")
+        print("   ~1.0 => correct L residues in a MIRRORED FOLD: only dense frame-based pressure sees it.")
     print(f"⚠️ GENERATION numbers (full reverse diffusion from noise), not the denoising val/rmsd.")
     print(f"   TM>0.5 is the usual 'same fold' threshold; random pairs sit near 0.17-0.3.")
     print(f"⭐ MIRRORED (correct distances, wrong handedness): {n_mir}/{len(rows)}.")
