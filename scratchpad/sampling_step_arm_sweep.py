@@ -49,6 +49,13 @@ def main():
     ap.add_argument("--steps", type=int, nargs="+", default=[25, 50, 100, 200])
     ap.add_argument("--arms", nargs="+", default=["self", "nonself"])
     ap.add_argument("--ref_seed", type=int, default=0)
+    # ⛔ The nonself arm MUST run on a chain list where every chain has a
+    # different-sequence cluster-mate. 10 of the standard 32 do not, and
+    # _build_self_reference_topology returns None for the WHOLE BATCH when any one
+    # chain fails -- so a single mate-less chain strips conditioning from all 4 and
+    # the arm silently measures the UNCONDITIONED floor. That is exactly what the
+    # first sweep produced (0.29/0.28/0.22, n_distinct_refs=1 throughout).
+    ap.add_argument("--nonself_chain_list", default="")
     args = ap.parse_args()
 
     rows = []
@@ -69,6 +76,8 @@ def main():
             cfg_exp.validation_sampling.dt = STEPS_TO_DT[steps]
             cfg_exp.validation_sampling.topology_nonself = (arm == "nonself")
             cfg_exp.validation_sampling.topology_nonself_seed = args.ref_seed
+            if arm == "nonself" and args.nonself_chain_list:
+                cfg_exp.validation_sampling.fixed_chain_list = args.nonself_chain_list
 
             ds_dir = f"../configs/datasets_config/{cfg_exp.dataset_config_subdir}"
             with hydra.initialize(ds_dir, version_base=hydra.__version__):
