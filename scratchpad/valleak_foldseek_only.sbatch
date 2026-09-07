@@ -42,7 +42,7 @@ echo "argv bytes=$BYTES  ARG_MAX=$LIMIT"
     echo "       Shard into per-directory createdb + iterative 'foldseek concatdbs' (also _ss/_ca/_h)."
     exit 79; }
 
-rm -f "$WORK"/tdb* "$WORK"/aln* "$WORK"/hits.tsv
+rm -f "$WORK"/tdb* "$WORK"/aln* "$WORK"/hits.tsv*
 "$FS" createdb "$WORK"/train/s*/*.pdb "$WORK/tdb"
 # ⛔ Verify, do not assume: this is the exact step that failed silently last time.
 [ -s "$WORK/tdb.index" ] || { echo "FATAL: createdb produced no tdb.index"; exit 80; }
@@ -53,8 +53,11 @@ echo "tdb entries: $(wc -l < "$WORK/tdb.index")"
 
 # ⛔ TM mode (--alignment-type 1), never the default 3Di: 3Di false-negatives on remote structural
 # similarity would UNDERSTATE leakage, i.e. bias us toward wrongly calling the split clean.
-"$FS" search "$WORK/qdb2" "$WORK/tdb" "$WORK/aln" "$WORK/tmp2" \
-    --alignment-type 1 -e 10 --max-seqs 2000 --threads "${SLURM_CPUS_PER_TASK:-32}"
+# ⛔ -a stores the alignment BACKTRACE. Without it convertalis aborts with "Backtrace cigar is
+# missing in the alignment result" (and, in foldseek 10.941cd33, a core dump) the moment you ask for
+# fident/alnlen. The search itself succeeds either way, so the flag is easy to miss.
+"$FS" search "$WORK/qdb2" "$WORK/tdb" "$WORK/aln" "$WORK/tmp3" \
+    --alignment-type 1 -a -e 10 --max-seqs 2000 --threads "${SLURM_CPUS_PER_TASK:-32}"
 "$FS" convertalis "$WORK/qdb2" "$WORK/tdb" "$WORK/aln" "$WORK/hits.tsv" \
     --format-output "query,target,alntmscore,qtmscore,ttmscore,fident,alnlen,evalue"
 [ -s "$WORK/hits.tsv" ] || { echo "FATAL: convertalis produced no hits.tsv"; exit 82; }
