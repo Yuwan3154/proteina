@@ -113,12 +113,13 @@ def main():
     print(f"[load] {src} from {args.ckpt} @ step {ck.get('global_step')}", flush=True)
     model = model.to(dev).eval()
 
-    print(f"\n{'chain':>10} {'L':>5} {'ca_rmsd_A':>10} {'mirror_rmsd':>11} {'tm':>7} "
+    print(f"\n{'chain':>10} {'id':>8} {'L':>5} {'ca_rmsd_A':>10} {'mirror_rmsd':>11} {'tm':>7} "
           f"{'dist_mae_A':>11} {'rg_ratio':>9} {'chir':>7} {'verdict':>7}")
     rows = []
     it = iter(dm.val_dataloader())
     for i in range(args.n):
-        b = model._prepare(next(it), train=False)
+        raw = next(it)
+        b = model._prepare(raw, train=False)
         b = {k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in b.items()}
         with torch.no_grad():
             s, z, _ = model.model.encode(b["contacts"], b["aatype"], b["mask"])
@@ -129,6 +130,8 @@ def main():
         keep = b["mask"][0].bool()
         gen14 = coords.reshape(-1, L, 14, 3)[0]
         gt14 = b["atom_pos"].reshape(-1, L, 14, 3)[0]
+        cid = b.get("protein_id") or raw.get("protein_id") or raw.get("id") or []
+        chain_id = str(cid[0]) if len(cid) else "?"
         name = f"gen{i:02d}"
         gp, tp = os.path.join(args.out, f"{name}_gen.pdb"), os.path.join(args.out, f"{name}_gt.pdb")
         write_atom14_pdb(gp, gen14, b["aatype"][0], b["mask"][0])
@@ -153,14 +156,25 @@ def main():
         #                pressure, which is exactly what AF3 dropped from AF2.
         chir = chirality_agreement(gen14, gt14, b['aatype'][0], b['mask'][0])
         mirrored = rmsd_mir < 0.5 * rmsd and rmsd > 4.0
-        rows.append((name, int(keep.sum()), rmsd, rmsd_mir, tm, mae, rg, mirrored, chir))
-        print(f"{name:>10} {int(keep.sum()):>5} {rmsd:>10.2f} {rmsd_mir:>11.2f} "
+        rows.append((name, chain_id, int(keep.sum()), rmsd, rmsd_mir, tm, mae, rg, mirrored, chir))
+        print(f"{name:>10} {chain_id:>8} {int(keep.sum()):>5} {rmsd:>10.2f} {rmsd_mir:>11.2f} "
               f"{('%.3f' % tm) if tm is not None else '  n/a':>7} {mae:>11.2f} {rg:>9.2f} "
               f"{chir:>7.3f} {'MIRROR' if mirrored else '':>7}", flush=True)
 
+    # ⭐ A machine-readable row per chain, keyed by the REAL chain id. Without this the probe's
+    # results cannot be joined to anything else (leakage TMs, conditioning class), and every
+    # cross-analysis has to re-derive the loader order by hand.
+    csv_path = os.path.join(args.out, "gen_results.csv")
+    with open(csv_path, "w") as fh:
+        fh.write("label,chain_id,length,ca_rmsd,mirror_rmsd,tm,dist_mae,rg_ratio,mirrored,chirality\n")
+        for r in rows:
+            tmv = "" if r[5] is None else f"{r[5]:.4f}"
+            fh.write(f"{r[0]},{r[1]},{r[2]},{r[3]:.4f},{r[4]:.4f},{tmv},"
+                     f"{r[6]:.4f},{r[7]:.4f},{int(r[8])},{r[9]:.4f}\n")
     print(f"\nwrote {2*len(rows)} PDBs to {args.out}")
-    n_mir = sum(1 for r in rows if r[7])
-    mir_chir = [r[8] for r in rows if r[7]]
+    print(f"wrote per-chain results to {csv_path}")
+    n_mir = sum(1 for r in rows if r[8])
+    mir_chir = [r[9] for r in rows if r[8]]
     if mir_chir:
         import statistics
         m = statistics.mean(mir_chir)
