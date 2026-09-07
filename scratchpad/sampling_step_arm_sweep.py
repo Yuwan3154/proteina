@@ -25,6 +25,7 @@ import sys
 import hydra
 import lightning as L
 import torch
+from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -83,9 +84,20 @@ def main():
             # A datamodule instance cannot be reused across repeated validate() calls (re-setup
             # trips "The truth value of a DataFrame is ambiguous"); build one per point.
             dm = hydra.utils.instantiate(cfg_data.datamodule)
-            trainer = L.Trainer(accelerator="gpu", devices=1, num_nodes=1, logger=False,
-                                enable_progress_bar=False)
-            trainer.validate(model, datamodule=dm)
+            # A logger is MANDATORY, not cosmetic. _run_validation_trajectory returns early on
+            # `self.logger is None or not hasattr(self.logger, "experiment")`, and that guard sits
+            # AFTER the qualitative_only check so it gates the METRIC path too. With logger=False
+            # this sweep ran 43 minutes and produced all-NaN with n_distinct_refs=0 -- sampling
+            # never executed. CSVLogger does not work either: it has `experiment`, but the payload
+            # path calls `self.logger.experiment.log(...)` and CSVLogger exposes log_metrics.
+            wl = WandbLogger(project="stepsweep_probe", name=f"{arm}_{steps}",
+                             save_dir="/tmp/stepsweep_wandb", offline=True)
+            model._fixed_val_batches_cache = None
+            model._val_pass_idx = 0
+            trainer = L.Trainer(accelerator="gpu", devices=1, num_nodes=1, logger=wl,
+                                enable_checkpointing=False, enable_progress_bar=False,
+                                limit_val_batches=cfg_exp.opt.get("limit_val_batches", 64))
+            trainer.validate(model, datamodule=dm, ckpt_path=None, verbose=False)
             cm = {k: float(v) for k, v in trainer.callback_metrics.items()}
             got = {lab: next((v for k, v in cm.items() if k.endswith(key)), float("nan"))
                    for key, lab in REPORT}
