@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=coordcen
+#SBATCH --job-name=unres
 #SBATCH --partition=mit_quicktest
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -17,6 +17,6 @@ export DATA_PATH=/orcd/pool/006/chenxiou/proteina/data
 export TMPDIR=/orcd/scratch/orcd/011/chenxiou/.tmp
 mkdir -p "$TMPDIR"
 cd /orcd/scratch/orcd/011/chenxiou/proteina_sh
-echo "=== coordinate centering / EDM scale ==="
-python scratchpad/check_coord_centering.py --n 40
+echo "=== unresolved atoms + chirality supervision ==="
+python scratchpad/check_unresolved_atoms.py --n 40
 echo "DATACHIR_EXIT=$?"
