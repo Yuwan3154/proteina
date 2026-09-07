@@ -5,9 +5,12 @@ positive rate, and "uniform" must not. Getting that backwards would silently cha
 of the whole training task by ~4x, and nothing downstream would complain.
 """
 
+import os
 import sys
 
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from proteinfoundation.datasets.contact_augment import augment_contacts
 

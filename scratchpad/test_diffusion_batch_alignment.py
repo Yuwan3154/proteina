@@ -69,7 +69,13 @@ def main():
     mask = torch.ones(B, Lr)
     mask[2, -2:] = 0.0                       # a distinguishable per-structure mask
     ref_feats, ref_pos, a2t, amask, ruid = atom14_features(aatype, mask)
-    atom_pos = torch.arange(B, dtype=torch.float32)[:, None, None].expand(B, Lr * 14, 3).contiguous()
+    # ⛔ A per-structure CONSTANT (the old fixture) is degenerate now that the targets are centred:
+    # a structure whose atoms all share one point centres to all-zeros, destroying the identity the
+    # test keys on. Use a distinct rigid SHAPE per structure instead, identified by its internal
+    # distance matrix, which is exactly the quantity a rigid augmentation must preserve.
+    base = torch.randn(1, Lr * 14, 3, generator=torch.Generator().manual_seed(3)) * 8.0
+    scales = torch.tensor([1.0, 2.0, 3.0])[:B, None, None]
+    atom_pos = (base * scales).contiguous() + torch.tensor([40.0, -25.0, 15.0])
     batch = {"contacts": torch.zeros(B, Lr, Lr), "aatype": aatype, "mask": mask,
              "ref_feats": ref_feats, "ref_pos": ref_pos, "atom_to_token": a2t,
              "atom_mask": amask, "ref_space_uid": ruid, "atom_pos": atom_pos}
@@ -77,10 +83,38 @@ def main():
 
     check("x_gt_rep has B*n rows", out["x_gt_rep"].shape[0] == B * n,
           str(tuple(out["x_gt_rep"].shape)))
-    gt_src = out["x_gt_rep"][:, 0, 0]
-    check("x_gt_rep row b*n+j carries structure b's coordinates",
-          all(int(gt_src[b * n + j]) == b for b in range(B) for j in range(n)),
-          f"{[int(v) for v in gt_src]}")
+    # ⛔ x_gt_rep is now the AUGMENTED target (centred + independently rotated/translated per
+    # replica), which it MUST be so the loss target matches the noised input. So the invariant is no
+    # longer "carries structure b's coordinates" but "is a RIGID TRANSFORM of structure b" --
+    # checked through the internal distance matrix, which a rigid motion preserves exactly.
+    def pdist(p):
+        d = p[:, None, :].double() - p[None, :, :].double()
+        return (d * d).sum(-1).sqrt()
+
+    ok_src, detail = True, []
+    for b in range(B):
+        keep = amask[b].bool()
+        d_ref = pdist(atom_pos[b][keep])
+        for j in range(n):
+            d_row = pdist(out["x_gt_rep"][b * n + j][keep])
+            err = (d_row - d_ref).abs().max().item()
+            ok_src &= err < 1e-3
+            if j == 0:
+                detail.append(f"b{b}:{err:.1e}")
+    check("x_gt_rep row b*n+j is a RIGID transform of structure b", ok_src, " ".join(detail))
+
+    # And the replicas must genuinely differ, or the per-sample augmentation is not happening.
+    spread = max((out["x_gt_rep"][b * n] - out["x_gt_rep"][b * n + 1]).abs().max().item()
+                 for b in range(B))
+    check("replicas of one structure got DIFFERENT augmentations", spread > 1.0,
+          f"max |diff| {spread:.2f} A")
+
+    # Centring must have happened: the augmented COM sits near the origin, not at the raw offset.
+    com = (out["x_gt_rep"] * out["atom_mask_rep"][..., None]).sum(1) / \
+        out["atom_mask_rep"].sum(1, keepdim=True).clamp_min(1e-8)
+    check("augmented targets are CENTRED (raw fixture sat ~50 A off-origin)",
+          com.norm(dim=-1).max().item() < 6.0,
+          f"max |COM| {com.norm(dim=-1).max().item():.2f} A")
 
     # The masks must be replicated in the SAME order, or the loss averages over the wrong atoms.
     mask_counts = out["atom_mask_rep"].sum(-1)
