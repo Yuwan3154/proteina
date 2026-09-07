@@ -93,6 +93,22 @@ def main():
         print("no structures found")
         return 1
 
+    # ⭐ CALIBRATE ON THE NATIVES, never on an assumed sign convention. Every _gt structure is a
+    # real protein and therefore correct-handed by definition, so whatever value they take IS the
+    # right-handed signature. This removes the guesswork about which way the dihedral sign runs.
+    nat = []
+    for gp in sorted(glob.glob(os.path.join(args.dir, "*_gt.pdb"))):
+        t = read_ca(gp)
+        if len(t) < 40:
+            continue
+        sc, _ = helical_score(t)
+        if sc is not None:
+            nat.append(sc)
+    if nat:
+        na = np.array(nat)
+        print(f"NATIVE calibration ({len(na)} real structures): right-handed fraction "
+              f"mean {na.mean():.3f}  min {na.min():.3f}  max {na.max():.3f}\n")
+
     mir = [r for r in rows if r[1]]
     ok = [r for r in rows if not r[1]]
     print(f"structures scored: {len(rows)}   mirrored (by native): {len(mir)}   correct: {len(ok)}\n")
@@ -102,9 +118,16 @@ def main():
             print(f"  {lab:>8}: right-handed dihedral fraction  "
                   f"mean {v.mean():.3f}  min {v.min():.3f}  max {v.max():.3f}")
 
-    tp_ = sum(1 for r in mir if r[2] < args.threshold)
-    fp_ = sum(1 for r in ok if r[2] < args.threshold)
-    print(f"\ndetector: flag as mirrored when the right-handed fraction < {args.threshold}")
+    # Direction taken from the natives, not from an assumption: a generated chain is called
+    # mirrored when its score falls on the OPPOSITE side of the threshold from real proteins.
+    nat_mean = float(np.mean(nat)) if nat else 0.5
+    native_low = nat_mean < args.threshold
+    flag = (lambda v: v >= args.threshold) if native_low else (lambda v: v < args.threshold)
+    print(f"natives sit {'BELOW' if native_low else 'ABOVE'} {args.threshold} "
+          f"(mean {nat_mean:.3f}), so a generated chain is flagged when its score is on the other side.")
+    tp_ = sum(1 for r in mir if flag(r[2]))
+    fp_ = sum(1 for r in ok if flag(r[2]))
+    print(f"\ndetector: flag as mirrored when the score is opposite the native side of {args.threshold}")
     print(f"  correctly flagged   : {tp_}/{len(mir)}")
     print(f"  wrongly flagged     : {fp_}/{len(ok)}")
     acc = (tp_ + (len(ok) - fp_)) / len(rows)
@@ -112,7 +135,7 @@ def main():
 
     # What the fix would BUY: reflect every flagged structure and rescore.
     before = float(np.mean([r[4] for r in rows]))
-    after = float(np.mean([(r[5] if r[2] < args.threshold else r[4]) for r in rows]))
+    after = float(np.mean([(r[5] if flag(r[2]) else r[4]) for r in rows]))
     print(f"\nmean CA-RMSD as generated        : {before:.2f} A")
     print(f"mean CA-RMSD, flagged reflected   : {after:.2f} A")
     print("\n⚠️ The detector never sees the native. The native is used only to LABEL chains for")
