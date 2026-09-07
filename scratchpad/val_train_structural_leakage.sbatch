@@ -26,7 +26,8 @@ WORK=/orcd/scratch/orcd/011/chenxiou/valleak
 mkdir -p "$WORK"
 cd "$WORK"
 
-FS=$(command -v foldseek || echo "$HOME/.local/bin/foldseek")
+# foldseek lives in its own conda env on this host, not on PATH and not a module.
+FS=$(command -v foldseek || echo /home/chenxiou/.conda/envs/foldseek/bin/foldseek)
 echo "foldseek: $FS"
 "$FS" version 2>/dev/null || { echo "FATAL: foldseek not found"; exit 77; }
 
