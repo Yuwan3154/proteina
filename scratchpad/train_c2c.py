@@ -128,14 +128,24 @@ def main():
         # unaveraged model -- warm-starting from it would discard the averaging and start from a
         # set of weights nothing was ever measured on.
         if "ema" in sd:
-            model.model.load_state_dict(
-                {k: v for k, v in sd["ema"]["params"].items()}, strict=True)
+            missing, unexpected = model.model.load_state_dict(
+                {k: v for k, v in sd["ema"]["params"].items()}, strict=False)
             src = f"EMA params (decay {sd['ema'].get('decay')})"
         else:
-            model.load_state_dict(sd["state_dict"], strict=True)
+            missing, unexpected = model.load_state_dict(sd["state_dict"], strict=False)
             src = "state_dict (no EMA in this checkpoint)"
-        print(f"[warm-start] {src} from {args.init_from} "
-              f"(step {sd.get('global_step')}), fresh optimizer at lr={model.lr}", flush=True)
+        # ⛔ strict=False ONLY to admit modules that did not exist when the checkpoint was written
+        # (fix A's reference-offset block). A blanket strict=False would silently accept a renamed
+        # or reshaped parameter and warm-start from a model that is quietly half-initialised, so
+        # every missing key must match a known-new module and NOTHING may be unexpected.
+        allowed = ("atom_enc.dist_proj", "atom_enc.valid_proj", "atom_enc.pair_mlp")
+        bad = [k for k in missing if not any(k.startswith(a) for a in allowed)]
+        assert not bad, f"warm-start would leave PRE-EXISTING params uninitialised: {bad[:8]}"
+        assert not unexpected, f"checkpoint has params the model lacks: {list(unexpected)[:8]}"
+        print(f"[warm-start] {src} from {args.init_from} (step {sd.get('global_step')}), "
+              f"fresh optimizer at lr={model.lr}", flush=True)
+        print(f"[warm-start] {len(missing)} newly-initialised params, all in {allowed}: "
+              f"{sorted(set(k.rsplit('.', 1)[0] for k in missing))}", flush=True)
     trainer.fit(model, datamodule=dm, ckpt_path=resume)
 
     if args.smoke:
