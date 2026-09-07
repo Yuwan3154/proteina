@@ -5,9 +5,12 @@ the contact map actually CHANGES the output (a model that ignores its conditioni
 happily and be worthless), EDM limits, and that gradients reach every major sub-module.
 """
 
+import os
 import sys
 
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from proteinfoundation.datasets.atom_features import N_REF_FEATS, atom14_features
 from proteinfoundation.nn.af3_diffusion import diffusion_loss

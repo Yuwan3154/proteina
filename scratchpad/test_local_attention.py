@@ -126,7 +126,7 @@ def main():
     s = torch.randn(B, L, c_s)
     z = torch.randn(B, L, L, c_z)
     a_tok, q_atom = enc(torch.randn(B, A2, 8), torch.randn(B, A2, 3), a2t, s, z, am,
-                        noisy_pos=torch.randn(B, A2, 3))
+                        noisy_pos=torch.randn(B, A2, 3), ref_space_uid=a2t)
     check("encoder token shape", tuple(a_tok.shape) == (B, L, c_tok), str(tuple(a_tok.shape)))
     check("encoder atom shape", tuple(q_atom.shape) == (B, A2, c_a), str(tuple(q_atom.shape)))
     upd = dec(a_tok, q_atom, a2t, am, torch.randn(B, L, L, c_ap))
@@ -157,7 +157,7 @@ def main():
     opt.step()
     enc.zero_grad(); dec.zero_grad()
     a_tok2, q_atom2 = enc(torch.randn(B, A2, 8), torch.randn(B, A2, 3), a2t, s, z, am,
-                          noisy_pos=torch.randn(B, A2, 3))
+                          noisy_pos=torch.randn(B, A2, 3), ref_space_uid=a2t)
     dec(a_tok2, q_atom2, a2t, am, torch.randn(B, L, L, c_ap)).sum().backward()
     still_dead = [n for n, p in params if p.grad is None or p.grad.abs().max() == 0]
     check("after one step EVERY parameter receives gradient", not still_dead, str(still_dead[:4]))
