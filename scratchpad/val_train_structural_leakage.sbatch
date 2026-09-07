@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=valleak
-#SBATCH --partition=mit_normal
+#SBATCH --partition=mit_preemptable
+#SBATCH --requeue
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
@@ -39,7 +40,8 @@ python /orcd/scratch/orcd/011/chenxiou/proteina_sh/scratchpad/build_leakage_pdbs
 # ⛔ Resume-safe: on a timeout or crash, rerun the IDENTICAL command against the SAME tmp dir.
 # Never rm -rf tmp to "start clean" -- foldseek resumes from it and a wipe throws away hours.
 "$FS" createdb "$WORK/query" "$WORK/qdb"
-"$FS" createdb "$WORK/train" "$WORK/tdb"
+# createdb takes several input directories, so the 1024-per-dir shards cost nothing here.
+"$FS" createdb "$WORK"/train/s*/ "$WORK/tdb"
 "$FS" search "$WORK/qdb" "$WORK/tdb" "$WORK/aln" "$WORK/tmp" \
     --alignment-type 1 -e 10 --max-seqs 2000 --threads "${SLURM_CPUS_PER_TASK:-32}"
 "$FS" convertalis "$WORK/qdb" "$WORK/tdb" "$WORK/aln" "$WORK/hits.tsv" \

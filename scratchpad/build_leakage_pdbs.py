@@ -45,7 +45,10 @@ def main():
     dm = hydra.utils.instantiate(cfg.datamodule)
     dm.setup("fit")
 
-    def dump(loader, out, n, tag):
+    def dump(loader, out, n, tag, shard=False):
+        """⛔ shard=True keeps every directory under 1024 entries. 40k PDBs in one directory is
+        slow enough on this filesystem to matter, and foldseek createdb accepts several input
+        directories, so `train/s*/` costs nothing over a single flat folder."""
         it, written = iter(loader), 0
         while written < n:
             try:
@@ -62,15 +65,18 @@ def main():
                 ca = coords[j][m[j]][:, 1, :]
                 if ca.shape[0] < 30:      # foldseek is unreliable on very short chains
                     continue
-                write_ca(os.path.join(out, f"{stem}.pdb"), ca.numpy())
+                sub = os.path.join(out, f"s{written // 1000:03d}") if shard else out
+                os.makedirs(sub, exist_ok=True)
+                write_ca(os.path.join(sub, f"{stem}.pdb"), ca.numpy())
                 written += 1
-        print(f"[{tag}] wrote {written} CA-only PDBs to {out}", flush=True)
+        where = f"{out}/s*/ ({(written // 1000) + 1} shards)" if shard else out
+        print(f"[{tag}] wrote {written} CA-only PDBs to {where}", flush=True)
         return written
 
     # ⭐ The SAME first-N-in-loader-order the generation probe used, so the leakage question is asked
     # about the exact chains whose TM scores we reported.
     dump(dm.val_dataloader(), qdir, args.n_val, "val")
-    dump(dm.train_dataloader(), tdir, args.n_train, "train")
+    dump(dm.train_dataloader(), tdir, args.n_train, "train", shard=True)
     print("\n⚠️ The training sample is the first n_train chains in loader order, not the full split.")
     print("   A NEGATIVE result (no fold match) is therefore weaker than a positive one: a neighbour")
     print("   could exist in the part of training that was not searched.")
