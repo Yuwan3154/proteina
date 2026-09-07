@@ -32,6 +32,11 @@ from proteinfoundation.datasets.sse_topology import (
     sse_sequence_gap,
 )
 
+# Sentinel written to graph.topology_ref_id when the sample is unconditioned (dropped, no index
+# row, or -- under require_nonself -- no non-self template available). Downstream, a sample is
+# SELF-referenced iff topology_ref_id == its own protein_id, and unconditioned iff it is this.
+MASK_REF_ID = "MASK"
+
 
 class TopologyReferenceTransform(T.BaseTransform):
     """Adds topology_tokens / topology_pos / topology_he_* to a graph.
@@ -46,6 +51,8 @@ class TopologyReferenceTransform(T.BaseTransform):
         drop_prob: probability of replacing the whole reference with MASK, so the model can also
             run unconditioned (needed for classifier-free guidance at sampling time).
         self_fallback: use the query's own topology when no valid template exists.
+        require_nonself: drop to MASK rather than ever returning the query's own
+            topology. For the non-self validation arm.
     """
 
     def __init__(
@@ -57,6 +64,7 @@ class TopologyReferenceTransform(T.BaseTransform):
         mutate_prob: float = 0.3,
         drop_prob: float = 0.0,
         self_fallback: bool = True,
+        require_nonself: bool = False,
         exact_max: int = 10,
         bin_step: int = 2,
         catch_all_above: int = 30,
@@ -70,6 +78,9 @@ class TopologyReferenceTransform(T.BaseTransform):
         self.mutate_prob = mutate_prob
         self.drop_prob = drop_prob
         self.self_fallback = self_fallback
+        # Validation-only: refuse the self-reference entirely, so the arm measures
+        # template threading rather than the model's ability to copy the answer.
+        self.require_nonself = require_nonself
         self.alphabet = SSEAlphabet(
             exact_max=exact_max, bin_step=bin_step, catch_all_above=catch_all_above, min_len=min_len
         )
@@ -262,6 +273,44 @@ class TopologyReferenceTransform(T.BaseTransform):
             return None
         return self._build_reference(row, length, augment=False)
 
+    def nonself_reference(self, stem: str, length: int, seed: Optional[int] = None):
+        """A RETRIEVED same-cluster, different-sequence topology. The realistic task.
+
+        ⭐ Counterpart to self_reference for the validation SAMPLING path. self_reference conditions
+        on the correct answer, so the headline
+        `validation_sampling/contact_precision_at_L_*` is a CEILING, not a measurement: every one of
+        the fixed validation chains gets its own topology. This returns a genuine template instead,
+        which is what a test-time user actually has.
+
+        Returns (features, reference_stem). reference_stem is returned rather than logged internally
+        so the caller can record WHICH template was used -- without it the number cannot be
+        stratified by reference quality afterwards, which is the whole point of measuring it.
+
+        ⛔ Returns None when the chain has no different-sequence mate, rather than silently falling
+        back to self. A silent fallback would put ceiling samples back into the arm that exists to
+        exclude them, and the arm would quietly measure the thing it was built to avoid.
+
+        seed makes the draw reproducible across sweep points, so a step-count sweep compares the
+        SAME (query, reference) pairs at every step count instead of re-rolling the template and
+        confounding the comparison.
+        """
+        self._ensure_loaded()
+        row = self._id_to_row.get(stem)
+        if row is None:
+            return None
+        if seed is not None:
+            gen_saved, self._generator = self._generator, torch.Generator().manual_seed(
+                (seed + row) % (2**63)
+            )
+        try:
+            t_row = self._pick_template(row)
+        finally:
+            if seed is not None:
+                self._generator = gen_saved
+        if t_row == row or not self._runs_for(t_row):
+            return None
+        return self._build_reference(t_row, length, augment=False), str(self._index["ids"][t_row])
+
     def forward(self, graph: Data) -> Data:
         self._ensure_loaded()
         L = int(graph.coords.shape[0])
@@ -270,14 +319,30 @@ class TopologyReferenceTransform(T.BaseTransform):
 
         drop = float(torch.rand(1, generator=self._generator)) < self.drop_prob
         if row is None or drop:
+            graph.topology_ref_id = MASK_REF_ID
             return self._set_empty(graph)
 
         t_row = self._pick_template(row)  # returns `row` itself when no valid template exists
+        # ⭐ require_nonself: for a validation arm that measures the REALISTIC task (thread a
+        # template that is not the answer). Without it, self-fallback silently hands back the
+        # query's own topology and the metric becomes a ceiling rather than a measurement.
+        if self.require_nonself and t_row == row:
+            graph.topology_ref_id = MASK_REF_ID
+            return self._set_empty(graph)
         if t_row == row and not self.self_fallback:
+            graph.topology_ref_id = MASK_REF_ID
             return self._set_empty(graph)
         if not self._runs_for(t_row):
             t_row = row
+        if self.require_nonself and t_row == row:
+            graph.topology_ref_id = MASK_REF_ID
+            return self._set_empty(graph)
 
+        # ⛔ Set on EVERY exit path, not just this one. dense_padded_collate INTERSECTS keys across
+        # the samples in a batch, so a key present on only some samples is silently DROPPED from the
+        # batch entirely -- it would not misalign, it would vanish, and the stratification would
+        # come back empty with no error.
+        graph.topology_ref_id = str(self._index["ids"][t_row])
         for key, value in self._build_reference(t_row, L, augment=True).items():
             setattr(graph, key, value)
         return graph

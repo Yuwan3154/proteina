@@ -43,7 +43,7 @@ from proteinfoundation.datasets.cath_utils import (
     apply_fold_mask_to_indices,
     load_cath_mapping,
 )
-from proteinfoundation.datasets.topology_reference import TopologyReferenceTransform
+from proteinfoundation.datasets.topology_reference import MASK_REF_ID, TopologyReferenceTransform
 from proteinfoundation.utils import logtrace
 from proteinfoundation.utils.dense_padding_data_loader import (
     FLOAT_PADDING_VALUE,
@@ -2870,6 +2870,9 @@ class ModelTrainerBase(L.LightningModule):
             )
             return None
         ref_map = self._topology_reference_map()
+        # Which template each sampled chain actually got. Without recording it the sampling metric
+        # cannot be stratified by reference quality afterwards.
+        self._last_sampling_ref_ids = []
         refs = []
         for s in range(nsamples):
             stem = str(stems[s])
@@ -2881,7 +2884,28 @@ class ModelTrainerBase(L.LightningModule):
                     "different experiment. Sampling UNCONDITIONED instead."
                 )
                 return None
-            ref = transform.self_reference(src, int(mask[s].sum()))
+            # ⭐ nonself arm: condition on a RETRIEVED template instead of the chain's own
+            # topology. self_reference hands the model the correct answer, which makes the headline
+            # sampling metric a CEILING rather than a measurement of the realistic task. The arm is
+            # opt-in so the historical number stays comparable.
+            if self.cfg_exp.validation_sampling.get("topology_nonself", False):
+                got = transform.nonself_reference(
+                    src, int(mask[s].sum()),
+                    seed=int(self.cfg_exp.validation_sampling.get("topology_nonself_seed", 0)),
+                )
+                if got is None:
+                    # ⛔ No silent fall back to self: that would put ceiling samples straight back
+                    # into the arm whose entire purpose is to exclude them.
+                    logger.warning(
+                        f"validation_sampling[nonself]: {src} has no different-sequence "
+                        "cluster-mate; sampling UNCONDITIONED rather than falling back to self."
+                    )
+                    return None
+                ref, ref_stem = got
+                self._last_sampling_ref_ids.append(ref_stem)
+            else:
+                ref = transform.self_reference(src, int(mask[s].sum()))
+                self._last_sampling_ref_ids.append(src)
             if ref is None:
                 logger.warning(
                     f"validation_sampling: {src} is absent from the topology index"
@@ -2951,7 +2975,26 @@ class ModelTrainerBase(L.LightningModule):
         gt = c_1 if binary_gt else (c_1 + 1.0) * 0.5
         noisy = batch.get("contact_map_t")
 
-        overall, floor, per_bin, floor_per_bin = [], [], {}, {}
+        # ⭐ Split by what the sample was CONDITIONED ON. The headline sampling metric is 100%
+        # self-reference by construction (_build_self_reference_topology), i.e. a ceiling; the
+        # realistic task is threading a template that is NOT the answer. Without this split the
+        # loss-path number is a blend of ~25% unconditioned, ~17-20% self and the rest genuine
+        # cross-chain, and the three cannot be told apart. `topology_ref_id` is set on every exit
+        # path of TopologyReferenceTransform.forward; "MASK" means unconditioned.
+        ref_ids = batch.get("topology_ref_id")
+        own_ids = batch.get("protein_id", batch.get("id"))
+
+        def _ref_class(i):
+            if ref_ids is None or i >= len(ref_ids):
+                return None
+            r = str(ref_ids[i])
+            if r == MASK_REF_ID:
+                return "mask"
+            if own_ids is not None and i < len(own_ids) and r == str(own_ids[i]):
+                return "self"
+            return "retrieved"
+
+        overall, floor, per_bin, floor_per_bin, per_ref = [], [], {}, {}, {}
         for i in range(mask.shape[0]):
             if not bool(mask[i].any()):
                 continue
@@ -2962,6 +3005,9 @@ class ModelTrainerBase(L.LightningModule):
             bin_name = self._t_bin_name(float(t[i]))
             overall.append(p)
             per_bin.setdefault(bin_name, []).append(p)
+            cls = _ref_class(i)
+            if cls is not None:
+                per_ref.setdefault(cls, []).append(p)
             if noisy is not None:
                 mb = self._compute_contact_map_metrics(
                     noisy[i].detach().float(), gt[i].detach(), mask[i]
@@ -2986,6 +3032,21 @@ class ModelTrainerBase(L.LightningModule):
             entries.append((f"contact_precision_at_L_single_step_{name}", float(np.mean(vals))))
         for name, vals in floor_per_bin.items():
             entries.append((f"contact_precision_at_L_noisy_floor_{name}", float(np.mean(vals))))
+        # The `retrieved` row is the one that describes the task we actually care about. The
+        # `_frac` companions matter as much as the scores: a mean over 2 samples and a mean over
+        # 40 look identical in wandb, and the mixture drifts with the sampler.
+        n_ref_total = sum(len(v) for v in per_ref.values())
+        for name, vals in per_ref.items():
+            entries.append((f"contact_precision_at_L_single_step_ref_{name}", float(np.mean(vals))))
+        # ⛔ Iterate the FIXED class list, not per_ref's keys. batch_size is 1, so a within-batch
+        # fraction is always 1/1 and Lightning averages only over batches where the key was logged
+        # -- every frac came back as exactly 1.000, which is impossible and told us nothing about
+        # the mixture. Emitting 0.0 for the absent classes makes the epoch mean the TRUE fraction.
+        # It also makes the key set constant per batch, which is safer for DDP than a
+        # data-dependent one (see the sync_dist note below).
+        for name in ("self", "retrieved", "mask"):
+            entries.append((f"contact_ref_frac_{name}",
+                            len(per_ref.get(name, ())) / max(n_ref_total, 1)))
         for name, value in entries:
             # sync_dist MUST stay False here. `entries` is data-dependent: `per_bin` /
             # `floor_per_bin` only contain the t bins this rank's samples happened to land in,
