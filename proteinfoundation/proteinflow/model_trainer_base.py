@@ -2870,6 +2870,9 @@ class ModelTrainerBase(L.LightningModule):
             )
             return None
         ref_map = self._topology_reference_map()
+        # Which template each sampled chain actually got. Without recording it the sampling metric
+        # cannot be stratified by reference quality afterwards.
+        self._last_sampling_ref_ids = []
         refs = []
         for s in range(nsamples):
             stem = str(stems[s])
@@ -2881,7 +2884,28 @@ class ModelTrainerBase(L.LightningModule):
                     "different experiment. Sampling UNCONDITIONED instead."
                 )
                 return None
-            ref = transform.self_reference(src, int(mask[s].sum()))
+            # ⭐ nonself arm: condition on a RETRIEVED template instead of the chain's own
+            # topology. self_reference hands the model the correct answer, which makes the headline
+            # sampling metric a CEILING rather than a measurement of the realistic task. The arm is
+            # opt-in so the historical number stays comparable.
+            if self.cfg_exp.validation_sampling.get("topology_nonself", False):
+                got = transform.nonself_reference(
+                    src, int(mask[s].sum()),
+                    seed=int(self.cfg_exp.validation_sampling.get("topology_nonself_seed", 0)),
+                )
+                if got is None:
+                    # ⛔ No silent fall back to self: that would put ceiling samples straight back
+                    # into the arm whose entire purpose is to exclude them.
+                    logger.warning(
+                        f"validation_sampling[nonself]: {src} has no different-sequence "
+                        "cluster-mate; sampling UNCONDITIONED rather than falling back to self."
+                    )
+                    return None
+                ref, ref_stem = got
+                self._last_sampling_ref_ids.append(ref_stem)
+            else:
+                ref = transform.self_reference(src, int(mask[s].sum()))
+                self._last_sampling_ref_ids.append(src)
             if ref is None:
                 logger.warning(
                     f"validation_sampling: {src} is absent from the topology index"

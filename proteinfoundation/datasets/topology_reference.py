@@ -273,6 +273,44 @@ class TopologyReferenceTransform(T.BaseTransform):
             return None
         return self._build_reference(row, length, augment=False)
 
+    def nonself_reference(self, stem: str, length: int, seed: Optional[int] = None):
+        """A RETRIEVED same-cluster, different-sequence topology. The realistic task.
+
+        ⭐ Counterpart to self_reference for the validation SAMPLING path. self_reference conditions
+        on the correct answer, so the headline
+        `validation_sampling/contact_precision_at_L_*` is a CEILING, not a measurement: every one of
+        the fixed validation chains gets its own topology. This returns a genuine template instead,
+        which is what a test-time user actually has.
+
+        Returns (features, reference_stem). reference_stem is returned rather than logged internally
+        so the caller can record WHICH template was used -- without it the number cannot be
+        stratified by reference quality afterwards, which is the whole point of measuring it.
+
+        ⛔ Returns None when the chain has no different-sequence mate, rather than silently falling
+        back to self. A silent fallback would put ceiling samples back into the arm that exists to
+        exclude them, and the arm would quietly measure the thing it was built to avoid.
+
+        seed makes the draw reproducible across sweep points, so a step-count sweep compares the
+        SAME (query, reference) pairs at every step count instead of re-rolling the template and
+        confounding the comparison.
+        """
+        self._ensure_loaded()
+        row = self._id_to_row.get(stem)
+        if row is None:
+            return None
+        if seed is not None:
+            gen_saved, self._generator = self._generator, torch.Generator().manual_seed(
+                (seed + row) % (2**63)
+            )
+        try:
+            t_row = self._pick_template(row)
+        finally:
+            if seed is not None:
+                self._generator = gen_saved
+        if t_row == row or not self._runs_for(t_row):
+            return None
+        return self._build_reference(t_row, length, augment=False), str(self._index["ids"][t_row])
+
     def forward(self, graph: Data) -> Data:
         self._ensure_loaded()
         L = int(graph.coords.shape[0])
