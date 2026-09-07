@@ -23,7 +23,9 @@ set -uo pipefail
 ENV_DIR=/home/chenxiou/cue-openfold-env-sm120
 source "$ENV_DIR/.venv/bin/activate"
 export DATA_PATH=/orcd/pool/006/chenxiou/proteina/data
-WORK=/orcd/scratch/orcd/011/chenxiou/valleak
+# ⛔ WORK is parameterised so a smaller, faster companion run can proceed in its OWN tmp dir.
+# Two foldseek runs sharing one tmp would corrupt each other's resume state.
+WORK=${WORK:-/orcd/scratch/orcd/011/chenxiou/valleak}
 mkdir -p "$WORK"
 cd "$WORK"
 
@@ -51,7 +53,7 @@ echo "=== top structural neighbour per validation chain ==="
 python - <<'PY'
 import collections, os
 best = {}
-path = "/orcd/scratch/orcd/011/chenxiou/valleak/hits.tsv"
+path = os.environ.get("WORK", "/orcd/scratch/orcd/011/chenxiou/valleak") + "/hits.tsv"
 for line in open(path):
     f = line.rstrip("\n").split("\t")
     if len(f) < 4:
