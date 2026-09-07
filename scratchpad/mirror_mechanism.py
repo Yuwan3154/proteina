@@ -119,7 +119,15 @@ def main():
 
     model = ContactToCoordTrainer(model_cfg=dict(MODEL_CFG, n_diffusion_samples=8))
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    model.model.load_state_dict(ck["ema"]["params"], strict=True)
+    missing, unexpected = model.model.load_state_dict(ck["ema"]["params"], strict=False)
+    # ⛔ A PRE-fix-A checkpoint loads here with fix A's three modules left RANDOM, which is not the
+    # old model and not the new one. Zeroing them would not recover the old model either, because
+    # the offset term is now gated by ref_space_uid regardless. So refuse outright rather than
+    # report a number for a model that never existed.
+    assert not missing, (
+        f"checkpoint predates the reference-offset block ({sorted(set(k.rsplit('.', 1)[0] for k in missing))}). "
+        "Run this against a fix-A checkpoint; a pre-A one cannot give a valid baseline here.")
+    assert not unexpected, f"checkpoint has params the model lacks: {list(unexpected)[:8]}"
     print(f"[load] EMA @ step {ck.get('global_step')}", flush=True)
     model = model.to(dev).eval()
 
