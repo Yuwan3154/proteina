@@ -75,8 +75,14 @@ def write_atom14_pdb(path, coords14, aatype, mask):
             if not all(np.isfinite([x, y, z])):
                 continue
             el = nm[0]
+            # ⛔ Column-exact PDB. The altLoc blank at col 17 is NOT optional: without it resName
+            # lands at 17-19 instead of 18-20 and every field after shifts one column left, so
+            # USalign reports "Cannot parse file ... Chain number 0" and every TM-score silently
+            # reads n/a. Canonical layout: 1-6 record, 7-11 serial, 12 blank, 13-16 name,
+            # 17 altLoc, 18-20 resName, 21 blank, 22 chain, 23-26 resSeq, 27 iCode, 28-30 blank,
+            # 31-38 x, 39-46 y, 47-54 z.
             lines.append(
-                f"ATOM  {serial:>5d} {nm:<4s}{aa3:>3s} A{i+1:>4d}    "
+                f"ATOM  {serial:>5d} {nm:<4s} {aa3:>3s} A{i+1:>4d}    "
                 f"{x:>8.3f}{y:>8.3f}{z:>8.3f}  1.00  0.00          {el:>2s}"
             )
             serial += 1
