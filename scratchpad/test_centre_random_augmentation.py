@@ -54,10 +54,18 @@ check("COM spread is consistent with s_trans=1.0, not with the raw offset",
       f"mean |COM| {com.norm(dim=-1).mean().item():.2f} A")
 
 print("\n=== rigid motion: distances must be preserved exactly ===")
+# ⛔ NOT torch.cdist. It uses the |a|^2 + |b|^2 - 2ab expansion, which loses precision badly when
+# coordinate magnitudes dwarf the distances being resolved -- and the REFERENCE side here is the
+# uncentred 61 A-offset structure this change exists to remove. Measured: cdist reports 4.4e-02
+# where an explicit difference reports 1.5e-05 on the identical tensors. Using cdist would have
+# failed a correct implementation and invited a "fix" to working code.
+def pdist(p):
+    d = p[:, None, :].double() - p[None, :, :].double()
+    return (d * d).sum(-1).sqrt()
+
 keep = mask[0].bool()
-d0 = torch.cdist(x[0][keep], x[0][keep])
-worst = max((torch.cdist(out[0, j][keep], out[0, j][keep]) - d0).abs().max().item()
-            for j in range(N))
+d0 = pdist(x[0][keep])
+worst = max((pdist(out[0, j][keep]) - d0).abs().max().item() for j in range(N))
 check("all pairwise distances preserved", worst < 1e-3, f"max |dd| {worst:.2e}")
 
 print("\n=== ⛔ CHIRALITY: the augmentation must NEVER reflect ===")
