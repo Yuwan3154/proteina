@@ -65,7 +65,7 @@ z = torch.randn(B, L, L, 16)
 noisy = torch.randn(B, A, 3)
 
 with torch.no_grad():
-    a_tok, q = enc(feats, pos, a2t, s, z, amask, noisy_pos=noisy, ref_space_uid=uid)
+    a_tok, q, _ = enc(feats, pos, a2t, s, z, amask, noisy_pos=noisy, ref_space_uid=uid)
 check("encoder runs and is finite", torch.isfinite(a_tok).all().item() and
       tuple(a_tok.shape) == (B, L, 48), str(tuple(a_tok.shape)))
 
@@ -75,20 +75,20 @@ check("encoder runs and is finite", torch.isfinite(a_tok).all().item() and
 pos_b = pos.clone()
 pos_b[0, 1 * 14 + 5] += 10.0                      # TRP CG, rigid group 4
 with torch.no_grad():
-    a2, _ = enc(feats, pos_b, a2t, s, z, amask, noisy_pos=noisy, ref_space_uid=uid)
-    a3, _ = enc(feats, pos_b, a2t, s, z, amask, noisy_pos=noisy,
-                ref_space_uid=torch.zeros_like(uid))     # everything in ONE space = no gate
+    a2, _, _ = enc(feats, pos_b, a2t, s, z, amask, noisy_pos=noisy, ref_space_uid=uid)
+    a3, _, _ = enc(feats, pos_b, a2t, s, z, amask, noisy_pos=noisy,
+                   ref_space_uid=torch.zeros_like(uid))  # everything in ONE space = no gate
 d_gated = (a2 - a_tok).abs().max().item()
 with torch.no_grad():
-    a0_ungated, _ = enc(feats, pos, a2t, s, z, amask, noisy_pos=noisy,
-                        ref_space_uid=torch.zeros_like(uid))
+    a0_ungated, _, _ = enc(feats, pos, a2t, s, z, amask, noisy_pos=noisy,
+                           ref_space_uid=torch.zeros_like(uid))
 d_ungated = (a3 - a0_ungated).abs().max().item()
 check("an ungated uid propagates the perturbation FURTHER than the real gate",
       d_ungated > d_gated, f"gated={d_gated:.4f} ungated={d_ungated:.4f}")
 
 print("\n=== 3. masking and gradients ===")
 enc.zero_grad()
-a_tok, q = enc(feats, pos, a2t, s, z, amask, noisy_pos=noisy, ref_space_uid=uid)
+a_tok, q, _ = enc(feats, pos, a2t, s, z, amask, noisy_pos=noisy, ref_space_uid=uid)
 a_tok.sum().backward()
 for nm in ["pair_proj", "dist_proj", "valid_proj"]:
     g = getattr(enc, nm).weight.grad
@@ -111,6 +111,38 @@ check("padded atom slots share a frame with NO real atom",
       _ap == A or int((_up[:, A:] == 0).all()) == 1,
       f"padded slots {A}..{_ap} all sentinel-0")
 check("no real atom carries the padding sentinel", int((_up[:, :A] != 0).all()) == 1)
+
+print("\n=== 4. the DECODER must receive the chirality-bearing pair, not a mirror-invariant one ===")
+# ⛔ The decoder is the ONLY module that emits coordinates. AF3 feeds it the ENCODER's pair tensor
+# (atom_cross_attention.py:409, `pair_cond=enc.pair_cond`). Ours used to rebuild it from the trunk
+# `z`, which is built purely from the contact map, relative sequence position and sequence -- all
+# exactly reflection-invariant -- so the coordinate-emitting blocks had NO 3D reference geometry.
+from proteinfoundation.nn.atom_attention import AtomAttentionDecoder  # noqa: E402
+
+_, _, p_enc = enc(feats, pos, a2t, s, z, amask, noisy_pos=noisy, ref_space_uid=uid)
+check("encoder returns its atom-pair tensor", p_enc is not None and p_enc.dim() == 5,
+      str(tuple(p_enc.shape)) if p_enc is not None else "None")
+
+dec = AtomAttentionDecoder(c_atom=32, c_atompair=8, c_token=48, n_blocks=1, n_heads=2)
+a_tok_d, q_d, p_d = enc(feats, pos, a2t, s, z, amask, noisy_pos=noisy, ref_space_uid=uid)
+z_ap = torch.randn(B, L, L, 8)
+with torch.no_grad():
+    out_enc = dec(a_tok_d, q_d, a2t, amask, z_ap, enc_pair=p_d)
+    out_trunk = dec(a_tok_d, q_d, a2t, amask, z_ap, enc_pair=None)
+check("passing the encoder pair CHANGES the decoder output",
+      (out_enc - out_trunk).abs().max().item() > 1e-4,
+      f"max |diff| {(out_enc - out_trunk).abs().max().item():.3e}")
+
+# The decisive one: perturb a REFERENCE POSITION and confirm the decoder output responds. Under the
+# old trunk-only path it could not, because ref_pos never reached the decoder.
+pos_p = pos.clone()
+pos_p[0, 1 * 14 + 4] += 5.0                      # TRP CB, inside the chirality tetrahedron
+with torch.no_grad():
+    _, q_p, p_p = enc(feats, pos_p, a2t, s, z, amask, noisy_pos=noisy, ref_space_uid=uid)
+    out_perturbed = dec(a_tok_d, q_p, a2t, amask, z_ap, enc_pair=p_p)
+check("a reference-geometry change reaches the coordinate output",
+      (out_perturbed - out_enc).abs().max().item() > 1e-4,
+      f"max |diff| {(out_perturbed - out_enc).abs().max().item():.3e}")
 
 print(f"\n{len(PASS)}/{len(PASS) + len(FAIL)} passed")
 if FAIL:

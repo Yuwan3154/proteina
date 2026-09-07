@@ -169,7 +169,7 @@ class ContactToCoord(nn.Module):
         n = self.to_noise_s(self.norm_noise(self.fourier(c_noise)))
         s_cond = self.norm_s(s) + n[:, None, :]
 
-        a_token, q_atom = self.atom_enc(
+        a_token, q_atom, enc_pair = self.atom_enc(
             ref_feats, ref_pos, atom_to_token, s_cond, z, atom_mask, noisy_pos=r_noisy,
             ref_space_uid=ref_space_uid,
         )
@@ -178,8 +178,14 @@ class ContactToCoord(nn.Module):
 
         # The decoder blocks the token pair itself; densifying it to [B,A,A,c] here was 925 MB at
         # L=384 and is exactly what the blocked layout exists to avoid.
+        # ⭐ Reuse the ENCODER's atom-pair tensor, as AF3 does (atom_cross_attention.py:409,
+        # `pair_cond=enc.pair_cond`). It is the only chirality-bearing pair signal in the network;
+        # the trunk projection it replaces is built from the contact map, relative sequence position
+        # and sequence, all of which are exactly reflection-invariant -- so the coordinate-emitting
+        # blocks previously had no 3D reference geometry at all.
         return self.atom_dec(
-            a_token, q_atom, atom_to_token, atom_mask, self.pair_to_atompair(z)
+            a_token, q_atom, atom_to_token, atom_mask, self.pair_to_atompair(z),
+            enc_pair=enc_pair,
         )
 
     def denoise(self, x_noisy, sigma, s, z, mask, ref_feats, ref_pos, atom_to_token, atom_mask,

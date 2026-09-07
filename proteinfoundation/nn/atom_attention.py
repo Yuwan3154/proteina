@@ -209,7 +209,13 @@ class AtomAttentionEncoder(nn.Module):
         a_token.scatter_add_(1, idx[..., None].expand(-1, -1, a_atom.shape[-1]), a_atom)
         cnt = torch.zeros(B, L, 1, device=q.device, dtype=a_atom.dtype)
         cnt.scatter_add_(1, idx[..., None], atom_mask[..., None].to(a_atom.dtype))
-        return a_token / cnt.clamp_min(1.0), q
+        # ⭐ `p` is returned so the DECODER can reuse it, which is what AF3 does:
+        # alphafold3 atom_cross_attention.py:409 passes `pair_cond=enc.pair_cond` into the decoder
+        # transformer. It is the ONLY chirality-bearing pair signal in the network -- it carries the
+        # signed reference offsets, 1/(1+d^2) and the ref_space_uid validity embedding. Rebuilding
+        # the decoder's pair from the trunk `z` instead leaves the coordinate-emitting blocks with a
+        # purely reflection-invariant bias (contact map + relative position + sequence).
+        return a_token / cnt.clamp_min(1.0), q, p
 
 
 class AtomAttentionDecoder(nn.Module):
@@ -235,9 +241,14 @@ class AtomAttentionDecoder(nn.Module):
         # the EDM output scaling c_out = sigma/sqrt(1+r^2) keeps the early update small anyway.
         self.to_pos = nn.Linear(c_atom, 3, bias=False)
 
-    def forward(self, a_token, q_atom, atom_to_token, atom_mask, z_atompair):
+    def forward(self, a_token, q_atom, atom_to_token, atom_mask, z_atompair, enc_pair=None):
         """z_atompair [B,L,L,c_atompair]: the token pair already projected to the atompair width.
-        Blocked here rather than densified to [B,A,A,c] by the caller."""
+        Blocked here rather than densified to [B,A,A,c] by the caller.
+
+        enc_pair [B,NB,Q,K,c_atompair]: the ENCODER's atom-pair tensor. When given it is used
+        directly, matching AF3 (`pair_cond=enc.pair_cond`, atom_cross_attention.py:409). Falls back
+        to the trunk projection only for callers that predate this signature.
+        """
         B, A = atom_mask.shape
         idx = atom_to_token.clamp(min=0)
         q = q_atom + torch.gather(
@@ -248,7 +259,7 @@ class AtomAttentionDecoder(nn.Module):
         mp = _pad_atoms(atom_mask[..., None], ap)[..., 0]
         ip = _pad_atoms(idx[..., None], ap)[..., 0]
 
-        pair = gather_blocked_pair(z_atompair, ip, qidx, kidx)
+        pair = enc_pair if enc_pair is not None else gather_blocked_pair(z_atompair, ip, qidx, kidx)
         key_mask = mp.bool()[:, kidx] & kvalid[None]
         for blk in self.blocks:
             qp = blk(qp, qp, pair, key_mask, qidx, kidx)
