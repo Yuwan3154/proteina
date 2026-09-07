@@ -3014,7 +3014,15 @@ class ModelTrainerBase(L.LightningModule):
         n_ref_total = sum(len(v) for v in per_ref.values())
         for name, vals in per_ref.items():
             entries.append((f"contact_precision_at_L_single_step_ref_{name}", float(np.mean(vals))))
-            entries.append((f"contact_ref_frac_{name}", len(vals) / max(n_ref_total, 1)))
+        # ⛔ Iterate the FIXED class list, not per_ref's keys. batch_size is 1, so a within-batch
+        # fraction is always 1/1 and Lightning averages only over batches where the key was logged
+        # -- every frac came back as exactly 1.000, which is impossible and told us nothing about
+        # the mixture. Emitting 0.0 for the absent classes makes the epoch mean the TRUE fraction.
+        # It also makes the key set constant per batch, which is safer for DDP than a
+        # data-dependent one (see the sync_dist note below).
+        for name in ("self", "retrieved", "mask"):
+            entries.append((f"contact_ref_frac_{name}",
+                            len(per_ref.get(name, ())) / max(n_ref_total, 1)))
         for name, value in entries:
             # sync_dist MUST stay False here. `entries` is data-dependent: `per_bin` /
             # `floor_per_bin` only contain the t bins this rank's samples happened to land in,
