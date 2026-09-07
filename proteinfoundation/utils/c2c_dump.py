@@ -113,4 +113,55 @@ def dump_sample(out_dir, name, coords_gen14, coords_gt14, aatype, mask, contacts
     # distance matrix is from the true one, which needs no alignment and so cannot be flattered
     # by a bad superposition.
     chir = chirality_agreement(coords_gen14, coords_gt14, aatype, mask)
-    return float(np.abs(d_gen - d_gt).mean()), chir
+    hand = handedness_metrics(ca_gen.cpu().numpy(), ca_gt.cpu().numpy())
+    return float(np.abs(d_gen - d_gt).mean()), chir, hand
+
+
+def _ca_dihedrals(ca):
+    """CA pseudo-dihedral over every consecutive quadruple, degrees."""
+    b0, b1, b2 = ca[1:-2] - ca[:-3], ca[2:-1] - ca[1:-2], ca[3:] - ca[2:-1]
+    n1, n2 = np.cross(b0, b1), np.cross(b1, b2)
+    m = np.cross(n1, b1 / np.linalg.norm(b1, axis=1, keepdims=True))
+    return np.degrees(np.arctan2((m * n2).sum(-1), (n1 * n2).sum(-1)))
+
+
+def _kabsch_rmsd(a, b, allow_reflection=False):
+    a = a - a.mean(0, keepdims=True)
+    b = b - b.mean(0, keepdims=True)
+    u, _, vt = np.linalg.svd(a.T @ b)
+    d = 1.0 if allow_reflection else np.sign(np.linalg.det(u @ vt))
+    rot = u @ np.diag([1.0, 1.0, d]) @ vt
+    return float(np.sqrt((((a @ rot) - b) ** 2).sum(-1).mean()))
+
+
+def handedness_metrics(ca_gen, ca_gt):
+    """Metrics that can ACTUALLY see a mirror image.
+
+    ⛔⛔ `chirality_agreement` CANNOT. It tests per-residue CA stereocentres, and a mirrored
+    generation keeps its residues correctly L -- measured 0.999 (min 0.980) across 122 mirrored
+    chains. Any monitoring that relies on it will report "all good" through a 48% mirror rate.
+    What inverts in a mirror is the FOLD: the CA pseudo-dihedral sign, and the proper-vs-improper
+    superposition gap.
+
+    Returns dict:
+      helix_pos_frac : fraction of helical-range CA dihedrals that are POSITIVE. Real proteins sit
+                       near 0.12; a mirrored structure near 0.89. Native-calibrated, not assumed.
+      rmsd_proper    : CA-RMSD under a det=+1 (physical) superposition.
+      rmsd_reflected : CA-RMSD when an improper rotation is allowed.
+      is_mirrored    : 1.0 when the reflection fits distinctly better -- the operational definition.
+    """
+    out = {}
+    n = min(len(ca_gen), len(ca_gt))
+    if n < 8:
+        return out
+    g, t = ca_gen[:n], ca_gt[:n]
+    d = _ca_dihedrals(g)
+    sel = d[(np.abs(d) > 30.0) & (np.abs(d) < 90.0)]
+    if len(sel) >= 5:
+        out["helix_pos_frac"] = float((sel > 0).mean())
+    p = _kabsch_rmsd(g, t, allow_reflection=False)
+    r = _kabsch_rmsd(g, t, allow_reflection=True)
+    out["rmsd_proper"] = p
+    out["rmsd_reflected"] = r
+    out["is_mirrored"] = float(p > 2.0 * r and p - r > 1.0)
+    return out

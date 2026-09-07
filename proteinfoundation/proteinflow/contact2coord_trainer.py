@@ -163,16 +163,23 @@ class ContactToCoordTrainer(L.LightningModule):
         gt14 = b["atom_pos"].reshape(-1, L, 14, 3)[0]
         out_dir = os.path.join(self.dump_dir, f"step{self.global_step:07d}")
         name = f"val{batch_idx:02d}"
-        mad, chir = dump_sample(out_dir, name, gen14, gt14, b["aatype"][0], b["mask"][0],
-                                b["contacts"][0])
+        mad, chir, hand = dump_sample(out_dir, name, gen14, gt14, b["aatype"][0], b["mask"][0],
+                                      b["contacts"][0])
         # Mean |d_gen - d_gt| over CA pairs: alignment-free, so a bad superposition cannot
         # flatter it, and directly comparable in Angstrom to the denoising rmsd.
         self.log("val/dist_mae_sampled", mad, sync_dist=False, rank_zero_only=True)
-        # ⭐ 1.0 = native handedness everywhere; ~0.0 = globally MIRRORED; ~0.5 = scrambled.
-        # The only logged metric that can see a mirror image -- every distance-based one is blind
-        # to it, and 4/8 and 5/8 of sampled chains were measured mirrored.
+        # ⛔⛔ chirality_agree does NOT detect mirrors, despite what its name suggests. It tests
+        # per-residue CA stereocentres, and a mirrored generation keeps its residues correctly L:
+        # measured 0.999 (min 0.980) across 122 mirrored chains. It is logged only to confirm the
+        # residues stay L; a drop here would mean D-amino acids, a different failure entirely.
         if chir == chir:                      # NaN check without importing math
             self.log("val/chirality_agree", chir, sync_dist=False, rank_zero_only=True)
+        # ⭐ THESE are the metrics that see a mirror. helix_pos_frac ~0.12 is native-handed and
+        # ~0.89 is mirrored (calibrated on 254 real structures); is_mirrored is the operational
+        # verdict from the proper-vs-improper superposition gap. Watch val/is_mirrored: it is the
+        # single number that says whether a fix is working, within one validation pass.
+        for k, v in hand.items():
+            self.log(f"val/{k}", float(v), sync_dist=False, rank_zero_only=True)
 
     # ── weight EMA ────────────────────────────────────────────────────────────────────────────
     def _ema_init(self):
