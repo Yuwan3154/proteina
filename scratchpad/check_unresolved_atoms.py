@@ -61,7 +61,12 @@ def main():
             raw = next(it)
         except StopIteration:
             break
-        cm = raw["mask_dict"]["coords"][..., 0].bool()          # [B, L, 37] per-atom resolvedness
+        # ⛔ NOT raw["mask_dict"]["coords"] -- that is the PADDING mask from _dense_padded_collate.
+        # Crystallographic resolvedness is `graph.coords != fill_value_coords` (pdb_data.py:1837),
+        # i.e. an atom is unresolved exactly when its coordinates sit at the 1e-5 fill value.
+        # Measuring against the padding mask (my first attempt) proves nothing about resolvedness.
+        FILL = 1e-5
+        cm = (raw["coords"].float().abs() > (FILL * 10)).any(-1)   # [B, L, 37] resolved
         b = mod._prepare(raw, train=False)
         L = b["mask"].shape[1]
         amask = b["atom_mask"].reshape(-1, L, 14).bool()        # what the loss actually supervises
