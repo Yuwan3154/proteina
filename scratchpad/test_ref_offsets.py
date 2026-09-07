@@ -102,6 +102,16 @@ check("padded residues produce zero token output",
 check("uid stays inside the int range implied by N_RIGID_GROUPS",
       int(uid.max()) < L * N_RIGID_GROUPS, f"max uid={int(uid.max())} < {L * N_RIGID_GROUPS}")
 
+# _pad_atoms zero-fills, so a raw uid of 0 (residue 0, group 0) would collide with PADDING and make
+# padded slots look like they share residue 0's backbone frame. The encoder shifts by +1 to avoid it.
+from proteinfoundation.nn.atom_attention import _pad_atoms, blocked_indices  # noqa: E402
+_q, _k, _kv, _ap = blocked_indices(A, uid.device)
+_up = _pad_atoms((uid + 1)[..., None], _ap)[..., 0]
+check("padded atom slots share a frame with NO real atom",
+      _ap == A or int((_up[:, A:] == 0).all()) == 1,
+      f"padded slots {A}..{_ap} all sentinel-0")
+check("no real atom carries the padding sentinel", int((_up[:, :A] != 0).all()) == 1)
+
 print(f"\n{len(PASS)}/{len(PASS) + len(FAIL)} passed")
 if FAIL:
     print("FAILED: " + ", ".join(FAIL))

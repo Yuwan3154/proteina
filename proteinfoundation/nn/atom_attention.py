@@ -185,7 +185,10 @@ class AtomAttentionEncoder(nn.Module):
         # ⛔ Offsets are only meaningful between atoms sharing a reference frame. Without this gate
         # the projection subtracts coordinates expressed in DIFFERENT rigid-group frames, which is
         # most of the 128-key window -- garbage the model has to learn to ignore.
-        up = _pad_atoms(ref_space_uid[..., None], ap)[..., 0]
+        # +1 so the zero-fill from _pad_atoms is a sentinel: padded slots then match NO real frame.
+        # Harmless today (key_mask zeroes those keys and pair_mlp mixes only over channels), but
+        # without it padding shares a uid with residue 0's backbone group.
+        up = _pad_atoms((ref_space_uid + 1)[..., None], ap)[..., 0]
         valid = (up[:, qidx][:, :, :, None] == up[:, kidx][:, :, None, :]).to(rp.dtype)[..., None]
         off = rp[:, qidx][:, :, :, None, :] - rp[:, kidx][:, :, None, :, :]
         p = self.pair_proj(off) * valid
