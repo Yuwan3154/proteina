@@ -141,7 +141,16 @@ def main():
         allowed = ("atom_enc.dist_proj", "atom_enc.valid_proj", "atom_enc.pair_mlp")
         bad = [k for k in missing if not any(k.startswith(a) for a in allowed)]
         assert not bad, f"warm-start would leave PRE-EXISTING params uninitialised: {bad[:8]}"
-        assert not unexpected, f"checkpoint has params the model lacks: {list(unexpected)[:8]}"
+        # ⛔ `pair_to_atompair` is the ONE key allowed to be dropped: it was the decoder's own trunk
+        # projection, made dead by reusing the encoder pair, and DDP refuses unused parameters. Any
+        # OTHER unexpected key still fails loudly -- a silently half-loaded warm start is the exact
+        # failure this assertion exists to prevent.
+        droppable = ("pair_to_atompair",)
+        stale = [k for k in unexpected if not any(d in k for d in droppable)]
+        assert not stale, f"checkpoint has params the model lacks: {stale[:8]}"
+        if unexpected:
+            print(f"[warm-start] dropped {len(unexpected)} retired param(s): {list(unexpected)}",
+                  flush=True)
         print(f"[warm-start] {src} from {args.init_from} (step {sd.get('global_step')}), "
               f"fresh optimizer at lr={model.lr}", flush=True)
         print(f"[warm-start] {len(missing)} newly-initialised params, all in {allowed}: "

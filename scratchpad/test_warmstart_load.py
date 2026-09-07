@@ -41,8 +41,9 @@ print(f"  unexpected keys : {len(unexpected)}  {list(unexpected)[:6]}")
 
 if bad:
     fails.append(f"PRE-EXISTING params would be left uninitialised: {bad[:8]}")
-if unexpected:
-    fails.append(f"checkpoint carries params the model lacks: {list(unexpected)[:8]}")
+stale = [k for k in unexpected if "pair_to_atompair" not in k]
+if stale:
+    fails.append(f"checkpoint carries params the model lacks: {stale[:8]}")
 if not missing:
     fails.append("no missing keys at all -- fix A's modules are absent from the model")
 

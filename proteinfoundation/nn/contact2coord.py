@@ -135,7 +135,11 @@ class ContactToCoord(nn.Module):
             c_atom=c_atom, c_atompair=c_atompair, c_token=c_token,
             n_blocks=atom_blocks, n_heads=atom_heads,
         )
-        self.pair_to_atompair = nn.Linear(c_z, c_atompair, bias=False)
+        # ⛔ The decoder's own trunk-pair projection is GONE. It became dead the moment the decoder
+        # started reusing the encoder's pair tensor, and DDP rejects unused parameters outright:
+        # "your LightningModule has parameters that were not used in producing the loss". The trunk
+        # contribution is not lost -- the ENCODER already folds it in via z_to_atompair, so it still
+        # appears exactly once, as in AF3.
 
     # ── trunk: contact map -> (s, z) ──────────────────────────────────────────────────────────
     def encode(self, contacts, aatype, mask):
@@ -184,8 +188,7 @@ class ContactToCoord(nn.Module):
         # and sequence, all of which are exactly reflection-invariant -- so the coordinate-emitting
         # blocks previously had no 3D reference geometry at all.
         return self.atom_dec(
-            a_token, q_atom, atom_to_token, atom_mask, self.pair_to_atompair(z),
-            enc_pair=enc_pair,
+            a_token, q_atom, atom_to_token, atom_mask, None, enc_pair=enc_pair,
         )
 
     def denoise(self, x_noisy, sigma, s, z, mask, ref_feats, ref_pos, atom_to_token, atom_mask,
