@@ -133,6 +133,27 @@ def main():
     acc = (tp_ + (len(ok) - fp_)) / len(rows)
     print(f"  accuracy            : {acc*100:.1f}%")
 
+    # ⭐ Are the false positives simply chains with too little helix for the statistic to mean
+    # anything? nsel is the number of dihedrals in helical range; a low count makes the fraction
+    # noisy. If the FPs cluster at low nsel, abstaining there is principled rather than tuned.
+    fps = [r for r in ok if flag(r[2])]
+    tns = [r for r in ok if not flag(r[2])]
+    if fps:
+        print(f"\n  false positives  : nsel {sorted(r[3] for r in fps)}")
+        print(f"  true negatives   : nsel median {int(np.median([r[3] for r in tns]))}, "
+              f"min {min(r[3] for r in tns)}")
+        for gate in (10, 20, 30, 40):
+            keep = [r for r in rows if r[3] >= gate]
+            if not keep:
+                continue
+            m2 = [r for r in keep if r[1]]
+            o2 = [r for r in keep if not r[1]]
+            t2 = sum(1 for r in m2 if flag(r[2]))
+            f2 = sum(1 for r in o2 if flag(r[2]))
+            a2 = (t2 + (len(o2) - f2)) / len(keep)
+            print(f"  abstain when nsel < {gate:>2}: keeps {len(keep):>3}/{len(rows)} chains, "
+                  f"caught {t2}/{len(m2)}, false {f2}/{len(o2)}, accuracy {a2*100:.1f}%")
+
     # What the fix would BUY: reflect every flagged structure and rescore.
     before = float(np.mean([r[4] for r in rows]))
     after = float(np.mean([(r[5] if flag(r[2]) else r[4]) for r in rows]))
