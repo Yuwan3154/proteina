@@ -255,7 +255,7 @@ class ContactToCoord(nn.Module):
 
     @torch.no_grad()
     def rollout(self, s, z, mask, ref_feats, ref_pos, atom_to_token, atom_mask, ref_space_uid,
-                n_steps: int = MINI_ROLLOUT_STEPS):
+                n_steps: int = MINI_ROLLOUT_STEPS, augment_steps: bool = False):
         """SI Alg. 18. Defaults to the 20-step mini-rollout; pass 200 for full inference."""
         B, A = atom_mask.shape
         dev = s.device
@@ -273,7 +273,18 @@ class ContactToCoord(nn.Module):
         x = sig[0] * torch.randn(B, A, 3, device=dev) * m
         for i in range(n_steps):
             s_prev, s_cur = sig[i], sig[i + 1]
-            x = (x - (x * m).sum(dim=1, keepdim=True) / nreal) * m
+            if augment_steps:
+                # ⭐ AF3 SI Alg. 18 / Protenix generator.py:201 re-apply the FULL Alg. 19 rigid
+                # augmentation at the top of EVERY sampling step, not just centring. The network is
+                # not SE(3)-equivariant (coordinates enter through a plain nn.Linear(3, c_atom)), so
+                # it carries a frame-dependent bias; re-randomising each step averages that bias
+                # over the trajectory instead of letting whatever frame the initial noise picked
+                # compound for all 200 steps.
+                # ⚠️ A proper rotation CANNOT flip handedness, so this is not a direct chirality
+                # fix -- any effect is indirect, via which frame the early steps commit in.
+                x = centre_random_augmentation(x, atom_mask, n_sample=1)[:, 0]
+            else:
+                x = (x - (x * m).sum(dim=1, keepdim=True) / nreal) * m
             gamma = 0.8 if s_cur > 1.0 else 0.0
             t_hat = s_prev * (gamma + 1.0)
             x_noisy = x + 1.003 * torch.sqrt((t_hat ** 2 - s_prev ** 2).clamp_min(0)) \

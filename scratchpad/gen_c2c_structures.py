@@ -87,6 +87,10 @@ def main():
     ap.add_argument("--steps", type=int, default=FULL_INFERENCE_STEPS)
     ap.add_argument("--out", default="/orcd/scratch/orcd/011/chenxiou/c2c_gen")
     ap.add_argument("--usalign", default="USalign")
+    # ⭐ AF3 SI Alg. 18 / Protenix generator.py:201 re-apply the full rigid augmentation at the top
+    # of EVERY sampling step. Ours only centres. Exposed here so the effect can be measured on an
+    # EXISTING checkpoint, with no retraining.
+    ap.add_argument("--augment_steps", action="store_true")
     ap.add_argument("--dataset",
                     default="pdb_train_contact-confind-topology_S25_max384_purge-test_cutoff-190828")
     args = ap.parse_args()
@@ -125,7 +129,8 @@ def main():
             s, z, _ = model.model.encode(b["contacts"], b["aatype"], b["mask"])
             coords = model.model.rollout(s, z, b["mask"], b["ref_feats"], b["ref_pos"],
                                          b["atom_to_token"], b["atom_mask"], b["ref_space_uid"],
-                                         n_steps=args.steps)
+                                         n_steps=args.steps,
+                                         augment_steps=args.augment_steps)
         L = b["mask"].shape[1]
         keep = b["mask"][0].bool()
         gen14 = coords.reshape(-1, L, 14, 3)[0]
