@@ -19,6 +19,7 @@ Reports every sampled chain, not a mean: the set is small and a mean over a bimo
 import argparse
 import glob
 import os
+import re
 import subprocess
 import sys
 
@@ -58,22 +59,25 @@ def kabsch_rmsd(a, b, allow_reflection=False):
 
 
 def usalign_tm(gen_pdb, gt_pdb, usalign):
-    """Sequence-DEPENDENT TM (-TMscore 5): same chain, same length, index correspondence."""
-    try:
-        out = subprocess.run([usalign, gen_pdb, gt_pdb, "-TMscore", "5"],
-                             capture_output=True, text=True, timeout=300).stdout
-    except (OSError, subprocess.SubprocessError):
-        return None
+    """Sequence-DEPENDENT TM (-TMscore 5): same chain, same length, index correspondence.
+
+    ⛔ Raises rather than returning None on a broken invocation. A silent None prints as "n/a", and
+    a whole column of n/a is exactly what hid the PDB-writer bug for four generation runs -- the
+    scores were never computed and nothing said so.
+    """
+    out = subprocess.run([usalign, gen_pdb, gt_pdb, "-TMscore", "5"],
+                         capture_output=True, text=True, timeout=300).stdout
     # ⛔ Read the value normalised by the TRUE NATIVE (Structure_2 = the gt file), never max() of
     # the two -- max() inflates ~1.5-2x and has burned this project three times. The earlier
     # startswith("TM-score=") parse returned n/a for every chain: USalign indents these lines.
-    import re
     for line in out.splitlines():
         if "TM-score=" in line and "Structure_2" in line:
             m = re.search(r"TM-score=\s*([0-9.]+)", line)
             if m:
                 return float(m.group(1))
-    return None
+    raise RuntimeError(
+        f"USalign produced no Structure_2 TM-score for {gen_pdb} vs {gt_pdb}. "
+        f"First 400 chars of output:\n{out[:400]}")
 
 
 def main():
