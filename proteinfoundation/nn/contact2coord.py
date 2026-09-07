@@ -41,6 +41,43 @@ from proteinfoundation.nn.contact_map_tri import TriBlock
 MAX_REL_POS = 32   # AF3 SI DiffusionConditioning max_relative_idx
 
 
+def centre_random_augmentation(x, atom_mask, n_sample: int, s_trans: float = 1.0):
+    """AF3 SI Alg. 19. Centre on the masked COM, then apply an INDEPENDENT random rotation and
+    translation to each of n_sample replicas.
+
+    Args:
+        x:         [B, A, 3] ground-truth coordinates
+        atom_mask: [B, A] 1 for real atoms -- the COM must ignore padding, which is 42% of slots
+                   at L=224 in a 384-padded batch
+        n_sample:  diffusion replicas per structure
+        s_trans:   translation scale in Angstrom; AF3/Protenix use 1.0
+
+    Returns [B, n_sample, A, 3].
+
+    ⛔ The rotation must be PROPER (det=+1). A QR of a Gaussian gives O(3), which is det=-1 half
+    the time -- that would mirror half the training targets and manufacture exactly the chirality
+    failure we are chasing. The Gram-Schmidt construction below is det=+1 by design, and
+    test_centre_random_augmentation.py measures it.
+    """
+    B, A, _ = x.shape
+    m = atom_mask[..., None].to(x.dtype)
+    com = (x * m).sum(dim=1, keepdim=True) / m.sum(dim=1, keepdim=True).clamp_min(1e-8)
+    xc = (x - com) * m                                             # [B, A, 3]
+
+    # Proper rotations via Gram-Schmidt on two Gaussians: e2 = e0 x e1 forces det=+1.
+    v = torch.randn(B * n_sample, 2, 3, device=x.device, dtype=x.dtype)
+    e0 = v[:, 0] / v[:, 0].norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    v1 = v[:, 1] - e0 * (v[:, 1] * e0).sum(-1, keepdim=True)
+    e1 = v1 / v1.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    e2 = torch.cross(e0, e1, dim=-1)
+    rot = torch.stack([e0, e1, e2], dim=-2)                        # [B*n, 3, 3], rows orthonormal
+
+    xe = xc[:, None].expand(B, n_sample, A, 3).reshape(B * n_sample, A, 3)
+    out = torch.einsum("bai,bji->baj", xe, rot)
+    out = out + s_trans * torch.randn(B * n_sample, 1, 3, device=x.device, dtype=x.dtype)
+    return (out * m.repeat_interleave(n_sample, dim=0)).reshape(B, n_sample, A, 3)
+
+
 class ContactToCoord(nn.Module):
     def __init__(
         self,
@@ -177,7 +214,20 @@ class ContactToCoord(nn.Module):
             B, A, _ = x_gt.shape
             n = self.n_diffusion_samples
             sigma = sample_noise_level((B, n), x_gt.device, x_gt.dtype)      # [B, n]
-            x_rep = x_gt[:, None].expand(B, n, A, 3).reshape(B * n, A, 3)
+            # ⛔⛔ AF3 SI Alg. 19 CentreRandomAugmentation, applied PER DIFFUSION REPLICA.
+            # Two separate bugs this fixes, both measured:
+            #  1. NOTHING centred the targets. Measured mean |centroid| = 61 A (max 222), because
+            #     GlobalRotationTransform rotates about the ORIGIN on uncentred deposited coords.
+            #     The data scale the model saw was 64.5 A against SIGMA_DATA=16 -- every EDM
+            #     constant miscalibrated 4x -- and S_MAX=160 sat only 2.5x above the data instead
+            #     of ~10x, so the top of the schedule never destroyed the structure. Centred, the
+            #     scale is 18.2 A (1.14x of SIGMA_DATA) and S_MAX is 8.8x above it.
+            #     ⛔ This was INVISIBLE in val/loss: weighted_rigid_align removes translation.
+            #  2. The old `x_gt[:, None].expand(...)` is a pure broadcast, so all n replicas shared
+            #     ONE orientation. Protenix augments per sample (generator.py:345-351, N_sample=48),
+            #     as do OpenFold3 (model.py:474-475) and Boltz (diffusion.py:749-757).
+            # s_trans = 1.0 A is AF3's published value (Protenix utils.py:31), not a choice here.
+            x_rep = centre_random_augmentation(x_gt, atom_mask, n_sample=n).reshape(B * n, A, 3)
             sig_flat = sigma.reshape(B * n)
             x_noisy = x_rep + torch.randn_like(x_rep) * sig_flat[:, None, None]
             # The trunk runs ONCE; only the diffusion module sees the expanded batch.
