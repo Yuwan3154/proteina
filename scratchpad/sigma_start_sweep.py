@@ -71,7 +71,8 @@ def main():
         arms.append((f"train_{name}", sig / SIGMA_DATA, sig))
     print("ARMS (sampler starting sigma):")
     for n, sm, sig in arms:
-        print(f"  {n:14s} S_MAX={sm if sm is None else f'{sm:.3f}':>10}  sigma_start={sig:9.2f}")
+        sm_str = "default" if sm is None else f"{sm:.3f}"
+        print(f"  {n:14s} S_MAX={sm_str:>10}  sigma_start={sig:9.2f}")
 
     with hydra.initialize("../configs/datasets_config/pdb", version_base=hydra.__version__):
         cfg = hydra.compose(config_name=args.dataset)
