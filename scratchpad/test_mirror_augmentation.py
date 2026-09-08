@@ -21,7 +21,8 @@ import sys
 
 import torch
 
-sys.path.insert(0, "/Users/Chenxi/SOLab/proteina/.claude/worktrees/distogram-head")
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from proteinfoundation.nn.contact2coord import ContactToCoord
 
