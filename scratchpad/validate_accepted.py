@@ -19,7 +19,7 @@ import numpy as np
 sys.path.insert(0, "/orcd/scratch/orcd/011/chenxiou/proteina_sh")
 sys.path.insert(0, "/orcd/scratch/orcd/011/chenxiou/proteina_sh/scratchpad")
 
-from ramachandran_check import ca_trace, hand, phi_psi
+from ramachandran_check import hand, phi_psi
 from residue_chirality import signed_volumes
 
 DIRS = [
@@ -34,7 +34,7 @@ def main():
         paths = sorted(glob.glob(pat))
         rows = []
         for p in paths:
-            ph, h, v = phi_psi(p), hand(ca_trace(p)), signed_volumes(p)
+            ph, h, v = phi_psi(p), hand(p), signed_volumes(p)   # hand() takes a PATH, not a trace
             if len(ph) and not np.isnan(h) and len(v):
                 rows.append((h, float((ph > 0).mean()), float(v.mean()), float((v > 0).mean())))
         a = np.asarray(rows)
