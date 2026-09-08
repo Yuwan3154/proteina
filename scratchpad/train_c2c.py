@@ -42,6 +42,14 @@ def main():
     ap.add_argument("--batch_size", type=int, default=1)
     # AF3's diffusion mini-batch (SI Alg. 20); Protenix ships 48. Capped here by measured VRAM.
     ap.add_argument("--n_diff", type=int, default=48)
+    # ⛔⛔ NO GROUNDED VALUE EXISTS for the GLOBAL-FOLD mirror fraction, so the default is
+    # 0.0 = augmentation OFF = current behaviour exactly. RoseTTAFold3 ships "we invert the
+    # chirality in 2% of PDB examples" (AtomWorks, PMC12363939) but that is PER-ATOM chiral
+    # centres, which this model already gets right at frac-L 0.9988 -- it does NOT ground a
+    # fold-hand fraction. Supplying a non-zero value is a deliberate user decision.
+    ap.add_argument("--p_mirror", type=float, default=0.0,
+                    help="fraction of TARGETS reflected during training, with a +-1 hand "
+                         "label fed to the model. 0.0 disables fix D entirely.")
     ap.add_argument("--lr", type=float, default=None)
     # Warm start from a specific checkpoint's WEIGHTS. Ignored once last.ckpt exists, so a chained
     # successor resumes normally instead of warm-starting again and discarding the segment.
@@ -59,6 +67,7 @@ def main():
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
     MODEL_CFG["n_diffusion_samples"] = args.n_diff
+    MODEL_CFG["p_mirror"] = args.p_mirror
 
     ds_dir = f"../configs/datasets_config/{args.subdir}"
     with hydra.initialize(ds_dir, version_base=hydra.__version__):
@@ -79,7 +88,8 @@ def main():
                                   n_dump=args.n_dump, **kw)
     n_par = sum(p.numel() for p in model.parameters())
     print(f"[model] {n_par/1e6:.2f} M parameters, {MODEL_CFG['n_blocks']} diffusion blocks, "
-          f"n_diffusion_samples={args.n_diff}, lr={model.lr}, warmup={model.warmup_steps}", flush=True)
+          f"n_diffusion_samples={args.n_diff}, lr={model.lr}, warmup={model.warmup_steps}, "
+          f"p_mirror={args.p_mirror}", flush=True)
     print(f"[dump] validation structures -> "
           f"{dump_dir if args.n_dump > 0 else 'DISABLED (n_dump=0)'}", flush=True)
 
@@ -143,7 +153,11 @@ def main():
         # (fix A's reference-offset block). A blanket strict=False would silently accept a renamed
         # or reshaped parameter and warm-start from a model that is quietly half-initialised, so
         # every missing key must match a known-new module and NOTHING may be unexpected.
-        allowed = ("atom_enc.dist_proj", "atom_enc.valid_proj", "atom_enc.pair_mlp")
+        # `to_hand_s` is fix D's hand-label projection. It is legitimately absent from any
+        # checkpoint written before fix D, so a warm start must be allowed to initialise it --
+        # but ONLY it, so a genuinely half-loaded warm start still fails loudly.
+        allowed = ("atom_enc.dist_proj", "atom_enc.valid_proj", "atom_enc.pair_mlp",
+                   "to_hand_s")
         bad = [k for k in missing if not any(k.startswith(a) for a in allowed)]
         assert not bad, f"warm-start would leave PRE-EXISTING params uninitialised: {bad[:8]}"
         # ⛔ `pair_to_atompair` is the ONE key allowed to be dropped: it was the decoder's own trunk
