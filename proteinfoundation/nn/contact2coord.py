@@ -256,7 +256,7 @@ class ContactToCoord(nn.Module):
     @torch.no_grad()
     def rollout(self, s, z, mask, ref_feats, ref_pos, atom_to_token, atom_mask, ref_space_uid,
                 n_steps: int = MINI_ROLLOUT_STEPS, augment_steps: bool = False, x_init=None,
-                churn_noise=None):
+                churn_noise=None, record=None):
         """SI Alg. 18. Defaults to the 20-step mini-rollout; pass 200 for full inference."""
         B, A = atom_mask.shape
         dev = s.device
@@ -300,4 +300,10 @@ class ContactToCoord(nn.Module):
             d = self.denoise(x_noisy, t_hat.expand(B), s, z, mask,
                              ref_feats, ref_pos, atom_to_token, atom_mask, ref_space_uid) * m
             x = (x_noisy + 1.5 * (s_cur - t_hat) * (x_noisy - d) / t_hat) * m
+            # `record` collects the DENOISED estimate x0_hat per step, not the noisy iterate: at high
+            # sigma the iterate is mostly noise and its handedness is meaningless, whereas x0_hat is
+            # the model's actual current guess at the structure. Used to find the step at which the
+            # sampler COMMITS to a hand. Default None appends nothing and costs nothing.
+            if record is not None:
+                record.append((float(s_cur), d.detach()))
         return x * m
