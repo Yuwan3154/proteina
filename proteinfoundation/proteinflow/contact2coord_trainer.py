@@ -46,12 +46,24 @@ class ContactToCoordTrainer(L.LightningModule):
     def __init__(self, model_cfg: Dict[str, Any], aug_rate: float = 0.1,
                  aug_mode: str = "balanced", lr: float = BASE_LR,
                  dump_dir: str = None, n_dump: int = 2, ema_decay: float = EMA_DECAY,
-                 warmup_steps: int = WARMUP_STEPS):
+                 warmup_steps: int = WARMUP_STEPS, use_smooth_lddt: bool = True,
+                 overfit_batch_path: str = None):
         super().__init__()
         self.save_hyperparameters()
         self.model = ContactToCoord(**model_cfg, n_ref_feats=N_REF_FEATS)
         self.aug_rate, self.aug_mode, self.lr = aug_rate, aug_mode, lr
         self.dump_dir, self.n_dump = dump_dir, n_dump
+        # smooth_lddt is built from cdist alone, so it is exactly reflection-INVARIANT, and it enters
+        # unweighted while the chiral MSE is scaled by the EDM weight, which collapses to ~1/sd^2 at
+        # high sigma -- the noise levels where the hand is committed. Turning it off makes the
+        # structure loss strictly chiral. AF3 itself drops it from fine-tuning 1 onward (SI 5.2).
+        self.use_smooth_lddt = use_smooth_lddt
+        # Overfit-one-structure mode: pin the FIRST training batch and reuse it for every train and
+        # val step. Not Lightning's overfit_batches: that only swaps a RandomSampler for a
+        # SequentialSampler, and our ClusterSampler would hand it a different chain every epoch.
+        # The batch is saved to disk so a resume, and the measurement script, see the same chain.
+        self.overfit_batch_path = overfit_batch_path
+        self._pinned = None
         # ⛔ Denominated in STEPS, so its meaning changes with the batch. At 2048
         # pairs/step the reference's 1000 steps is 2.05M pairs of warmup and takes
         # 38.6 h; our earlier runs warmed over 128k pairs. Set it to keep the DATA
@@ -124,7 +136,7 @@ class ContactToCoordTrainer(L.LightningModule):
         out = self.model(b)
         # x_gt_rep/atom_mask_rep are the structure repeated once per diffusion noise sample.
         dl, aux = diffusion_loss(out["x_denoised"], out["x_gt_rep"], out["sigma"],
-                                 out["atom_mask_rep"])
+                                 out["atom_mask_rep"], use_smooth_lddt=self.use_smooth_lddt)
         dg = self._distogram_loss(out["pair_logits"], b["atom_pos"], b["aatype"], b["mask"])
         loss = ALPHA_DIFFUSION * dl.mean() + ALPHA_DISTOGRAM * dg.mean()
         # ⭐ rmsd is the interpretable one: diffusion_loss builds mse as
@@ -134,7 +146,25 @@ class ContactToCoordTrainer(L.LightningModule):
                       "mse": aux["mse"].mean(), "sigma": out["sigma"].mean(),
                       "rmsd": (3.0 * aux["mse"]).sqrt().mean()}
 
+    def _pin(self, batch):
+        if self.overfit_batch_path is None:
+            return batch
+        if self._pinned is None:
+            if os.path.exists(self.overfit_batch_path):
+                # torch_geometric Batch: .to() mutates in place and returns self.
+                self._pinned = torch.load(self.overfit_batch_path,
+                                          weights_only=False).to(self.device)
+            else:
+                self._pinned = batch
+                # clone() first: PyG's .cpu() is in place and would move the live batch off-GPU.
+                torch.save(batch.clone().cpu(), self.overfit_batch_path)
+            L_ = int(self._pinned["mask_dict"]["coords"][..., 0, 0].sum())
+            print(f"[overfit] pinned ONE structure (L={L_}) via {self.overfit_batch_path}",
+                  flush=True)
+        return self._pinned
+
     def training_step(self, batch, _):
+        batch = self._pin(batch)
         loss, logs = self._step(batch, True)
         self.log_dict({f"train/{k}": v for k, v in logs.items()}, prog_bar=False)
         self.log("train/loss", loss, prog_bar=True)
@@ -143,6 +173,7 @@ class ContactToCoordTrainer(L.LightningModule):
     def validation_step(self, batch, batch_idx):
         # ⛔ No augmentation at validation: the metric must describe the model on real contact maps,
         # not on corrupted ones, or it cannot be compared against anything.
+        batch = self._pin(batch)
         loss, logs = self._step(batch, False)
         self.log_dict({f"val/{k}": v for k, v in logs.items()}, sync_dist=True)
         self.log("val/loss", loss, prog_bar=True, sync_dist=True)
