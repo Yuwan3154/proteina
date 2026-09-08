@@ -255,7 +255,7 @@ class ContactToCoord(nn.Module):
 
     @torch.no_grad()
     def rollout(self, s, z, mask, ref_feats, ref_pos, atom_to_token, atom_mask, ref_space_uid,
-                n_steps: int = MINI_ROLLOUT_STEPS, augment_steps: bool = False):
+                n_steps: int = MINI_ROLLOUT_STEPS, augment_steps: bool = False, x_init=None):
         """SI Alg. 18. Defaults to the 20-step mini-rollout; pass 200 for full inference."""
         B, A = atom_mask.shape
         dev = s.device
@@ -270,7 +270,9 @@ class ContactToCoord(nn.Module):
         m = atom_mask[..., None]
         nreal = atom_mask.sum(dim=1, keepdim=True).clamp_min(1.0)[..., None]
         sig = noise_schedule(torch.linspace(0.0, 1.0, n_steps + 1, device=dev))
-        x = sig[0] * torch.randn(B, A, 3, device=dev) * m
+        # x_init lets a caller supply the starting noise instead of drawing it, so the SAME seed and
+        # its REFLECTION can both be rolled out. Default None reproduces the original draw exactly.
+        x = (sig[0] * torch.randn(B, A, 3, device=dev) if x_init is None else x_init) * m
         for i in range(n_steps):
             s_prev, s_cur = sig[i], sig[i + 1]
             if augment_steps:
