@@ -110,9 +110,13 @@ def main():
           f"{dump_dir if args.n_dump > 0 else 'DISABLED (n_dump=0)'}", flush=True)
 
     os.makedirs(args.store, exist_ok=True)
+    # Overfit runs keep EVERY val_every checkpoint: on one structure val/loss falls monotonically,
+    # so top-k would silently delete the early ones and the mirror-rate TRAJECTORY with them.
+    keep = dict(monitor=None, save_top_k=-1, filename="step{step:07d}", auto_insert_metric_name=False) \
+        if args.overfit else dict(monitor="val/loss", mode="min", save_top_k=3)
     ckpt_cb = ModelCheckpoint(
-        dirpath=os.path.join(args.store, args.name), monitor="val/loss", mode="min",
-        save_top_k=3, save_last=True, every_n_train_steps=args.val_every,
+        dirpath=os.path.join(args.store, args.name), **keep,
+        save_last=True, every_n_train_steps=args.val_every,
         # ⛔⛔ Without this, Lightning's version counter writes `last-v1.ckpt` whenever `last.ckpt`
         # already exists from a PREVIOUS chain segment -- so the resume anchor below freezes at the
         # step the first segment reached and every requeue silently rewinds to it. Measured: the
