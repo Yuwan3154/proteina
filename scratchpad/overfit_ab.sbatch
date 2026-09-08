@@ -47,8 +47,12 @@ TRY="${TRY:-1}"; MAXTRY=10
 if ! python -c "import torch; assert torch.cuda.is_available(); torch.zeros(8).cuda(); print('[gpu]', torch.cuda.get_device_name(0))"; then
     echo "[gpu] UNUSABLE on $(hostname) (attempt $TRY/$MAXTRY)"
     if [ "$TRY" -lt "$MAXTRY" ]; then
-        CARD=h200; [ $(( (TRY + 1) % 2 )) -eq 0 ] && CARD=h100
-        TRY=$((TRY + 1)) ARM="$ARM" REPO="$REPO" sbatch --gres="gpu:$CARD:1" --job-name="$SLURM_JOB_NAME" \
+        # Resubmit to the SAME partition and card this job was given (CLI overrides included), so a
+        # retry on pi_so3 does not silently migrate to preemptable's default gres.
+        GRES_NOW=$(scontrol show job "$SLURM_JOB_ID" | grep -oE "TresPerNode=[^ ]+" | cut -d= -f2)
+        TRY=$((TRY + 1)) ARM="$ARM" REPO="$REPO" sbatch --partition="$SLURM_JOB_PARTITION" \
+            --gres="${GRES_NOW:-gpu:h200:1}" --cpus-per-task="$SLURM_CPUS_PER_TASK" \
+            --mem="${SLURM_MEM_PER_NODE}M" --job-name="$SLURM_JOB_NAME" \
             "$REPO/scratchpad/overfit_ab.sbatch"
     else
         echo "FATAL: $MAXTRY nodes all had unusable GPUs -- not transient"
