@@ -17,14 +17,16 @@
 #   ARM=off  identical, but --no_lddt: the chiral MSE is the only structure loss
 # usage:  ARM=off sbatch --job-name=c2c_ov_lddt_off scratchpad/overfit_ab.sbatch
 #
-# Everything else is the vanilla baseline: 24 blocks, 4 tri blocks, NDIFF=16, lr 6e-4, warmup 1000,
-# ACCUM 16 on one device (effective batch 16, as c2c_tbeta/c2c_pmirror). Same --seed in both arms so
+# Everything else is the vanilla baseline: 24 blocks, 4 tri blocks, NDIFF=16, lr 6e-4, warmup 1000.
+# ACCUM defaults to the baseline 16; the user chose ACCUM=1 for this A/B (2026-09-08) so a single
+# structure converges in minutes rather than hours -- applied to BOTH arms. Same --seed in both arms so
 # they pin the SAME chain and start from the SAME init. No chain: 48 h on preemptable is enough, and
 # a preemption requeues this job id, which resumes from last.ckpt and re-pins from overfit_batch.pt.
 set -uo pipefail
 ARM="${ARM:?ARM must be on or off}"
 case "$ARM" in on) LDDT_FLAG="";; off) LDDT_FLAG="--no_lddt";; *) echo "FATAL: ARM=$ARM"; exit 76;; esac
 NAME="c2c_ov_lddt_${ARM}"
+ACCUM="${ACCUM:-16}"
 
 REPO="${REPO:-/orcd/scratch/orcd/011/chenxiou/proteina_sh}"
 cd "$REPO"
@@ -50,7 +52,7 @@ if ! python -c "import torch; assert torch.cuda.is_available(); torch.zeros(8).c
         # Resubmit to the SAME partition and card this job was given (CLI overrides included), so a
         # retry on pi_so3 does not silently migrate to preemptable's default gres.
         GRES_NOW=$(scontrol show job "$SLURM_JOB_ID" | grep -oE "TresPerNode=[^ ]+" | cut -d= -f2)
-        TRY=$((TRY + 1)) ARM="$ARM" REPO="$REPO" sbatch --partition="$SLURM_JOB_PARTITION" \
+        TRY=$((TRY + 1)) ARM="$ARM" REPO="$REPO" ACCUM="$ACCUM" sbatch --partition="$SLURM_JOB_PARTITION" \
             --gres="${GRES_NOW:-gpu:h200:1}" --cpus-per-task="$SLURM_CPUS_PER_TASK" \
             --mem="${SLURM_MEM_PER_NODE}M" --job-name="$SLURM_JOB_NAME" \
             "$REPO/scratchpad/overfit_ab.sbatch"
@@ -61,10 +63,10 @@ if ! python -c "import torch; assert torch.cuda.is_available(); torch.zeros(8).c
 fi
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 git -C "$REPO" log --oneline -1
-echo "[arm] $ARM  -> --name $NAME $LDDT_FLAG"
+echo "[arm] $ARM  -> --name $NAME $LDDT_FLAG  (accum $ACCUM)"
 
 torchrun --standalone --nproc_per_node=1 \
-    scratchpad/train_c2c.py --devices 1 --accum 16 --n_diff 16 --lr 0.0006 \
+    scratchpad/train_c2c.py --devices 1 --accum "$ACCUM" --n_diff 16 --lr 0.0006 \
     --precision bf16-mixed --val_every 500 --warmup 1000 \
     --overfit --seed 0 --name "$NAME" $LDDT_FLAG
 rc=$?
