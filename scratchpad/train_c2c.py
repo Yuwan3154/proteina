@@ -87,6 +87,11 @@ def main():
     ckpt_cb = ModelCheckpoint(
         dirpath=os.path.join(args.store, args.name), monitor="val/loss", mode="min",
         save_top_k=3, save_last=True, every_n_train_steps=args.val_every,
+        # ⛔⛔ Without this, Lightning's version counter writes `last-v1.ckpt` whenever `last.ckpt`
+        # already exists from a PREVIOUS chain segment -- so the resume anchor below freezes at the
+        # step the first segment reached and every requeue silently rewinds to it. Measured: the
+        # run was at step 1422 in `last-v1.ckpt` while `last.ckpt` still held step 1022.
+        enable_version_counter=False,
     )
     logger = WandbLogger(project="contact2coord", name=args.name,
                          save_dir=args.store, offline=args.smoke)
