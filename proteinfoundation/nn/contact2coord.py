@@ -314,6 +314,12 @@ class ContactToCoord(nn.Module):
         """SI Alg. 18. Defaults to the 20-step mini-rollout; pass 200 for full inference."""
         B, A = atom_mask.shape
         dev = s.device
+        # ⛔ Inference asks for the RIGHT-HANDED branch by default once the model was trained with
+        # labels. This lives HERE, not only in forward(): steps_sweep.py, gen_c2c_rejection.py and
+        # the validation dump call rollout() directly, and a label-less rollout of a fix-D model
+        # is just the reflection-equivariant coin flip again. An explicit hand still overrides.
+        if hand is None and self.p_mirror > 0.0:
+            hand = torch.ones(B, device=dev, dtype=s.dtype)
         # ⛔ EVERY step is masked, and the centring uses a MASKED mean. Padding is not a small
         # detail here: at L=224 in a 384-padded batch, 42% of the A=5376 atom slots are padding.
         # The previous version centred with `x.mean(dim=1)` over ALL slots and never masked the

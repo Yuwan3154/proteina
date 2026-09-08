@@ -96,6 +96,22 @@ def main():
     check("flipping the label CHANGES the output (label is not a dead bias)", delta > 1e-4,
           f"max|d(+1)-d(-1)| = {delta:.3e}")
 
+    # 6. rollout() with NO hand must behave as hand=+1, because the measurement scripts and the
+    #    validation dump call rollout() directly and never pass one.
+    with torch.no_grad():
+        ro = (s, z, b["mask"][:2], b["ref_feats"][:2], b["ref_pos"][:2],
+              b["atom_to_token"][:2], b["atom_mask"][:2], b["ref_space_uid"][:2])
+        x0 = torch.randn(2, b["atom_mask"].shape[1], 3)
+        r_none = m.rollout(*ro, n_steps=3, x_init=x0, churn_noise=torch.zeros(3, *x0.shape))
+        r_plus = m.rollout(*ro, n_steps=3, x_init=x0, churn_noise=torch.zeros(3, *x0.shape),
+                           hand=torch.tensor([1.0, 1.0]))
+        r_minus = m.rollout(*ro, n_steps=3, x_init=x0, churn_noise=torch.zeros(3, *x0.shape),
+                            hand=torch.tensor([-1.0, -1.0]))
+    same = (r_none - r_plus).abs().max().item()
+    diff = (r_none - r_minus).abs().max().item()
+    check("rollout(hand=None) defaults to +1 when p_mirror>0 (direct callers get the label)",
+          same < 1e-6 and diff > 1e-4, f"|none-plus| = {same:.1e}, |none-minus| = {diff:.3e}")
+
     print(f"\n{sum(PASS)}/{len(PASS)} passed")
     sys.exit(0 if all(PASS) else 1)
 
