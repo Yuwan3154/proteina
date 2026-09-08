@@ -32,6 +32,10 @@ def main():
     ap.add_argument("--ckpt", nargs="+", required=True, help="one or more checkpoints to score")
     ap.add_argument("--k", type=int, default=128, help="rollouts per checkpoint (SE ~4.4%% at p=0.5)")
     ap.add_argument("--steps", type=int, default=MINI_ROLLOUT_STEPS)
+    # EMA(0.999) is still 0.999^N of the INIT after N steps: 61% at 500, 13% at 2000. For a short
+    # overfit run the EMA is a blur of the whole trajectory, so RAW weights are the primary readout
+    # and EMA is reported beside them rather than instead of them.
+    ap.add_argument("--weights", choices=["raw", "ema", "both"], default="both")
     args = ap.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -44,35 +48,41 @@ def main():
     print(f"[data] pinned structure: L={int(keep.sum())} (padded {L}), {args.k} rollouts x "
           f"{args.steps} steps per checkpoint", flush=True)
 
-    print(f"\n{'step':>7} {'mirrored':>10} {'+-SE':>6} {'rmsd_unmir_med':>15} "
+    print(f"\n{'step':>7} {'wts':>4} {'mirrored':>10} {'+-SE':>6} {'rmsd_unmir_med':>15} "
           f"{'rmsd_refl_of_mir_med':>21} {'n_unmir':>8} {'n_mir':>6}")
+    variants = ["raw", "ema"] if args.weights == "both" else [args.weights]
     for path in args.ckpt:
         ck = torch.load(path, map_location="cpu", weights_only=False)
-        assert "ema" in ck, "refusing to score the unaveraged model"
-        model.model.load_state_dict(ck["ema"]["params"], strict=True)
         step = ck.get("global_step")
-        hands, rp, rr = [], [], []
-        with torch.no_grad():
-            s, z, _ = model.model.encode(b["contacts"], b["aatype"], b["mask"])
-            for i in range(args.k):
-                torch.manual_seed(31_000 + i)
-                c = model.model.rollout(s, z, b["mask"], b["ref_feats"], b["ref_pos"],
-                                        b["atom_to_token"], b["atom_mask"], b["ref_space_uid"],
-                                        n_steps=args.steps)
-                ca = c.reshape(-1, L, 14, 3)[0][keep][:, 1, :].float().cpu().numpy()
-                hands.append(helix_pos_frac(ca))
-                rp.append(kabsch_rmsd(ca, gt))
-                rr.append(_kabsch_rmsd(ca, gt, allow_reflection=True))
-        h, rp, rr = np.array(hands), np.array(rp), np.array(rr)
-        ok = ~np.isnan(h)
-        mir = ok & (h > 0.5)
-        unmir = ok & (h <= 0.5)
-        p = float(mir.sum()) / max(int(ok.sum()), 1)
-        se = float(np.sqrt(p * (1 - p) / max(int(ok.sum()), 1)))
-        print(f"{step:7d} {100*p:9.1f}% {100*se:5.1f} "
-              f"{np.median(rp[unmir]) if unmir.sum() else float('nan'):15.3f} "
-              f"{np.median(rr[mir]) if mir.sum() else float('nan'):21.3f} "
-              f"{int(unmir.sum()):8d} {int(mir.sum()):6d}", flush=True)
+        for wts in variants:
+            if wts == "ema":
+                assert "ema" in ck, "checkpoint carries no EMA"
+                model.model.load_state_dict(ck["ema"]["params"], strict=True)
+            else:
+                sd = {k[len("model."):]: v for k, v in ck["state_dict"].items() if k.startswith("model.")}
+                model.model.load_state_dict(sd, strict=True)
+            hands, rp, rr = [], [], []
+            with torch.no_grad():
+                s, z, _ = model.model.encode(b["contacts"], b["aatype"], b["mask"])
+                for i in range(args.k):
+                    torch.manual_seed(31_000 + i)
+                    c = model.model.rollout(s, z, b["mask"], b["ref_feats"], b["ref_pos"],
+                                            b["atom_to_token"], b["atom_mask"], b["ref_space_uid"],
+                                            n_steps=args.steps)
+                    ca = c.reshape(-1, L, 14, 3)[0][keep][:, 1, :].float().cpu().numpy()
+                    hands.append(helix_pos_frac(ca))
+                    rp.append(kabsch_rmsd(ca, gt))
+                    rr.append(_kabsch_rmsd(ca, gt, allow_reflection=True))
+            h, rp, rr = np.array(hands), np.array(rp), np.array(rr)
+            ok = ~np.isnan(h)
+            mir = ok & (h > 0.5)
+            unmir = ok & (h <= 0.5)
+            p = float(mir.sum()) / max(int(ok.sum()), 1)
+            se = float(np.sqrt(p * (1 - p) / max(int(ok.sum()), 1)))
+            print(f"{step:7d} {wts:>4} {100*p:9.1f}% {100*se:5.1f} "
+                  f"{np.median(rp[unmir]) if unmir.sum() else float('nan'):15.3f} "
+                  f"{np.median(rr[mir]) if mir.sum() else float('nan'):21.3f} "
+                  f"{int(unmir.sum()):8d} {int(mir.sum()):6d}", flush=True)
     print("\n  rmsd_unmir_med: proper-Kabsch CA-RMSD of the right-handed samples to the pinned chain.")
     print("  rmsd_refl_of_mir_med: CA-RMSD of the MIRRORED samples once a reflection is allowed --")
     print("  small means they are accurate mirror images, large means they are simply wrong.")
