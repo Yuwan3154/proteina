@@ -34,6 +34,7 @@ from proteinfoundation.nn.af3_diffusion import (
     MINI_ROLLOUT_STEPS,
     noise_schedule,
     sample_noise_level,
+    sample_noise_level_beta,
 )
 from proteinfoundation.nn.atom_attention import AtomAttentionDecoder, AtomAttentionEncoder
 from proteinfoundation.nn.contact_map_tri import TriBlock
@@ -99,6 +100,7 @@ class ContactToCoord(nn.Module):
         c_noise_embedding: int = 256,
         n_diffusion_samples: int = 48,
         p_mirror: float = 0.0,
+        t_beta=None,
     ):
         super().__init__()
         self.c_s, self.c_z, self.c_token, self.c_atom = c_s, c_z, c_token, c_atom
@@ -109,9 +111,15 @@ class ContactToCoord(nn.Module):
         # nothing about the current model changes unless a value is supplied deliberately.
         # RoseTTAFold3 ships "we invert the chirality in 2% of PDB examples" (AtomWorks, PMC12363939)
         # -- ⛔ that is PER-ATOM CHIRAL CENTRES, which this model already gets right at frac-L 0.9988.
-        # It does NOT ground a GLOBAL-FOLD mirror fraction; do not copy 0.02 across.
+        # It does not by itself ground a GLOBAL-FOLD fraction; the user chose 0.02 anyway on
+        # 2026-09-08, judging RF3's rate sufficient. The default stays 0.0.
         assert 0.0 <= p_mirror <= 1.0, f"p_mirror must be a probability, got {p_mirror}"
         self.p_mirror = p_mirror
+        # t_beta = (p1, p2) switches the TRAINING noise distribution from AF3's lognormal to
+        # Proteina's mix_up02_beta mapped through our inference schedule. None = AF3 default,
+        # i.e. exactly the current behaviour. Adds NO parameters, so warm starts still load strict.
+        assert t_beta is None or len(t_beta) == 2, f"t_beta must be (p1, p2) or None, got {t_beta}"
+        self.t_beta = tuple(float(v) for v in t_beta) if t_beta is not None else None
 
         # ── inputs ────────────────────────────────────────────────────────────────────────────
         # The contact map enters as a 2-way embedding rather than a scalar: a contact and a
@@ -244,7 +252,11 @@ class ContactToCoord(nn.Module):
             # 1500, turning the moment the 1000-step warmup handed over full lr).
             B, A, _ = x_gt.shape
             n = self.n_diffusion_samples
-            sigma = sample_noise_level((B, n), x_gt.device, x_gt.dtype)      # [B, n]
+            if self.t_beta is None:
+                sigma = sample_noise_level((B, n), x_gt.device, x_gt.dtype)      # [B, n]
+            else:
+                sigma = sample_noise_level_beta((B, n), x_gt.device, x_gt.dtype,
+                                                p1=self.t_beta[0], p2=self.t_beta[1])
             # ⛔⛔ AF3 SI Alg. 19 CentreRandomAugmentation, applied PER DIFFUSION REPLICA.
             # Two separate bugs this fixes, both measured:
             #  1. NOTHING centred the targets. Measured mean |centroid| = 61 A (max 222), because

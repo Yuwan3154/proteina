@@ -17,7 +17,8 @@
 # reason -- if a genmaps shard landed here it would consume this cap and training could never start.
 # pi_so3's H200s are held by another user; if they free, this can move there.
 set -uo pipefail
-REPO=/orcd/scratch/orcd/011/chenxiou/proteina_sh
+# Overridable so one launcher can drive a second checkout (e.g. proteina_mirror for fix D).
+REPO="${REPO:-/orcd/scratch/orcd/011/chenxiou/proteina_sh}"
 cd "$REPO"
 ENV_DIR=/home/chenxiou/cue-openfold-env-sm120
 module load cuda/12.8 2>/dev/null || module load cuda/12.6 2>/dev/null || true
@@ -52,7 +53,9 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 # We queue the SAME run against several partitions and card types at once (rtx_pro_6000 / h200 /
 # h100) and take whichever is scheduled first. Without a lock, two of them starting would train two
 # processes into ONE checkpoint directory. mkdir is atomic on POSIX, so it is the lock.
-LOCK=/orcd/scratch/orcd/011/chenxiou/c2c_store/.run.lock
+# Keyed by job name: the lock guards ONE run against duplicates of itself, not the whole store,
+# so c2c_pmirror and c2c_tbeta can train side by side.
+LOCK=/orcd/scratch/orcd/011/chenxiou/c2c_store/.run.lock.${SLURM_JOB_NAME}
 if ! mkdir "$LOCK" 2>/dev/null; then
     HOLDER=$(cat "$LOCK/jobid" 2>/dev/null)
     ST=$(squeue -h -j "$HOLDER" -o %T 2>/dev/null); RC=$?
@@ -89,8 +92,15 @@ if [ "$CHAIN" -gt 0 ] && [ -e "$CHAIN_MARK" ]; then
     CHAIN=0
 fi
 if [ "$CHAIN" -gt 0 ]; then
+    # ⛔ EXTRA MUST be re-exported. It carries --name and --t_beta, and a successor that loses it
+    # would silently write into the DEFAULT run directory (clobbering the baseline) and train with
+    # the DEFAULT noise distribution -- i.e. look healthy while running the wrong experiment.
+    # INIT_FROM too: train_c2c.py ignores it once last.ckpt exists, so a successor that finds a
+    # checkpoint resumes, and one that finds NONE (segment 1 died early) warm-starts again
+    # instead of training from scratch into the run directory.
     CHAIN=$((CHAIN - 1)) DEVICES="${DEVICES:-2}" ACCUM="${ACCUM:-8}" NDIFF="${NDIFF:-8}" LR="${LR:-0.0006}" \
         PRECISION="${PRECISION:-bf16-mixed}" VAL_EVERY="${VAL_EVERY:-500}" WARMUP="${WARMUP:-1000}" GRES="$GRES" \
+        EXTRA="${EXTRA:-}" REPO="$REPO" INIT_FROM="${INIT_FROM:-}" \
         sbatch --dependency=afterany:${SLURM_JOB_ID} \
                --partition="$SLURM_JOB_PARTITION" \
                --gres="$GRES" \

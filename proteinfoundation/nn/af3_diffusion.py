@@ -49,6 +49,31 @@ def sample_noise_level(shape, device, dtype=torch.float32) -> torch.Tensor:
     return SIGMA_DATA * torch.exp(P_MEAN + P_STD * n)
 
 
+def sample_noise_level_beta(shape, device, dtype=torch.float32,
+                            p1: float = 1.3, p2: float = 2.0, p_uniform: float = 0.02):
+    """Proteina's `mix_up02_beta`: t ~ 0.98*Beta(p1,p2) + 0.02*U(0,1), then sigma = schedule(t).
+
+    ⛔ CONVENTION, verified in Proteina's own code, not assumed: `r3n_fm.py:156` interpolates
+    `x_t = (1-t)*x_0 + t*x_1` with x_0 the reference (noise) and x_1 the data, and
+    `log_snr(t) = log(t/(1-t))^2`. So **t=0 is FULL NOISE and t=1 is data**, and a Beta skewed toward
+    0 samples MORE at high noise. Beta(1.3, 2.0) has mean 0.394 -> noise-skewed.
+
+    Why route through `noise_schedule` rather than inventing a sigma law: it makes TRAINING visit
+    exactly the sigma trajectory the SAMPLER traverses, so the two stop occupying different regions.
+    Under the default lognormal, training's median sigma is 4.82 while the sampler starts at 2560 --
+    a level a training draw reaches once in 69,657.
+
+    Resulting sigma quantiles (Beta(1.3,2.0)): p10 ~1442, p25 ~707, p50 ~184, p75 ~26, p90 ~2.9.
+    """
+    beta = torch.distributions.Beta(
+        torch.tensor(float(p1), device=device), torch.tensor(float(p2), device=device))
+    t = beta.sample(shape).to(device=device, dtype=dtype)
+    u = torch.rand(shape, device=device, dtype=dtype)
+    pick = torch.rand(shape, device=device, dtype=dtype)
+    t = torch.where(pick < p_uniform, u, t)
+    return noise_schedule(t)
+
+
 def noise_schedule(t: torch.Tensor, s_max: float = S_MAX) -> torch.Tensor:
     """SI 3.7.1 Eq. 7: sigma_data * (s_max^(1/p) + t*(s_min^(1/p) - s_max^(1/p)))^p, t in [0,1].
 

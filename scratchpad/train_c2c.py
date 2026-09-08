@@ -50,6 +50,12 @@ def main():
     ap.add_argument("--p_mirror", type=float, default=0.0,
                     help="fraction of TARGETS reflected during training, with a +-1 hand "
                          "label fed to the model. 0.0 disables fix D entirely.")
+    # Shift the TRAINING noise distribution toward high noise: t ~ 0.98*Beta(p1,p2)+0.02*U,
+    # sigma = noise_schedule(t). t=0 is FULL NOISE (verified in Proteina r3n_fm.py:156), so a
+    # Beta skewed toward 0 samples MORE at high noise. "1.3,2.0" is the user's own Proteina
+    # recipe. Empty string = AF3 lognormal = current behaviour, unchanged.
+    ap.add_argument("--t_beta", default="",
+                    help="p1,p2 for Proteina mix_up02_beta noise sampling, e.g. 1.3,2.0")
     ap.add_argument("--lr", type=float, default=None)
     # Warm start from a specific checkpoint's WEIGHTS. Ignored once last.ckpt exists, so a chained
     # successor resumes normally instead of warm-starting again and discarding the segment.
@@ -68,6 +74,8 @@ def main():
     args = ap.parse_args()
     MODEL_CFG["n_diffusion_samples"] = args.n_diff
     MODEL_CFG["p_mirror"] = args.p_mirror
+    MODEL_CFG["t_beta"] = (tuple(float(v) for v in args.t_beta.split(","))
+                           if args.t_beta else None)
 
     ds_dir = f"../configs/datasets_config/{args.subdir}"
     with hydra.initialize(ds_dir, version_base=hydra.__version__):
@@ -89,7 +97,7 @@ def main():
     n_par = sum(p.numel() for p in model.parameters())
     print(f"[model] {n_par/1e6:.2f} M parameters, {MODEL_CFG['n_blocks']} diffusion blocks, "
           f"n_diffusion_samples={args.n_diff}, lr={model.lr}, warmup={model.warmup_steps}, "
-          f"p_mirror={args.p_mirror}", flush=True)
+          f"p_mirror={args.p_mirror}, t_beta={MODEL_CFG['t_beta']}", flush=True)
     print(f"[dump] validation structures -> "
           f"{dump_dir if args.n_dump > 0 else 'DISABLED (n_dump=0)'}", flush=True)
 
