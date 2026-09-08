@@ -49,9 +49,15 @@ def sample_noise_level(shape, device, dtype=torch.float32) -> torch.Tensor:
     return SIGMA_DATA * torch.exp(P_MEAN + P_STD * n)
 
 
-def noise_schedule(t: torch.Tensor) -> torch.Tensor:
-    """SI 3.7.1 Eq. 7: sigma_data * (s_max^(1/p) + t*(s_min^(1/p) - s_max^(1/p)))^p, t in [0,1]."""
-    a = S_MAX ** (1.0 / RHO)
+def noise_schedule(t: torch.Tensor, s_max: float = S_MAX) -> torch.Tensor:
+    """SI 3.7.1 Eq. 7: sigma_data * (s_max^(1/p) + t*(s_min^(1/p) - s_max^(1/p)))^p, t in [0,1].
+
+    s_max is overridable ONLY so the sampler's starting noise can be swept. It matters because
+    training and inference occupy very different sigma regimes: training draws
+    sigma = 16*exp(-1.2 + 1.5*N(0,1)) (median 4.8), while the sampler starts at 16*S_MAX = 2560 --
+    a level a training draw reaches once in 69,657 samples. Default is unchanged.
+    """
+    a = s_max ** (1.0 / RHO)
     b = S_MIN ** (1.0 / RHO)
     return SIGMA_DATA * (a + t * (b - a)) ** RHO
 

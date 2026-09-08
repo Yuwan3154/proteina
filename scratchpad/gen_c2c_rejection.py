@@ -142,7 +142,11 @@ def main():
     if ok.any():
         print(f"  CA-RMSD accepted           : mean {a[ok,2].mean():.3f}  median {np.median(a[ok,2]):.3f}")
     print(f"  CA-RMSD first draw (baseline): mean {a[:,3].mean():.3f}  median {np.median(a[:,3]):.3f}")
-    print(f"  first-draw mirrored          : {float((a[:,1] > 0.5).mean())*100:.1f}%")
+    # ⛔ Column 1 is the hand of the RETURNED sample (the accepted draw, or the last failed one when
+    # attempts ran out) -- NOT the first draw. It was labelled "first-draw mirrored" and that read as
+    # a 3.1% baseline against the established 51.8%, which is the opposite of what it measures.
+    print(f"  RESIDUAL mirrored after rejection : "
+          f"{float((a[:,1] > 0.5).mean())*100:.1f}%   (baseline first-draw rate is ~51.8%)")
 
 
 if __name__ == "__main__":

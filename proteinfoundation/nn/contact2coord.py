@@ -256,7 +256,7 @@ class ContactToCoord(nn.Module):
     @torch.no_grad()
     def rollout(self, s, z, mask, ref_feats, ref_pos, atom_to_token, atom_mask, ref_space_uid,
                 n_steps: int = MINI_ROLLOUT_STEPS, augment_steps: bool = False, x_init=None,
-                churn_noise=None, record=None):
+                churn_noise=None, record=None, s_max=None):
         """SI Alg. 18. Defaults to the 20-step mini-rollout; pass 200 for full inference."""
         B, A = atom_mask.shape
         dev = s.device
@@ -270,7 +270,8 @@ class ContactToCoord(nn.Module):
         # 0.90-0.98 -- right shape, uncontrolled scale, which is exactly what a drifting centre does.
         m = atom_mask[..., None]
         nreal = atom_mask.sum(dim=1, keepdim=True).clamp_min(1.0)[..., None]
-        sig = noise_schedule(torch.linspace(0.0, 1.0, n_steps + 1, device=dev))
+        t_grid = torch.linspace(0.0, 1.0, n_steps + 1, device=dev)
+        sig = noise_schedule(t_grid) if s_max is None else noise_schedule(t_grid, s_max=s_max)
         # x_init lets a caller supply the starting noise instead of drawing it, so the SAME seed and
         # its REFLECTION can both be rolled out. Default None reproduces the original draw exactly.
         x = (sig[0] * torch.randn(B, A, 3, device=dev) if x_init is None else x_init) * m
