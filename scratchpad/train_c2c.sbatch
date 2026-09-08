@@ -89,8 +89,12 @@ if [ "$CHAIN" -gt 0 ] && [ -e "$CHAIN_MARK" ]; then
     CHAIN=0
 fi
 if [ "$CHAIN" -gt 0 ]; then
+    # ⛔ EXTRA MUST be re-exported. It carries --name and --t_beta, and a successor that loses it
+    # would silently write into the DEFAULT run directory (clobbering the baseline) and train with
+    # the DEFAULT noise distribution -- i.e. look healthy while running the wrong experiment.
     CHAIN=$((CHAIN - 1)) DEVICES="${DEVICES:-2}" ACCUM="${ACCUM:-8}" NDIFF="${NDIFF:-8}" LR="${LR:-0.0006}" \
         PRECISION="${PRECISION:-bf16-mixed}" VAL_EVERY="${VAL_EVERY:-500}" WARMUP="${WARMUP:-1000}" GRES="$GRES" \
+        EXTRA="${EXTRA:-}" \
         sbatch --dependency=afterany:${SLURM_JOB_ID} \
                --partition="$SLURM_JOB_PARTITION" \
                --gres="$GRES" \
