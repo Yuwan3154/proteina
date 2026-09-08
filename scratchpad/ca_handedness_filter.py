@@ -4,10 +4,23 @@ Handedness is a coin flip: with the checkpoint fixed and only the noise varying,
 changed hand between two draws. If the sole error is a global sign, it does not need a training fix
 to be usable -- it needs a detector.
 
-The detector: natural proteins are built from right-handed alpha-helices, and the CA-trace
-pseudo-dihedral over four consecutive residues is POSITIVE (~+50 deg) in a right-handed helix and
-negative in its mirror. A reflection flips the sign of every dihedral, so the fraction of positive
-dihedrals in helical range should separate the two populations cleanly.
+The detector: natural proteins are built from right-handed alpha-helices, and under THIS module's
+convention the CA-trace pseudo-dihedral over four consecutive residues is NEGATIVE (~-50 deg) in a
+right-handed helix and positive in its mirror. A reflection flips the sign of every dihedral, so the
+fraction of POSITIVE dihedrals in helical range ("helix_pos_frac") is LOW for a real protein and
+HIGH for a mirrored one, and separates the two populations cleanly.
+
+⛔⛔ THE SIGN ABOVE SAID "POSITIVE ... IN A RIGHT-HANDED HELIX" UNTIL 2026-09-07. IT WAS WRONG, AND
+INVERTED. Measured, not argued -- `scratchpad/test_dihedral_convention.py` builds an ideal helix
+(radius 2.3 A, rise 1.5 A, 100 deg/residue) and reports:
+    right-handed: mean dihedral -50.044 deg, helix_pos_frac 0.000
+    left-handed:  mean dihedral +50.044 deg, helix_pos_frac 1.000
+    reflection check: -50.044 -> +50.044, sum 0.00e+00
+and 254 NATIVE chains measure median helix_pos_frac 0.0815 (mean 0.1225, 2.0% above 0.5), which is
+only consistent with right-handed = NEGATIVE.
+⭐ The CODE and the 0.12/0.89 calibration were always correct; only this comment was wrong. Anyone
+who "fixes" the code to match the old comment BREAKS A WORKING DETECTOR -- which is why the
+correction is spelled out rather than silently edited.
 
 ⛔ This is scored WITHOUT reference to the native -- otherwise it would be useless at inference. The
 native is used only to LABEL each chain for scoring the detector, never as an input to it.
