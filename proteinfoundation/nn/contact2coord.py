@@ -255,7 +255,8 @@ class ContactToCoord(nn.Module):
 
     @torch.no_grad()
     def rollout(self, s, z, mask, ref_feats, ref_pos, atom_to_token, atom_mask, ref_space_uid,
-                n_steps: int = MINI_ROLLOUT_STEPS, augment_steps: bool = False, x_init=None):
+                n_steps: int = MINI_ROLLOUT_STEPS, augment_steps: bool = False, x_init=None,
+                churn_noise=None):
         """SI Alg. 18. Defaults to the 20-step mini-rollout; pass 200 for full inference."""
         B, A = atom_mask.shape
         dev = s.device
@@ -289,8 +290,13 @@ class ContactToCoord(nn.Module):
                 x = (x - (x * m).sum(dim=1, keepdim=True) / nreal) * m
             gamma = 0.8 if s_cur > 1.0 else 0.0
             t_hat = s_prev * (gamma + 1.0)
-            x_noisy = x + 1.003 * torch.sqrt((t_hat ** 2 - s_prev ** 2).clamp_min(0)) \
-                * torch.randn_like(x) * m
+            # ⛔ churn_noise makes the EDM stochastic term reproducible AND transformable. Without it
+            # rollout(Me) and M rollout(e) draw DIFFERENT churn, so even an exactly
+            # reflection-equivariant model shows a large residual and the test measures nothing.
+            # The trajectory commutes with M only if the churn is reflected too: M(x + c*eps) =
+            # Mx + c*M eps. Default None is the original fresh draw.
+            eps = torch.randn_like(x) if churn_noise is None else churn_noise[i]
+            x_noisy = x + 1.003 * torch.sqrt((t_hat ** 2 - s_prev ** 2).clamp_min(0)) * eps * m
             d = self.denoise(x_noisy, t_hat.expand(B), s, z, mask,
                              ref_feats, ref_pos, atom_to_token, atom_mask, ref_space_uid) * m
             x = (x_noisy + 1.5 * (s_cur - t_hat) * (x_noisy - d) / t_hat) * m
