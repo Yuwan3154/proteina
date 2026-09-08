@@ -78,9 +78,18 @@ def main():
     print(f"[load] EMA @ step {ck.get('global_step')}", flush=True)
     model = model.to(dev).eval()
 
+    # ⛔ The validation epoch yields ONE CHAIN PER CLUSTER -- 254, not the 4158 Lightning prints.
+    # Asking for more raises StopIteration mid-run (job 22258436 died that way at --n 400). Cap to
+    # what actually exists rather than crashing, and say so.
+    loader = dm.val_dataloader()
+    avail = len(loader)
+    n_use = min(args.n, avail)
+    if n_use < args.n:
+        print(f"[data] requested --n {args.n} but the val epoch holds {avail} chains; using {n_use}",
+              flush=True)
     batches = []
-    it = iter(dm.val_dataloader())
-    for _ in range(args.n):
+    it = iter(loader)
+    for _ in range(n_use):
         raw = next(it)
         b = model._prepare(raw, train=False)
         batches.append({k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in b.items()})
