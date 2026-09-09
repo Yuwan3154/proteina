@@ -54,7 +54,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 # h100) and take whichever is scheduled first. Without a lock, two of them starting would train two
 # processes into ONE checkpoint directory. mkdir is atomic on POSIX, so it is the lock.
 # Keyed by job name: the lock guards ONE run against duplicates of itself, not the whole store,
-# so c2c_pmirror and c2c_tbeta can train side by side.
+# so different runs (c2c_tbeta, c2c_lddtoff, ...) can train side by side.
 LOCK=/orcd/scratch/orcd/011/chenxiou/c2c_store/.run.lock.${SLURM_JOB_NAME}
 if ! mkdir "$LOCK" 2>/dev/null; then
     HOLDER=$(cat "$LOCK/jobid" 2>/dev/null)
@@ -92,19 +92,23 @@ if [ "$CHAIN" -gt 0 ] && [ -e "$CHAIN_MARK" ]; then
     CHAIN=0
 fi
 if [ "$CHAIN" -gt 0 ]; then
+    TL=$(squeue -h -j "$SLURM_JOB_ID" -o %l 2>/dev/null)   # this job's own time limit
     # ⛔ EXTRA MUST be re-exported. It carries --name and --t_beta, and a successor that loses it
     # would silently write into the DEFAULT run directory (clobbering the baseline) and train with
     # the DEFAULT noise distribution -- i.e. look healthy while running the wrong experiment.
     # INIT_FROM too: train_c2c.py ignores it once last.ckpt exists, so a successor that finds a
     # checkpoint resumes, and one that finds NONE (segment 1 died early) warm-starts again
     # instead of training from scratch into the run directory.
+    # The successor also inherits THIS job's time limit, cpus and mem: the file's defaults (6 h,
+    # 16 CPU, 200 GB) are mit_normal_gpu's; on pi_so3 node4007 (66 GB free) they would pend forever.
     CHAIN=$((CHAIN - 1)) DEVICES="${DEVICES:-2}" ACCUM="${ACCUM:-8}" NDIFF="${NDIFF:-8}" LR="${LR:-0.0006}" \
         PRECISION="${PRECISION:-bf16-mixed}" VAL_EVERY="${VAL_EVERY:-500}" WARMUP="${WARMUP:-1000}" GRES="$GRES" \
         EXTRA="${EXTRA:-}" REPO="$REPO" INIT_FROM="${INIT_FROM:-}" \
         sbatch --dependency=afterany:${SLURM_JOB_ID} \
                --partition="$SLURM_JOB_PARTITION" \
                --gres="$GRES" \
-               --time=06:00:00 \
+               --time="${TL:-06:00:00}" \
+               --cpus-per-task="$SLURM_CPUS_PER_TASK" --mem="${SLURM_MEM_PER_NODE}M" \
                --job-name="$SLURM_JOB_NAME" \
                "$CHAIN_SELF" \
         && touch "$CHAIN_MARK" \

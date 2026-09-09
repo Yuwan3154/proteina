@@ -71,7 +71,19 @@ def main():
     # illegal-memory-access: it makes the ranks issue different CUDA/NCCL work.
     ap.add_argument("--n_dump", type=int, default=2)
     ap.add_argument("--smoke", action="store_true")
+    # A/B on the loss's chirality: smooth_lddt is distance-only (reflection-invariant) and enters
+    # unweighted, while the chiral MSE is EDM-weighted down to ~1/sd^2 at high sigma. --no_lddt
+    # leaves the MSE as the only structure loss. AF3 drops LDDT from fine-tuning 1 (SI 5.2).
+    ap.add_argument("--no_lddt", action="store_true", help="drop smooth_lddt from the diffusion loss")
+    # Overfit ONE structure: the trainer pins its first training batch and reuses it for every
+    # train/val step (saved to <run>/overfit_batch.pt). Every other hyperparameter is untouched.
+    ap.add_argument("--overfit", action="store_true", help="pin the first batch; one-structure run")
+    ap.add_argument("--seed", type=int, default=None, help="L.seed_everything; None = unseeded")
     args = ap.parse_args()
+    if args.seed is not None:
+        L.seed_everything(args.seed, workers=True)
+    # Each DDP rank would pin a DIFFERENT first batch; the one-structure run is single-device.
+    assert not (args.overfit and args.devices > 1), "--overfit requires --devices 1"
     MODEL_CFG["n_diffusion_samples"] = args.n_diff
     MODEL_CFG["p_mirror"] = args.p_mirror
     MODEL_CFG["t_beta"] = (tuple(float(v) for v in args.t_beta.split(","))
@@ -91,20 +103,29 @@ def main():
     dump_dir = os.path.join(args.store, args.name, "samples")
     kw = {"lr": args.lr} if args.lr is not None else {}
     kw["warmup_steps"] = args.warmup
+    kw["use_smooth_lddt"] = not args.no_lddt
+    if args.overfit:
+        os.makedirs(os.path.join(args.store, args.name), exist_ok=True)
+        kw["overfit_batch_path"] = os.path.join(args.store, args.name, "overfit_batch.pt")
     model = ContactToCoordTrainer(model_cfg=MODEL_CFG,
                                   dump_dir=(dump_dir if args.n_dump > 0 else None),
                                   n_dump=args.n_dump, **kw)
     n_par = sum(p.numel() for p in model.parameters())
     print(f"[model] {n_par/1e6:.2f} M parameters, {MODEL_CFG['n_blocks']} diffusion blocks, "
           f"n_diffusion_samples={args.n_diff}, lr={model.lr}, warmup={model.warmup_steps}, "
-          f"p_mirror={args.p_mirror}, t_beta={MODEL_CFG['t_beta']}", flush=True)
+          f"p_mirror={args.p_mirror}, t_beta={MODEL_CFG['t_beta']}, smooth_lddt={not args.no_lddt}, "
+          f"overfit={args.overfit}, seed={args.seed}", flush=True)
     print(f"[dump] validation structures -> "
           f"{dump_dir if args.n_dump > 0 else 'DISABLED (n_dump=0)'}", flush=True)
 
     os.makedirs(args.store, exist_ok=True)
+    # Overfit runs keep EVERY val_every checkpoint: on one structure val/loss falls monotonically,
+    # so top-k would silently delete the early ones and the mirror-rate TRAJECTORY with them.
+    keep = dict(monitor=None, save_top_k=-1, filename="step{step:07d}", auto_insert_metric_name=False) \
+        if args.overfit else dict(monitor="val/loss", mode="min", save_top_k=3)
     ckpt_cb = ModelCheckpoint(
-        dirpath=os.path.join(args.store, args.name), monitor="val/loss", mode="min",
-        save_top_k=3, save_last=True, every_n_train_steps=args.val_every,
+        dirpath=os.path.join(args.store, args.name), **keep,
+        save_last=True, every_n_train_steps=args.val_every,
         # ⛔⛔ Without this, Lightning's version counter writes `last-v1.ckpt` whenever `last.ckpt`
         # already exists from a PREVIOUS chain segment -- so the resume anchor below freezes at the
         # step the first segment reached and every requeue silently rewinds to it. Measured: the
