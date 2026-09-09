@@ -19,11 +19,11 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, "/orcd/scratch/orcd/011/chenxiou/proteina_sh")
 
-from steps_sweep import MODEL_CFG, helix_pos_frac, kabsch_rmsd  # noqa: E402
+from steps_sweep import MODEL_CFG, helix_pos_frac  # noqa: E402
 
 from proteinfoundation.nn.af3_diffusion import MINI_ROLLOUT_STEPS  # noqa: E402
 from proteinfoundation.proteinflow.contact2coord_trainer import ContactToCoordTrainer  # noqa: E402
-from proteinfoundation.utils.c2c_dump import _kabsch_rmsd  # noqa: E402
+from proteinfoundation.utils.c2c_dump import handedness_metrics  # noqa: E402
 
 
 def main():
@@ -45,11 +45,18 @@ def main():
     L = b["mask"].shape[1]
     keep = b["mask"][0].bool()
     gt = b["atom_pos"].reshape(-1, L, 14, 3)[0][keep][:, 1, :].float().cpu().numpy()
+    # ⛔ The CA-dihedral criterion (helix_pos_frac > 0.5) is a coin flip on beta-rich chains: the
+    # NATIVE 6kn9_B scores 0.490. For a single KNOWN target the proper-vs-reflected superposition
+    # gap is exact, so `is_mirrored` from handedness_metrics (p > 2r and p - r > 1 A, the same
+    # operational definition the validation dump logs) is the primary criterion; helix_pos is
+    # reported beside it only for continuity with the 254-chain sweeps.
+    nat = helix_pos_frac(gt)
     print(f"[data] pinned structure: L={int(keep.sum())} (padded {L}), {args.k} rollouts x "
-          f"{args.steps} steps per checkpoint", flush=True)
+          f"{args.steps} steps per checkpoint | native helix_pos_frac={nat:.3f} "
+          f"({'UNRELIABLE for this chain' if 0.3 < nat < 0.7 else 'usable'})", flush=True)
 
-    print(f"\n{'step':>7} {'wts':>4} {'mirrored':>10} {'+-SE':>6} {'rmsd_unmir_med':>15} "
-          f"{'rmsd_refl_of_mir_med':>21} {'n_unmir':>8} {'n_mir':>6}")
+    print(f"\n{'step':>7} {'wts':>4} {'mirrored':>10} {'+-SE':>6} {'rmsd_proper_notmir':>18} "
+          f"{'rmsd_refl_of_mir':>16} {'n_notmir':>9} {'n_mir':>6} {'helix_pos>.5':>13}")
     variants = ["raw", "ema"] if args.weights == "both" else [args.weights]
     for path in args.ckpt:
         ck = torch.load(path, map_location="cpu", weights_only=False)
@@ -61,7 +68,7 @@ def main():
             else:
                 sd = {k[len("model."):]: v for k, v in ck["state_dict"].items() if k.startswith("model.")}
                 model.model.load_state_dict(sd, strict=True)
-            hands, rp, rr = [], [], []
+            hands, rp, rr, mirs = [], [], [], []
             with torch.no_grad():
                 s, z, _ = model.model.encode(b["contacts"], b["aatype"], b["mask"])
                 for i in range(args.k):
@@ -70,23 +77,27 @@ def main():
                                             b["atom_to_token"], b["atom_mask"], b["ref_space_uid"],
                                             n_steps=args.steps)
                     ca = c.reshape(-1, L, 14, 3)[0][keep][:, 1, :].float().cpu().numpy()
-                    hands.append(helix_pos_frac(ca))
-                    rp.append(kabsch_rmsd(ca, gt))
-                    rr.append(_kabsch_rmsd(ca, gt, allow_reflection=True))
-            h, rp, rr = np.array(hands), np.array(rp), np.array(rr)
-            ok = ~np.isnan(h)
-            mir = ok & (h > 0.5)
-            unmir = ok & (h <= 0.5)
-            p = float(mir.sum()) / max(int(ok.sum()), 1)
-            se = float(np.sqrt(p * (1 - p) / max(int(ok.sum()), 1)))
+                    hm = handedness_metrics(ca, gt)
+                    hands.append(hm.get("helix_pos_frac", float("nan")))
+                    rp.append(hm["rmsd_proper"])
+                    rr.append(hm["rmsd_reflected"])
+                    mirs.append(hm["is_mirrored"])
+            h, rp, rr, mirs = np.array(hands), np.array(rp), np.array(rr), np.array(mirs)
+            mir = mirs > 0.5          # reflection fits DISTINCTLY better than any proper rotation
+            n = len(mirs)
+            p = float(mir.sum()) / n
+            se = float(np.sqrt(p * (1 - p) / n))
+            hp = float(np.mean(h[np.isfinite(h)] > 0.5)) if np.isfinite(h).any() else float("nan")
             print(f"{step:7d} {wts:>4} {100*p:9.1f}% {100*se:5.1f} "
-                  f"{np.median(rp[unmir]) if unmir.sum() else float('nan'):15.3f} "
-                  f"{np.median(rr[mir]) if mir.sum() else float('nan'):21.3f} "
-                  f"{int(unmir.sum()):8d} {int(mir.sum()):6d}", flush=True)
-    print("\n  rmsd_unmir_med: proper-Kabsch CA-RMSD of the right-handed samples to the pinned chain.")
-    print("  rmsd_refl_of_mir_med: CA-RMSD of the MIRRORED samples once a reflection is allowed --")
-    print("  small means they are accurate mirror images, large means they are simply wrong.")
-
+                  f"{np.median(rp[~mir]) if (~mir).sum() else float('nan'):18.3f} "
+                  f"{np.median(rr[mir]) if mir.sum() else float('nan'):16.3f} "
+                  f"{int((~mir).sum()):9d} {int(mir.sum()):6d} {100*hp:12.1f}%", flush=True)
+    print("\n  mirrored: is_mirrored = proper RMSD > 2x the reflection-allowed RMSD AND gap > 1 A")
+    print("  (the validation dump's operational definition; exact for a single KNOWN target).")
+    print("  rmsd_proper_notmir: median proper-Kabsch CA-RMSD of the NON-mirrored samples --")
+    print("  ~1 A means folded and right-handed, ~20 A means unfolded garbage.")
+    print("  rmsd_refl_of_mir: median CA-RMSD of the MIRRORED samples once a reflection is allowed.")
+    print("  helix_pos>.5: the CA-dihedral criterion, continuity only -- unreliable on beta-rich chains.")
 
 if __name__ == "__main__":
     main()
