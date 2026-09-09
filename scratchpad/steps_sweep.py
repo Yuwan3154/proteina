@@ -21,6 +21,7 @@ confound that made the sigma-start sweep's RMSD column unreadable.
 """
 
 import argparse
+import os
 import sys
 
 import hydra
@@ -28,7 +29,10 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-sys.path.insert(0, "/orcd/scratch/orcd/011/chenxiou/proteina_sh")
+# ⛔ The repo root comes from THIS file's location, never a hardcoded checkout: a fix-D checkpoint
+# (to_hand_s) only loads against proteina_mirror, and a hardcoded proteina_sh silently imported the
+# wrong model even when launched from the right checkout (job 22373592, strict-load failure).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from proteinfoundation.proteinflow.contact2coord_trainer import ContactToCoordTrainer
 from proteinfoundation.utils.c2c_dump import _ca_dihedrals
@@ -71,9 +75,15 @@ def main():
     dm = hydra.utils.instantiate(cfg.datamodule)
     dm.setup("fit")
 
-    model = ContactToCoordTrainer(model_cfg=dict(MODEL_CFG, n_diffusion_samples=8))
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     assert "ema" in ck, "refusing to score the unaveraged model"
+    # ⛔ Build the model from the checkpoint's OWN saved config, not this file's MODEL_CFG: a fix-D
+    # run trained with p_mirror>0 must be measured with p_mirror>0, or rollout() injects no hand
+    # label and the sweep silently scores the label-less model (the coin flip again).
+    cfg = dict(ck["hyper_parameters"]["model_cfg"], n_diffusion_samples=8)
+    print(f"[cfg] from checkpoint: p_mirror={cfg.get('p_mirror', 'n/a')} t_beta={cfg.get('t_beta', 'n/a')}",
+          flush=True)
+    model = ContactToCoordTrainer(model_cfg=cfg)
     model.model.load_state_dict(ck["ema"]["params"], strict=True)
     print(f"[load] EMA @ step {ck.get('global_step')}", flush=True)
     model = model.to(dev).eval()

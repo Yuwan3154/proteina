@@ -17,9 +17,9 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, "/orcd/scratch/orcd/011/chenxiou/proteina_sh")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from steps_sweep import MODEL_CFG, helix_pos_frac  # noqa: E402
+from steps_sweep import helix_pos_frac  # noqa: E402
 
 from proteinfoundation.nn.af3_diffusion import MINI_ROLLOUT_STEPS  # noqa: E402
 from proteinfoundation.proteinflow.contact2coord_trainer import ContactToCoordTrainer  # noqa: E402
@@ -40,7 +40,12 @@ def main():
     dev = "cuda" if torch.cuda.is_available() else "cpu"
 
     raw = torch.load(os.path.join(args.run, "overfit_batch.pt"), weights_only=False).to(dev)
-    model = ContactToCoordTrainer(model_cfg=dict(MODEL_CFG, n_diffusion_samples=8)).to(dev).eval()
+    # Model config from the FIRST checkpoint's saved hparams (all ckpts of one run share it).
+    ck0 = torch.load(args.ckpt[0], map_location="cpu", weights_only=False)
+    cfg = dict(ck0["hyper_parameters"]["model_cfg"], n_diffusion_samples=8)
+    print(f"[cfg] from checkpoint: p_mirror={cfg.get('p_mirror', 'n/a')} t_beta={cfg.get('t_beta', 'n/a')}",
+          flush=True)
+    model = ContactToCoordTrainer(model_cfg=cfg).to(dev).eval()
     b = model._prepare(raw, train=False)
     L = b["mask"].shape[1]
     keep = b["mask"][0].bool()
