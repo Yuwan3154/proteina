@@ -14,7 +14,9 @@
 #         MODE=smoke sbatch synth_index.sbatch      (first 100 chains of part 0 + self-alignment gate)
 set -uo pipefail
 REPO=/orcd/scratch/orcd/011/chenxiou/proteina_tri
-OUT=/orcd/scratch/orcd/011/chenxiou/synth_index
+# ⛔ Overridable: a REBUILD must not write into the index a running job is mmap-reading. Point
+# OUT_DIR at a fresh directory (e.g. synth_index_v2) and switch the config only once it is done.
+OUT="${OUT_DIR:-/orcd/scratch/orcd/011/chenxiou/synth_index}"
 DATA=/orcd/pool/006/chenxiou/proteina/data/pdb_train
 T2=/orcd/compute/so3/002/chenxi/of_run/pp1c_work
 EXTRA=/orcd/scratch/orcd/011/chenxiou/t2_extra           # templates generated for uncovered clusters (B4)
