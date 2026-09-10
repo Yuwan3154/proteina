@@ -147,6 +147,12 @@ log:
   last_ckpt_every_n_steps: 50
 
 validation_sampling:
+  # Validation sampling conditions on a SYNTHETIC reference of each fixed chain (user D7), i.e. a
+  # template row of its own group in the training TM range, drawn with a fixed seed so the same
+  # (query, reference) pairs are scored at every validation -- not on the chain's own topology
+  # (which would make the headline a ceiling).
+  topology_nonself: True
+  topology_nonself_seed: 0
   # Sampling steps = ceil(1/dt). 200 was inherited from coordinate diffusion; a binary
   # L x L contact map does not need that schedule, and at ~51 ms/step for a batch of 4
   # the schedule was most of the validation cost. 50 steps cuts it 4x.
