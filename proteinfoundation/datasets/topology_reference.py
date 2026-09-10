@@ -11,12 +11,19 @@ realise a topology it is given rather than to copy itself. Chains with no differ
 Everything the transform needs comes from a precomputed flat index, so no second .pt is read per
 sample. Element positions are rescaled from the template's length onto the query's, which is what
 lets cross-attention relate a topology element to a query residue at all.
+
+reference_source="synthetic" replaces the cluster draw with a partially-diffused variant of the
+query's OWN structure (a synthetic template, TM to the native inside a configured range), read
+from an index built by utils/precompute_synthetic_topology_index.py. Every chain then has a
+non-self reference regardless of cluster size; a chain that still has none falls back to the
+unconditional MASK reference and says so loudly (topology_missing_ref = 1 + a warning).
 """
 
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence, Tuple
 
 import torch
 import torch_geometric.transforms as T
+from loguru import logger
 from torch_geometric.data import Data
 
 from proteinfoundation.datasets.sse_topology import (
@@ -24,6 +31,7 @@ from proteinfoundation.datasets.sse_topology import (
     DSSP_STRAND,
     MASK_TOKEN,
     N_PAIR_FEATURES,
+    SSE_TYPES,
     STRUCTURAL_PAIR_FEATURES,
     SSEAlphabet,
     circuit_topology_features,
@@ -36,6 +44,11 @@ from proteinfoundation.datasets.sse_topology import (
 # row, or -- under require_nonself -- no non-self template available). Downstream, a sample is
 # SELF-referenced iff topology_ref_id == its own protein_id, and unconditioned iff it is this.
 MASK_REF_ID = "MASK"
+
+# Value of ref_align_target (a RESIDUE-axis tensor, so it is padded like the residues rather than
+# like the topology_* keys) for a query residue that USalign leaves unaligned (or aligned to a
+# reference element beyond the helix/strand cap). Also what the dense collate pads with.
+ALIGN_NONE = -1
 
 
 class TopologyReferenceTransform(T.BaseTransform):
@@ -53,6 +66,18 @@ class TopologyReferenceTransform(T.BaseTransform):
         self_fallback: use the query's own topology when no valid template exists.
         require_nonself: drop to MASK rather than ever returning the query's own
             topology. For the non-self validation arm.
+        reference_source: "cluster" (a same-cluster, different-sequence chain -- the original
+            scheme) or "synthetic" (a partially-diffused variant of the query's OWN native from a
+            synthetic-template index; see utils/precompute_synthetic_topology_index). In synthetic
+            mode the index groups each chain with its template rows, and the draw is uniform over
+            the rows whose template-vs-native TM lies in ``tm_range``.
+        tm_range: (lo, hi), inclusive, synthetic mode only.
+        sse_types: DSSP types the token alphabet encodes. (1, 2) = helix+strand only, vocab 44,
+            for a model that never reads loop tokens (tri).
+        type_mutate_prob: augmentation -- per-element probability of flipping helix <-> strand.
+        token_mask_prob: augmentation -- per-element probability of replacing the helix/strand
+            token by MASK; the pre-mask token is emitted as ``topology_he_tokens_target`` for a
+            masked-token loss. Both rates default to 0 = mechanism skipped, bit-identical output.
     """
 
     def __init__(
@@ -70,7 +95,14 @@ class TopologyReferenceTransform(T.BaseTransform):
         catch_all_above: int = 30,
         min_len: int = 1,
         seed: int = 0,
+        reference_source: str = "cluster",
+        tm_range: Tuple[float, float] = (0.5, 0.9),
+        sse_types: Sequence[int] = SSE_TYPES,
+        type_mutate_prob: float = 0.0,
+        token_mask_prob: float = 0.0,
     ):
+        if reference_source not in ("cluster", "synthetic"):
+            raise ValueError(f"reference_source must be 'cluster' or 'synthetic', got {reference_source!r}")
         self.index_path = index_path
         self.max_topology_len = max_topology_len
         self.max_topology_he_len = max_topology_he_len
@@ -81,8 +113,13 @@ class TopologyReferenceTransform(T.BaseTransform):
         # Validation-only: refuse the self-reference entirely, so the arm measures
         # template threading rather than the model's ability to copy the answer.
         self.require_nonself = require_nonself
+        self.reference_source = reference_source
+        self.tm_range = (float(tm_range[0]), float(tm_range[1]))
+        self.type_mutate_prob = float(type_mutate_prob)
+        self.token_mask_prob = float(token_mask_prob)
         self.alphabet = SSEAlphabet(
-            exact_max=exact_max, bin_step=bin_step, catch_all_above=catch_all_above, min_len=min_len
+            exact_max=exact_max, bin_step=bin_step, catch_all_above=catch_all_above, min_len=min_len,
+            types=tuple(int(t) for t in sse_types),
         )
         self.seed = seed
         self._index = None
@@ -164,11 +201,24 @@ class TopologyReferenceTransform(T.BaseTransform):
         return (feat - self._feat_mean) / self._feat_std
 
     def _pick_template(self, row: int) -> int:
-        """A same-cluster chain with a different sequence, or the query itself as fallback."""
+        """A same-cluster chain with a different sequence, or the query itself as fallback.
+
+        Synthetic mode: a template row of the query's own group with TM inside ``tm_range``; -1
+        when there is none (the caller decides what that means -- never the query itself).
+        """
         idx = self._index
         cl = int(idx["cluster_of"][row])
         lo, hi = int(idx["members_offset"][cl]), int(idx["members_offset"][cl + 1])
         members = idx["members_flat"][lo:hi]
+        if self.reference_source == "synthetic":
+            if members.numel() == 0:
+                return -1
+            tm = idx["row_tm"][members.long()].float()
+            cand = members[(tm >= self.tm_range[0]) & (tm <= self.tm_range[1])]
+            if cand.numel() == 0:
+                return -1
+            j = int(torch.randint(cand.numel(), (1,), generator=self._generator))
+            return int(cand[j])
         if members.numel() <= 1:
             return row
         own = idx["seq_hash"][row]
@@ -178,6 +228,25 @@ class TopologyReferenceTransform(T.BaseTransform):
         j = int(torch.randint(cand.numel(), (1,), generator=self._generator))
         return int(cand[j])
 
+    def _align_for(self, t_row: int, length: int, n_he: int) -> torch.Tensor:
+        """Per-query-residue reference element index (into the helix/strand axis, before the cap)
+        or ALIGN_NONE, from the index's USalign ground truth. All-NONE when the index has none or
+        the stored vector was built for a different chain length."""
+        idx = self._index
+        if "align_offset" not in idx:
+            return torch.full((length,), ALIGN_NONE, dtype=torch.long)
+        a, b = int(idx["align_offset"][t_row]), int(idx["align_offset"][t_row + 1])
+        if b - a != length:
+            if b > a:
+                logger.warning(
+                    f"[topology] alignment vector for row {t_row} has length {b - a}, query has {length} "
+                    "-- alignment target dropped for this sample"
+                )
+            return torch.full((length,), ALIGN_NONE, dtype=torch.long)
+        align = idx["align_flat"][a:b].long()
+        # elements beyond the helix/strand cap were never shown to the model
+        return torch.where(align < n_he, align, torch.full_like(align, ALIGN_NONE))
+
     def assemble_reference(
         self,
         runs,
@@ -186,7 +255,7 @@ class TopologyReferenceTransform(T.BaseTransform):
         length: int,
         augment: bool = False,
     ) -> Dict[str, torch.Tensor]:
-        """The six tensors the model consumes, from raw run/contact/structural inputs.
+        """The topology_* tensors the model consumes, from raw run/contact/structural inputs.
 
         Public because the same assembly has to serve a reference read off a structure file (see
         ``utils/topology_from_structure``) as serves one read out of the index: it carries the
@@ -206,27 +275,39 @@ class TopologyReferenceTransform(T.BaseTransform):
             he_contact = torch.zeros(len(keep), len(keep))
             structural = torch.zeros(len(keep), len(keep), len(STRUCTURAL_PAIR_FEATURES))
 
-        if augment and self.mutate_prob > 0.0 and self.sigma_frac > 0.0:
+        length_aug = self.mutate_prob > 0.0 and self.sigma_frac > 0.0
+        if augment and (length_aug or self.type_mutate_prob > 0.0):
             runs = perturb_runs(
                 runs,
                 self.sigma_frac,
-                self.mutate_prob,
+                self.mutate_prob if length_aug else 0.0,
                 self._generator,
                 min_len=self.alphabet.min_len,
+                type_mutate_prob=self.type_mutate_prob,
             )
+            # a type flip only swaps helix <-> strand, so `keep` and every per-element tensor
+            # (contacts, structural features, alignment target) stay aligned with the runs
 
-        tokens = torch.tensor(self.alphabet.runs_to_tokens(runs), dtype=torch.long)
-        pos = element_positions(runs, target_len=length)
+        # The 1D token axis carries exactly the runs the alphabet encodes: with the default
+        # 3-type alphabet that is every run; with a helix+strand alphabet the loops are gone and
+        # the positions must be filtered the same way or tokens and positions would misalign.
+        tok_keep = [
+            i for i, (t, n) in enumerate(runs) if t in self.alphabet.types and n >= self.alphabet.min_len
+        ]
+        tokens = torch.tensor([self.alphabet.token(*runs[i]) for i in tok_keep], dtype=torch.long)
+        pos_all = element_positions(runs, target_len=length)
         # Un-rescaled midpoints: each element's own-chain residue index, origin 0, exactly like
         # the query's own indexing. A model that LEFT-ALIGNS query and reference (rather than
         # stretching the reference onto the query length) needs these, not the rescaled ones.
-        pos_raw = element_positions(runs, target_len=None)
+        pos_raw_all = element_positions(runs, target_len=None)
+        pos = pos_all[tok_keep] if len(tok_keep) else torch.zeros(0, dtype=torch.float32)
+        pos_raw = pos_raw_all[tok_keep] if len(tok_keep) else torch.zeros(0, dtype=torch.float32)
         he_tokens = torch.tensor(
             [self.alphabet.token(*runs[i]) for i in keep], dtype=torch.long
         )
-        he_pos = pos[keep] if len(keep) else torch.zeros(0, dtype=torch.float32)
+        he_pos = pos_all[keep] if len(keep) else torch.zeros(0, dtype=torch.float32)
 
-        he_pos_raw = pos_raw[keep] if len(keep) else torch.zeros(0, dtype=torch.float32)
+        he_pos_raw = pos_raw_all[keep] if len(keep) else torch.zeros(0, dtype=torch.float32)
         tokens = tokens[: self.max_topology_len]
         pos = pos[: self.max_topology_len]
         pos_raw = pos_raw[: self.max_topology_len]
@@ -235,6 +316,14 @@ class TopologyReferenceTransform(T.BaseTransform):
         he_pos_raw = he_pos_raw[:k]
         he_contact = he_contact[:k, :k]
         he_feat = self._pair_features(he_contact, structural[:k, :k], runs, keep[:k])
+
+        # Token masking (BERT-style, token identity only; positions and pair features stay): the
+        # pre-mask token is the target for the masked-token loss, 0 (= PAD) where not masked.
+        he_target = torch.zeros_like(he_tokens)
+        if augment and self.token_mask_prob > 0.0 and he_tokens.numel():
+            masked = torch.rand(he_tokens.shape, generator=self._generator) < self.token_mask_prob
+            he_target = torch.where(masked, he_tokens, he_target)
+            he_tokens = torch.where(masked, torch.full_like(he_tokens, MASK_TOKEN), he_tokens)
 
         return {
             "topology_tokens": tokens if tokens.numel() else torch.full((1,), MASK_TOKEN, dtype=torch.long),
@@ -249,6 +338,9 @@ class TopologyReferenceTransform(T.BaseTransform):
             ),
             "topology_he_contact": he_contact if he_contact.numel() else torch.zeros(1, 1),
             "topology_he_feat": he_feat if he_feat.numel() else torch.zeros(1, 1, N_PAIR_FEATURES),
+            "topology_he_tokens_target": (
+                he_target if he_target.numel() else torch.zeros(1, dtype=torch.long)
+            ),
         }
 
     def _build_reference(self, t_row: int, length: int, augment: bool) -> Dict[str, torch.Tensor]:
@@ -307,7 +399,7 @@ class TopologyReferenceTransform(T.BaseTransform):
         finally:
             if seed is not None:
                 self._generator = gen_saved
-        if t_row == row or not self._runs_for(t_row):
+        if t_row < 0 or t_row == row or not self._runs_for(t_row):
             return None
         return self._build_reference(t_row, length, augment=False), str(self._index["ids"][t_row])
 
@@ -320,35 +412,66 @@ class TopologyReferenceTransform(T.BaseTransform):
         drop = float(torch.rand(1, generator=self._generator)) < self.drop_prob
         if row is None or drop:
             graph.topology_ref_id = MASK_REF_ID
-            return self._set_empty(graph)
+            if row is None and self.reference_source == "synthetic":
+                return self._set_empty(graph, missing=True, stem=stem)
+            return self._set_empty(graph, L=L)
 
-        t_row = self._pick_template(row)  # returns `row` itself when no valid template exists
+        t_row = self._pick_template(row)  # cluster: `row` itself when no valid template; synthetic: -1
+        if self.reference_source == "synthetic":
+            if t_row < 0 or not self._runs_for(t_row):
+                graph.topology_ref_id = MASK_REF_ID
+                return self._set_empty(graph, missing=True, stem=stem)
+            graph.topology_ref_id = str(self._index["ids"][t_row])
+            feats = self._build_reference(t_row, L, augment=True)
+            for key, value in feats.items():
+                setattr(graph, key, value)
+            n_he = int(feats["topology_he_tokens"].numel())
+            graph.ref_align_target = self._align_for(t_row, L, n_he)
+            graph.topology_missing_ref = torch.zeros(1, dtype=torch.long)
+            return graph
         # ⭐ require_nonself: for a validation arm that measures the REALISTIC task (thread a
         # template that is not the answer). Without it, self-fallback silently hands back the
         # query's own topology and the metric becomes a ceiling rather than a measurement.
         if self.require_nonself and t_row == row:
             graph.topology_ref_id = MASK_REF_ID
-            return self._set_empty(graph)
+            return self._set_empty(graph, L=L)
         if t_row == row and not self.self_fallback:
             graph.topology_ref_id = MASK_REF_ID
-            return self._set_empty(graph)
+            return self._set_empty(graph, L=L)
         if not self._runs_for(t_row):
             t_row = row
         if self.require_nonself and t_row == row:
             graph.topology_ref_id = MASK_REF_ID
-            return self._set_empty(graph)
+            return self._set_empty(graph, L=L)
 
         # ⛔ Set on EVERY exit path, not just this one. dense_padded_collate INTERSECTS keys across
         # the samples in a batch, so a key present on only some samples is silently DROPPED from the
         # batch entirely -- it would not misalign, it would vanish, and the stratification would
         # come back empty with no error.
         graph.topology_ref_id = str(self._index["ids"][t_row])
-        for key, value in self._build_reference(t_row, L, augment=True).items():
+        feats = self._build_reference(t_row, L, augment=True)
+        for key, value in feats.items():
             setattr(graph, key, value)
+        # cluster mode carries no alignment ground truth unless the index was built with one
+        graph.ref_align_target = self._align_for(t_row, L, int(feats["topology_he_tokens"].numel()))
+        graph.topology_missing_ref = torch.zeros(1, dtype=torch.long)
         return graph
 
-    def _set_empty(self, graph: Data) -> Data:
-        """The no-reference case: a single MASK element, which the model treats as unconditioned."""
+    def _set_empty(self, graph: Data, L: Optional[int] = None, missing: bool = False,
+                   stem: str = "") -> Data:
+        """The no-reference case: a single MASK element, which the model treats as unconditioned.
+
+        ``missing=True`` is the synthetic-mode failure the run is NOT supposed to hit (a chain with
+        no template in range): it is logged loudly per occurrence and flagged on the graph so the
+        trainer can report its rate -- silence here would hide a data-coverage bug as "training".
+        """
+        if L is None:
+            L = int(graph.coords.shape[0])
+        if missing:
+            logger.warning(
+                f"[topology] NO synthetic reference for {stem!r} (TM range {self.tm_range}) -- "
+                "falling back to UNCONDITIONAL. This is not expected; check template coverage."
+            )
         graph.topology_tokens = torch.full((1,), MASK_TOKEN, dtype=torch.long)
         graph.topology_pos = torch.zeros(1, dtype=torch.float32)
         graph.topology_he_tokens = torch.full((1,), MASK_TOKEN, dtype=torch.long)
@@ -357,11 +480,16 @@ class TopologyReferenceTransform(T.BaseTransform):
         graph.topology_he_pos_raw = torch.zeros(1, dtype=torch.float32)
         graph.topology_he_contact = torch.zeros(1, 1)
         graph.topology_he_feat = torch.zeros(1, 1, N_PAIR_FEATURES)
+        graph.topology_he_tokens_target = torch.zeros(1, dtype=torch.long)
+        graph.ref_align_target = torch.full((L,), ALIGN_NONE, dtype=torch.long)
+        graph.topology_missing_ref = torch.tensor([1 if missing else 0], dtype=torch.long)
         return graph
 
     def __repr__(self) -> str:
         return (
-            f"{self.__class__.__name__}(max_topology_len={self.max_topology_len}, "
-            f"sigma_frac={self.sigma_frac}, mutate_prob={self.mutate_prob}, "
-            f"drop_prob={self.drop_prob})"
+            f"{self.__class__.__name__}(source={self.reference_source}, tm_range={self.tm_range}, "
+            f"max_topology_len={self.max_topology_len}, sigma_frac={self.sigma_frac}, "
+            f"mutate_prob={self.mutate_prob}, type_mutate_prob={self.type_mutate_prob}, "
+            f"token_mask_prob={self.token_mask_prob}, drop_prob={self.drop_prob}, "
+            f"vocab={self.alphabet.vocab_size})"
         )

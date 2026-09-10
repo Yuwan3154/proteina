@@ -135,16 +135,25 @@ def perturb_runs(
     generator: torch.Generator,
     min_len: int = 1,
     max_len: int = 512,
+    type_mutate_prob: float = 0.0,
 ) -> List[Tuple[int, int]]:
-    """Jitter element lengths, keeping types and order intact.
+    """Jitter element lengths (and optionally flip helix<->strand), keeping order and count intact.
 
     Sigma scales with each element's own length so a 4-residue strand and a 30-residue helix are
     perturbed comparably in relative terms. Perturbation happens in RESIDUE space and the caller
     re-tokenizes afterwards, so a jitter that stays inside a bucket correctly produces no change
     to the reference -- which is the point: within-bucket precision was never claimed.
+
+    type_mutate_prob: per-element probability that a helix becomes a strand or vice versa (loops
+    are never retyped). 0 disables it and consumes no RNG, so existing runs are bit-identical.
+    The element COUNT and ORDER never change, which is what keeps stored per-element tensors
+    (contacts, structural features, alignment targets) aligned with the perturbed runs.
     """
     out: List[Tuple[int, int]] = []
     for t, n in runs:
+        if type_mutate_prob > 0.0 and t in (DSSP_HELIX, DSSP_STRAND):
+            if float(torch.rand(1, generator=generator, device=generator.device)) < type_mutate_prob:
+                t = DSSP_STRAND if t == DSSP_HELIX else DSSP_HELIX
         if float(torch.rand(1, generator=generator, device=generator.device)) >= mutate_prob:
             out.append((t, n))
             continue

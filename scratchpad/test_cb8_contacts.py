@@ -44,7 +44,7 @@ def random_graph(L, seed, gly_every=7, drop_cb_at=(), drop_ca_at=()):
     coords = torch.randn(L, 37, 3, generator=g) * 6.0
     mask = torch.ones(L, 37, dtype=torch.bool)
     residue_type = torch.randint(0, 20, (L,), generator=g)
-    for i in range(0, L, gly_every):            # glycines: no CB atom
+    for i in (range(0, L, gly_every) if gly_every else ()):   # glycines: no CB atom
         residue_type[i] = 7
         mask[i, CB] = False
         coords[i, CB] = 1e-5                     # proteina's fill value for unresolved atoms
@@ -69,7 +69,7 @@ def main():
 
     # 1: the fallback is decided by the MASK, not by residue identity -- a GLN (index 5) with a resolved
     # CB keeps its CB (the old code used residue_type == 5 as 'glycine')
-    g = random_graph(20, seed=1, gly_every=1000)
+    g = random_graph(20, seed=1, gly_every=None)
     g.residue_type[:] = 5
     g.coords[3, CB] = g.coords[3, CA] + torch.tensor([9.0, 0.0, 0.0])   # CB far from own CA
     g.coords[4, CA] = g.coords[3, CB] + torch.tensor([1.0, 0.0, 0.0])
@@ -78,7 +78,7 @@ def main():
     check("GLN with resolved CB uses its CB (mask-gated, not residue_type==5)", bool(ours[3, 4]))
 
     # 2: inclusive cutoff, symmetry, diagonal
-    g = random_graph(6, seed=2, gly_every=1000)
+    g = random_graph(6, seed=2, gly_every=None)
     g.coords[:, CB] = torch.zeros(6, 3)
     g.coords[1, CB] = torch.tensor([8.0, 0.0, 0.0])          # exactly 8.0 -> contact
     g.coords[2, CB] = torch.tensor([8.0 + 1e-3, 0.0, 0.0])   # just above -> no contact

@@ -214,6 +214,8 @@ class PaddingTransform(T.BaseTransform):
                         fill_value = -1  # ignore_index for CE loss
                     elif key == "ext_lig":
                         fill_value = 2  # unknown class for padded residues
+                    elif key == "ref_align_target":
+                        fill_value = -1  # ALIGN_NONE: padded residues align to nothing
                     if key.startswith("topology_"):
                         # Left unpadded on purpose: the dense collate pads each key to the BATCH
                         # maximum, so the topology axes cost what a batch actually needs (median
