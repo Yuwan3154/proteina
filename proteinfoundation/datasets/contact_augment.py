@@ -4,7 +4,7 @@ The model must tolerate imperfect contact maps, because at deployment it consume
 the tri model rather than ground truth. Phase 1 approximates that by corrupting GT contacts.
 
 ⛔ THE TWO MODES ARE NOT INTERCHANGEABLE, and the difference is roughly 4x in difficulty. ConFind
-contact maps are about 2.5% positive, so:
+contact maps are about 2.5% positive (CB-8 maps ~7.6%, incl. the always-1 diagonal), so:
 
   "balanced" (DEFAULT) -- drop `rate` of the TRUE contacts and raise an equal COUNT of non-contacts.
       The positive rate is preserved exactly, and the corruption is symmetric in the sense that
@@ -22,10 +22,14 @@ from typing import Optional
 import torch
 
 
-def _symmetrise(m: torch.Tensor) -> torch.Tensor:
-    """A contact map is symmetric; corrupt the upper triangle and mirror it."""
+def _symmetrise(m: torch.Tensor, diag: torch.Tensor) -> torch.Tensor:
+    """A contact map is symmetric; corrupt the upper triangle, mirror it, keep the diagonal.
+
+    The diagonal is never corrupted: under the CB-8 (ContactEBM) definition it is 1 for every
+    real residue and the training input must match validation, which is not augmented.
+    """
     upper = torch.triu(m, diagonal=1)
-    return upper + upper.transpose(-1, -2)
+    return upper + upper.transpose(-1, -2) + torch.diag_embed(diag)
 
 
 def augment_contacts(
@@ -38,17 +42,19 @@ def augment_contacts(
     """Corrupt a binary contact map.
 
     Args:
-        contacts: [B, L, L] binary (0/1), symmetric, zero on the diagonal.
+        contacts: [B, L, L] binary (0/1), symmetric; the diagonal passes through untouched
+                  (0 for ConFind maps, 1 for CB-8 maps).
         mask:     [B, L] 1 for real residues.
         rate:     fraction to corrupt; see the mode semantics above.
         mode:     "balanced" (default) or "uniform".
     Returns:
-        [B, L, L] corrupted map, symmetric, diagonal zero, padded cells zero.
+        [B, L, L] corrupted map, symmetric, diagonal as given, padded cells zero.
     """
     assert mode in ("balanced", "uniform"), mode
     B, L, _ = contacts.shape
     device = contacts.device
     c = contacts.clone()
+    diag = torch.diagonal(c, dim1=-2, dim2=-1)  # [B, L], passed through uncorrupted
 
     pair = (mask[:, :, None] * mask[:, None, :]).to(torch.bool)
     eye = torch.eye(L, device=device, dtype=torch.bool)[None].expand(B, L, L)
@@ -59,7 +65,7 @@ def augment_contacts(
         r = torch.rand(c.shape, device=device, generator=generator)
         flip = elig & (r < rate)
         c = torch.where(flip, 1.0 - c, c)
-        return _symmetrise(c * elig.to(c.dtype)) * pair.to(c.dtype)
+        return _symmetrise(c * elig.to(c.dtype), diag) * pair.to(c.dtype)
 
     # balanced: per SAMPLE, drop `rate` of the 1s and raise the SAME COUNT of 0s.
     pos = elig & (c > 0.5)
@@ -78,4 +84,4 @@ def augment_contacts(
         add = n_idx[torch.randperm(n_idx.shape[0], device=device, generator=generator)[:k]]
         out[b, drop[:, 0], drop[:, 1]] = 0.0
         out[b, add[:, 0], add[:, 1]] = 1.0
-    return _symmetrise(out * elig.to(out.dtype)) * pair.to(out.dtype)
+    return _symmetrise(out * elig.to(out.dtype), diag) * pair.to(out.dtype)
