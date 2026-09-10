@@ -30,9 +30,11 @@ trap 'echo "[$(date)] SIGUSR1 received; waiting for SIGTERM."' USR1
 REPO=/orcd/scratch/orcd/011/chenxiou/proteina_tri
 ENV_DIR=/home/chenxiou/cue-openfold-env-sm120
 export DATA_PATH=/orcd/pool/006/chenxiou/proteina/data
-# Default = the v2 index (both template trees, 99.4% train-cluster coverage, audited 16/16 on
-# 2026-09-10). v1 (synth_index/, 89.9% coverage) is kept intact as the fallback.
-export SYNTH_INDEX_DIR="${SYNTH_INDEX_DIR:-/orcd/scratch/orcd/011/chenxiou/synth_index_v2}"
+# Default = the v3 index, the ONLY one built with the corrected element->residue spans (DSSP_GAP
+# runs) and the 8-channel featurization. Verified 2026-09-10: audit 16/16, coverage 99.4% of train
+# clusters, and 0 of 400 chains span-shifted (v2 measured 9 of 400). v2 and v1 are kept intact but
+# are NOT compatible with this code -- the transform raises on their stored feature width.
+export SYNTH_INDEX_DIR="${SYNTH_INDEX_DIR:-/orcd/scratch/orcd/011/chenxiou/synth_index_v3}"
 # 0.3 / 0.3 chosen by the user 2026-09-10 from the 1500-step sweep (job 22483230): at 0.3 the
 # alignment head learns exactly as well as at 1.0 (prec@Q 0.531 vs 0.530) for a smaller cost on the
 # main objective (cm_loss +0.0152 vs +0.0226), and 0.3 is also AF2 SI 1.9's auxiliary weight.
