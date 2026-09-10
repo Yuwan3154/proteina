@@ -236,8 +236,11 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             )
         return self._chain_to_cat
 
-    def _restrict_to_eligible(self, mapping: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    def _restrict_to_eligible(self, mapping: Dict[str, List[str]], strict: bool = True) -> Dict[str, List[str]]:
         """Keep only eligible members in every cluster and drop clusters left empty.
+
+        strict=False (val/test): a split with NO eligible member keeps its original mapping with a
+        warning instead of raising, so a tiny smoke index does not abort validation.
 
         Used with synthetic topology references: a chain without a template must never be drawn
         (the transform's fallback is unconditional and logged as an error), so the per-cluster
@@ -259,7 +262,10 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             f"members {n_members_before} -> {n_members_after}"
         )
         if not out:
-            raise ValueError("eligible_ids_file left no cluster with an eligible member")
+            if strict:
+                raise ValueError("eligible_ids_file left no cluster with an eligible member")
+            logger.warning("eligible_ids_file left no eligible member in this split; keeping it unrestricted")
+            return mapping
         return out
 
     def _get_dataloader(
@@ -310,7 +316,8 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             shuffle = False
         elif clusterid_to_seqid_mapping and self.sampling_mode != "random":
             if self.eligible_ids_file:
-                clusterid_to_seqid_mapping = self._restrict_to_eligible(clusterid_to_seqid_mapping)
+                clusterid_to_seqid_mapping = self._restrict_to_eligible(
+                    clusterid_to_seqid_mapping, strict=dataset is self.train_ds)
             sampler = ClusterSampler(
                 dataset=dataset,
                 clusterid_to_seqid_mapping=clusterid_to_seqid_mapping,
