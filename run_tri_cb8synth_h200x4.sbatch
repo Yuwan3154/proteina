@@ -30,7 +30,9 @@ trap 'echo "[$(date)] SIGUSR1 received; waiting for SIGTERM."' USR1
 REPO=/orcd/scratch/orcd/011/chenxiou/proteina_tri
 ENV_DIR=/home/chenxiou/cue-openfold-env-sm120
 export DATA_PATH=/orcd/pool/006/chenxiou/proteina/data
-export SYNTH_INDEX_DIR="${SYNTH_INDEX_DIR:-/orcd/scratch/orcd/011/chenxiou/synth_index}"
+# Default = the v2 index (both template trees, 99.4% train-cluster coverage, audited 16/16 on
+# 2026-09-10). v1 (synth_index/, 89.9% coverage) is kept intact as the fallback.
+export SYNTH_INDEX_DIR="${SYNTH_INDEX_DIR:-/orcd/scratch/orcd/011/chenxiou/synth_index_v2}"
 export ALIGN_W="${ALIGN_W:?ALIGN_W (alignment loss weight) must be set from the recorded sweep}"
 export MLM_W="${MLM_W:?MLM_W (masked-token loss weight) must be set from the recorded sweep}"
 CONFIG="${CONFIG:-training_contact_tri_full384_cb8synth_v1}"
