@@ -27,6 +27,7 @@ from proteinfoundation.datasets.sse_topology import (
     DSSP_STRAND,
     MASK_TOKEN,
     N_PAIR_FEATURES,
+    STRUCTURAL_PAIR_FEATURES,
 )
 from proteinfoundation.datasets.topology_reference import (
     ALIGN_NONE,
@@ -35,7 +36,7 @@ from proteinfoundation.datasets.topology_reference import (
 )
 
 PASS, FAIL = [], []
-N_STRUCT = 4
+N_STRUCT = len(STRUCTURAL_PAIR_FEATURES)  # derived: 4 before the CA-CA channels were dropped, 2 after
 L_A, L_B = 30, 20
 # native: loop3 helix10 loop2 strand8 loop7 (= 30 residues, 2 helix/strand elements)
 RUNS_A = [(0, 3), (1, 10), (0, 2), (2, 8), (0, 7)]
