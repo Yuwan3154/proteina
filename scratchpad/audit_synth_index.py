@@ -7,8 +7,10 @@ tensors describe what they claim to.
   1. structure: every group = 1 native row + its template rows; natives have row_is_native and TM 1;
      template TMs lie in the build band; members_flat never points at a native row.
   2. eligible list == exactly the chains with >= 1 template row in the training TM range.
-  3. alignment: align vector length == the chain's residue count; every value is -1 or a valid
-     element index of THAT template row; the aligned fraction is sane (not ~0, not ~1).
+  3. alignment: every template row of a group shares ONE align length, that length equals the
+     chain's residue count read from the processed .pt (authoritative -- NOT the sum of DSSP run
+     lengths, which drops residues whose backbone is incomplete), and every value is -1 or a valid
+     element index of THAT row; the aligned fraction is sane (not ~0, not ~1).
   4. features: he_flat is a binary TxT block of the right size; feat_flat has T*T*4 entries and is
      finite; the standardisation constants are finite and non-degenerate.
   5. the transform can actually build a reference from the index for a sampled chain (synthetic
@@ -19,7 +21,9 @@ usage: python audit_synth_index.py <index.pt> <eligible.txt> [--n 200] [--seed 0
 
 import argparse
 import collections
+import json
 import os
+import pathlib
 import random
 import sys
 
@@ -47,6 +51,7 @@ def main():
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tm-range", type=float, nargs=2, default=(0.5, 0.9))
+    ap.add_argument("--processed-dir", default="", help="pdb_train/processed, for the authoritative length check")
     a = ap.parse_args()
     lo, hi = a.tm_range
 
@@ -99,15 +104,19 @@ def main():
     runs_off, runs_flat = idx["runs_offset"].numpy(), idx["runs_flat"]
     bad_align_len = bad_align_val = bad_he = bad_feat = 0
     frac_aligned = []
+    align_len_of = {}
     for g in sample:
         nat = int(np.flatnonzero((cluster_of == g) & is_native)[0])
-        n_res = int(runs_flat[runs_off[nat]:runs_off[nat + 1]][:, 1].sum())
+        # ⛔ NOT sum(run lengths): dssp_to_runs drops residues with an incomplete backbone (-1) and
+        # runs below min_len, so that sum under-counts. The rows must merely AGREE with each other;
+        # the absolute length is checked against the processed .pt below, which is authoritative.
+        lens = {int(a_off[int(r) + 1] - a_off[int(r)]) for r in m_flat[m_off[g]:m_off[g + 1]]}
+        if len(lens) > 1:
+            bad_align_len += 1
+        align_len_of[str(ids[nat])] = max(lens) if lens else 0
         for r in m_flat[m_off[g]:m_off[g + 1]]:
             r = int(r)
             al = a_flat[a_off[r]:a_off[r + 1]].numpy()
-            if al.size != n_res:
-                bad_align_len += 1
-                continue
             T = int(he_size[r])
             if ((al != ALIGN_NONE) & ((al < 0) | (al >= max(T, 1)))).any():
                 bad_align_val += 1
@@ -118,7 +127,22 @@ def main():
             fe = f_flat[f_off[r]:f_off[r + 1]]
             if fe.numel() != T * T * len(STRUCTURAL_PAIR_FEATURES) or not bool(torch.isfinite(fe.float()).all()):
                 bad_feat += 1
-    check("alignment vectors have the native's residue length", bad_align_len == 0, f"{bad_align_len} bad")
+    check("all template rows of a chain share one alignment length", bad_align_len == 0, f"{bad_align_len} groups disagree")
+    # authoritative: the residue count on disk, for a subsample
+    if a.processed_dir:
+        from proteinfoundation.datasets.pdb_data import _processed_path_sharded
+        man = os.path.join(a.processed_dir, "..", "shard_manifest.json")
+        manifest = json.load(open(man)) if os.path.exists(man) else None
+        n_chk = n_bad = 0
+        for stem, alen in list(align_len_of.items())[:40]:
+            pt = _processed_path_sharded(pathlib.Path(a.processed_dir), stem, manifest)
+            if not pt.exists():
+                continue
+            g_ = torch.load(str(pt), map_location="cpu", weights_only=False)
+            n_chk += 1
+            n_bad += int(alen != int(g_.coords.shape[0]))
+        check("alignment length == residue count in the processed .pt", n_bad == 0,
+              f"{n_bad} of {n_chk} chains differ")
     check("alignment values are -1 or a valid element index", bad_align_val == 0, f"{bad_align_val} bad")
     check("SSE contact blocks are binary and T x T", bad_he == 0, f"{bad_he} bad")
     check("structural features are finite and T x T x 4", bad_feat == 0, f"{bad_feat} bad")
