@@ -6,9 +6,10 @@ on the FULL residue axis (`elem = full((L,), -1); elem[s:t] = a` in sse_contact_
 sse_structural_pair_features and the synthetic-index builder), so every element after a dropped
 residue is shifted LEFT by the number of residues dropped before it.
 
-Measured incidence on the v2 synthetic index (job 22483503): 335,203 of 2,280,757 alignment-carrying
-rows (14.70%) have sum(run lengths) != alignment length, i.e. their element map and their residue
-axis disagree.
+Measured incidence (job 22484779, 400 eligible chains, per STRUCTURE): 9 of 400 = 2.2% of chains
+have sum(run lengths) != residue count -- median 1 residue dropped, mean 36.9, max 323. Every
+element after the first gap is mislabelled. (An earlier 14.70% figure compared a template row's
+runs against the NATIVE's residue count -- two different structures -- and is retracted.)
 
 These tests FAIL on the current code. They are the acceptance criteria for the fix.
 """
