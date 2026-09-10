@@ -86,6 +86,9 @@ lora:
 opt:
   lr: 0.0001
   max_epochs: 1000   # full dataset; the overfit runs peaked by epoch ~120
+  # Hard stop in optimizer steps; -1 = unbounded (the production run). The sweep/smoke launcher
+  # overrides it on the command line, and hydra's struct mode refuses a key the file lacks.
+  max_steps: -1
   accumulate_grad_batches: 8    # 4 GPUs x bs 1 x 8 = effective batch 32, unchanged from the 2-GPU arms (user, D4).
                                 # MEASURED: tri fits batch 1 ONLY on a 95 GB RTX PRO 6000
                                 #  (71.81 GB = 76% of card at L=384; batch 2 OOMs).
