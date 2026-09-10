@@ -30,16 +30,21 @@ def resolve(df, key):
     return None
 
 
-def tail_stats(df, key, frac):
+def tail_stats(df, key, frac, upto=None):
+    """Tail statistics of `key`. `upto` caps the step range so arms that ran different numbers of
+    steps (a preempted arm restarts at 0) are compared over the SAME window -- otherwise the control
+    could be read at step 800 against an arm at 1500 and the difference would be schedule, not weight."""
     col = resolve(df, key)
     if col is None or "trainer/global_step" not in df.columns:
         return None
     d = df[["trainer/global_step", col]].dropna()
+    if upto is not None:
+        d = d[d["trainer/global_step"] <= upto]
     if d.empty:
         return None
-    cut = d["trainer/global_step"].max() * (1 - frac)
-    t = d[d["trainer/global_step"] >= cut][col].to_numpy()
-    return float(t.mean()), float(t.std(ddof=1) if len(t) > 1 else 0.0), int(d["trainer/global_step"].max())
+    hi = d["trainer/global_step"].max()
+    t = d[d["trainer/global_step"] >= hi * (1 - frac)][col].to_numpy()
+    return float(t.mean()), float(t.std(ddof=1) if len(t) > 1 else 0.0), int(hi)
 
 
 def main():
@@ -63,11 +68,16 @@ def main():
     if "ctrl" not in hist:
         print("no ctrl arm found -- nothing to compare against")
     ctrl = hist.get("ctrl")
+    # compare every arm over the window they all reached
+    common = min((int(df["trainer/global_step"].max()) for df, _ in hist.values()
+                  if "trainer/global_step" in df.columns and not df["trainer/global_step"].dropna().empty),
+                 default=None)
+    print(f"common step window: 0-{common} (arms are compared only where ALL of them have data)")
     print(f"\n{'arm':>12} {'steps':>6} | {'cm_loss tail':>14} {'d vs ctrl':>10} | {'precL tail':>11} {'d vs ctrl':>10} | align_loss  prec@Q | mlm_loss  acc | missing_ref")
     for arm, (df, cfg) in sorted(hist.items()):
         row = [f"{arm:>12}"]
-        cm = tail_stats(df, MAIN_KEYS[0], args.tail)
-        pl = tail_stats(df, MAIN_KEYS[1], args.tail)
+        cm = tail_stats(df, MAIN_KEYS[0], args.tail, common)
+        pl = tail_stats(df, MAIN_KEYS[1], args.tail, common)
         steps = cm[2] if cm else 0
         row.append(f"{steps:6d} |")
         for key, st in ((MAIN_KEYS[0], cm), (MAIN_KEYS[1], pl)):
@@ -76,16 +86,16 @@ def main():
                 continue
             d = ""
             if ctrl is not None and arm != "ctrl":
-                cs = tail_stats(ctrl[0], key, args.tail)
+                cs = tail_stats(ctrl[0], key, args.tail, common)
                 if cs:
                     delta = st[0] - cs[0]
                     flag = "" if abs(delta) <= 2 * max(cs[1], 1e-9) else (" WORSE" if (delta > 0) == (key.endswith("loss")) else " better")
                     d = f"{delta:+.4f}{flag}"
             row.append(f"{st[0]:8.4f}±{st[1]:.4f} {d:>10} |")
-        a = tail_stats(df, "train/align_loss", args.tail)
-        q = tail_stats(df, "train/align_precision_at_q", args.tail)
-        m = tail_stats(df, "train/mlm_loss", args.tail)
-        acc = tail_stats(df, "train/mlm_acc", args.tail)
+        a = tail_stats(df, "train/align_loss", args.tail, common)
+        q = tail_stats(df, "train/align_precision_at_q", args.tail, common)
+        m = tail_stats(df, "train/mlm_loss", args.tail, common)
+        acc = tail_stats(df, "train/mlm_acc", args.tail, common)
         mr = tail_stats(df, "train/topology_missing_ref_frac", 1.0)
         row.append(f" {a[0] if a else float('nan'):9.4f} {q[0] if q else float('nan'):6.3f} | {m[0] if m else float('nan'):8.4f} {acc[0] if acc else float('nan'):5.3f} | {mr[0] if mr else float('nan'):.4f}")
         print(" ".join(row))
