@@ -65,6 +65,7 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         cath_balanced_sharpness_power: float = 1.0,
         cath_balanced_member_tracking: bool = False,
         cath_balanced_emit_topology: bool = False,
+        eligible_ids_file: Optional[str] = None,
     ):
         """Initialising the base data module class.
 
@@ -130,6 +131,9 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         self.cath_balanced_sharpness_power = cath_balanced_sharpness_power
         self.cath_balanced_member_tracking = cath_balanced_member_tracking
         self.cath_balanced_emit_topology = cath_balanced_emit_topology
+        # Restrict cluster draws to these chain ids (one per line), e.g. chains that have a
+        # synthetic topology reference; clusters left with no eligible member are dropped.
+        self.eligible_ids_file = eligible_ids_file
         self._chain_to_cat = None  # lazy cache for cath-balanced sampling
         # Last-built samplers kept on the datamodule so on_{train,validation}_epoch_start
         # can call set_epoch even on Lightning versions that don't auto-propagate.
@@ -232,6 +236,32 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             )
         return self._chain_to_cat
 
+    def _restrict_to_eligible(self, mapping: Dict[str, List[str]]) -> Dict[str, List[str]]:
+        """Keep only eligible members in every cluster and drop clusters left empty.
+
+        Used with synthetic topology references: a chain without a template must never be drawn
+        (the transform's fallback is unconditional and logged as an error), so the per-cluster
+        draw is restricted to templated members. The cluster count shrinks accordingly; the
+        dropped clusters are reported so the coverage gap is visible in the log, not hidden.
+        """
+        with open(self.eligible_ids_file) as fh:
+            eligible = {line.strip() for line in fh if line.strip()}
+        out = {}
+        n_members_before = sum(len(v) for v in mapping.values())
+        for cl, seqs in mapping.items():
+            kept = [s for s in seqs if s in eligible]
+            if kept:
+                out[cl] = kept
+        n_members_after = sum(len(v) for v in out.values())
+        logger.info(
+            f"eligible_ids_file={self.eligible_ids_file}: {len(eligible)} eligible ids; clusters "
+            f"{len(mapping)} -> {len(out)} ({len(mapping) - len(out)} dropped, no eligible member); "
+            f"members {n_members_before} -> {n_members_after}"
+        )
+        if not out:
+            raise ValueError("eligible_ids_file left no cluster with an eligible member")
+        return out
+
     def _get_dataloader(
         self,
         dataset: Dataset,
@@ -279,6 +309,8 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             )
             shuffle = False
         elif clusterid_to_seqid_mapping and self.sampling_mode != "random":
+            if self.eligible_ids_file:
+                clusterid_to_seqid_mapping = self._restrict_to_eligible(clusterid_to_seqid_mapping)
             sampler = ClusterSampler(
                 dataset=dataset,
                 clusterid_to_seqid_mapping=clusterid_to_seqid_mapping,
