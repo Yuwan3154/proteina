@@ -52,6 +52,12 @@ datamodule:
       type_mutate_prob: 0.1          # per-element probability of a helix <-> strand flip (user, D5)
       token_mask_prob: 0.1           # per-element probability of MASKing the token; target kept for the MLM loss (user, D5)
       drop_prob: 0.25                # train an unconditional branch for classifier-free guidance.
+      drop_ref_len_range: [5, 39]    # a DROPPED reference is a variable-length FULLY MASKED
+                                     # scratch pad, not one dead token (user, D20). Range = the
+                                     # p5-p95 of what training actually serves, MEASURED over 1,500
+                                     # references (job 22502519: p5 5, median 20, p95 39).
+                                     # Drawn independently of the chain, so the unconditional branch
+                                     # cannot leak the query's own topology. [1, 1] = old behaviour.
       self_fallback: True            # irrelevant in synthetic mode (never self); kept for the cluster-mode reader
       min_len: 1                     # 1-residue elements are kept: 16.87% of all elements
     - _target_: "proteinfoundation.datasets.transforms.PaddingTransform"
