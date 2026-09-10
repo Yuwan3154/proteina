@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=synthidx
-#SBATCH --partition=mit_normal
+#SBATCH --partition=pi_so3,mit_normal
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
@@ -20,7 +20,14 @@ T2=/orcd/compute/so3/002/chenxi/of_run/pp1c_work
 EXTRA=/orcd/scratch/orcd/011/chenxiou/t2_extra           # templates generated for uncovered clusters (B4)
 mkdir -p "$OUT/parts" "$OUT/logs"
 cd "$REPO"
-source /home/chenxiou/cue-openfold-env-sm120/.venv/bin/activate
+# conda env cue_openfold (torch cu126, pydssp): the sm120 uv venv has no pydssp, and the training
+# jobs import from that venv live, so it is not modified. CPU-only work; the CUDA build is moot.
+module load miniforge
+set +u
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda deactivate 2>/dev/null
+conda activate cue_openfold
+set -u
 export CUE_HOST=engaging DATA_PATH=/orcd/pool/006/chenxiou/proteina/data
 export SKIP_CONFIND_PRECOMPUTE=1 PYTHONPATH=$REPO${PYTHONPATH:+:$PYTHONPATH} CUDA_VISIBLE_DEVICES=""
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
