@@ -210,6 +210,11 @@ def main():
         if not all(torch.isfinite(torch.tensor(cm[k])) for k in need):
             print("FAIL: non-finite loss", flush=True)
             return 8
+        if torch.cuda.is_available():
+            # the number a card must have: NDIFF x diff_chunk memory is decided from this, not guessed
+            print(f"[mem] peak allocated {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB, "
+                  f"peak reserved {torch.cuda.max_memory_reserved() / 2**30:.1f} GiB "
+                  f"(n_diff={args.n_diff}, diff_chunk={args.diff_chunk}, accum={args.accum})", flush=True)
         print("SMOKE OK: finite losses produced on real batches", flush=True)
     return 0
 
