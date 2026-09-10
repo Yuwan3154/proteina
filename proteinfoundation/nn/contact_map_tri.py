@@ -295,7 +295,10 @@ class ContactMapTriSiT(nn.Module):
             # than branching) keeps the graph shape identical across ranks, which DDP requires.
             seq_dropped = batch.get("seq_dropped")
             if seq_dropped is not None:
-                keep_seq = 1.0 - seq_dropped.reshape(-1, 1, 1).to(e.dtype)
+                # ⛔ reshape(-1, 1, 1) is what OOM'd 22501212: a padded [B, 384] flag became
+                # [384, 1, 1] and broadcast e from [B, L, dim] to [384, L, dim]. Index the BATCH
+                # dimension explicitly so a wrong shape cannot silently expand the tensor.
+                keep_seq = 1.0 - seq_dropped.reshape(B, -1)[:, :1, None].to(e.dtype)
                 e = e * keep_seq
             q_feat = e  # the only per-token query features tri has; the OT head reads them
             e = F.pad(e, (0, 0, 0, T))

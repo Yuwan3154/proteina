@@ -36,6 +36,11 @@ from proteinfoundation.utils.ff_utils.pdb_utils import extract_cath_code_by_leve
 from proteinfoundation.utils.dense_padding_data_loader import FLOAT_PADDING_VALUE
 from proteinfoundation.utils.frozen_str_map import FrozenStrMap
 
+# Keys that carry ONE value per graph, not one per residue. They are stored as shape [1], which the
+# padder cannot distinguish from a 1-residue tensor, so they must be named here or they get padded
+# to the residue axis. (`topology_*` keys are skipped by their own prefix rule below.)
+PER_GRAPH_KEYS = frozenset({"seq_dropped"})
+
 
 def sample_uniform_rotation(shape=(), dtype=None, device=None) -> torch.Tensor:
     """Samples rotation matrices uniformly from SO(3).
@@ -257,6 +262,13 @@ class PaddingTransform(T.BaseTransform):
                         fill_value = 2  # unknown class for padded residues
                     elif key == "ref_align_target":
                         fill_value = -1  # ALIGN_NONE: padded residues align to nothing
+                    if key in PER_GRAPH_KEYS:
+                        # ⛔ A per-GRAPH scalar is stored as shape [1], which is indistinguishable
+                        # from a 1-residue per-RESIDUE tensor. Padding it to max_size turned
+                        # `seq_dropped` into [384]; the model then reshaped it to [384, 1, 1] and
+                        # broadcast the sequence embedding from [1, 384, 320] to [384, 384, 320],
+                        # blowing the pair grid up to ~92 GiB (tri_cb8synth 22501212 OOM).
+                        continue
                     if key.startswith("topology_"):
                         # Left unpadded on purpose: the dense collate pads each key to the BATCH
                         # maximum, so the topology axes cost what a batch actually needs (median
