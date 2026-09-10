@@ -26,6 +26,7 @@ from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from proteinfoundation.nn.af3_diffusion import (
     SIGMA_DATA,
@@ -100,8 +101,14 @@ class ContactToCoord(nn.Module):
         c_noise_embedding: int = 256,
         n_diffusion_samples: int = 48,
         t_beta=None,
+        diff_chunk: int = 0,
     ):
         super().__init__()
+        # Run the diffusion module over the expanded (B x n_diffusion_samples) batch in slices of
+        # this many samples, each under activation checkpointing, so peak activation memory is
+        # ~one slice instead of all n samples (that is what lets AF3's 48 fit on one card).
+        # 0 = no slicing, bit-identical to the original single call. Adds no parameters.
+        self.diff_chunk = int(diff_chunk)
         self.c_s, self.c_z, self.c_token, self.c_atom = c_s, c_z, c_token, c_atom
         # AF3's diffusion mini-batch (SI Alg. 20); Protenix ships 48 (configs_base.py:122).
         self.n_diffusion_samples = n_diffusion_samples
@@ -207,6 +214,13 @@ class ContactToCoord(nn.Module):
         ratio = b / SIGMA_DATA
         return x_noisy / (1.0 + ratio ** 2) + upd * b / torch.sqrt(1.0 + ratio ** 2)
 
+    def _denoise_masked(self, x_noisy, sigma, s, z, mask, ref_feats, ref_pos, atom_to_token,
+                        atom_mask, ref_space_uid):
+        """denoise() with padded atoms zeroed; a plain function of its inputs so it can be
+        activation-checkpointed per sample chunk."""
+        return self.denoise(x_noisy, sigma, s, z, mask, ref_feats, ref_pos, atom_to_token,
+                            atom_mask, ref_space_uid) * atom_mask[..., None]
+
     def forward(self, batch: Dict[str, torch.Tensor], run_rollout: bool = False):
         contacts, aatype, mask = batch["contacts"], batch["aatype"], batch["mask"]
         ref_feats, ref_pos = batch["ref_feats"], batch["ref_pos"]
@@ -251,12 +265,21 @@ class ContactToCoord(nn.Module):
             sig_flat = sigma.reshape(B * n)
             x_noisy = x_rep + torch.randn_like(x_rep) * sig_flat[:, None, None]
             # The trunk runs ONCE; only the diffusion module sees the expanded batch.
-            rep = lambda t: t.repeat_interleave(n, dim=0)
-            out["x_denoised"] = self.denoise(
-                x_noisy, sig_flat, rep(s), rep(z), rep(mask), rep(ref_feats), rep(ref_pos),
-                rep(atom_to_token), rep(atom_mask), rep(ref_space_uid)
-            ) * rep(atom_mask)[..., None]
-            out["atom_mask_rep"] = rep(atom_mask)
+            # bidx maps each expanded row to its structure, so per-chunk gathers replace a full
+            # repeat_interleave of every trunk tensor (z alone is n x [L, L, c_z]).
+            bidx = torch.arange(B, device=x_gt.device).repeat_interleave(n)
+            trunk = (s, z, mask, ref_feats, ref_pos, atom_to_token, atom_mask, ref_space_uid)
+            step = B * n if self.diff_chunk <= 0 else min(self.diff_chunk, B * n)
+            parts = []
+            for i in range(0, B * n, step):
+                sl = slice(i, i + step)
+                args = (x_noisy[sl], sig_flat[sl]) + tuple(t[bidx[sl]] for t in trunk)
+                if step < B * n and torch.is_grad_enabled():
+                    parts.append(checkpoint(self._denoise_masked, *args, use_reentrant=False))
+                else:
+                    parts.append(self._denoise_masked(*args))
+            out["x_denoised"] = torch.cat(parts, dim=0)
+            out["atom_mask_rep"] = atom_mask[bidx]
             out["x_gt_rep"] = x_rep
             out["sigma"] = sig_flat
         if run_rollout or x_gt is None:

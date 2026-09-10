@@ -46,6 +46,9 @@ def main():
     # sigma = noise_schedule(t). t=0 is FULL NOISE (verified in Proteina r3n_fm.py:156), so a
     # Beta skewed toward 0 samples MORE at high noise. "1.3,2.0" is the user's own Proteina
     # recipe. Empty string = AF3 lognormal = current behaviour, unchanged.
+    # Diffusion-module slicing (activation-checkpointed): run the n_diff samples in chunks of this
+    # size so 48 fits on one card; 0 = one call, bit-identical to before. See contact2coord.py.
+    ap.add_argument("--diff_chunk", type=int, default=0)
     ap.add_argument("--t_beta", default="",
                     help="p1,p2 for Proteina mix_up02_beta noise sampling, e.g. 1.3,2.0")
     ap.add_argument("--lr", type=float, default=None)
@@ -77,6 +80,7 @@ def main():
     # Each DDP rank would pin a DIFFERENT first batch; the one-structure run is single-device.
     assert not (args.overfit and args.devices > 1), "--overfit requires --devices 1"
     MODEL_CFG["n_diffusion_samples"] = args.n_diff
+    MODEL_CFG["diff_chunk"] = args.diff_chunk
     MODEL_CFG["t_beta"] = (tuple(float(v) for v in args.t_beta.split(","))
                            if args.t_beta else None)
 
@@ -104,7 +108,7 @@ def main():
     n_par = sum(p.numel() for p in model.parameters())
     print(f"[model] {n_par/1e6:.2f} M parameters, {MODEL_CFG['n_blocks']} diffusion blocks, "
           f"n_diffusion_samples={args.n_diff}, lr={model.lr}, warmup={model.warmup_steps}, "
-          f"t_beta={MODEL_CFG['t_beta']}, smooth_lddt={not args.no_lddt}, "
+          f"t_beta={MODEL_CFG['t_beta']}, diff_chunk={args.diff_chunk}, smooth_lddt={not args.no_lddt}, "
           f"overfit={args.overfit}, seed={args.seed}", flush=True)
     print(f"[dump] validation structures -> "
           f"{dump_dir if args.n_dump > 0 else 'DISABLED (n_dump=0)'}", flush=True)
