@@ -28,6 +28,7 @@ import lightning as L
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 import wandb
 from jaxtyping import Bool, Float
 from loguru import logger
@@ -1530,6 +1531,9 @@ class ModelTrainerBase(L.LightningModule):
                 )
                 train_loss = train_loss + dssp_loss_weight * torch.mean(dssp_loss_total)
 
+            # Topology-reference auxiliary losses (alignment head, masked-token head); 0 when off.
+            train_loss = train_loss + self._topology_aux_losses(nn_out, batch, mask, log_prefix)
+
             if predict_coords:
                 x_1_pred = nn_out["coords_pred"]
                 pred_frames_tensor7 = None
@@ -2939,6 +2943,114 @@ class ModelTrainerBase(L.LightningModule):
     def _t_bin_name(cls, t_value: float) -> str:
         lo, hi = cls.T_BIN_EDGES
         return cls.T_BIN_NAMES[0] if t_value < lo else (cls.T_BIN_NAMES[1] if t_value < hi else cls.T_BIN_NAMES[2])
+
+    def _topology_aux_losses(self, nn_out, batch, mask, log_prefix):
+        """Auxiliary losses on the topology reference, each skipped entirely at weight 0.
+
+        align  -- the Q x T alignment head (the probing head, now trained end to end): which
+                  reference helix/strand element each query residue is structurally aligned to,
+                  from the USalign ground truth the index stores (``ref_align_target``, -1 = none).
+                  ``loss.align_loss`` = "softmax" (per residue over T elements + "none", the
+                  one-to-one structure of the target) or "bce" (per cell with pos_weight, the
+                  probe's exact form). Samples with no aligned residue (dropped/MASK references,
+                  chains without ground truth) contribute nothing.
+        mlm    -- masked-token prediction of the reference's pre-mask helix/strand tokens
+                  (``topology_he_tokens_target`` > 1 marks a masked element).
+        Also reports the rate of the synthetic-reference fallback (``topology_missing_ref``), which
+        is supposed to stay at 0.
+        Every self.log here is unconditional given the config, so DDP ranks never disagree on the
+        set of collectives.
+        """
+        loss_cfg = self.cfg_exp.loss
+        w_align = float(loss_cfg.get("align_loss_weight", 0.0))
+        w_mlm = float(loss_cfg.get("mlm_loss_weight", 0.0))
+        total = torch.zeros((), device=mask.device, dtype=torch.float32)
+        bs = mask.shape[0]
+        log_kw = dict(on_step=True, on_epoch=True, prog_bar=False, logger=True, batch_size=bs,
+                      sync_dist=True, add_dataloader_idx=False)
+        missing = batch.get("topology_missing_ref")
+        if missing is not None:
+            self.log(f"{log_prefix}/topology_missing_ref_frac", missing.float().mean(), **log_kw)
+        if w_align <= 0.0 and w_mlm <= 0.0:
+            return total
+        he_tokens = batch.get("topology_he_tokens")
+        if he_tokens is None:
+            raise ValueError("align/mlm loss weights > 0 but the batch carries no topology_he_tokens")
+        q_valid = mask.bool()
+        he_valid = he_tokens > 0  # a MASKed element (token 1) is still a real element
+
+        if w_align > 0.0:
+            a_logits = nn_out.get("align_logits")
+            tgt = batch.get("ref_align_target")
+            if a_logits is None or tgt is None:
+                raise ValueError("align_loss_weight > 0 requires nn.align_head.enabled and a dataset "
+                                 "that emits ref_align_target (synthetic topology index with alignments)")
+            B, L, T = a_logits.shape
+            tgt = tgt[:, :L].long()
+            qt_valid = q_valid[:, :, None] & he_valid[:, None, :]
+            aligned = (tgt >= 0) & (tgt < T) & q_valid                    # [B, L]
+            A = torch.zeros_like(a_logits)
+            A.scatter_(2, tgt.clamp(min=0)[..., None], aligned[..., None].to(A.dtype))
+            Q = aligned.sum(1)                                              # true rows per sample
+            has_q = Q > 0
+            form = str(loss_cfg.get("align_loss", "softmax"))
+            if form == "bce":
+                # the probe's form: per-cell BCE, positives up-weighted by (#cells - #pos) / #pos
+                n_valid = qt_valid.sum((1, 2)).clamp(min=1).to(A.dtype)
+                n_pos = A.sum((1, 2)).clamp(min=1)
+                pw = ((n_valid - n_pos) / n_pos)[:, None, None]
+                ls = F.logsigmoid(a_logits)
+                ls_neg = F.logsigmoid(-a_logits)
+                cell = -(pw * A * ls + (1.0 - A) * ls_neg) * qt_valid.to(A.dtype)
+                per_sample = cell.sum((1, 2)) / n_valid
+            elif form == "softmax":
+                none_logit = nn_out["align_none_logits"][..., None]        # [B, L, 1]
+                el = a_logits.masked_fill(~he_valid[:, None, :], -1e4)
+                logits_all = torch.cat([el, none_logit], dim=-1)          # [B, L, T + 1]
+                cls = torch.where(aligned, tgt.clamp(min=0), torch.full_like(tgt, T))
+                ce = F.cross_entropy(logits_all.transpose(1, 2), cls, reduction="none")  # [B, L]
+                per_sample = (ce * q_valid).sum(1) / q_valid.sum(1).clamp(min=1)
+            else:
+                raise ValueError(f"loss.align_loss must be 'softmax' or 'bce', got {form!r}")
+            align_loss = (per_sample * has_q).sum() / has_q.sum().clamp(min=1)
+            with torch.no_grad():
+                # precision@Q per sample (the probe's metric): top-Q scored cells that are true
+                score = a_logits.masked_fill(~qt_valid, float("-inf")).reshape(B, -1)
+                flat_a = A.reshape(B, -1)
+                pq = []
+                for b in range(B):
+                    q = int(Q[b])
+                    if q == 0:
+                        continue
+                    top = torch.topk(score[b], min(q, score.shape[1])).indices
+                    pq.append(flat_a[b, top].mean())
+                prec = torch.stack(pq).mean() if pq else torch.zeros((), device=mask.device)
+            self.log(f"{log_prefix}/align_loss", align_loss.detach(), **log_kw)
+            self.log(f"{log_prefix}/align_precision_at_q", prec, **log_kw)
+            self.log(f"{log_prefix}/align_frac_samples", has_q.float().mean(), **log_kw)
+            total = total + w_align * align_loss
+
+        if w_mlm > 0.0:
+            m_logits = nn_out.get("mlm_logits")
+            m_tgt = batch.get("topology_he_tokens_target")
+            if m_logits is None or m_tgt is None:
+                raise ValueError("mlm_loss_weight > 0 requires nn.mlm_head.enabled and a dataset with "
+                                 "token_mask_prob > 0 (topology_he_tokens_target)")
+            T = m_logits.shape[1]
+            m_tgt = m_tgt[:, :T].long()
+            sel = m_tgt > 1                                                 # real tokens are >= 2
+            n_masked = sel.sum()
+            if int(n_masked) > 0:
+                mlm_loss = F.cross_entropy(m_logits[sel], m_tgt[sel])
+                acc = (m_logits[sel].argmax(-1) == m_tgt[sel]).float().mean()
+            else:
+                mlm_loss = torch.zeros((), device=mask.device)
+                acc = torch.zeros((), device=mask.device)
+            self.log(f"{log_prefix}/mlm_loss", mlm_loss.detach(), **log_kw)
+            self.log(f"{log_prefix}/mlm_acc", acc, **log_kw)
+            self.log(f"{log_prefix}/mlm_n_masked", n_masked.float(), **log_kw)
+            total = total + w_mlm * mlm_loss
+        return total
 
     def _log_single_step_contact_metrics(
         self, nn_out, batch, c_1, mask, t, log_prefix, val_step, batch_idx

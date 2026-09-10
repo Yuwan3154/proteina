@@ -193,6 +193,25 @@ class ContactMapTriSiT(nn.Module):
                 **sh_cfg,
             )
 
+        # Query x reference ALIGNMENT head: the probing head (Linear(dim -> 1) on the final Q x T
+        # block, scratchpad/probe_train.py) attached from step 0 and trained end to end against the
+        # USalign ground truth the index carries (ref_align_target). `align_none` scores the
+        # "aligned to no element" class from the query residue's own diagonal cell, for the
+        # per-residue softmax form of the loss; the BCE form ignores it. Off => no parameters, no
+        # outputs, the model is bit-identical to before.
+        ah_cfg = dict(kwargs.get("align_head") or {})
+        self.align_head = None
+        self.align_none = None
+        if ah_cfg.get("enabled", False):
+            self.align_head = nn.Linear(self.dim, 1)
+            self.align_none = nn.Linear(self.dim, 1)
+        # Masked-token (MLM) head over the reference's helix/strand tokens, read from the element's
+        # own diagonal cell of the final grid; target = the pre-mask token (topology_he_tokens_target).
+        mh_cfg = dict(kwargs.get("mlm_head") or {})
+        self.mlm_head = None
+        if mh_cfg.get("enabled", False):
+            self.mlm_head = nn.Linear(self.dim, self.topology_vocab_size)
+
         self.out_norm = nn.LayerNorm(self.dim)
         self.out = nn.Linear(self.dim, 1)
         nn.init.zeros_(self.out.weight)
@@ -309,7 +328,8 @@ class ContactMapTriSiT(nn.Module):
         for blk in self.blocks:
             z = blk(z, pair_mask, cond)
 
-        logits = self.out(self.out_norm(z))[..., 0]
+        zn = self.out_norm(z)
+        logits = self.out(zn)[..., 0]
         logits = logits[:, :L, :L]
         logits = 0.5 * (logits + logits.transpose(1, 2))  # a contact map is symmetric by definition
         # Padded cells carry a learned constant otherwise (LayerNorm of the masked-to-zero trunk
@@ -323,6 +343,16 @@ class ContactMapTriSiT(nn.Module):
             "contact_map_logits": logits,
             "contact_map_pred": torch.sigmoid(logits),
         }
+
+        if self.align_head is not None:
+            # [B, L, T]: query residue i vs reference element e, zero on non-real cells
+            qt_valid = q_valid[:, :, None] & he_valid[:, None, :]
+            out["align_logits"] = self.align_head(zn[:, :L, L:])[..., 0] * qt_valid.to(zn.dtype)
+            ar = torch.arange(L, device=device)
+            out["align_none_logits"] = self.align_none(zn[:, ar, ar])[..., 0] * q_valid.to(zn.dtype)
+        if self.mlm_head is not None:
+            at = torch.arange(L, N, device=device)
+            out["mlm_logits"] = self.mlm_head(zn[:, at, at])  # [B, T, vocab]
 
         if self.structure_head is not None:
             out.update(
