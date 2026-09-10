@@ -3013,6 +3013,11 @@ class ModelTrainerBase(L.LightningModule):
             else:
                 raise ValueError(f"loss.align_loss must be 'softmax' or 'bce', got {form!r}")
             align_loss = (per_sample * has_q).sum() / has_q.sum().clamp(min=1)
+            if form == "bce":
+                # ⛔ DDP refuses a parameter that produced no gradient. The "none" logit is only
+                # consumed by the softmax form, so under bce it needs a zero-valued touch to stay
+                # in the graph; the loss VALUE is unchanged.
+                align_loss = align_loss + 0.0 * nn_out["align_none_logits"].sum()
             with torch.no_grad():
                 # precision@Q per sample (the probe's metric): top-Q scored cells that are true
                 score = a_logits.masked_fill(~qt_valid, float("-inf")).reshape(B, -1)
@@ -3044,7 +3049,11 @@ class ModelTrainerBase(L.LightningModule):
                 mlm_loss = F.cross_entropy(m_logits[sel], m_tgt[sel])
                 acc = (m_logits[sel].argmax(-1) == m_tgt[sel]).float().mean()
             else:
-                mlm_loss = torch.zeros((), device=mask.device)
+                # ⛔ A step CAN mask nothing (token_mask_prob 0.1, batch 1, few elements). A plain
+                # zeros() would leave mlm_head with no gradient and DDP aborts the run with
+                # "parameters that were not used in producing the loss" -- measured on the smoke.
+                # A zero-scaled touch keeps the head in the graph at an unchanged loss value.
+                mlm_loss = 0.0 * m_logits.sum()
                 acc = torch.zeros((), device=mask.device)
             self.log(f"{log_prefix}/mlm_loss", mlm_loss.detach(), **log_kw)
             self.log(f"{log_prefix}/mlm_acc", acc, **log_kw)

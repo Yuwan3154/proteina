@@ -165,8 +165,21 @@ def main():
     check("mlm gradient reaches the trunk", trunk_grad_norm(both) > 0)
     b2 = dict(batch)
     b2["topology_he_tokens_target"] = torch.zeros(B, T, dtype=torch.long)
-    total, logged = run_helper(out, b2, align_loss_weight=0.0, mlm_loss_weight=1.0)
+    both.zero_grad(set_to_none=True)
+    out2 = both(dict(batch))
+    total, logged = run_helper(out2, b2, align_loss_weight=0.0, mlm_loss_weight=1.0)
     check("mlm: no masked positions -> loss 0, n_masked 0", float(total) == 0.0 and logged["train/mlm_n_masked"] == 0.0)
+    # ⛔ DDP aborts on a parameter that produced no gradient, so an empty step must still put the
+    # head in the graph (measured: the 1-GPU smoke died with "parameters that were not used").
+    total.backward()
+    check("mlm: empty step still gives mlm_head a gradient (DDP)",
+          both.mlm_head.weight.grad is not None and float(both.mlm_head.weight.grad.abs().sum()) == 0.0)
+    both.zero_grad(set_to_none=True)
+    out3 = both(dict(batch))
+    tb, _ = run_helper(out3, batch, align_loss_weight=1.0, mlm_loss_weight=0.0, align_loss="bce")
+    tb.backward()
+    check("bce: align_none still gets a (zero) gradient (DDP)",
+          both.align_none.weight.grad is not None and float(both.align_none.weight.grad.abs().sum()) == 0.0)
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     sys.exit(1 if FAIL else 0)
