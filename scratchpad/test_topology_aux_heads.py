@@ -83,6 +83,15 @@ class Stub:
         self.logged[name] = float(value)
 
 
+def trunk_grad_norm(model):
+    """Total gradient mass on the trunk (blocks + embeddings), excluding the heads themselves."""
+    tot = 0.0
+    for name, p in model.named_parameters():
+        if p.grad is not None and not name.startswith(("align_head", "align_none", "mlm_head", "out.", "out_norm")):
+            tot += float(p.grad.abs().sum())
+    return tot
+
+
 def run_helper(nn_out, batch, **loss):
     stub = Stub(**loss)
     total = ModelTrainerBase._topology_aux_losses(stub, nn_out, batch, batch["mask"], "train")
@@ -121,8 +130,9 @@ def main():
         total, logged = run_helper(out, batch, align_loss_weight=1.0, mlm_loss_weight=0.0, align_loss=form)
         check(f"[{form}] alignment loss finite and positive", torch.isfinite(total) and float(total) > 0, f"{float(total):.4f}")
         total.backward()
-        trunk_grad = both.blocks[0].parameters().__next__().grad
-        check(f"[{form}] gradient reaches the trunk (end to end)", trunk_grad is not None and float(trunk_grad.abs().sum()) > 0)
+        # at init OpenFold's zero-init output projections make the FIRST parameters' gradients zero, so
+        # test the block as a whole (its output projections and the embeddings do receive gradient)
+        check(f"[{form}] gradient reaches the trunk (end to end)", trunk_grad_norm(both) > 0)
         check(f"[{form}] align_frac_samples = 0.5 (one of two samples has ground truth)", abs(logged["train/align_frac_samples"] - 0.5) < 1e-6)
         check(f"[{form}] precision@Q logged in [0, 1]", 0.0 <= logged["train/align_precision_at_q"] <= 1.0)
 
@@ -152,7 +162,7 @@ def main():
     ce = torch.nn.functional.cross_entropy(out["mlm_logits"][0, 1:2], torch.tensor([17]))
     check("mlm loss equals CE at the masked position", abs(float(total) - float(ce)) < 1e-5)
     total.backward()
-    check("mlm gradient reaches the trunk", float(both.blocks[0].parameters().__next__().grad.abs().sum()) > 0)
+    check("mlm gradient reaches the trunk", trunk_grad_norm(both) > 0)
     b2 = dict(batch)
     b2["topology_he_tokens_target"] = torch.zeros(B, T, dtype=torch.long)
     total, logged = run_helper(out, b2, align_loss_weight=0.0, mlm_loss_weight=1.0)
