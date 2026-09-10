@@ -52,6 +52,10 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tm-range", type=float, nargs=2, default=(0.5, 0.9))
     ap.add_argument("--processed-dir", default="", help="pdb_train/processed, for the authoritative length check")
+    # ⛔ Explicit, NOT derived as processed-dir/..: `processed` is a SYMLINK to another filesystem, so
+    # ".." resolves through the link to the TARGET's parent and the manifest silently goes missing --
+    # which made the bucket None, every path wrong, and this check pass VACUOUSLY on 0 chains.
+    ap.add_argument("--manifest", default="", help="shard_manifest.json (usually pdb_train/shard_manifest.json)")
     a = ap.parse_args()
     lo, hi = a.tm_range
 
@@ -131,8 +135,10 @@ def main():
     # authoritative: the residue count on disk, for a subsample
     if a.processed_dir:
         from proteinfoundation.datasets.pdb_data import _processed_path_sharded
-        man = os.path.join(a.processed_dir, "..", "shard_manifest.json")
-        manifest = json.load(open(man)) if os.path.exists(man) else None
+        assert a.manifest and os.path.exists(a.manifest), \
+            f"--manifest must name an existing shard_manifest.json (got {a.manifest!r}); without it every " \
+            "bucketed path is wrong and this check would pass on zero chains"
+        manifest = json.load(open(a.manifest))
         n_chk = n_bad = 0
         for stem, alen in list(align_len_of.items())[:40]:
             pt = _processed_path_sharded(pathlib.Path(a.processed_dir), stem, manifest)
@@ -141,8 +147,9 @@ def main():
             g_ = torch.load(str(pt), map_location="cpu", weights_only=False)
             n_chk += 1
             n_bad += int(alen != int(g_.coords.shape[0]))
-        check("alignment length == residue count in the processed .pt", n_bad == 0,
-              f"{n_bad} of {n_chk} chains differ")
+        # ⛔ A check that inspected nothing is not a pass.
+        check("alignment length == residue count in the processed .pt (non-vacuous)",
+              n_bad == 0 and n_chk >= 10, f"{n_bad} of {n_chk} chains differ")
     check("alignment values are -1 or a valid element index", bad_align_val == 0, f"{bad_align_val} bad")
     check("SSE contact blocks are binary and T x T", bad_he == 0, f"{bad_he} bad")
     check("structural features are finite and T x T x 4", bad_feat == 0, f"{bad_feat} bad")
