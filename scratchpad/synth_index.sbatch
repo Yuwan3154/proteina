@@ -37,7 +37,7 @@ N_PARTS="${N_PARTS:-40}"
 TPL_ARGS=(--templates "$T2/templates_band:$T2/index_band.npz")
 [ -f "$EXTRA/index_band.npz" ] && TPL_ARGS+=(--templates "$EXTRA/templates_band:$EXTRA/index_band.npz")
 COMMON=(--base-index "$DATA/topology_index.pt" --processed-dir "$DATA/processed" --manifest "$DATA/shard_manifest.json"
-        "${TPL_ARGS[@]}" --n-parts "$N_PARTS" --out-dir "$OUT/parts" --workers 32
+        "${TPL_ARGS[@]}" --n-parts "$N_PARTS" --out-dir "$OUT/parts" --workers "${SLURM_CPUS_PER_TASK:-32}"
         --usalign /home/chenxiou/.local/bin/USalign)
 case "$MODE" in
   smoke)
