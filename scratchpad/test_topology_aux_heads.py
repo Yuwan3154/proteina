@@ -119,8 +119,16 @@ def main():
           torch.allclose(out["contact_map_logits"], out_plain["contact_map_logits"], atol=1e-6))
 
     # 3. weights 0 -> exactly zero
-    total, logged = run_helper(out, batch, align_loss_weight=0.0, mlm_loss_weight=0.0)
+    both.zero_grad(set_to_none=True)
+    out0 = both(dict(batch))
+    total, logged = run_helper(out0, batch, align_loss_weight=0.0, mlm_loss_weight=0.0)
     check("weights 0: total is exactly 0", float(total) == 0.0)
+    # ⛔ the sweep's CONTROL arm is exactly this case; without a zero-scaled touch DDP aborts with
+    # "parameters that were not used in producing the loss" (measured on job 22467593).
+    total.backward()
+    check("weights 0: BOTH heads still get a (zero) gradient for DDP",
+          all(h.weight.grad is not None and float(h.weight.grad.abs().sum()) == 0.0
+              for h in (both.align_head, both.align_none, both.mlm_head)))
     check("weights 0: only the missing-ref rate is logged", set(logged) == {"train/topology_missing_ref_frac"}, str(set(logged)))
 
     # 4. softmax form: finite, gradient reaches the trunk, sample without GT contributes nothing

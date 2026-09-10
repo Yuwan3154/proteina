@@ -2971,6 +2971,19 @@ class ModelTrainerBase(L.LightningModule):
         missing = batch.get("topology_missing_ref")
         if missing is not None:
             self.log(f"{log_prefix}/topology_missing_ref_frac", missing.float().mean(), **log_kw)
+        # ⛔ DDP aborts on any parameter that produced no gradient, so a head that EXISTS in the model
+        # but whose loss weight is 0 must still be touched. The control arm of a weight sweep is
+        # exactly this case (align_w = mlm_w = 0 with both heads enabled) and it died on
+        # "parameters that were not used in producing the loss". The touches are zero-scaled, so the
+        # loss VALUE is identical to skipping the term -- which is what "rate 0 = skipped" must mean.
+        zero_touch = torch.zeros((), device=mask.device)
+        if w_align <= 0.0 and "align_logits" in nn_out:
+            zero_touch = zero_touch + 0.0 * nn_out["align_logits"].sum()
+            if "align_none_logits" in nn_out:
+                zero_touch = zero_touch + 0.0 * nn_out["align_none_logits"].sum()
+        if w_mlm <= 0.0 and "mlm_logits" in nn_out:
+            zero_touch = zero_touch + 0.0 * nn_out["mlm_logits"].sum()
+        total = total + zero_touch
         if w_align <= 0.0 and w_mlm <= 0.0:
             return total
         he_tokens = batch.get("topology_he_tokens")
