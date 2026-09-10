@@ -101,6 +101,7 @@ class TopologyReferenceTransform(T.BaseTransform):
         sse_types: Sequence[int] = SSE_TYPES,
         type_mutate_prob: float = 0.0,
         token_mask_prob: float = 0.0,
+        drop_ref_len_range: Sequence[int] = (5, 39),
     ):
         if reference_source not in ("cluster", "synthetic"):
             raise ValueError(f"reference_source must be 'cluster' or 'synthetic', got {reference_source!r}")
@@ -118,6 +119,13 @@ class TopologyReferenceTransform(T.BaseTransform):
         self.tm_range = (float(tm_range[0]), float(tm_range[1]))
         self.type_mutate_prob = float(type_mutate_prob)
         self.token_mask_prob = float(token_mask_prob)
+        # Element count of a DROPPED (fully masked) reference, drawn uniformly in this inclusive
+        # range. Default = the p5-p95 of what training actually serves, MEASURED over 1,500
+        # references on the v3 index (job 22502519): p5 5, p25 12, median 20, p75 27, p95 39.
+        # (lo, hi) = (1, 1) reproduces the old single-token behaviour.
+        self.drop_ref_len_range = (int(drop_ref_len_range[0]), int(drop_ref_len_range[1]))
+        if self.drop_ref_len_range[0] > self.drop_ref_len_range[1]:
+            raise ValueError(f"drop_ref_len_range must be (lo, hi) with lo <= hi, got {drop_ref_len_range}")
         self.alphabet = SSEAlphabet(
             exact_max=exact_max, bin_step=bin_step, catch_all_above=catch_all_above, min_len=min_len,
             types=tuple(int(t) for t in sse_types),
@@ -478,7 +486,23 @@ class TopologyReferenceTransform(T.BaseTransform):
 
     def _set_empty(self, graph: Data, L: Optional[int] = None, missing: bool = False,
                    stem: str = "") -> Data:
-        """The no-reference case: a single MASK element, which the model treats as unconditioned.
+        """The no-reference case: a variable-length, FULLY MASKED reference.
+
+        Every token is MASK, but the element count and positions are real, so the model gets a
+        SCRATCH PAD it can write into through the MLM head rather than a single dead token (user
+        2026-09-10). The count is drawn uniformly from ``drop_ref_len_range`` and the midpoints are
+        spread evenly across the query, which is what real references do: measured over 1,500
+        served references, the last element's midpoint sits at 0.966 x L (p5 0.840, p95 1.009).
+
+        ⛔ The length is drawn INDEPENDENTLY of this chain, never from a real template of it. A
+        template is a partial-diffusion variant of the query's OWN native, so its element count and
+        positions correlate with the query's true topology -- reusing them here would leak that
+        topology into the branch that is supposed to be unconditioned, which is exactly what
+        classifier-free guidance must not have.
+
+        ⛔ No MLM targets are emitted (all zero), so the SSE MLM loss is DISABLED for these samples:
+        the trainer selects on ``m_tgt > 1`` and real tokens start at 2. Predicting the tokens of a
+        reference that was never shown would be learning the dataset's reference distribution.
 
         ``missing=True`` is the synthetic-mode failure the run is NOT supposed to hit (a chain with
         no template in range): it is logged loudly per occurrence and flagged on the graph so the
@@ -486,20 +510,31 @@ class TopologyReferenceTransform(T.BaseTransform):
         """
         if L is None:
             L = int(graph.coords.shape[0])
+        lo, hi = self.drop_ref_len_range
+        if hi >= lo >= 1:
+            n_el = int(torch.randint(int(lo), int(hi) + 1, (1,), generator=self._generator))
+        else:
+            n_el = 1
+        n_el = max(1, min(n_el, self.max_topology_he_len))
+        # Midpoints of n_el equal slices of the query: (i + 0.5) * L / n_el.
+        pos = (torch.arange(n_el, dtype=torch.float32) + 0.5) * (float(L) / max(n_el, 1))
         if missing:
             logger.warning(
                 f"[topology] NO synthetic reference for {stem!r} (TM range {self.tm_range}) -- "
                 "falling back to UNCONDITIONAL. This is not expected; check template coverage."
             )
-        graph.topology_tokens = torch.full((1,), MASK_TOKEN, dtype=torch.long)
-        graph.topology_pos = torch.zeros(1, dtype=torch.float32)
-        graph.topology_he_tokens = torch.full((1,), MASK_TOKEN, dtype=torch.long)
-        graph.topology_he_pos = torch.zeros(1, dtype=torch.float32)
-        graph.topology_pos_raw = torch.zeros(1, dtype=torch.float32)
-        graph.topology_he_pos_raw = torch.zeros(1, dtype=torch.float32)
-        graph.topology_he_contact = torch.zeros(1, 1)
-        graph.topology_he_feat = torch.zeros(1, 1, N_PAIR_FEATURES)
-        graph.topology_he_tokens_target = torch.zeros(1, dtype=torch.long)
+        n_tok = max(1, min(n_el, self.max_topology_len))
+        graph.topology_tokens = torch.full((n_tok,), MASK_TOKEN, dtype=torch.long)
+        graph.topology_pos = pos[:n_tok].clone()
+        graph.topology_pos_raw = pos[:n_tok].clone()
+        graph.topology_he_tokens = torch.full((n_el,), MASK_TOKEN, dtype=torch.long)
+        graph.topology_he_pos = pos.clone()
+        graph.topology_he_pos_raw = pos.clone()
+        graph.topology_he_contact = torch.zeros(n_el, n_el)
+        graph.topology_he_feat = torch.zeros(n_el, n_el, N_PAIR_FEATURES)
+        # All zero on purpose: 0 is PAD, and the trainer's `sel = m_tgt > 1` therefore selects
+        # nothing, so no MLM loss is taken on a reference the model was never shown.
+        graph.topology_he_tokens_target = torch.zeros(n_el, dtype=torch.long)
         graph.ref_align_target = torch.full((L,), ALIGN_NONE, dtype=torch.long)
         graph.topology_missing_ref = torch.tensor([1 if missing else 0], dtype=torch.long)
         return graph
@@ -510,5 +545,6 @@ class TopologyReferenceTransform(T.BaseTransform):
             f"max_topology_len={self.max_topology_len}, sigma_frac={self.sigma_frac}, "
             f"mutate_prob={self.mutate_prob}, type_mutate_prob={self.type_mutate_prob}, "
             f"token_mask_prob={self.token_mask_prob}, drop_prob={self.drop_prob}, "
+            f"drop_ref_len_range={self.drop_ref_len_range}, "
             f"vocab={self.alphabet.vocab_size})"
         )
