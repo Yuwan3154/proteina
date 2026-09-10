@@ -35,6 +35,11 @@ datamodule:
       contact_method: distance
       contact_atom_type: "CB"
       contact_distance_cutoff: 8.0
+    - _target_: "proteinfoundation.datasets.transforms.SequenceDropoutTransform"
+      # Whole query sequence dropped, length preserved (user 2026-09-10). Drawn INDEPENDENTLY of the
+      # topology drop_prob below, so ~0.25 x 0.25 = 6.25% of training sees neither sequence nor
+      # reference. 0 disables the mechanism entirely.
+      prob: 0.25
     - _target_: "proteinfoundation.datasets.topology_reference.TopologyReferenceTransform"
       index_path: ${oc.env:SYNTH_INDEX_DIR}/topology_index_cb8_synth.pt
       reference_source: synthetic

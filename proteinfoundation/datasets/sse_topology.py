@@ -25,6 +25,11 @@ import torch
 # -1 marks residues with an incomplete backbone and breaks a run.
 DSSP_LOOP, DSSP_HELIX, DSSP_STRAND = 0, 1, 2
 SSE_TYPES = (DSSP_LOOP, DSSP_HELIX, DSSP_STRAND)
+# A stretch of residues that carries no element: an incomplete backbone (-1), or a run shorter than
+# the alphabet's min_len. It is KEPT in the run list, with its true length, so that run lengths
+# always tile the chain and `runs_to_spans` stays in the source chain's residue coordinates. No
+# alphabet contains it, so it is never tokenised and never enters `keep`.
+DSSP_GAP = -1
 
 PAD_TOKEN = 0
 MASK_TOKEN = 1  # whole-reference dropout, for classifier-free guidance
@@ -112,8 +117,15 @@ class SSEAlphabet:
 def dssp_to_runs(dssp: torch.Tensor, min_len: int = 1) -> List[Tuple[int, int]]:
     """Run-length-compress a per-residue DSSP assignment into (type, length) pairs.
 
-    Residues labelled -1 (incomplete backbone) terminate the current run and contribute nothing,
-    so an unresolved stretch does not silently fuse the elements on either side of it.
+    Residues labelled -1 (incomplete backbone) terminate the current run, and so does a run shorter
+    than ``min_len``. Neither is DELETED: both are emitted as a DSSP_GAP run carrying their true
+    length, so the run lengths always sum to the chain's residue count and `runs_to_spans` therefore
+    reports positions in the source chain's own coordinates.
+
+    ⛔ They used to be dropped, which silently shifted every later element LEFT by the number of
+    dropped residues -- corrupting the element->residue map that sse_contact_reference,
+    sse_structural_pair_features and the index builders' alignment ground truth all rely on
+    (measured 2026-09-10: 2.2% of chains, up to 323 residues).
     """
     runs: List[Tuple[int, int]] = []
     values = dssp.tolist()
@@ -122,8 +134,8 @@ def dssp_to_runs(dssp: torch.Tensor, min_len: int = 1) -> List[Tuple[int, int]]:
         j = i
         while j < len(values) and values[j] == values[i]:
             j += 1
-        if values[i] >= 0 and (j - i) >= min_len:
-            runs.append((int(values[i]), j - i))
+        keep = values[i] >= 0 and (j - i) >= min_len
+        runs.append((int(values[i]) if keep else DSSP_GAP, j - i))
         i = j
     return runs
 
@@ -151,6 +163,11 @@ def perturb_runs(
     """
     out: List[Tuple[int, int]] = []
     for t, n in runs:
+        # A gap is a property of the SOURCE chain (unresolved residues), not an element, so it is
+        # never jittered or retyped -- and it consumes no RNG, keeping gap-free chains bit-identical.
+        if t == DSSP_GAP:
+            out.append((t, n))
+            continue
         if type_mutate_prob > 0.0 and t in (DSSP_HELIX, DSSP_STRAND):
             if float(torch.rand(1, generator=generator, device=generator.device)) < type_mutate_prob:
                 t = DSSP_STRAND if t == DSSP_HELIX else DSSP_HELIX
@@ -182,7 +199,11 @@ def encode_topology(
 
 
 def runs_to_spans(runs: Sequence[Tuple[int, int]]) -> List[Tuple[int, int]]:
-    """Residue interval [start, end) covered by each run, in the source chain's own coordinates."""
+    """Residue interval [start, end) covered by each run, in the source chain's own coordinates.
+
+    Correct because `dssp_to_runs` emits DSSP_GAP runs for unresolved stretches, so run lengths tile
+    the chain. Feeding it a run list with the gaps stripped out reintroduces the shift.
+    """
     spans = []
     pos = 0
     for _, n in runs:

@@ -169,6 +169,47 @@ class ChainBreakPerResidueTransform(T.BaseTransform):
         return graph
 
 
+class SequenceDropoutTransform(T.BaseTransform):
+    """Drops the WHOLE query sequence for a sample, with the chain's length preserved.
+
+    The model keeps every residue, its coordinates and its topology reference; only the amino-acid
+    identities stop being conditioned on, so the sample trains the sequence-free branch. The draw is
+    INDEPENDENT of the topology reference dropout (user 2026-09-10), so at prob 0.25 alongside
+    drop_prob 0.25 about 0.25 x 0.25 = 6.25% of training sees neither sequence nor reference.
+
+    `residue_type` is left untouched -- the flag is what the model reads -- so any other consumer of
+    the sequence keeps working and the drop cannot leak through a second path.
+    """
+
+    def __init__(self, prob: float = 0.0, seed: int = 0):
+        """Args:
+            prob: per-sample probability of dropping the sequence. 0 disables the mechanism and
+                consumes no randomness, so runs without it are bit-identical.
+            seed: offset mixed into the per-worker torch seed, so dataloader workers do not share
+                one stream of decisions (same reasoning as TopologyReferenceTransform).
+        """
+        if not 0.0 <= prob <= 1.0:
+            raise ValueError(f"prob must be in [0, 1], got {prob}")
+        self.prob = float(prob)
+        self.seed = int(seed)
+        self._generator = None
+
+    def forward(self, graph: Data) -> Data:
+        if self.prob <= 0.0:
+            graph.seq_dropped = torch.zeros(1, dtype=torch.long)
+            return graph
+        if self._generator is None:
+            self._generator = torch.Generator().manual_seed(
+                (self.seed + torch.initial_seed()) % (2**63)
+            )
+        drop = float(torch.rand(1, generator=self._generator)) < self.prob
+        graph.seq_dropped = torch.tensor([1 if drop else 0], dtype=torch.long)
+        return graph
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(prob={self.prob}, seed={self.seed})"
+
+
 class PaddingTransform(T.BaseTransform):
     """Pads tensors in graph to a specified maximum size.
 

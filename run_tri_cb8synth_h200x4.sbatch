@@ -33,8 +33,11 @@ export DATA_PATH=/orcd/pool/006/chenxiou/proteina/data
 # Default = the v2 index (both template trees, 99.4% train-cluster coverage, audited 16/16 on
 # 2026-09-10). v1 (synth_index/, 89.9% coverage) is kept intact as the fallback.
 export SYNTH_INDEX_DIR="${SYNTH_INDEX_DIR:-/orcd/scratch/orcd/011/chenxiou/synth_index_v2}"
-export ALIGN_W="${ALIGN_W:?ALIGN_W (alignment loss weight) must be set from the recorded sweep}"
-export MLM_W="${MLM_W:?MLM_W (masked-token loss weight) must be set from the recorded sweep}"
+# 0.3 / 0.3 chosen by the user 2026-09-10 from the 1500-step sweep (job 22483230): at 0.3 the
+# alignment head learns exactly as well as at 1.0 (prec@Q 0.531 vs 0.530) for a smaller cost on the
+# main objective (cm_loss +0.0152 vs +0.0226), and 0.3 is also AF2 SI 1.9's auxiliary weight.
+export ALIGN_W="${ALIGN_W:-0.3}"
+export MLM_W="${MLM_W:-0.3}"
 CONFIG="${CONFIG:-training_contact_tri_full384_cb8synth_v1}"
 RUN="${RUN:-tri_cb8synth}"
 NGPU="${NGPU:-4}"

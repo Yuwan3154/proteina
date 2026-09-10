@@ -11,23 +11,34 @@ have sum(run lengths) != residue count -- median 1 residue dropped, mean 36.9, m
 element after the first gap is mislabelled. (An earlier 14.70% figure compared a template row's
 runs against the NATIVE's residue count -- two different structures -- and is retracted.)
 
-These tests FAIL on the current code. They are the acceptance criteria for the fix.
+These were RED when written; the central fix (DSSP_GAP runs) makes them green.
 """
 
 import torch
 
-from proteinfoundation.datasets.sse_topology import dssp_to_runs, runs_to_spans
+from proteinfoundation.datasets.sse_topology import (
+    DSSP_HELIX,
+    DSSP_STRAND,
+    dssp_to_runs,
+    runs_to_spans,
+)
 
-DSSP_HELIX, DSSP_STRAND = 1, 2
 
 
 def elem_of_residue(dssp, min_len=1):
-    """What every consumer builds: element index per residue, on the full residue axis."""
+    """Element index per residue on the full residue axis -- verbatim what the consumers build.
+
+    Mirrors sse_contact_reference / sse_structural_pair_features / the index builder: `keep` is the
+    helix+strand runs, and `elem[s:t] = a` numbers by POSITION IN keep, so gap runs occupy residues
+    but never take an element index.
+    """
     runs = dssp_to_runs(dssp, min_len=min_len)
     spans = runs_to_spans(runs)
+    keep = [i for i, (t, _) in enumerate(runs) if t in (DSSP_HELIX, DSSP_STRAND)]
     elem = torch.full((dssp.numel(),), -1, dtype=torch.long)
-    for e, (s, t) in enumerate(spans):
-        elem[s:t] = e
+    for a, ia in enumerate(keep):
+        s, t = spans[ia]
+        elem[s:t] = a
     return elem
 
 
@@ -70,4 +81,4 @@ if __name__ == "__main__":
             except AssertionError as e:
                 n_fail += 1
                 print(f"FAIL {name}: {e}")
-    print(f"\n{n_fail} of 4 failing (expected: 3 until the spans are fixed)")
+    print(f"\n{n_fail} of 4 failing")

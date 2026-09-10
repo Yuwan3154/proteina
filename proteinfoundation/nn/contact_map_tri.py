@@ -289,6 +289,14 @@ class ContactMapTriSiT(nn.Module):
         q_feat = None
         if rtype is not None:
             e = self.seq_emb(rtype.long().clamp(min=0))
+            # Whole-sequence dropout (SequenceDropoutTransform): zero the sequence term for the
+            # flagged samples, which is exactly the state the `rtype is None` branch below leaves
+            # the model in -- the length and every other input are untouched. Multiplying (rather
+            # than branching) keeps the graph shape identical across ranks, which DDP requires.
+            seq_dropped = batch.get("seq_dropped")
+            if seq_dropped is not None:
+                keep_seq = 1.0 - seq_dropped.reshape(-1, 1, 1).to(e.dtype)
+                e = e * keep_seq
             q_feat = e  # the only per-token query features tri has; the OT head reads them
             e = F.pad(e, (0, 0, 0, T))
             z = z + e[:, :, None, :] + e[:, None, :, :]
