@@ -152,7 +152,8 @@ def main():
               n_bad == 0 and n_chk >= 10, f"{n_bad} of {n_chk} chains differ")
     check("alignment values are -1 or a valid element index", bad_align_val == 0, f"{bad_align_val} bad")
     check("SSE contact blocks are binary and T x T", bad_he == 0, f"{bad_he} bad")
-    check("structural features are finite and T x T x 4", bad_feat == 0, f"{bad_feat} bad")
+    check(f"structural features are finite and T x T x {len(STRUCTURAL_PAIR_FEATURES)}",
+          bad_feat == 0, f"{bad_feat} bad")
     fa = np.array(frac_aligned)
     check("aligned fraction is sane (mean in 0.1-0.95)", 0.1 < fa.mean() < 0.95,
           f"mean {fa.mean():.3f} p5 {np.percentile(fa, 5):.3f} p95 {np.percentile(fa, 95):.3f}")
