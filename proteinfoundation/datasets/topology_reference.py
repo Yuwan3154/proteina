@@ -31,6 +31,7 @@ from proteinfoundation.datasets.sse_topology import (
     DSSP_STRAND,
     MASK_TOKEN,
     N_PAIR_FEATURES,
+    PAIR_FEATURE_NAMES,
     SSE_TYPES,
     STRUCTURAL_PAIR_FEATURES,
     SSEAlphabet,
@@ -151,6 +152,15 @@ class TopologyReferenceTransform(T.BaseTransform):
         if self.has_pair_features:
             self._feat_mean = self._index["pair_feature_mean"].float()
             self._feat_std = self._index["pair_feature_std"].float().clamp(min=1e-6)
+            # Caught at construction rather than mid-epoch: an index built before the CA-CA
+            # channels were dropped carries stats for a wider feature vector.
+            if self._feat_mean.numel() != N_PAIR_FEATURES:
+                raise ValueError(
+                    f"{self.index_path} stores standardisation stats for "
+                    f"{self._feat_mean.numel()} pair features but this code defines "
+                    f"{N_PAIR_FEATURES} ({', '.join(PAIR_FEATURE_NAMES)}). Rebuild the index with "
+                    f"precompute_synthetic_topology_index.py."
+                )
         else:
             # An index built before the featurization still drives the contact-only mode: the
             # shape is unchanged, the structural channels read as zero, and standardisation is
@@ -174,14 +184,23 @@ class TopologyReferenceTransform(T.BaseTransform):
         return idx["he_flat"][a:b].reshape(size, size).float()
 
     def _he_structural_for(self, row: int, size: int) -> torch.Tensor:
-        """The [T, T, 3] channels that only the index can supply (see sse_topology)."""
+        """The [T, T, len(STRUCTURAL_PAIR_FEATURES)] channels only the index can supply."""
         idx = self._index
         n_struct = len(STRUCTURAL_PAIR_FEATURES)
         if not self.has_pair_features or size <= 0:
             return torch.zeros(size, size, n_struct)
         a, b = int(idx["feat_offset"][row]), int(idx["feat_offset"][row + 1])
+        # A width mismatch means the index was built with a DIFFERENT feature set (the CA-CA
+        # distance channels were dropped 2026-09-10). Returning zeros here would train the model on
+        # silently blank structural features, so fail instead and name the rebuild.
         if b - a != size * size * n_struct:
-            return torch.zeros(size, size, n_struct)
+            stored = (b - a) / max(size * size, 1)
+            raise ValueError(
+                f"index row {row} stores {stored:g} structural channels per element pair but this "
+                f"code expects {n_struct} ({', '.join(STRUCTURAL_PAIR_FEATURES)}). The index at "
+                f"{self.index_path} predates the feature-set change -- rebuild it with "
+                f"precompute_synthetic_topology_index.py."
+            )
         return idx["feat_flat"][a:b].reshape(size, size, n_struct).float()
 
     def _pair_features(

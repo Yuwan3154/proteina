@@ -274,8 +274,6 @@ def sse_contact_reference(
 PAIR_FEATURE_NAMES = (
     "contact_max",
     "contact_frac",
-    "min_ca_dist",
-    "mean_ca_dist",
     "orientation_cos",
     "circuit_series",
     "circuit_parallel_contains",
@@ -284,7 +282,10 @@ PAIR_FEATURE_NAMES = (
     "seq_gap",
 )
 N_PAIR_FEATURES = len(PAIR_FEATURE_NAMES)
-STRUCTURAL_PAIR_FEATURES = ("contact_frac", "min_ca_dist", "mean_ca_dist", "orientation_cos")
+# The CA-CA distance channels were dropped (user 2026-09-10): a reference feature that can only be
+# derived from real coordinates is one a synthetic-reference generator has to reproduce, and it
+# complicates augmentation for no established benefit.
+STRUCTURAL_PAIR_FEATURES = ("contact_frac", "orientation_cos")
 ORIENTATION_PAIR_FEATURES = ("orientation_cos",)
 CIRCUIT_PAIR_FEATURES = (
     "circuit_series",
@@ -292,7 +293,7 @@ CIRCUIT_PAIR_FEATURES = (
     "circuit_parallel_inside",
     "circuit_cross",
 )
-PROXIMITY_PAIR_FEATURES = ("contact_frac", "min_ca_dist", "mean_ca_dist", "seq_gap")
+PROXIMITY_PAIR_FEATURES = ("contact_frac", "seq_gap")
 
 # Which channels of the 2D SSE reference the pair track sees. "contact" is the original
 # behaviour (which elements touch, nothing more); the other three add the descriptions of HOW they
@@ -381,7 +382,7 @@ def sse_structural_pair_features(
     runs: Sequence[Tuple[int, int]],
     keep: Sequence[int],
 ) -> torch.Tensor:
-    """[T, T, 4] contact fraction, closest/mean CA-CA distance and axis cosine per element pair.
+    """[T, T, 2] contact fraction and axis cosine per element pair.
 
     Args:
         contact_map: [L, L] binarised residue contact map.
@@ -389,9 +390,8 @@ def sse_structural_pair_features(
         coord_mask: [L, n_atoms] validity flags for those coordinates.
         runs, keep: the run-length decomposition and the indices retained in the 2D reference.
 
-    Residues without a resolved CA are excluded from the distance reductions; a pair with no
-    resolved CA on either side gets distance 0, which the contact channels already mark as
-    uninformative.
+    Residues without a resolved CA are excluded from the axis fit; an element pair with no resolved
+    CA on either side gets cosine 0, which the contact channels already mark as uninformative.
     """
     T = len(keep)
     out = torch.zeros((T, T, len(STRUCTURAL_PAIR_FEATURES)), dtype=torch.float32)
@@ -417,23 +417,12 @@ def sse_structural_pair_features(
 
     ca_ok = valid & (coord_mask[:, CA_ATOM_INDEX] > 0.5)
     if ca_ok.any():
-        row_ca = elem[ca_ok]
-        n_ca = torch.zeros(T).scatter_add_(0, row_ca, torch.ones(row_ca.numel()))
-        d = torch.cdist(
-            coords[ca_ok, CA_ATOM_INDEX, :].float()[None],
-            coords[ca_ok, CA_ATOM_INDEX, :].float()[None],
-        )[0]
-        has_ca = (n_ca[:, None] > 0) & (n_ca[None, :] > 0)
-        dmin = _block_reduce(d, row_ca, T, "amin")
-        out[..., 1] = torch.where(has_ca, dmin, torch.zeros_like(dmin))
-        dmean = _block_reduce(d, row_ca, T, "sum") / (n_ca[:, None] * n_ca[None, :]).clamp(min=1.0)
-        out[..., 2] = torch.where(has_ca, dmean, torch.zeros_like(dmean))
         axes = _element_axes(coords[:, CA_ATOM_INDEX, :].float(), elem, ca_ok, T)
-        out[..., 3] = (axes @ axes.T).clamp(-1.0, 1.0)
-    # All three channels are symmetric by definition, but torch.cdist takes a matmul path for
-    # larger inputs that is asymmetric at ~1e-5, and the float16 storage then amplifies that to a
-    # whole ulp (0.03 A) whenever a mirrored pair straddles a rounding boundary. Averaging the two
-    # halves restores the invariant exactly, at float32 precision, before it is ever cast.
+        out[..., 1] = (axes @ axes.T).clamp(-1.0, 1.0)
+    # Both channels are symmetric by definition, but the reductions take matmul paths that are
+    # asymmetric at ~1e-5, and the float16 storage then amplifies that to a whole ulp whenever a
+    # mirrored pair straddles a rounding boundary. Averaging the two halves restores the invariant
+    # exactly, at float32 precision, before it is ever cast.
     return 0.5 * (out + out.transpose(0, 1))
 
 
