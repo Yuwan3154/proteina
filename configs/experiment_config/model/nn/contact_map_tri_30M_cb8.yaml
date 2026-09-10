@@ -1,0 +1,55 @@
+name: contact_map_tri_30M_cb8
+nn_class: ContactMapTriSiT   # dispatches Proteina's NN_REGISTRY
+
+# ── Deliberately the opposite design to contact_map_hier_topology_30M ────────────────────────
+# No 1D single track, no attention, no hierarchy: one pair representation, updated only by
+# triangle multiplicative updates plus the AF2 Evoformer transition. The topology reference is
+# CONCATENATED onto the token axis rather than cross-attended, so the grid is (L+T) x (L+T) and
+# triangle multiplication carries information between query and reference through the same
+# i -> k -> j paths it uses within each.
+
+# Wide and shallow, deliberately. Triangle multiplication's dominant term is an N^3 einsum whose
+# cost is LINEAR in the hidden width, while parameters grow as width^2 -- so trading depth for
+# width buys parameters at a sub-linear runtime cost. At N = 256 + 64 = 320, 12x320 does 0.79x
+# the N^3 work of 19x256 and stores 0.79x the activations for the same parameter count.
+pair_dim: 320        # 12 blocks -> 27,793,729 params, counted from the module itself, against
+                     # 28.46M for the local_attn arm. Per block: 2 triangle updates (~6*d^2 each),
+                     # the 4x transition (8*d^2), and the FiLM projection.
+tri_hidden: 320      # sets the N^3 cost directly (it is the einsum's contracted width), so this is
+                     # the knob to turn first if runtime overshoots -- it need not equal pair_dim
+                     # here, since this model does not use cuequivariance's fused kernel.
+n_blocks: 12
+transition_n: 4      # AF2 Evoformer expansion factor
+dim_cond: 128
+
+max_rel_pos: 64      # clip radius for the LEFT-ALIGNED relative position. Query residue i sits at
+                     # i and reference element e at its own-chain midpoint, both from 0, so this
+                     # radius has to cover query-to-element offsets as well as query-to-query.
+# Read by the TRAINER, not by ContactMapTriSiT (which consumes the reference unconditionally
+# whenever the keys are present). _build_self_reference_topology gates on it, so leaving it
+# absent made validation sampling pass topology=None and this arm generate UNCONDITIONED while
+# the hier arm generated on each chain's own ground-truth topology.
+topology_cond: True
+max_topology_he_len: 64
+topology_vocab_size: 44   # helix+strand alphabet (sse_types [1, 2]): 2 special + 2 types x 21 length slots.
+                          # The 65-id alphabet spent 21 ids on loop lengths tri never reads (user, 2026-09-08).
+n_residue_types: 22
+
+# ── auxiliary heads (weights live in the experiment yaml's loss section; 0 = term skipped) ───────
+# Q x T alignment head: the probing head (Linear(dim -> 1) on the final query x reference block)
+# attached from step 0 and trained END TO END against the USalign ground truth the synthetic index
+# carries (ref_align_target). Also emits a per-residue "aligned to nothing" logit for the softmax form.
+align_head:
+  enabled: True
+# Masked-token head: predicts the pre-mask helix/strand token of MASKed reference elements from the
+# element's own diagonal cell (needs token_mask_prob > 0 in the dataset transform).
+mlm_head:
+  enabled: True
+
+pair_ref_features: both   # same channel selection as the hier arms, read from their own mapping
+                          # so the three models are fed identical reference features
+
+contact_map_mode: True
+contact_map_input_dim: 1
+non_contact_value: 0
+predict_coords: False

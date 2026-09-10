@@ -1,0 +1,89 @@
+# max384 tri dataset with (1) CB-8 Å contacts in ContactEBM's convention and (2) SYNTHETIC topology
+# references: a partially-diffused variant of the query's own native (T2 templates), TM 0.5-0.9 to the
+# native, from the index built by utils/precompute_synthetic_topology_index.py. Every chain then has a
+# non-self reference regardless of cluster size (user directive 2026-09-09). Clone of
+# pdb_train_contact-confind-topology_S25_max384_purge-test_cutoff-190828 with those two blocks changed
+# and the new reference augmentations switched on.
+datamodule:
+  _target_: "proteinfoundation.datasets.pdb_data.PDBLightningDataModule"
+  data_dir: ${oc.env:DATA_PATH}/pdb_train/ # Directory where the dataset is stored
+  in_memory: False
+  format: "cif" # format for file download
+  overwrite: False # Whether to overwrite existing dataset files and reprocess the raw data
+  regenerate_missing: True # When True, regenerate only missing .pt files (e.g. after purge_invalid_pt_files)
+  # arguments for BaseLightningDataModule class
+  batch_padding: True # whether we want a sparse PyG batch or a padded dense batch
+  sampling_mode: "cluster-random" # sample randomly inside each sequence similarity cluster during training
+  # Only chains with a synthetic reference in the training TM range may be drawn (one id per line,
+  # written by the index merge). Clusters left without one are dropped and counted in the log --
+  # they are the clusters whose templates are still being generated. The transform's unconditional
+  # fallback therefore should never fire; if it does, the log says so loudly.
+  eligible_ids_file: ${oc.env:SYNTH_INDEX_DIR}/eligible_ids_tm0.5-0.9.txt
+  cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/  # For CATH index conversion when fold_cond
+  multilabel_mode: "sample"  # sample | average | sum | transformer
+  transforms:
+    - _target_: "proteinfoundation.datasets.transforms.GlobalRotationTransform" # Transforms to apply to dataset examples
+    - _target_: "proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform"
+    - _target_: "proteinfoundation.datasets.transforms.CATHLabelTransform" # activate for fold-conditional training
+      root_dir: ${oc.env:DATA_PATH}/cathdata/ # Root directory for CATH labels
+    - _target_: "proteinfoundation.datasets.transforms.CATHToIndicesTransform"  # Convert CATH strings to indices for model
+      cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/
+    - _target_: "proteinfoundation.datasets.transforms.DSSPTargetTransform"  # 3-state secondary structure for DSSP aux loss
+    - _target_: "proteinfoundation.datasets.transforms.ContactMapTransform"  # Required for contact_map_mode training
+      # ContactEBM's CB-8 definition (contact_ebm/data/contact_targets.py): CB atom where resolved,
+      # else CA; d <= 8.0 A; symmetric; diagonal 1; no sequence-separation filter.
+      contact_method: distance
+      contact_atom_type: "CB"
+      contact_distance_cutoff: 8.0
+    - _target_: "proteinfoundation.datasets.topology_reference.TopologyReferenceTransform"
+      index_path: ${oc.env:SYNTH_INDEX_DIR}/topology_index_cb8_synth.pt
+      reference_source: synthetic
+      tm_range: [0.5, 0.9]           # user decision 2026-09-10 (D1)
+      sse_types: [1, 2]              # helix+strand alphabet only, vocab 44 (tri never reads loop tokens)
+      max_topology_len: 128          # covers the element-count distribution; see plan for percentiles
+      max_topology_he_len: 64        # helix/strand axis of the 2D SSE-by-SSE reference
+      sigma_frac: 0.15               # augmentation sigma as a fraction of each element's own length
+      mutate_prob: 0.3               # per-element probability of a length perturbation
+      type_mutate_prob: 0.1          # per-element probability of a helix <-> strand flip (user, D5)
+      token_mask_prob: 0.1           # per-element probability of MASKing the token; target kept for the MLM loss (user, D5)
+      drop_prob: 0.25                # train an unconditional branch for classifier-free guidance.
+      self_fallback: True            # irrelevant in synthetic mode (never self); kept for the cluster-mode reader
+      min_len: 1                     # 1-residue elements are kept: 16.87% of all elements
+    - _target_: "proteinfoundation.datasets.transforms.PaddingTransform"
+      max_size: 384
+  batch_size: 1 # MEASURED on a 95 GB RTX PRO 6000: the tri model fits batch 1 only, at every
+                # length tried. At L=384 (grid N=384+64=448) peak is 71.81 GB = 76% of the card;
+                # batch 2 OOMs.
+  num_workers: 8 # Number of workers for dataloader (overridden per rank by ncpus_per_task_train_)
+  pin_memory: True # Pin memory for dataloader
+  prefetch_factor: 2 # Prefetch factor for dataloader
+
+  dataselector:
+    _target_: "proteinfoundation.datasets.pdb_data.PDBDataSelector"
+    data_dir: ${oc.env:DATA_PATH}/pdb_train/ # Directory where the dataset is stored
+    fraction: 1 # Fraction of dataset to use
+    molecule_type: "protein" # Type of molecule for which to select
+    experiment_types: ["diffraction", "EM"] # other options are "NMR" and "other"
+    min_length: 50 # Exclude peptides of length smaller than 50
+    max_length: 384 # Exclude polypeptides greater than length 384
+    oligomeric_min: null
+    oligomeric_max: null
+    best_resolution: 0.0  # Include only proteins with resolution >= 0.0
+    worst_resolution: 5.0 # Include only proteins with resolution <= 5.0
+    has_ligands: [] # Include only proteins containing the ligand `ZN`
+    remove_ligands: [] # Exclude specific ligands from any available protein-ligand complexes
+    remove_non_standard_residues: True # Include only proteins containing standard amino acid residues
+    remove_pdb_unavailable: True # Include only proteins that are available to download
+    max_deposition_date: "2019-08-28" # Only include structures deposited on or before this date
+    exclude_ids: []  # Use exclude_ids_from_file in datasplitter (rosetta_decoys.txt)
+
+  datasplitter:
+    _target_: "proteinfoundation.datasets.pdb_data.PDBDataSplitter"
+    data_dir: ${oc.env:DATA_PATH}/pdb_train/ # Directory where the dataset is stored
+    train_val_test: [0.98, 0.019, 0.001] # Cross-validation ratios to use for train, val, and test splits
+    split_type: "sequence_similarity" # Split sequences by sequence similarity clustering, other option is "random"
+    split_sequence_similarity: 0.25 # Clustering at 25% sequence similarity (argument is ignored if split_type!="sequence_similarity")
+    overwrite_sequence_clusters: False # Previous clusterings at same sequence similarity are reused and not overwritten (argument is ignored if split_type!="sequence_similarity")
+    exclude_ids: []  # Inline IDs excluded from train, distributed to val/test
+    exclude_ids_from_file: ${oc.env:DATA_PATH}/pdb_train/rosetta_decoys.txt  # One chain ID per line
+    drop_ids_from_file: ${oc.env:DATA_PATH}/pdb_train/unusable_chains.txt
