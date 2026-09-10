@@ -17,11 +17,17 @@ import sys
 import tempfile
 
 import torch
+
 from torch_geometric.data import Data
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from proteinfoundation.datasets.sse_topology import DSSP_HELIX, DSSP_STRAND, MASK_TOKEN
+from proteinfoundation.datasets.sse_topology import (
+    DSSP_HELIX,
+    DSSP_STRAND,
+    MASK_TOKEN,
+    N_PAIR_FEATURES,
+)
 from proteinfoundation.datasets.topology_reference import (
     ALIGN_NONE,
     MASK_REF_ID,
@@ -76,8 +82,9 @@ def build_toy_index(path):
         "he_flat": torch.tensor(he_flat, dtype=torch.uint8),
         "feat_offset": torch.tensor(feat_offset, dtype=torch.int64),
         "feat_flat": torch.tensor(feat_flat, dtype=torch.float16),
-        "pair_feature_mean": torch.zeros(10),
-        "pair_feature_std": torch.ones(10),
+        # derived, never hardcoded: the width changed 10 -> 8 when the CA-CA channels were dropped
+        "pair_feature_mean": torch.zeros(N_PAIR_FEATURES),
+        "pair_feature_std": torch.ones(N_PAIR_FEATURES),
         "row_tm": torch.tensor([1.0, 0.45, 0.6, 0.85, 1.0], dtype=torch.float16),
         "row_is_native": torch.tensor([1, 0, 0, 0, 1], dtype=torch.bool),
         "row_rewind": torch.tensor([0, 300, 250, 200, 0], dtype=torch.int16),
