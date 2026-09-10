@@ -53,18 +53,31 @@ def main():
     ap.add_argument("--project", default="tri_cb8_sweep")
     ap.add_argument("--prefix", default="tri_cb8sw_")
     ap.add_argument("--tail", type=float, default=0.25)
+    ap.add_argument("--exclude", default="smoke", help="comma-separated arm names to ignore (default: the 20-step smoke)")
     args = ap.parse_args()
     api = wandb.Api()
     runs = [r for r in api.runs(f"{args.entity}/{args.project}") if r.name.startswith(args.prefix)]
-    print(f"{len(runs)} arms in {args.project}")
+    skip = set(args.exclude.split(",")) if args.exclude else set()
+    print(f"{len(runs)} runs in {args.project} (excluding arms: {sorted(skip) or 'none'})")
     hist = {}
     for r in runs:
         arm = r.name[len(args.prefix):]
-        cfg = r.config
+        if arm in skip:
+            continue
         # no keys= filter: wandb drops every row lacking ANY requested key, and the _step/_epoch
         # renaming means the bare names are usually absent entirely
         df = r.history(pandas=True, samples=100000)
-        hist[arm] = (df, cfg)
+        n = int(df["trainer/global_step"].max()) if "trainer/global_step" in df.columns and not df["trainer/global_step"].dropna().empty else -1
+        # ⛔ An arm can have SEVERAL wandb runs (each failed/preempted attempt made one). Keep the
+        # one that got furthest, or a 19-step crashed attempt silently becomes "the arm" and drags
+        # the common comparison window down with it.
+        if arm in hist and hist[arm][2] >= n:
+            print(f"  {r.name}: {n} steps -- superseded by a longer run of the same arm, skipped")
+            continue
+        if arm in hist:
+            print(f"  {r.name}: {n} steps -- replaces a shorter run of the same arm")
+        hist[arm] = (df, r.config, n)
+    hist = {k: (v[0], v[1]) for k, v in hist.items()}
     if "ctrl" not in hist:
         print("no ctrl arm found -- nothing to compare against")
     ctrl = hist.get("ctrl")
