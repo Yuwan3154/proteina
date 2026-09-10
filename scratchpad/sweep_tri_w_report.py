@@ -19,12 +19,26 @@ AUX_KEYS = ("train/align_loss", "train/align_precision_at_q", "train/mlm_loss", 
             "train/topology_missing_ref_frac", "validation_loss/loss")
 
 
+def resolve(df, key):
+    """Lightning's on_step/on_epoch logging renames `train/x` to `train/x_step` and `train/x_epoch`
+    in wandb, so the exact name is usually ABSENT. Prefer the per-step series, then the epoch one,
+    then the bare name; return None when the metric never appeared (a missing column must not raise
+    -- that was the KeyError this pre-flight caught)."""
+    for cand in (f"{key}_step", key, f"{key}_epoch"):
+        if cand in df.columns:
+            return cand
+    return None
+
+
 def tail_stats(df, key, frac):
-    d = df[["trainer/global_step", key]].dropna()
+    col = resolve(df, key)
+    if col is None or "trainer/global_step" not in df.columns:
+        return None
+    d = df[["trainer/global_step", col]].dropna()
     if d.empty:
         return None
     cut = d["trainer/global_step"].max() * (1 - frac)
-    t = d[d["trainer/global_step"] >= cut][key].to_numpy()
+    t = d[d["trainer/global_step"] >= cut][col].to_numpy()
     return float(t.mean()), float(t.std(ddof=1) if len(t) > 1 else 0.0), int(d["trainer/global_step"].max())
 
 
@@ -42,7 +56,9 @@ def main():
     for r in runs:
         arm = r.name[len(args.prefix):]
         cfg = r.config
-        df = r.history(keys=["trainer/global_step", *MAIN_KEYS, *AUX_KEYS], pandas=True, samples=100000)
+        # no keys= filter: wandb drops every row lacking ANY requested key, and the _step/_epoch
+        # renaming means the bare names are usually absent entirely
+        df = r.history(pandas=True, samples=100000)
         hist[arm] = (df, cfg)
     if "ctrl" not in hist:
         print("no ctrl arm found -- nothing to compare against")
