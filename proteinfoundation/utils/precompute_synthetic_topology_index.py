@@ -169,6 +169,9 @@ def _chain_job(args):
     except Exception as e:  # recorded per chain and audited afterwards, never silent
         return stem, None, [], [("native", f"load_failed:{type(e).__name__}")], None
     seq = getattr(g, "sequence", None)
+    # integer residue types, for the identity gate below: `sequence` may be a string or absent, and
+    # the npz stores aatype indices, so this is the form the two can actually be compared in
+    seq_ref = getattr(g, "residue_type", None)
     coords, cmask, dssp = getattr(g, "coords", None), getattr(g, "coord_mask", None), getattr(g, "dssp_target", None)
     if coords is None or cmask is None:
         return stem, None, [], [("native", "no_coords")], seq
@@ -189,6 +192,20 @@ def _chain_job(args):
         skips.append(("templates", "no_band_index_entry"))
         return stem, native, rows, skips, seq
     npz = np.load(npz_path)
+    # ⛔⛔ IDENTITY GATE. The npz is located by NAME, and a name is not a molecule: T2 keys templates
+    # on <pdbid>_<auth_asym_id> while proteina keys on <pdbid>_<label_asym_id>, so a string join can
+    # hand back a DIFFERENT POLYMER of the same entry, with a perfectly plausible structure attached.
+    # That defect reached 14.4% of our chains and no length check could see it (a mis-joined chain can
+    # have the identical residue count). openfold's own consumer never suffered it because its pool
+    # compares the npz sequence against the query on every draw -- this is the same guard, applied
+    # once at build time. Refuse the template rather than train on another chain's topology.
+    t_aatype = npz["aatype"] if "aatype" in npz else None
+    if t_aatype is not None and seq_ref is not None:
+        t_seq = np.asarray(t_aatype).astype(np.int16)
+        q_seq = np.asarray(seq_ref).astype(np.int16)
+        if t_seq.shape != q_seq.shape or not bool((t_seq == q_seq).all()):
+            skips.append(("templates", f"identity_mismatch:npz_{t_seq.shape[0]}_vs_query_{q_seq.shape[0]}"))
+            return stem, native, rows, skips, seq
     tcoords, amask = npz["coords"], torch.from_numpy(npz["atom_mask"].astype(bool))
     L_t = int(amask.shape[0])
     slot_to_rung = {int(s): r for r, s in enumerate(band_slot.tolist()) if s >= 0}
