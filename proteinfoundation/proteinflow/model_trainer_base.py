@@ -3112,16 +3112,46 @@ class ModelTrainerBase(L.LightningModule):
             n_masked = sel.sum()
             if int(n_masked) > 0:
                 mlm_loss = F.cross_entropy(m_logits[sel], m_tgt[sel])
-                acc = (m_logits[sel].argmax(-1) == m_tgt[sel]).float().mean()
+                tgt_sel = m_tgt[sel]
+                correct = (m_logits[sel].argmax(-1) == tgt_sel).float().sum()
+                acc = correct / float(int(n_masked))
+                # ⭐ The bar mlm_acc has to clear. Uniform chance (1/42) is the WRONG bar: the
+                # length slots are far from uniform, so a head that learned only the marginal would
+                # beat uniform while having learned nothing conditional. This scores the
+                # always-emit-the-most-common-token predictor on the SAME tokens, from a running
+                # count of every target seen so far. Scored BEFORE the update so a step's own
+                # targets cannot shift the mode it is scored against.
+                counts = getattr(self, "_mlm_target_counts", None)
+                if counts is None or counts.numel() != m_logits.shape[-1]:
+                    counts = torch.zeros(m_logits.shape[-1], device=m_logits.device,
+                                         dtype=torch.float64)
+                    self._mlm_target_counts = counts
+                base_correct = (tgt_sel == int(counts.argmax())).float().sum()
+                counts.index_add_(0, tgt_sel, torch.ones_like(tgt_sel, dtype=counts.dtype))
             else:
                 # ⛔ A step CAN mask nothing (token_mask_prob 0.1, batch 1, few elements). A plain
                 # zeros() would leave mlm_head with no gradient and DDP aborts the run with
                 # "parameters that were not used in producing the loss" -- measured on the smoke.
                 # A zero-scaled touch keeps the head in the graph at an unchanged loss value.
                 mlm_loss = 0.0 * m_logits.sum()
+                correct = torch.zeros((), device=mask.device)
+                base_correct = torch.zeros((), device=mask.device)
                 acc = torch.zeros((), device=mask.device)
             self.log(f"{log_prefix}/mlm_loss", mlm_loss.detach(), **log_kw)
-            self.log(f"{log_prefix}/mlm_acc", acc, **log_kw)
+            # ⛔ Weighted by n_masked, NOT by batch size. 22.0% of validation steps mask nothing
+            # (P(nothing masked) = 0.9^n_elements, 0.59 for a 5-element reference) and used to log a
+            # hard 0 into the average, understating mlm_acc by ~28% relative (0.0164 logged vs
+            # 0.0210 true, measured on tri_cb8synth_v4 at step 575). Those steps are not wrong
+            # predictions, they are absent ones. With this weight the EPOCH aggregate is exactly
+            # sum(correct)/sum(n_masked); the _step value is still the raw per-step number, so read
+            # mlm_correct/mlm_n_masked for an exact ratio at any other granularity.
+            # ⛔ Logged UNCONDITIONALLY: log_kw carries sync_dist=True, so a rank that skipped a
+            # log would desynchronise the collective count and hang the run.
+            mlm_kw = {**log_kw, "batch_size": max(int(n_masked), 1)}
+            self.log(f"{log_prefix}/mlm_acc", acc, **mlm_kw)
+            self.log(f"{log_prefix}/mlm_acc_marginal_baseline",
+                     base_correct / max(float(int(n_masked)), 1.0), **mlm_kw)
+            self.log(f"{log_prefix}/mlm_correct", correct, **log_kw)
             self.log(f"{log_prefix}/mlm_n_masked", n_masked.float(), **log_kw)
             total = total + w_mlm * mlm_loss
         return total

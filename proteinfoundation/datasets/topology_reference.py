@@ -437,17 +437,28 @@ class TopologyReferenceTransform(T.BaseTransform):
         row = self._id_to_row.get(stem)
 
         drop = float(torch.rand(1, generator=self._generator)) < self.drop_prob
+        synthetic = self.reference_source == "synthetic"
+        # ⛔ Synthetic mode resolves the template BEFORE honouring the drop, so
+        # topology_missing_ref reports the index's COVERAGE rather than coverage-after-dropout.
+        # Resolving it only on the kept branch scaled the reported rate by (1 - drop_prob): a hole
+        # in 1 chain of 100 read as 0.75 of 100, and a real coverage regression could hide inside
+        # the dropout. Cluster mode stays on the original path so the ctrl/ot_fgw arms keep their
+        # RNG stream and stay comparable across the A/B.
+        syn_row = self._pick_template(row) if (synthetic and row is not None) else None
+        missing = synthetic and (
+            row is None or syn_row is None or syn_row < 0 or not self._runs_for(syn_row)
+        )
         if row is None or drop:
             graph.topology_ref_id = MASK_REF_ID
-            if row is None and self.reference_source == "synthetic":
-                return self._set_empty(graph, missing=True, stem=stem)
+            if missing:
+                return self._set_empty(graph, L=L, missing=True, stem=stem)
             return self._set_empty(graph, L=L)
 
-        t_row = self._pick_template(row)  # cluster: `row` itself when no valid template; synthetic: -1
-        if self.reference_source == "synthetic":
-            if t_row < 0 or not self._runs_for(t_row):
+        if synthetic:
+            if missing:
                 graph.topology_ref_id = MASK_REF_ID
-                return self._set_empty(graph, missing=True, stem=stem)
+                return self._set_empty(graph, L=L, missing=True, stem=stem)
+            t_row = syn_row
             graph.topology_ref_id = str(self._index["ids"][t_row])
             feats = self._build_reference(t_row, L, augment=True)
             for key, value in feats.items():
@@ -456,6 +467,8 @@ class TopologyReferenceTransform(T.BaseTransform):
             graph.ref_align_target = self._align_for(t_row, L, n_he)
             graph.topology_missing_ref = torch.zeros(1, dtype=torch.long)
             return graph
+
+        t_row = self._pick_template(row)  # cluster: `row` itself when no valid template
         # ⭐ require_nonself: for a validation arm that measures the REALISTIC task (thread a
         # template that is not the answer). Without it, self-fallback silently hands back the
         # query's own topology and the metric becomes a ceiling rather than a measurement.
