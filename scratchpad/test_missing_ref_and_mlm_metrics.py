@@ -112,7 +112,7 @@ def test_p4_lightning_batch_size_weighting():
         def training_step(self, batch, _):
             acc, n = STEPS[int(batch[0])]
             self.log("acc_weighted", torch.tensor(acc), on_step=False, on_epoch=True,
-                     batch_size=max(n, 1))
+                     batch_size=n)
             self.log("acc_plain", torch.tensor(acc), on_step=False, on_epoch=True, batch_size=1)
             return self.p(torch.zeros(1, 1)).sum() * 0.0
 
@@ -125,17 +125,18 @@ def test_p4_lightning_batch_size_weighting():
     tr.fit(m, DataLoader(DS(), batch_size=1))
     got_w = float(tr.callback_metrics["acc_weighted"])
     got_p = float(tr.callback_metrics["acc_plain"])
-    # batch_size=max(n,1) means the two zero-mask steps still carry weight 1, so the weighted mean
-    # is sum(a*w)/sum(w) with w = [2,1,4,1,4] -- strictly better than plain, and the exact
-    # sum(correct)/sum(n_masked) whenever no step masks nothing.
-    expect_w = sum(a * max(n, 1) for a, n in STEPS) / sum(max(n, 1) for _, n in STEPS)
-    check("batch_size weights the epoch mean", abs(got_w - expect_w) < 1e-6,
-          f"got {got_w:.4f}, expected {expect_w:.4f}")
+    # batch_size=0 drops a no-target step from the weighted mean entirely, so the aggregate is
+    # EXACTLY sum(correct)/sum(n_masked). max(n,1) was the earlier, partial fix: it left the
+    # spurious zeros in at weight 1 -- which for a batch-size-1 run is the weight they already had.
+    check("batch_size=0 gives the exact token-weighted mean", abs(got_w - weighted) < 1e-6,
+          f"got {got_w:.4f}, expected {weighted:.4f}")
     check("unweighted mean is the diluted one", abs(got_p - unweighted) < 1e-6,
           f"got {got_p:.4f}, expected {unweighted:.4f}")
     check("weighting moves the number away from the diluted value", abs(got_w - got_p) > 1e-3,
           f"weighted {got_w:.4f} vs plain {got_p:.4f}")
-    print(f"    (pure token-weighted over steps that had targets would be {weighted:.4f})")
+    partial = sum(a * max(n, 1) for a, n in STEPS) / sum(max(n, 1) for _, n in STEPS)
+    check("exact beats the max(n,1) partial fix", abs(got_w - partial) > 1e-3,
+          f"exact {got_w:.4f} vs partial {partial:.4f} vs diluted {got_p:.4f}")
 
 
 def test_p5_marginal_baseline():

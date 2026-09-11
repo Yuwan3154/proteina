@@ -3147,7 +3147,15 @@ class ModelTrainerBase(L.LightningModule):
             # mlm_correct/mlm_n_masked for an exact ratio at any other granularity.
             # ⛔ Logged UNCONDITIONALLY: log_kw carries sync_dist=True, so a rank that skipped a
             # log would desynchronise the collective count and hang the run.
-            mlm_kw = {**log_kw, "batch_size": max(int(n_masked), 1)}
+            # batch_size=0 on a step with no targets, NOT max(...,1): a weight of 1 would leave the
+            # spurious zero in the average at exactly the weight it already had (tri runs batch
+            # size 1), which only shrinks the dilution -- 0.0175 against a true 0.0205. VERIFIED on
+            # a real Trainer (job 22596389): weight 0 drops the step from the weighted mean and
+            # reproduces sum(correct)/sum(n_masked) exactly.
+            # The denominator is 0 only if EVERY step in an aggregation window masked nothing, which
+            # at a 22% per-step rate over 64 val batches is 0.22^64 -- and it would surface as nan,
+            # not as a silently wrong number.
+            mlm_kw = {**log_kw, "batch_size": int(n_masked)}
             self.log(f"{log_prefix}/mlm_acc", acc, **mlm_kw)
             self.log(f"{log_prefix}/mlm_acc_marginal_baseline",
                      base_correct / max(float(int(n_masked)), 1.0), **mlm_kw)
