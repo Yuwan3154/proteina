@@ -50,7 +50,9 @@ def missing_of(t, stem):
 
 def test_p3():
     print("\nP3 -- topology_missing_ref reports coverage, not coverage-after-dropout")
-    with tempfile.TemporaryDirectory() as td:
+    # ignore_cleanup_errors: TMPDIR is shared network scratch and rmtree raced with the
+    # index loader's own files -- 'Directory not empty' killed the run AFTER P3 had passed.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         idx = os.path.join(td, "toy_index.pt")
         build_toy_index(idx)
 
