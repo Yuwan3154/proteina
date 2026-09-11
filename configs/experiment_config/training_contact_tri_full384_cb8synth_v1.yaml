@@ -101,7 +101,13 @@ opt:
   # `val_check_interval` was Lightning's minibatch counter, which conflated
   # accumulation; this knob is now multiplied by accumulate_grad_batches in
   # train.py so a value of 1000 here = 1000 gradient updates between val runs.
-  val_check_interval_optim_steps: 25
+  # MEASURED, not estimated (scratchpad/val_cost.py over 31 rounds of tri_cb8synth-22574536):
+  # at 25 optim steps a cheap round cost 18.2 s against a 287 s training window, and every
+  # 5th round ran TM sampling at 256 s -- 18.6% of wall-clock in total. 50 steps + TM every
+  # 20th round puts it at 4.98%, which is the 4-5% the user asked for. The val SAMPLE stays
+  # at 64 batches on purpose: contact precision selects the top-5 checkpoints, so halving
+  # the sample to buy the same time would trade correctness for resolution.
+  val_check_interval_optim_steps: 50
   limit_val_batches: 64  # batches per rank per validation. Unset walks all 8082
                          # val chains, which dominates wall clock at a short cadence.
   skip_nan_grad: False
@@ -167,7 +173,9 @@ validation_sampling:
   # validation_sampling/tmscore_{mean,median,min,max} and rmsd_mean.
   # Set tmscore_n_samples: 0 to disable. Bump tmscore_every_n_val_epochs to amortize cost.
   tmscore_n_samples: 4
-  tmscore_every_n_val_epochs: 5
+  tmscore_every_n_val_epochs: 20  # 5 -> 20 with the P1 cadence change: a TM round costs
+                                  # 256 s vs 18 s for a cheap one, so it was 78% of all
+                                  # validation time. Now every 1000 optim steps.
   # USalign mode for predicted-vs-GT scoring. 5 = TMscore-style residue-index alignment
   # (canonical for structure prediction, prevents inflated scores from sequence-independent
   # re-alignment). 0 = USalign default (TMalign, sequence-independent — diagnostic only).
