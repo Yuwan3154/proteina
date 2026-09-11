@@ -44,6 +44,7 @@ from proteinfoundation.datasets.cath_utils import (
     apply_fold_mask_to_indices,
     load_cath_mapping,
 )
+from proteinfoundation.datasets.sse_topology import MASK_TOKEN as TOPOLOGY_MASK_TOKEN
 from proteinfoundation.datasets.topology_reference import MASK_REF_ID, TopologyReferenceTransform
 from proteinfoundation.utils import logtrace
 from proteinfoundation.utils.dense_padding_data_loader import (
@@ -2900,11 +2901,20 @@ class ModelTrainerBase(L.LightningModule):
                 if got is None:
                     # ⛔ No silent fall back to self: that would put ceiling samples straight back
                     # into the arm whose entire purpose is to exclude them.
+                    # ⛔⛔ PER-CHAIN, not per-batch. Returning None here unconditioned the WHOLE
+                    # validation batch because one fixed chain lacked a reference -- and
+                    # validation_sampling/contact_precision_at_L_median is what
+                    # checkpoint_best_contact_precision selects on, so one bad chain silently
+                    # changed what "best" means for every checkpoint. (Hit for real: 4rgp_A has no
+                    # mmCIF in our raw tree and no template, so it is unkeyable.)
                     logger.warning(
                         f"validation_sampling[nonself]: {src} has no different-sequence "
-                        "cluster-mate; sampling UNCONDITIONED rather than falling back to self."
+                        "cluster-mate; THIS CHAIN samples unconditioned, the rest of the batch "
+                        "keeps its references."
                     )
-                    return None
+                    refs.append(None)
+                    self._last_sampling_ref_ids.append("")
+                    continue
                 ref, ref_stem = got
                 self._last_sampling_ref_ids.append(ref_stem)
             else:
@@ -2914,10 +2924,26 @@ class ModelTrainerBase(L.LightningModule):
                 logger.warning(
                     f"validation_sampling: {src} is absent from the topology index"
                     + (f" (reference for {stem})" if src != stem else "")
-                    + "; sampling UNCONDITIONED."
+                    + "; THIS CHAIN samples unconditioned, the rest of the batch keeps its "
+                    "references."
                 )
-                return None
+                refs.append(None)
+                continue
             refs.append(ref)
+        if all(r is None for r in refs):
+            return None                      # nothing to condition on at all
+        # A chain without a reference gets the same all-MASK scratch pad the training path gives a
+        # dropped reference, so the batch keeps ONE shape while only that sample is unconditioned.
+        present = next(r for r in refs if r is not None)
+        blank = {k: torch.zeros_like(present[k]) for k in self.TOPOLOGY_KEYS}
+        if "topology_he_tokens" in blank:
+            blank["topology_he_tokens"] = torch.full_like(present["topology_he_tokens"],
+                                                          TOPOLOGY_MASK_TOKEN)
+        n_blank = sum(1 for r in refs if r is None)
+        if n_blank:
+            logger.warning(f"validation_sampling: {n_blank} of {len(refs)} chains sample "
+                           "unconditioned (masked reference); the others are conditioned.")
+        refs = [r if r is not None else blank for r in refs]
         return {
             k: self._stack_topology([r[k] for r in refs]).to(self.device)
             for k in self.TOPOLOGY_KEYS
