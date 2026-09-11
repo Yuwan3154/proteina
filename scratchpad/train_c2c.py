@@ -110,6 +110,11 @@ def main():
           f"n_diffusion_samples={args.n_diff}, lr={model.lr}, warmup={model.warmup_steps}, "
           f"t_beta={MODEL_CFG['t_beta']}, diff_chunk={args.diff_chunk}, smooth_lddt={not args.no_lddt}, "
           f"overfit={args.overfit}, seed={args.seed}", flush=True)
+    # ⛔ Echo the DATASET. --dataset arrives inside the launcher's EXTRA variable and was the one
+    # setting no artifact recorded: c2c_cb8 22505379 had to be argued for from four sibling flags,
+    # because the default is the OLD ConFind dataset and a dropped flag would train the wrong
+    # contact definition while every other banner value looked right.
+    print(f"[data] dataset={args.dataset} subdir={args.subdir}", flush=True)
     print(f"[dump] validation structures -> "
           f"{dump_dir if args.n_dump > 0 else 'DISABLED (n_dump=0)'}", flush=True)
 

@@ -81,9 +81,17 @@ if ! mkdir "$LOCK" 2>/dev/null; then
         if [ "$RC" -ne 0 ]; then
             echo "[lock] squeue failed (rc=$RC); refusing to judge whether $HOLDER is alive. Exiting."; exit 0
         fi
-        if [ -n "$ST" ]; then
-            echo "[lock] job $HOLDER is $ST and holds the run; this duplicate exits cleanly."; exit 0
-        fi
+        # ⛔ Gate on a LIVE state, not on "squeue printed something". A predecessor killed by
+        # SIGKILL (node failure, OOM-killer, scancel -9) never runs the EXIT trap, so its lock
+        # survives; while slurmctld still remembers the job, %T prints a TERMINAL state and the old
+        # `-n "$ST"` test read that as "still holds the run" and exited 0 -- COMPLETED, so --requeue
+        # would not retry and no log line looked like a failure.
+        case "$ST" in
+            PENDING|RUNNING|CONFIGURING|COMPLETING|SUSPENDED|RESIZING)
+                echo "[lock] job $HOLDER is $ST and holds the run; this duplicate exits cleanly."; exit 0
+                ;;
+        esac
+        [ -n "$ST" ] && echo "[lock] holder $HOLDER is $ST (terminal); taking the stale lock."
         echo "[lock] stale lock from $HOLDER (no longer queued); taking it."
     fi
 fi
