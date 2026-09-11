@@ -41,6 +41,23 @@ for step, vs, ve, prev_end in cycles:
     tt += train_s
     print(f"{step:>6} {val_s:8.1f} {train_s:9.1f} {cycle_s:9.1f} {100*val_s/cycle_s:6.1f}%")
 if tv + tt:
-    print(f"\nTOTAL over {len(cycles)-1} full cycles: val {tv:.0f}s  train {tt:.0f}s  -> validation is {100*tv/(tv+tt):.1f}% of wall-clock")
-    print(f"train throughput inside training windows: {25/(tt/(len(cycles)-1))*60:.1f} optim steps/min")
-    print(f"observed end-to-end: {25/((tv+tt)/(len(cycles)-1))*60:.2f} optim steps/min")
+    # ⛔ Derive the cadence from the log, never hardcode it. This was 25 when written; P1 moved it
+    # to 50 and every throughput figure silently halved until the discrepancy was noticed.
+    steps = [c[0] for c in cycles]
+    gaps = {b - a for a, b in zip(steps, steps[1:]) if b > a}
+    interval = min(gaps) if gaps else 0
+    n = len(cycles) - 1
+    print(f"\nTOTAL over {n} full cycles: val {tv:.0f}s  train {tt:.0f}s  -> validation is {100*tv/(tv+tt):.1f}% of wall-clock")
+    if not interval:
+        print("cadence: UNKNOWN (need two completed rounds) -- throughput not reported")
+    else:
+        print(f"cadence: {interval} optim steps between validations (read from the log)")
+        print(f"train throughput inside training windows: {interval/(tt/n)*60:.1f} optim steps/min")
+        print(f"observed end-to-end: {interval/((tv+tt)/n)*60:.2f} optim steps/min")
+    # ⛔ The expensive TM-sampling round fires every tmscore_every_n_val_epochs rounds, so a log with
+    # fewer rounds than that has NOT seen one and its percentage is a cheap-rounds-only floor. This
+    # is the exact trap that produced a 6.0% reading of a run that actually spent 18.6%.
+    tm = [c for c in cycles[1:] if (c[2] - c[1]) > 3 * (tv / max(n, 1))]
+    if not tm:
+        print("⚠️ PARTIAL RANGE: no TM-sampling round in this log yet, so the percentage above is a "
+              "cheap-rounds-only FLOOR, not the steady state. Re-run once one has fired.")
