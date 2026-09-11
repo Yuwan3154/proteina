@@ -3043,6 +3043,32 @@ class ModelTrainerBase(L.LightningModule):
                     top = torch.topk(score[b], min(q, score.shape[1])).indices
                     pq.append(flat_a[b, top].mean())
                 prec = torch.stack(pq).mean() if pq else torch.zeros((), device=mask.device)
+
+                # ⛔ The SAME metric on a score that uses POSITION ONLY: pick the element whose
+                # own-chain midpoint is nearest this residue. A synthetic template is a variant of
+                # the query's own native and so keeps its residue indexing, which makes this
+                # baseline strong -- MEASURED offline at 0.555 (job 22507049) against a trained
+                # head's 0.531 at 1500 steps. Without it, a rising align_precision_at_q reads as
+                # "learning to thread" when it may be below what position alone already gives.
+                # Same idea as contact_precision_at_L_noisy_floor for the contact map.
+                # ⛔ Logged UNCONDITIONALLY, like align_precision_at_q above it. Gating the call on
+                # whether this batch had any aligned rows would make the number of logged metrics
+                # data-dependent, and with sync_dist that is a collective-count mismatch between
+                # ranks -- the hang this file already documents for the single-step metrics.
+                he_pos_raw = batch.get("topology_he_pos_raw")
+                pb = []
+                if he_pos_raw is not None:
+                    q_idx = torch.arange(L, device=a_logits.device, dtype=torch.float32)
+                    pos_score = -(q_idx[None, :, None] - he_pos_raw[:, None, :T].float()).abs()
+                    pos_score = pos_score.masked_fill(~qt_valid, float("-inf")).reshape(B, -1)
+                    for b in range(B):
+                        qb = int(Q[b])
+                        if qb == 0:
+                            continue
+                        top = torch.topk(pos_score[b], min(qb, pos_score.shape[1])).indices
+                        pb.append(flat_a[b, top].mean())
+                pos_prec = torch.stack(pb).mean() if pb else torch.zeros((), device=mask.device)
+                self.log(f"{log_prefix}/align_precision_at_q_pos_baseline", pos_prec, **log_kw)
             self.log(f"{log_prefix}/align_loss", align_loss.detach(), **log_kw)
             self.log(f"{log_prefix}/align_precision_at_q", prec, **log_kw)
             self.log(f"{log_prefix}/align_frac_samples", has_q.float().mean(), **log_kw)
