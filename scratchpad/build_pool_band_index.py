@@ -20,10 +20,22 @@ import pathlib
 import numpy as np
 
 
+BAND_KEYS = ("tm", "rewind", "length", "slot", "min_tm", "max_tm")
+
+
 def load_band(path):
+    """Materialise the arrays ONCE.
+
+    ⛔ Indexing an NpzFile (`z[key][i]`) re-reads and re-decompresses the WHOLE array on every
+    access. Doing that per row per key was 69k x 6 = 414k full-array decompressions: it ran for
+    minutes and then OOM-killed a 48 GB job. Reading each array once turns the same work into
+    ordinary numpy indexing.
+    """
     z = np.load(path, allow_pickle=True)
     chains = [str(c) for c in z["chains"]]
-    return {c: i for i, c in enumerate(chains)}, z
+    arrays = {k: np.asarray(z[k]) for k in BAND_KEYS if k in z}
+    z.close()
+    return {c: i for i, c in enumerate(chains)}, arrays
 
 
 def main():
@@ -68,15 +80,27 @@ def main():
         raise SystemExit("no rows resolved -- refusing to write an empty band index")
 
     out = {"chains": np.array([r[0] for r in rows])}
-    for key in ("tm", "rewind", "length", "slot", "min_tm", "max_tm"):
-        stacked = []
-        for _, tree, i in rows:
-            z = bands[tree][1]
-            stacked.append(z[key][i] if key in z else None)
-        if any(s is None for s in stacked):
+    n_by_tree = {t: len(bands[t][0]) for t in bands}
+    for key in BAND_KEYS:
+        if not all(key in bands[t][1] for t in bands):
             print(f"  key {key!r} absent from at least one source band index -- omitted")
             continue
-        out[key] = np.stack(stacked)
+        # min_tm / max_tm are 0-d band BOUNDS, one per file, not per-chain rows. Carry them through
+        # as globals, and check the trees agree: a disagreement would mean the trees were pruned to
+        # DIFFERENT bands, which silently changes what "in band" means for part of the pool.
+        per_chain = all(bands[t][1][key].ndim >= 1 and bands[t][1][key].shape[0] == n_by_tree[t]
+                        for t in bands)
+        if per_chain:
+            out[key] = np.stack([bands[tree][1][key][i] for _, tree, i in rows])
+        else:
+            vals = {t: np.asarray(bands[t][1][key]).ravel()[0] for t in bands}
+            if len({round(float(v), 6) for v in vals.values()}) != 1:
+                raise SystemExit(f"source trees disagree on {key}: {vals} -- they were pruned to "
+                                 "different bands, so the pool would not have one definition of "
+                                 "'in band'. Refusing to write.")
+            out[key] = np.asarray(next(iter(vals.values())))
+            print(f"  key {key!r} is a global band bound = {float(next(iter(vals.values()))):.3f} "
+                  "(identical across all source trees)")
     np.savez(a.out, **out)
 
     print(f"\nwrote {a.out}: {len(rows)} chains, keys {sorted(out)}")

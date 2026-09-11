@@ -76,7 +76,19 @@ def main():
                 continue
 
             src_name = partner if (sst == "remap" and partner) else label_id
-            src, tree_label = find_npz(src_name, trees)
+            # ⛔ A `regenerate` chain STILL has an npz in the T2 tree under this stem -- the
+            # mis-joined one. Searching the trees in order would return it and place a DIFFERENT
+            # POLYMER under the correct auth name: worse than the original bug, because the result
+            # looks right. Regenerated chains may come only from the regen tree.
+            if action == "regenerate":
+                search = [(l, t) for l, t in trees if l == "regen"]
+                if not search:
+                    counts["regen_tree_not_supplied"] += 1
+                    unplaced.append((label_id, "action=regenerate but no --regen-tree given"))
+                    continue
+            else:
+                search = trees
+            src, tree_label = find_npz(src_name, search)
             if src is None:
                 counts[f"missing_npz_{action}"] += 1
                 unplaced.append((label_id, f"no npz for {src_name} in any tree ({action})"))
