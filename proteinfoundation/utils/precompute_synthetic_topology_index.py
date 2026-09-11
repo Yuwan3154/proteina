@@ -305,11 +305,41 @@ def cmd_build(args):
         mine = mine[: args.limit]
     print(f"part {args.part}/{args.n_parts}: {len(mine)} chains", flush=True)
 
+    # ⛔ The ONE translation layer. The template pool is keyed by auth_asym_id, the dataset by
+    # label_asym_id; a string join between them silently selects a DIFFERENT POLYMER (measured: 14.4%
+    # of our chains). The alias is applied HERE, once, and FAILS CLOSED: a stem absent from the alias
+    # gets NO template and a recorded reason, never a fallback to its own name. That silent
+    # passthrough is what produced the defect.
+    alias = {}
+    if args.chain_alias:
+        with open(args.chain_alias) as fh:
+            head = fh.readline().rstrip("\n").split("\t")
+            il = head.index("label_id")
+            ia = head.index("auth_id")
+            for line in fh:
+                f = line.rstrip("\n").split("\t")
+                if len(f) > max(il, ia) and f[ia]:
+                    alias[f[il]] = f[ia]
+        print(f"chain alias: {len(alias)} label->auth entries from {args.chain_alias}", flush=True)
+
     jobs = []
+    n_alias_miss = 0
     for stem in mine:
         pt = str(_processed_path_sharded(Path(args.processed_dir), stem, manifest))
-        npz, tm, rw, sl = find_template(stem, roots)
+        if args.chain_alias:
+            key = alias.get(stem)
+            if not key:
+                n_alias_miss += 1
+                jobs.append((stem, pt, None, None, None, None, args.min_len, args.tm_min,
+                             args.tm_max, bool(args.selftest)))
+                continue
+        else:
+            key = stem
+        npz, tm, rw, sl = find_template(key, roots)
         jobs.append((stem, pt, npz, tm, rw, sl, args.min_len, args.tm_min, args.tm_max, bool(args.selftest)))
+    if args.chain_alias:
+        print(f"  {n_alias_miss} chains have no alias entry -> no template (recorded, not guessed)",
+              flush=True)
 
     out_rows = []          # per chain: dict
     skip_lines = []
@@ -460,6 +490,11 @@ def main():
     b.add_argument("--processed-dir", required=True)
     b.add_argument("--manifest", default="", help="shard_manifest.json of the processed dir")
     b.add_argument("--templates", action="append", required=True, help="ROOT:index_band.npz, repeatable")
+    b.add_argument("--chain-alias", default="",
+                   help="TSV with label_id and auth_id columns. The template pool is keyed by "
+                        "auth_asym_id and the dataset by label_asym_id; without this they join by "
+                        "string and silently select a different polymer. Fails closed: a stem with "
+                        "no alias entry gets no template.")
     b.add_argument("--part", type=int, required=True)
     b.add_argument("--n-parts", type=int, required=True)
     b.add_argument("--out-dir", required=True)
