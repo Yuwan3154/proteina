@@ -16,10 +16,22 @@ df = r.history(samples=100000, pandas=True)
 
 M = "validation_loss/contact_precision_at_L_single_step"
 F = "validation_loss/contact_precision_at_L_noisy_floor"
-sub = df[["trainer/global_step", M, F]].dropna()
+# ⛔ `global_step` is the TRUE optimizer step (it matches the diag log and the on-box watcher).
+# `trainer/global_step` runs ~1.28x higher on this trainer and reading it overstates every step
+# label by ~28% -- the generative rounds sat at real steps 1000/2001/3002/4003/5004 while
+# trainer/global_step called them 1279/2559/3839/5119/6399, one of which was AHEAD of the run.
+# `global_step` is logged on far fewer rows than the metrics, so an inner join is EMPTY. Sort by
+# wandb's own row counter and forward-fill, giving each metric row the most recent true step.
+if "global_step" in df.columns and "_step" in df.columns:
+    df = df.sort_values("_step")
+    df["_true_step"] = df["global_step"].ffill()
+    STEP = "_true_step"
+else:
+    STEP = "trainer/global_step"
+sub = df[[STEP, M, F]].dropna()
 m, f = sub[M].to_numpy(), sub[F].to_numpy()
-st = sub["trainer/global_step"].to_numpy()
-print(f"{len(sub)} paired points, steps {int(st.min())}..{int(st.max())}")
+st = sub[STEP].to_numpy()
+print(f"{len(sub)} paired points, steps {int(st.min())}..{int(st.max())} (axis: {STEP})")
 for lo, hi, name in [(0, len(m)//4, "first quarter"), (3*len(m)//4, len(m), "last quarter")]:
     mm, ff = m[lo:hi], f[lo:hi]
     print(f"  {name:14} metric median {np.median(mm):.4f}  floor median {np.median(ff):.4f}  "
