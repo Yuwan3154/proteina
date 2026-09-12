@@ -75,7 +75,11 @@ def wandb_rounds(arm):
         mir = {int(a): float(b) for a, b in zip(sub["trainer/global_step"], sub["val/is_mirrored"])}
     if {"val/rmsd_proper", "val/rmsd_reflected"} <= set(df.columns):
         sub = df[["trainer/global_step", "val/rmsd_proper", "val/rmsd_reflected"]].dropna()
-        gap = {int(r["trainer/global_step"]): float(r["val/rmsd_proper"] - r["val/rmsd_reflected"])
+        # ⛔ RELATIVE to structure scale. An absolute gap is meaningless without it: at step 2144 the
+        # t_beta arm had rmsd_proper 129.7 A, where +1.62 A is 1.2% (noise) but an absolute 1.5 A
+        # test called it "resolved" and fired a spurious DISAGREE against a correct detector reading.
+        gap = {int(r["trainer/global_step"]):
+               float(r["val/rmsd_proper"] - r["val/rmsd_reflected"]) / max(float(r["val/rmsd_proper"]), 1e-9)
                for _, r in sub.iterrows()}
     return mir, gap
 
@@ -88,7 +92,7 @@ for arm, label in ARMS.items():
         print("  no dumped samples yet")
         continue
     print(f"  {'step':>7} {'n':>3} {'mean':>6} {'native':>7} {'MIRROR':>7} {'mid':>4} {'spread':>7}"
-          f" {'is_mirrored':>12} {'p-r gap':>8}  phase")
+          f" {'is_mirrored':>12} {'p-r gap%':>8}  phase")
     resolved = []
     for step, g in det:
         lo, hi = int((g < NATIVE).sum()), int((g > MIRROR).sum())
@@ -97,14 +101,17 @@ for arm, label in ARMS.items():
         wv = wb.get(step, wb.get(step - 1))
         wstr = f"{round(wv*N_PER_ROUND):>2}/{N_PER_ROUND}" if wv is not None else "   -"
         gp = gaps.get(step, gaps.get(step - 1))
-        gstr = f"{gp:+8.2f}" if gp is not None else f"{'-':>8}"
-        # the two indicators must AGREE; a large gap with an amorphous distribution (or vice versa)
-        # means one of them is wrong and the round should not be pooled
+        gstr = f"{100*gp:+7.1f}%" if gp is not None else f"{'-':>8}"
+        # Observed separation over the 10 rounds available: amorphous 0.2-5.2%, resolved 8.9-35%.
+        # The boundary lies somewhere in 5-9%; rather than invent a cut inside that band, anything
+        # landing in it is AMBIGUOUS and the calibrated detector stays authoritative.
         flag = ""
         if gp is not None:
-            if amorph and gp > 1.5:
+            if 0.05 <= gp <= 0.09:
+                flag = "  (gap AMBIGUOUS, 5-9% band)"
+            elif amorph and gp > 0.09:
                 flag = "  ⚠️ DISAGREE (gap says resolved)"
-            elif not amorph and gp < 0.5:
+            elif not amorph and gp < 0.05:
                 flag = "  ⚠️ DISAGREE (gap says amorphous)"
         print(f"  {step:>7} {len(g):>3} {g.mean():6.3f} {lo:>7} {hi:>7} {mid:>4} {g.std():7.3f}"
               f" {wstr:>12} {gstr}  {'AMORPHOUS' if amorph else 'resolved'}{flag}")
