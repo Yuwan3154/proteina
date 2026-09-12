@@ -56,28 +56,39 @@ def detector_rounds(arm):
 
 
 def wandb_rounds(arm):
+    """(step -> is_mirrored) and (step -> proper-minus-reflected RMSD gap).
+
+    The gap is an INDEPENDENT cross-check on the PDB detector -- different code path, different
+    input -- and unlike the binary is_mirrored it separates amorphous from resolved continuously:
+    an amorphous round has proper ~ reflected (gap < ~1 A) because there is no hand either way.
+    """
     api = wandb.Api()
     rs = [r for r in api.runs("DP_CO_AFdiffusion/contact2coord") if r.name == arm]
     if not rs:
-        return []
+        return {}, {}
     import pandas as pd
     frames = [r.history(samples=100000, pandas=True) for r in rs]
     df = pd.concat([f for f in frames if "trainer/global_step" in f.columns], ignore_index=True)
-    if "val/is_mirrored" not in df.columns:
-        return []
-    sub = df[["trainer/global_step", "val/is_mirrored"]].dropna().sort_values("trainer/global_step")
-    return list(zip(sub["trainer/global_step"].to_numpy(), sub["val/is_mirrored"].to_numpy()))
+    mir, gap = {}, {}
+    if "val/is_mirrored" in df.columns:
+        sub = df[["trainer/global_step", "val/is_mirrored"]].dropna()
+        mir = {int(a): float(b) for a, b in zip(sub["trainer/global_step"], sub["val/is_mirrored"])}
+    if {"val/rmsd_proper", "val/rmsd_reflected"} <= set(df.columns):
+        sub = df[["trainer/global_step", "val/rmsd_proper", "val/rmsd_reflected"]].dropna()
+        gap = {int(r["trainer/global_step"]): float(r["val/rmsd_proper"] - r["val/rmsd_reflected"])
+               for _, r in sub.iterrows()}
+    return mir, gap
 
 
 for arm, label in ARMS.items():
     print(f"\n{'='*74}\n{arm} -- {label}\n{'='*74}")
     det = detector_rounds(arm)
-    wb = dict(wandb_rounds(arm))
+    wb, gaps = wandb_rounds(arm)
     if not det:
         print("  no dumped samples yet")
         continue
     print(f"  {'step':>7} {'n':>3} {'mean':>6} {'native':>7} {'MIRROR':>7} {'mid':>4} {'spread':>7}"
-          f" {'is_mirrored':>12}  phase")
+          f" {'is_mirrored':>12} {'p-r gap':>8}  phase")
     resolved = []
     for step, g in det:
         lo, hi = int((g < NATIVE).sum()), int((g > MIRROR).sum())
@@ -85,8 +96,18 @@ for arm, label in ARMS.items():
         amorph = mid > lo + hi
         wv = wb.get(step, wb.get(step - 1))
         wstr = f"{round(wv*N_PER_ROUND):>2}/{N_PER_ROUND}" if wv is not None else "   -"
+        gp = gaps.get(step, gaps.get(step - 1))
+        gstr = f"{gp:+8.2f}" if gp is not None else f"{'-':>8}"
+        # the two indicators must AGREE; a large gap with an amorphous distribution (or vice versa)
+        # means one of them is wrong and the round should not be pooled
+        flag = ""
+        if gp is not None:
+            if amorph and gp > 1.5:
+                flag = "  ⚠️ DISAGREE (gap says resolved)"
+            elif not amorph and gp < 0.5:
+                flag = "  ⚠️ DISAGREE (gap says amorphous)"
         print(f"  {step:>7} {len(g):>3} {g.mean():6.3f} {lo:>7} {hi:>7} {mid:>4} {g.std():7.3f}"
-              f" {wstr:>12}  {'AMORPHOUS' if amorph else 'resolved'}")
+              f" {wstr:>12} {gstr}  {'AMORPHOUS' if amorph else 'resolved'}{flag}")
         if not amorph and step >= RESOLVED_STEP and wv is not None:
             resolved.append(wv)
     if resolved:
