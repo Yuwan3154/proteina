@@ -30,11 +30,53 @@ import sys
 import hydra
 import lightning as L
 import torch
+from lightning.pytorch.loggers import Logger
+from lightning.pytorch.utilities import rank_zero_only
 from omegaconf import OmegaConf
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from proteinfoundation.proteinflow.proteina import Proteina
+
+
+class _NullExperiment:
+    def log(self, *args, **kwargs):
+        pass
+
+
+class _NullLogger(Logger):
+    """⛔ The sampling trajectory REFUSES TO RUN without a logger exposing `.experiment`.
+
+    `_run_validation_trajectory` opens with
+        `if is_rank0 and (self.logger is None or not hasattr(self.logger, "experiment")): return`
+    so a `Trainer(logger=False)` yields ZERO `validation_sampling/*` metrics -- silently, with a
+    cheerful "traj done" in the diagnostics. That is exactly what job 22757754 produced: the fixed
+    32-chain set loaded, all 8 batches "ran" in ~0 ms, and every metric came back `(absent)`.
+
+    A real wandb run is not wanted for an offline eval, so this satisfies the gate and swallows the
+    payload. The numbers still reach `trainer.callback_metrics`, because the model logs them via
+    `self.log(..., logger=False)` independently of this object.
+    """
+
+    @property
+    def name(self):
+        return "null"
+
+    @property
+    def version(self):
+        return "0"
+
+    @property
+    def experiment(self):
+        return _NullExperiment()
+
+    @rank_zero_only
+    def log_metrics(self, metrics, step=None):
+        pass
+
+    @rank_zero_only
+    def log_hyperparams(self, params, *args, **kwargs):
+        pass
 
 REPORT = (
     ("validation_sampling/contact_precision_at_L_median", "P@L (median)  <- headline"),
@@ -91,11 +133,17 @@ def main():
         print(f"[EMA load] unexpected: {n}")
 
     dm = hydra.utils.instantiate(cfg_data.datamodule)
-    trainer = L.Trainer(accelerator="gpu", devices=1, num_nodes=1, logger=False,
+    trainer = L.Trainer(accelerator="gpu", devices=1, num_nodes=1, logger=_NullLogger(),
                         enable_progress_bar=False, limit_val_batches=args.limit_val_batches)
     trainer.validate(model, datamodule=dm)
 
     cm = {k: float(v) for k, v in trainer.callback_metrics.items()}
+    # ⛔ Fail loudly. A silent (absent) row reads like "the model scored nothing" when it actually
+    # means the trajectory never ran -- the failure mode that wasted job 22757754.
+    if not any("validation_sampling/contact" in k for k in cm):
+        print("\n⛔ FATAL: no validation_sampling/contact_* metrics were produced. The sampling "
+              "trajectory did not run -- check the logger gate and tmscore_n_samples.")
+        return 2
     print(f"\n===== config={args.config_name}  arm={args.arm} =====")
     for key, label in REPORT:
         hits = [v for k, v in cm.items() if k.endswith(key)]
