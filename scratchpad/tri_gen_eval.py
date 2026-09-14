@@ -97,6 +97,12 @@ def main():
     ap.add_argument("--limit_val_batches", type=int, default=200)
     ap.add_argument("--store", default="/tmp/tri_gen_eval_store")
     ap.add_argument("--nonself_seed", type=int, default=0)
+    # ⛔ SAME POPULATION before comparing arms. On the default 32-chain list the OLD model's nonself
+    # pass sampled 7 chains UNCONDITIONED (no cluster-mate -> no topology at all, not a template),
+    # while the other three passes had zero. Those three arms were therefore measured on 32 chains
+    # and the fourth on an unconditioned-contaminated mixture. Pass val_fixed_nonself.txt to restrict
+    # every arm to the 22 chains that actually have a different-sequence mate.
+    ap.add_argument("--fixed_chain_list", default=None)
     args = ap.parse_args()
 
     with hydra.initialize("../configs/experiment_config", version_base=hydra.__version__):
@@ -111,6 +117,8 @@ def main():
     cfg_exp.validation_sampling.force_trajectory_at_step0 = True
     cfg_exp.validation_sampling.topology_nonself = (args.arm == "nonself")
     cfg_exp.validation_sampling.topology_nonself_seed = args.nonself_seed
+    if args.fixed_chain_list is not None:
+        cfg_exp.validation_sampling.fixed_chain_list = args.fixed_chain_list
     print(f"[arm] topology_nonself={cfg_exp.validation_sampling.topology_nonself} "
           f"(self => the model is handed the correct topology; a CEILING)")
     print(f"[chains] fixed_chain_list={cfg_exp.validation_sampling.get('fixed_chain_list')}")
