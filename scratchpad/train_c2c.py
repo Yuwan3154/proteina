@@ -70,6 +70,11 @@ def main():
     # unweighted, while the chiral MSE is EDM-weighted down to ~1/sd^2 at high sigma. --no_lddt
     # leaves the MSE as the only structure loss. AF3 drops LDDT from fine-tuning 1 (SI 5.2).
     ap.add_argument("--no_lddt", action="store_true", help="drop smooth_lddt from the diffusion loss")
+    # ⛔ No published value for this. 0.0 leaves the term out of the graph entirely, so every
+    # existing run stays byte-identical; any non-zero value is an experiment choice and must be
+    # recorded with the run.
+    ap.add_argument("--w_chiral", type=float, default=0.0,
+                    help="weight on the local CA sin-dihedral chirality loss (0 = off)")
     # Overfit ONE structure: the trainer pins its first training batch and reuses it for every
     # train/val step (saved to <run>/overfit_batch.pt). Every other hyperparameter is untouched.
     ap.add_argument("--overfit", action="store_true", help="pin the first batch; one-structure run")
@@ -99,6 +104,7 @@ def main():
     kw = {"lr": args.lr} if args.lr is not None else {}
     kw["warmup_steps"] = args.warmup
     kw["use_smooth_lddt"] = not args.no_lddt
+    kw["w_chiral"] = args.w_chiral
     if args.overfit:
         os.makedirs(os.path.join(args.store, args.name), exist_ok=True)
         kw["overfit_batch_path"] = os.path.join(args.store, args.name, "overfit_batch.pt")
@@ -109,7 +115,7 @@ def main():
     print(f"[model] {n_par/1e6:.2f} M parameters, {MODEL_CFG['n_blocks']} diffusion blocks, "
           f"n_diffusion_samples={args.n_diff}, lr={model.lr}, warmup={model.warmup_steps}, "
           f"t_beta={MODEL_CFG['t_beta']}, diff_chunk={args.diff_chunk}, smooth_lddt={not args.no_lddt}, "
-          f"overfit={args.overfit}, seed={args.seed}", flush=True)
+          f"overfit={args.overfit}, seed={args.seed}, w_chiral={args.w_chiral}", flush=True)
     # ⛔ Echo the DATASET. --dataset arrives inside the launcher's EXTRA variable and was the one
     # setting no artifact recorded: c2c_cb8 22505379 had to be argued for from four sibling flags,
     # because the default is the OLD ConFind dataset and a dropped flag would train the wrong

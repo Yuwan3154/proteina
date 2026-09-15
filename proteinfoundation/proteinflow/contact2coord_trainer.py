@@ -47,7 +47,7 @@ class ContactToCoordTrainer(L.LightningModule):
                  aug_mode: str = "balanced", lr: float = BASE_LR,
                  dump_dir: str = None, n_dump: int = 2, ema_decay: float = EMA_DECAY,
                  warmup_steps: int = WARMUP_STEPS, use_smooth_lddt: bool = True,
-                 overfit_batch_path: str = None):
+                 overfit_batch_path: str = None, w_chiral: float = 0.0):
         super().__init__()
         self.save_hyperparameters()
         self.model = ContactToCoord(**model_cfg, n_ref_feats=N_REF_FEATS)
@@ -58,6 +58,10 @@ class ContactToCoordTrainer(L.LightningModule):
         # high sigma -- the noise levels where the hand is committed. Turning it off makes the
         # structure loss strictly chiral. AF3 itself drops it from fine-tuning 1 onward (SI 5.2).
         self.use_smooth_lddt = use_smooth_lddt
+        # ⛔ DEFAULT 0.0 => the term is absent from the graph and every existing run is
+        # byte-identical. There is no published value for this weight; it is set per experiment and
+        # the chosen value must be recorded with the run, never inferred here.
+        self.w_chiral = w_chiral
         # Overfit-one-structure mode: pin the FIRST training batch and reuse it for every train and
         # val step. Not Lightning's overfit_batches: that only swaps a RandomSampler for a
         # SequentialSampler, and our ClusterSampler would hand it a different chain every epoch.
@@ -131,6 +135,58 @@ class ContactToCoordTrainer(L.LightningModule):
         ).reshape(B, L, L)
         return (ce * pair_mask).sum((1, 2)) / pair_mask.sum((1, 2)).clamp_min(1.0)
 
+    @staticmethod
+    def _ca_sin_dihedral(ca, eps: float = 1e-8):
+        """sin of the CA pseudo-dihedral over (i-1, i, i+1, i+2). ca: [B, L, 3] -> [B, L-3].
+
+        ⭐ WHY sin AND NOT THE ANGLE. Under a reflection every dihedral flips sign, so
+        `cos d` is EVEN (carries no handedness at all) and `sin d` is ODD. Training on `sin d`
+        therefore supervises EXACTLY the degree of freedom that mirroring corrupts, and nothing else
+        -- a mirrored structure has identical distances, identical contacts and identical |d|.
+        ⛔ Computed directly from cross products rather than via atan2: atan2's gradient is unstable
+        near the +-pi wrap, and we never need the angle itself.
+        """
+        b1 = ca[:, 1:-2] - ca[:, :-3]
+        b2 = ca[:, 2:-1] - ca[:, 1:-2]
+        b3 = ca[:, 3:] - ca[:, 2:-1]
+        n1 = torch.cross(b1, b2, dim=-1)
+        n2 = torch.cross(b2, b3, dim=-1)
+        b2n = b2 / b2.norm(dim=-1, keepdim=True).clamp_min(eps)
+        num = (torch.cross(n1, n2, dim=-1) * b2n).sum(-1)
+        den = n1.norm(dim=-1).clamp_min(eps) * n2.norm(dim=-1).clamp_min(eps)
+        return num / den.clamp_min(eps)
+
+    def _chirality_loss(self, x_denoised, x_gt, atom_mask_rep, L):
+        """Local, scale-free handedness supervision on the model's OWN output coordinates.
+
+        ⛔⛔ NOT a prediction head on the trunk. The conditioning input is a CONTACT MAP, which is
+        chirality-blind: a structure and its mirror have identical pairwise distances, so the correct
+        enantiomer is formally UNIDENTIFIABLE from the input and a head on `s`/`z` could only ever
+        learn the marginal prior that is already failing. Measuring the handedness of the GENERATED
+        coordinates is identifiable, and that is what this does.
+
+        ⭐ Why it can beat the plain MSE at the same job: the MSE is dominated by large-scale
+        positional error (these samples sit at ~20 A RMSD), so the sign of a local dihedral is a
+        vanishing fraction of it. This term is per-window and NORMALISED, so every residue
+        contributes equally regardless of global error -- dense, scale-free chirality gradient.
+
+        ⚠️ Honest caveat: this trains the SAME quantity the native-free mirror detector thresholds
+        (`helix_pos_frac`). An improvement in that detector after adding this term is therefore NOT
+        independent confirmation -- it is partly circular. Judge it on RMSD-after-reflection and on
+        the GT `val/is_mirrored` instead.
+        """
+        ca_p = x_denoised.reshape(-1, L, 14, 3)[:, :, 1, :]
+        ca_t = x_gt.reshape(-1, L, 14, 3)[:, :, 1, :]
+        # ⛔ MASK, not shape. atom14 slot 1 is CA; a window is valid only if all FOUR of its
+        # residues are real, otherwise padding zeros would contribute a meaningless dihedral.
+        res_m = atom_mask_rep.reshape(-1, L, 14)[:, :, 1] > 0.5
+        win_m = res_m[:, :-3] & res_m[:, 1:-2] & res_m[:, 2:-1] & res_m[:, 3:]
+        sp = self._ca_sin_dihedral(ca_p)
+        st = self._ca_sin_dihedral(ca_t)
+        se = ((sp - st) ** 2) * win_m
+        n = win_m.sum(-1).clamp_min(1)
+        return se.sum(-1) / n, (sp.detach(), st.detach(), win_m)
+
     def _step(self, batch, train: bool):
         b = self._prepare(batch, train)
         out = self.model(b)
@@ -142,9 +198,22 @@ class ContactToCoordTrainer(L.LightningModule):
         # ⭐ rmsd is the interpretable one: diffusion_loss builds mse as
         # sum_atoms||dx||^2 / n_atoms / 3 (SI Eq. 3's 1/3 prefactor), so RMSD = sqrt(3*mse) in
         # ANGSTROM. It is a DENOISING rmsd at the sampled noise level, not a generation rmsd.
-        return loss, {"diffusion": dl.mean(), "distogram": dg.mean(),
-                      "mse": aux["mse"].mean(), "sigma": out["sigma"].mean(),
-                      "rmsd": (3.0 * aux["mse"]).sqrt().mean()}
+        metrics = {"diffusion": dl.mean(), "distogram": dg.mean(),
+                   "mse": aux["mse"].mean(), "sigma": out["sigma"].mean(),
+                   "rmsd": (3.0 * aux["mse"]).sqrt().mean()}
+        if self.w_chiral > 0.0:
+            L = int(b["mask"].shape[1])
+            ch, (sp, st, wm) = self._chirality_loss(
+                out["x_denoised"], out["x_gt_rep"], out["atom_mask_rep"], L)
+            loss = loss + self.w_chiral * ch.mean()
+            metrics["chiral"] = ch.mean()
+            # ⭐ The READOUT that matters, logged even though it is not the loss: the fraction of
+            # windows whose predicted handedness has the WRONG SIGN. A mirrored structure drives
+            # this toward 1, a correct one toward 0, and unlike the loss it is interpretable and
+            # directly comparable to the detector's helix_pos_frac.
+            wrong = ((sp * st) < 0) & wm
+            metrics["chiral_sign_wrong"] = wrong.sum() / wm.sum().clamp_min(1)
+        return loss, metrics
 
     def _pin(self, batch):
         if self.overfit_batch_path is None:
