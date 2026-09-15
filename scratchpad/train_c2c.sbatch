@@ -38,6 +38,11 @@ mkdir -p "$TMPDIR" /orcd/scratch/orcd/011/chenxiou/c2c_store/logs
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+# ⭐ Record the EDM data scale this segment actually runs with. Unset => af3_diffusion.py's 16.0.
+# ⛔ This echo proves PARSING, not PARTICIPATION -- cross-check the logged `train/sigma`, which must
+# scale with SIGMA_DATA (sigma = SIGMA_DATA * exp(P_MEAN + P_STD*N)), i.e. 16 -> 10.31 must drop the
+# mean sigma by 1.552x. An unused env var cannot fake that.
+echo "[edm] SIGMA_DATA=${SIGMA_DATA:-16.0 (default)}"
 
 # ── self-chaining, mit_normal_gpu caps wall-clock at 6 h ───────────────────────────────────────
 # Carries every fix earned on the tri launcher this session:
@@ -101,9 +106,13 @@ if [ "$CHAIN" -gt 0 ]; then
     # instead of training from scratch into the run directory.
     # The successor also inherits THIS job's time limit, cpus and mem: the file's defaults (6 h,
     # 16 CPU, 200 GB) are mit_normal_gpu's; on pi_so3 node4007 (66 GB free) they would pend forever.
+    # ⛔⛔ SIGMA_DATA must be re-exported for the SAME reason EXTRA must: it is read at import time by
+    # af3_diffusion.py, and a successor that loses it silently reverts to 16.0 -- the run would keep
+    # training, keep logging, and look healthy while running a DIFFERENT experiment from the segment
+    # before it. Defaulting to 16.0 keeps every pre-existing chain byte-identical.
     CHAIN=$((CHAIN - 1)) DEVICES="${DEVICES:-2}" ACCUM="${ACCUM:-8}" NDIFF="${NDIFF:-8}" LR="${LR:-0.0006}" \
         PRECISION="${PRECISION:-bf16-mixed}" VAL_EVERY="${VAL_EVERY:-500}" WARMUP="${WARMUP:-1000}" GRES="$GRES" \
-        EXTRA="${EXTRA:-}" REPO="$REPO" INIT_FROM="${INIT_FROM:-}" \
+        EXTRA="${EXTRA:-}" REPO="$REPO" INIT_FROM="${INIT_FROM:-}" SIGMA_DATA="${SIGMA_DATA:-16.0}" \
         sbatch --dependency=afterany:${SLURM_JOB_ID} \
                --partition="$SLURM_JOB_PARTITION" \
                --gres="$GRES" \
