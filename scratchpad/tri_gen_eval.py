@@ -24,6 +24,7 @@ Usage (one model, one arm):
 """
 
 import argparse
+import json
 import os
 import sys
 
@@ -93,7 +94,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config_name", required=True)
     ap.add_argument("--ema_ckpt", required=True)
-    ap.add_argument("--arm", choices=["self", "nonself"], required=True)
+    ap.add_argument("--arm", choices=["self", "nonself", "mask"], required=True)
     ap.add_argument("--limit_val_batches", type=int, default=200)
     ap.add_argument("--store", default="/tmp/tri_gen_eval_store")
     ap.add_argument("--nonself_seed", type=int, default=0)
@@ -119,6 +120,19 @@ def main():
     cfg_exp.validation_sampling.topology_nonself_seed = args.nonself_seed
     if args.fixed_chain_list is not None:
         cfg_exp.validation_sampling.fixed_chain_list = args.fixed_chain_list
+    if args.arm == "mask":
+        # ⭐ The UNCONDITIONAL arm, and the discriminator the 2x2 cannot supply on its own: a model
+        # whose score barely moves between `self` and `nonself` is either robust to the reference or
+        # IGNORING it, and only the no-reference floor tells those apart.
+        # ⛔ Not done by setting `model.nn.topology_cond=False` -- that changes what gets BUILT, so
+        # the checkpoint would no longer match. A reference map covering no chain leaves the
+        # architecture intact and drives the resolver's documented "sampling UNCONDITIONED" path.
+        os.makedirs(args.store, exist_ok=True)
+        sentinel = os.path.join(args.store, "empty_ref_map.json")
+        with open(sentinel, "w") as fh:
+            json.dump({"__no_such_chain__": "__no_such_chain__"}, fh)
+        cfg_exp.validation_sampling.topology_reference_map = sentinel
+        print("[arm] mask: reference map covers no chain -> every sample is UNCONDITIONED")
     print(f"[arm] topology_nonself={cfg_exp.validation_sampling.topology_nonself} "
           f"(self => the model is handed the correct topology; a CEILING)")
     print(f"[chains] fixed_chain_list={cfg_exp.validation_sampling.get('fixed_chain_list')}")
