@@ -18,6 +18,7 @@ ground truth (SI 3.7.1). Both are provided here: `denoise` for training, `rollou
 """
 
 import math
+import os
 from typing import Optional
 
 import torch
@@ -25,7 +26,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ── AF3 constants, all cited ──────────────────────────────────────────────────────────────────
-SIGMA_DATA = 16.0          # SI Alg. 20 header; DeepMind diffusion_head.py:39
+# ⭐ SIGMA_DATA is the ONE constant here that should track OUR data rather than AF3's. EDM's weight
+# (sigma^2+sd^2)/(sigma*sd)^2 is exactly 1/c_out^2, which equalises gradient across noise levels
+# ONLY when sd equals the data's PER-COORDINATE std. Measured on the CB8 training set (64 chains,
+# 0 skips): centred 3D-norm RMS 17.85 A => per-coordinate 17.85/sqrt(3) = 10.31 A. Against sd=16
+# that leaves the high-noise regime training at 2.41x weaker gradient than the low-noise regime.
+# (The /sqrt(3) is exact because centre_random_augmentation applies a uniform random rotation, so
+# the marginal per-axis variance is Rg^2/3 whatever the chain's elongation.)
+# ⛔ Overridable by env ONLY, defaulting to AF3's published 16.0, so every existing run and every
+# existing checkpoint stays byte-identical unless a launcher opts in explicitly. Changing it also
+# moves c_in, c_skip, c_out, c_noise, the training sigma distribution AND the schedule top
+# (S_MAX*sd) -- it is NOT a loss-weight-only knob, so a run that changes it cannot resume a
+# checkpoint trained at another value; it must warm-start (INIT_FROM) into a NEW run name.
+SIGMA_DATA = float(os.environ.get("SIGMA_DATA", "16.0"))  # SI Alg. 20 header; DeepMind diffusion_head.py:39
 P_MEAN = -1.2              # SI 3.7.1 training noise distribution
 P_STD = 1.5                # SI 3.7.1
 S_MAX = 160.0              # SI 3.7.1 Eq. 7 inference schedule
