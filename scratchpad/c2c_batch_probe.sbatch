@@ -52,8 +52,15 @@ for BS in 1 2 4; do
     # Sample GPU memory while the trial runs; report the PEAK. Avoids patching train_c2c.py.
     ( while true; do nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits; sleep 3; done ) > "$TMPDIR/mem_$SLURM_JOB_ID.$BS" 2>/dev/null &
     SAMPLER=$!
+    # ⛔⛔ MIRROR THE PARENT RUN EXACTLY, varying ONLY batch_size/accum. A first version of this probe
+    # omitted --diff_chunk and --no_lddt and so ran diff_chunk=0 + smooth_lddt=True: all 48 diffusion
+    # samples resident at once plus an L^2 pair-grid sigmoid. It OOM'd at 94.58 GiB on a 97.9 GB card
+    # at batch 1 -- a configuration the run does not use, measuring a number that means nothing.
+    # Parent settings, from c2c_cb8_tbeta-22756317.out's own [model] line:
+    #   n_diffusion_samples=48, diff_chunk=8, smooth_lddt=False, t_beta=(1.3,2.0), lr=3e-4, warmup=2000
     timeout 900 python scratchpad/train_c2c.py --smoke \
-        --devices 1 --batch_size "$BS" --accum "$ACC" --n_diff 48 \
+        --devices 1 --batch_size "$BS" --accum "$ACC" --n_diff 48 --diff_chunk 8 \
+        --no_lddt --t_beta 1.3,2.0 --lr 0.0003 --warmup 2000 \
         --name "probe_bs${BS}_${SLURM_JOB_ID}" \
         --dataset pdb_train_contact-CB8_S25_max384_purge-test_cutoff-190828
     RC=$?
