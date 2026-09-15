@@ -693,6 +693,37 @@ class OpenFoldTemplateInference(nn.Module):
                     batch[key] = torch.zeros_like(batch[key])
 
     @staticmethod
+    def _strip_template_to_backbone_cb(raw: dict) -> None:
+        """AF2Rank mask_sidechains_add_cb, applied to the RAW template features in place.
+
+        ⛔ Must run BEFORE FeaturePipeline.process_features: `make_pseudo_beta("template_")` and
+        `atom37_to_torsion_angles("template_")` derive from template_all_atom_{positions,mask}, so
+        stripping afterwards would leave those channels carrying full-sidechain geometry.
+        Mirrors af2rank_openfold_scorer._strip_to_backbone_cb (keep N/CA/C/O/CB, project a CB onto
+        glycines) so this control and the production af2rank arm mask the template the same way.
+        """
+        pos, msk = raw["template_all_atom_positions"], raw["template_all_atom_mask"]
+        idx = {a: rc.atom_order[a] for a in ("N", "CA", "C", "O", "CB")}
+        keep = np.zeros(msk.shape[-1], dtype=bool)
+        keep[list(idx.values())] = True
+
+        bb_ok = np.all(msk[..., [idx["N"], idx["CA"], idx["C"]]] > 0, axis=-1)
+        need_cb = bb_ok & (msk[..., idx["CB"]] == 0)
+        for t, r in zip(*np.nonzero(need_cb)):
+            n, ca, c = (pos[t, r, idx[a]].astype(np.float64) for a in ("N", "CA", "C"))
+            norm = lambda x: x / (np.sqrt(np.square(x).sum()) + 1e-8)
+            bc = norm(n - ca)
+            nn = norm(np.cross(n - c, bc))
+            d = np.array([1.522 * np.cos(1.927),
+                          1.522 * np.sin(1.927) * np.cos(-2.143),
+                          -1.522 * np.sin(1.927) * np.sin(-2.143)])
+            pos[t, r, idx["CB"]] = ca + d @ np.array([bc, np.cross(nn, bc), nn])
+            msk[t, r, idx["CB"]] = 1.0
+
+        pos[..., ~keep, :] = 0.0
+        msk[..., ~keep] = 0.0
+
+    @staticmethod
     def _make_template_stub_features(
         sequence: str,
         mask: np.ndarray,
@@ -827,6 +858,7 @@ class OpenFoldTemplateInference(nn.Module):
         template_chain_id: Optional[str] = None,
         kalign_binary_path: Optional[str] = None,
         mask_template_aatype: bool = False,
+        mask_template_sidechains: bool = False,
         zero_template_unit_vector: bool = False,
         zero_template_torsion_angles: bool = False,
         _pad_to_length: Optional[int] = None,
@@ -962,6 +994,9 @@ class OpenFoldTemplateInference(nn.Module):
             torch.manual_seed(seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(seed)
+
+        if mask_template_sidechains:
+            self._strip_template_to_backbone_cb(raw)
 
         feats = self.feature_pipeline.process_features(raw, mode="predict", is_multimer=False)
 

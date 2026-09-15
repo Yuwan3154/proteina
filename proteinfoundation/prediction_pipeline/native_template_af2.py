@@ -124,6 +124,7 @@ def main(args):
                 template_chain_id=chain,
                 kalign_binary_path=kalign,
                 mask_template_aatype=args.mask_template_aatype,
+                mask_template_sidechains=args.mask_template_sidechains,
                 seed=args.seed,
                 skip_template_alignment=False,
             )
@@ -173,5 +174,9 @@ if __name__ == "__main__":
     ap.add_argument("--mask_template_aatype", action="store_true", default=False,
                     help="AF2Rank's setting; OFF by default so this matches the distogram-only run, "
                          "which shows AF2 the real query sequence in the template row")
+    ap.add_argument("--mask_template_sidechains", action="store_true", default=False,
+                    help="AF2Rank mask_sidechains_add_cb: strip the template to N/CA/C/O/CB and "
+                         "project a CB onto glycines. Independent of --mask_template_aatype; the "
+                         "full AF2Rank recipe sets both")
     ap.add_argument("--deepspeed_attn", action="store_true", default=False)
     main(ap.parse_args())
