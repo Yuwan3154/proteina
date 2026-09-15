@@ -259,12 +259,36 @@ class ContactToCoordTrainer(L.LightningModule):
                                     b["atom_to_token"], b["atom_mask"], b["ref_space_uid"],
                                     n_steps=FULL_INFERENCE_STEPS)
         L = b["mask"].shape[1]
-        gen14 = coords.reshape(-1, L, 14, 3)[0]
-        gt14 = b["atom_pos"].reshape(-1, L, 14, 3)[0]
+        gen_all = coords.reshape(-1, L, 14, 3)
+        gt_all = b["atom_pos"].reshape(-1, L, 14, 3)
         out_dir = os.path.join(self.dump_dir, f"step{self.global_step:07d}")
-        name = f"val{batch_idx:02d}"
-        mad, chir, hand = dump_sample(out_dir, name, gen14, gt14, b["aatype"][0], b["mask"][0],
-                                      b["contacts"][0])
+        # ⛔ Previously this scored ONLY entry [0] of the batch and discarded the rest, even though
+        # `rollout` had already generated every one of them. At batch_size=1 that was the whole
+        # batch so nothing was lost -- but in the 16-structure overfit it would have reported the
+        # mirror rate of a SINGLE structure repeated, and any batch_size>1 run silently threw away
+        # most of its own samples. Score them all; the handedness metrics then average over the
+        # batch instead of resting on one draw.
+        nb = int(gen_all.shape[0])
+        mads, chirs, hands = [], [], []
+        for j in range(nb):
+            # Keep the historical name when there is one structure, so existing sample directories
+            # and the offline detector's `*_gen.pdb` glob keep working unchanged.
+            name = f"val{batch_idx:02d}" if nb == 1 else f"val{batch_idx:02d}_{j:02d}"
+            m_j, c_j, h_j = dump_sample(out_dir, name, gen_all[j], gt_all[j], b["aatype"][j],
+                                        b["mask"][j], b["contacts"][j])
+            mads.append(m_j)
+            chirs.append(c_j)
+            if h_j:
+                hands.append(h_j)
+        mad = float(sum(mads) / max(len(mads), 1))
+        chir = float(sum(chirs) / max(len(chirs), 1))
+        # Average each handedness key over whichever structures produced it (a very short chain
+        # yields no helix_pos_frac, so the keys are not all present on every structure).
+        hand = {}
+        for k in {k for h in hands for k in h}:
+            vals = [h[k] for h in hands if k in h]
+            hand[k] = float(sum(vals) / len(vals))
+        hand["n_scored"] = float(len(hands))
         # Mean |d_gen - d_gt| over CA pairs: alignment-free, so a bad superposition cannot
         # flatter it, and directly comparable in Angstrom to the denoising rmsd.
         self.log("val/dist_mae_sampled", mad, sync_dist=False, rank_zero_only=True)

@@ -164,4 +164,16 @@ def handedness_metrics(ca_gen, ca_gt):
     out["rmsd_proper"] = p
     out["rmsd_reflected"] = r
     out["is_mirrored"] = float(p > 2.0 * r and p - r > 1.0)
+    # ⭐⭐ THE NON-CIRCULAR MIRROR DISCRIMINATOR, and the one to watch.
+    # `helix_pos_frac` is a LOCAL CA-dihedral statistic -- the same quantity the chirality loss
+    # trains and the same one the offline detector thresholds -- so it cannot independently confirm
+    # that a chirality fix worked. "Does allowing a reflection fit the fold better?" is independent
+    # of both, and it asks about the GLOBAL fold rather than local dihedral signs.
+    # ⛔ `is_mirrored` demands p > 2r, which is far too strict to catch a real mirror at these
+    # error levels: measured 23.52 vs 19.40 at step 4287 is plainly reflection-favouring yet scores
+    # 0 on that test (23.52 < 38.80). The GAP catches what the threshold misses.
+    out["rmsd_refl_gap"] = p - r
+    # Scale-free: an 0.06 A gap on a 26 A structure is noise, 4.12 A on 23.5 A is not. This is the
+    # number that showed the fold getting MORE mirrored over training (0.2% -> 17.5%, 8/8 rounds).
+    out["rmsd_refl_gap_frac"] = float((p - r) / p) if p > 1e-6 else 0.0
     return out
