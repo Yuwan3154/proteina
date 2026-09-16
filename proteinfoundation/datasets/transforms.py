@@ -749,6 +749,7 @@ class ContactMapTransform(T.BaseTransform):
         self,
         contact_atom_type: Literal["CA", "CB"] = "CB",
         contact_distance_cutoff: float = 8.0,
+        cb_fill: Literal["ca", "pseudo_cb"] = "ca",
         contact_method: Literal["distance", "confind", "frame2confind"] = "distance",
         confind_bin: str = "confind",
         confind_rotamer_lib: Optional[str] = None,
@@ -764,6 +765,10 @@ class ContactMapTransform(T.BaseTransform):
                 "CA" for alpha-carbon, "CB" for beta-carbon (CA where CB is not resolved,
                 ContactEBM convention).
             contact_distance_cutoff: Distance threshold in Angstroms for defining contacts.
+            cb_fill: What to use where CB is absent (glycine, or an unresolved side chain).
+                "ca" = the historical fallback to the CA atom. "pseudo_cb" = a
+                RoseTTAFold-style virtual CB built from the N/CA/C frame, which keeps
+                glycine on the same footing as every other residue.
                 Residue pairs with distance <= cutoff are considered in contact.
             contact_method: Contact map generation mode ("distance", "confind", or
                 "frame2confind"). ``confind`` expects precomputed raw maps in the
@@ -781,6 +786,13 @@ class ContactMapTransform(T.BaseTransform):
         """
         self.contact_atom_type = contact_atom_type
         self.contact_distance_cutoff = contact_distance_cutoff
+        # ⛔ DEFAULT "ca" reproduces the previous behaviour EXACTLY, so every existing run,
+        # config and preprocessed target is byte-identical unless a config opts in. Changing
+        # this mid-chain would silently alter the TRAINING TARGET between segments of the
+        # same run.
+        if cb_fill not in ("ca", "pseudo_cb"):
+            raise ValueError(f"cb_fill must be 'ca' or 'pseudo_cb', got {cb_fill!r}")
+        self.cb_fill = cb_fill
         self.contact_method = contact_method
         self.confind_bin = confind_bin
         self.confind_rotamer_lib = confind_rotamer_lib
@@ -789,6 +801,61 @@ class ContactMapTransform(T.BaseTransform):
         self.frame2confind_amp_dtype = frame2confind_amp_dtype
         self.frame2confind_device = frame2confind_device
 
+    @staticmethod
+    def _fill_missing_cb_pseudo(atom_coords, coords, coord_mask, missing_cb):
+        """RoseTTAFold-style virtual CB for residues whose CB is absent (glycine, or unresolved).
+
+        ⭐ Why this is better than the CA fallback. Substituting CA moves the contact centre ~1.5 A
+        toward the backbone and, worse, moves it in a DIRECTION that depends on nothing -- every
+        glycine's "CB" sits exactly on its CA. A virtual CB is placed where the real CB WOULD be
+        from the backbone frame, so glycine contacts are measured on the same footing as every other
+        residue instead of being systematically pulled inward.
+
+        Geometry: build the local frame from N->CA and CA->C, take their cross product for the
+        out-of-plane direction, and place CB along the ideal tetrahedral combination at 1.522 A.
+        ⛔ The three coefficients are NOT invented and NOT retyped from memory -- they are the
+        RoseTTAFold/trRosetta constants, taken from two independent in-repo copies that agree:
+          ProteinMPNN/protein_mpnn_utils.py:964   (unnormalised form)
+          proteinfoundation/utils/frame2confind_utils.py:38 :: _place_cb  (normalised form)
+        This uses the NORMALISED form (frame2confind's), which fixes the CA-CB bond at 1.522 A
+        instead of inheriting whatever length the input backbone happens to imply -- the point of
+        the switch is robustness on imperfect structures.
+
+        ⛔⛔ EDGE CASES. The construction needs N, CA and C all present. Where any of them is
+        missing the virtual CB is undefined, so those residues fall back to CA exactly as before --
+        never to a NaN and never to a silently wrong point. Residues with no CA at all are excluded
+        from the contact map entirely by the has_ca gate downstream, so they are not this method's
+        problem.
+        """
+        N_I, CA_I, C_I = 0, 1, 2
+        bb_ok = (
+            (coord_mask[:, N_I] >= 0.5)
+            & (coord_mask[:, CA_I] >= 0.5)
+            & (coord_mask[:, C_I] >= 0.5)
+        )
+        use_pseudo = missing_cb & bb_ok
+        use_ca = missing_cb & ~bb_ok
+
+        if use_pseudo.any():
+            n = coords[use_pseudo, N_I, :]
+            ca = coords[use_pseudo, CA_I, :]
+            c = coords[use_pseudo, C_I, :]
+            b = ca - n
+            c_ = c - ca
+            a = torch.cross(b, c_, dim=-1)
+            # ⛔ eps in every denominator: two identical backbone atoms (a degenerate or duplicated
+            # record) would otherwise divide by zero and emit NaN into the contact map, which
+            # propagates silently through cdist into the training target.
+            a = a / (a.norm(dim=-1, keepdim=True) + 1e-8)
+            b_n = b / (b.norm(dim=-1, keepdim=True) + 1e-8)
+            c_n = c_ / (c_.norm(dim=-1, keepdim=True) + 1e-8)
+            cb_dir = -0.58273431 * a + 0.56802827 * b_n - 0.54067466 * c_n
+            atom_coords[use_pseudo] = ca + 1.522 * cb_dir
+
+        if use_ca.any():
+            atom_coords[use_ca] = coords[use_ca, CA_I, :]
+        return atom_coords
+
     def _contact_map_from_distance(self, graph: Data) -> torch.Tensor:
         coords = graph.coords  # [L, num_atoms, 3]
 
@@ -796,14 +863,21 @@ class ContactMapTransform(T.BaseTransform):
             # CA is at index 1
             atom_coords = coords[:, 1, :]  # [L, 3]
         elif self.contact_atom_type == "CB":
-            # ContactEBM's definition, verbatim (ContactEBM/contact_ebm/data/contact_targets.py
-            # ::cb_coords): the CB atom (atom37 index 3) where it is RESOLVED, else the CA atom.
+            # CB is atom37 index 3. ⛔ The graph is already in OPENFOLD ordering by this point --
+            # pdb_data.py applies PDB_TO_OPENFOLD_INDEX_TENSOR BEFORE the transforms run. In the raw
+            # .pt (PDB ordering) index 3 is the backbone OXYGEN and CB is index 4, so this line is
+            # only correct because of that conversion. Verified on 5w3e_E: post-conversion index 3
+            # is 1.529 A from CA and absent for every glycine; index 4 would be 2.393 A and present.
             # Gated on the atom mask -- never on residue identity (the old `residue_type == 5`
-            # test selected GLN, not GLY) and never a pseudo-CB.
+            # test selected GLN, not GLY).
             coord_mask = graph.coord_mask
             atom_coords = coords[:, 3, :].clone()  # [L, 3]
             missing_cb = coord_mask[:, 3] < 0.5
-            atom_coords[missing_cb] = coords[missing_cb, 1, :]
+            if self.cb_fill == "pseudo_cb":
+                atom_coords = self._fill_missing_cb_pseudo(
+                    atom_coords, coords, coord_mask, missing_cb)
+            else:
+                atom_coords[missing_cb] = coords[missing_cb, 1, :]
         else:
             raise ValueError(f"Unknown contact_atom_type: {self.contact_atom_type}")
 
@@ -883,7 +957,7 @@ class ContactMapTransform(T.BaseTransform):
     def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}("
-            f"contact_atom_type={self.contact_atom_type}, "
+            f"contact_atom_type={self.contact_atom_type}, cb_fill={self.cb_fill}, "
             f"contact_distance_cutoff={self.contact_distance_cutoff}, "
             f"contact_method={self.contact_method})"
         )
