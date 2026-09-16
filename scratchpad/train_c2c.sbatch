@@ -113,6 +113,7 @@ if [ "$CHAIN" -gt 0 ]; then
     CHAIN=$((CHAIN - 1)) DEVICES="${DEVICES:-2}" ACCUM="${ACCUM:-8}" NDIFF="${NDIFF:-8}" LR="${LR:-0.0006}" \
         PRECISION="${PRECISION:-bf16-mixed}" VAL_EVERY="${VAL_EVERY:-500}" WARMUP="${WARMUP:-1000}" GRES="$GRES" \
         EXTRA="${EXTRA:-}" REPO="$REPO" INIT_FROM="${INIT_FROM:-}" SIGMA_DATA="${SIGMA_DATA:-16.0}" \
+        CKPT_EVERY="${CKPT_EVERY:-0}" \
         sbatch --dependency=afterany:${SLURM_JOB_ID} \
                --partition="$SLURM_JOB_PARTITION" \
                --gres="$GRES" \
@@ -135,6 +136,7 @@ torchrun --standalone --nproc_per_node="${DEVICES:-2}" \
     scratchpad/train_c2c.py --devices "${DEVICES:-2}" --accum "${ACCUM:-8}" \
     --n_diff "${NDIFF:-8}" --lr "${LR:-0.0006}" \
     --precision "${PRECISION:-bf16-mixed}" --val_every "${VAL_EVERY:-500}" --warmup "${WARMUP:-1000}" \
+    --ckpt_every "${CKPT_EVERY:-0}" \
     ${INIT_FROM:+--init_from "$INIT_FROM"} ${EXTRA:-}
 rc=$?
 echo "C2C_EXIT=$rc"
