@@ -28,6 +28,16 @@ datamodule:
       contact_method: distance
       contact_atom_type: "CB"
       contact_distance_cutoff: 8.0
+      # RoseTTAFold virtual CB where CB is absent (glycine / unresolved side chain), replacing the
+      # old fallback to CA which parked every glycine's contact centre exactly on its CA.
+      # Validated against real CB to 0.056 A mean (scratchpad/test_pseudo_cb.py).
+      # ⚠️ SWITCHED ON 2026-09-16 with the user's explicit agreement to accept a mid-run target
+      # change. Changeover points, for reading the curves later:
+      #   c2c_cb8_tbeta  global_step 7076
+      #   c2c_cb8_sd10   global_step 200
+      #   tri_cb8synth_v5 / c2c_cb8_wch03 / c2c_cb8_wch10 -- not running at the time, so they pick
+      #   this up from their first segment with no discontinuity.
+      cb_fill: "pseudo_cb"
     - _target_: "proteinfoundation.datasets.transforms.PaddingTransform"
       max_size: 384
   batch_size: 1 # MEASURED on a 95 GB RTX PRO 6000: the tri model fits batch 1 only, at every
