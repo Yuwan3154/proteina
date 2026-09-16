@@ -108,6 +108,12 @@ print(f"residues                   : {tot_res}   without CB (GLY/unresolved): {t
 if sh.size:
     print(f"contact-centre shift (A)   : mean {sh.mean():.3f}  median {np.median(sh):.3f}  "
           f"min {sh.min():.3f}  max {sh.max():.3f}  n={sh.size}")
+    # A shift of exactly 0 means the virtual CB was NOT built and the residue kept the old CA
+    # fallback -- i.e. N or C was missing (chain termini, unresolved backbone). Report it: it is
+    # the residual population where the two definitions still agree by construction.
+    n_ca_fb = int((sh < 1e-6).sum())
+    print(f"  still CA-fallback (no N/C): {n_ca_fb} of {sh.size} "
+          f"({100.0*n_ca_fb/max(sh.size,1):.2f}% of filled residues)")
 print(f"\ncontacts, pooled unordered pairs:")
 print(f"  AF2 CA-fill              : {tot_ca}")
 print(f"  RoseTTAFold pseudo-CB    : {tot_pcb}  ({tot_pcb-tot_ca:+d}, "
