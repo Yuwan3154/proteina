@@ -73,8 +73,11 @@ else:
     err = (filled[have] - real_cb).norm(dim=-1)
     check("virtual CB reproduces the real CB", float(err.mean()) < 0.25,
           f"mean {float(err.mean()):.3f} A, max {float(err.max()):.3f} A, n={int(have.sum())}")
-    check("virtual CB sits 1.522 A from CA",
-          abs(float((filled[have] - coords[have, CA_I, :]).norm(dim=-1).mean()) - 1.522) < 1e-3)
+    bond = (filled[have] - coords[have, CA_I, :]).norm(dim=-1)
+    # ⛔ NOT an exact 1.522 check: the unnormalised form inherits the real backbone geometry, so the
+    # bond varies slightly per residue. That is the intended behaviour -- assert the physical range.
+    check("virtual CA-CB bond is physical (1.45-1.60 A)",
+          1.45 < float(bond.mean()) < 1.60, f"mean {float(bond.mean()):.3f} A")
 
     # the thing the switch exists for
     gly = (cmask[:, CB_I] < 0.5) & (cmask[:, N_I] > 0.5) & (cmask[:, CA_I] > 0.5) & (cmask[:, C_I] > 0.5)
@@ -134,7 +137,16 @@ cm_ps = ContactMapTransform(cb_fill="pseudo_cb")._contact_map_from_distance(g)
 check("pseudo_cb produces a valid binary map", bool(torch.isfinite(cm_ps).all())
       and set(cm_ps.unique().tolist()) <= {0.0, 1.0})
 check("pseudo_cb map is symmetric", torch.equal(cm_ps, cm_ps.T))
-check("the two fills differ (the switch does something)", not torch.equal(cm_ca, cm_ps))
+# ⛔ Compare the FILLED COORDINATES, not the thresholded maps: at a coarse 8 A cutoff on synthetic
+# points the two maps can coincide by chance and the test would pass while the switch did nothing.
+_f_ca = coords[:, CB_I, :].clone()
+_miss = mask[:, CB_I] < 0.5
+_f_ca[_miss] = coords[_miss, CA_I, :]
+_f_ps = ContactMapTransform._fill_missing_cb_pseudo(
+    coords[:, CB_I, :].clone(), coords, mask, _miss)
+check("the switch actually moves the filled atoms",
+      float((_f_ps[_miss] - _f_ca[_miss]).norm(dim=-1).min()) > 1.0,
+      f"min shift {float((_f_ps[_miss] - _f_ca[_miss]).norm(dim=-1).min()):.3f} A")
 
 print("\nRESULT:", "ALL PASS" if ok else "FAILURE")
 sys.exit(0 if ok else 1)

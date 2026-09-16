@@ -817,9 +817,13 @@ class ContactMapTransform(T.BaseTransform):
         RoseTTAFold/trRosetta constants, taken from two independent in-repo copies that agree:
           ProteinMPNN/protein_mpnn_utils.py:964   (unnormalised form)
           proteinfoundation/utils/frame2confind_utils.py:38 :: _place_cb  (normalised form)
-        This uses the NORMALISED form (frame2confind's), which fixes the CA-CB bond at 1.522 A
-        instead of inheriting whatever length the input backbone happens to imply -- the point of
-        the switch is robustness on imperfect structures.
+        ⛔⛔ Uses the UNNORMALISED form (ProteinMPNN/trRosetta/RoseTTAFold). The normalised variant
+        was tried first and is WRONG for this purpose: with a, b, c unit vectors the combination
+        -0.583a + 0.568b - 0.541c is NOT itself unit (a is perpendicular to both b and c, but
+        b.c = cos(~69 deg) = 0.36), so |dir| = 0.86 and scaling it by 1.522 places CB at ~1.30 A.
+        Measured on 5w3e_E: the normalised form put glycine's CB 1.262 A from CA and reproduced real
+        CB only to 0.333 A mean error. The unnormalised coefficients already encode real bond
+        lengths, so no rescaling is applied.
 
         ⛔⛔ EDGE CASES. The construction needs N, CA and C all present. Where any of them is
         missing the virtual CB is undefined, so those residues fall back to CA exactly as before --
@@ -843,14 +847,14 @@ class ContactMapTransform(T.BaseTransform):
             b = ca - n
             c_ = c - ca
             a = torch.cross(b, c_, dim=-1)
-            # ⛔ eps in every denominator: two identical backbone atoms (a degenerate or duplicated
-            # record) would otherwise divide by zero and emit NaN into the contact map, which
-            # propagates silently through cdist into the training target.
-            a = a / (a.norm(dim=-1, keepdim=True) + 1e-8)
-            b_n = b / (b.norm(dim=-1, keepdim=True) + 1e-8)
-            c_n = c_ / (c_.norm(dim=-1, keepdim=True) + 1e-8)
-            cb_dir = -0.58273431 * a + 0.56802827 * b_n - 0.54067466 * c_n
-            atom_coords[use_pseudo] = ca + 1.522 * cb_dir
+            cb = -0.58273431 * a + 0.56802827 * b - 0.54067466 * c_ + ca
+            # ⛔ A degenerate backbone (duplicated or coincident atoms) yields a zero cross product
+            # and a CB sitting on CA -- finite, but meaningless. Send those to the CA fallback
+            # rather than letting a junk point into the training target. No division occurs here,
+            # so NaN is not the failure mode; a plausible-but-wrong coordinate is.
+            degenerate = ~torch.isfinite(cb).all(dim=-1) | (a.norm(dim=-1) < 1e-6)
+            cb = torch.where(degenerate[:, None], ca, cb)
+            atom_coords[use_pseudo] = cb
 
         if use_ca.any():
             atom_coords[use_ca] = coords[use_ca, CA_I, :]
