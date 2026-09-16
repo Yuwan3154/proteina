@@ -28,5 +28,5 @@ export SKIP_CONFIND_PRECOMPUTE=1 PYTHONPATH=$REPO${PYTHONPATH:+:$PYTHONPATH}
 export TMPDIR=/orcd/scratch/orcd/011/chenxiou/.tmp
 mkdir -p "$TMPDIR"
 
-python scratchpad/measure_cb_flip.py --n "${NCHAINS:-200}"
+python scratchpad/measure_cb_flip.py --n "${NCHAINS:-200}" --dir "${CHAINDIR:-/orcd/pool/006/chenxiou/proteina/data/pdb_train/processed}"
 echo "CBFLIP_EXIT=$?"

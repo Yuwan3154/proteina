@@ -34,8 +34,12 @@ ap.add_argument("--n", type=int, default=200)
 ap.add_argument("--cutoff", type=float, default=8.0)
 args = ap.parse_args()
 
+# ⛔ `processed/` is a SYMLINK to a prefix-sharded tree (00/, 01/, ...) with zero .pt at the top
+# level, so a flat glob silently returns nothing and the run would report on an empty sample.
 files = sorted(glob.glob(os.path.join(args.dir, "*.pt")))
-assert files, f"no .pt under {args.dir}"
+if not files:
+    files = sorted(glob.glob(os.path.join(args.dir, "**", "*.pt"), recursive=True))
+assert files, f"no .pt under {args.dir} (flat or recursive)"
 # deterministic stride sample -- no RNG, so a re-run reproduces the same chains exactly
 step = max(1, len(files) // args.n)
 sample = files[::step][: args.n]
