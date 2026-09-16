@@ -16,6 +16,10 @@ set -uo pipefail
 REPO=/orcd/scratch/orcd/011/chenxiou/proteina_tri
 cd "$REPO"
 ENV_DIR=/home/chenxiou/cue-openfold-env-sm120
+# activate.sh hard-requires TORCH_CUDA_ARCH_LIST on Engaging (`:?`), and the GPU launchers derive it
+# from nvidia-smi -- which does not exist on a CPU node. It is a build-time hint for compiling CUDA
+# extensions and nothing is compiled here, so it is inert; 9.0 is the h200 this same env trains on.
+export TORCH_CUDA_ARCH_LIST=9.0
 source "$ENV_DIR/.venv/bin/activate"
 source "$ENV_DIR/activate.sh"
 export CUE_HOST=engaging
