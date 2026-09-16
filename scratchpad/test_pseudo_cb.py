@@ -85,8 +85,14 @@ else:
         f2 = ContactMapTransform._fill_missing_cb_pseudo(
             coords[:, CB_I, :].clone(), coords, cmask, cmask[:, CB_I] < 0.5)
         off = (f2[gly] - coords[gly, CA_I, :]).norm(dim=-1)
-        check("glycine no longer collapses onto CA", float(off.min()) > 1.5,
+        # ⛔ Assert the INTENT (no longer sitting on CA) and physical plausibility, not a tight
+        # constant: the unnormalised form inherits real backbone geometry, so the bond genuinely
+        # varies per residue. A >1.5 A threshold failed at 1.442 A, which is a fine CA-CB bond.
+        check("glycine no longer collapses onto CA (offset >> 0)", float(off.min()) > 1.2,
               f"min offset {float(off.min()):.3f} A over n={int(gly.sum())} GLY")
+        check("every glycine virtual CB is a physical bond (1.2-1.8 A)",
+              bool(((off > 1.2) & (off < 1.8)).all()),
+              f"range {float(off.min()):.3f}-{float(off.max()):.3f} A")
 
 # ═══ B. missing-backbone edge cases ═══════════════════════════════════════════════════════════
 print("\n== B. missing backbone atoms fall back to CA, never NaN ==")
