@@ -60,6 +60,13 @@ def main():
     # step takes ~144 s, so the old every-500-steps validation would first fire after 20 h
     # -- we would see nothing at all before the window closed.
     ap.add_argument("--val_every", type=int, default=500)
+    # ⛔ Checkpoint cadence was hard-wired to --val_every. In OVERFIT mode the keep policy is
+    # save_top_k=-1 (keep EVERYTHING, deliberately, so the trajectory can be analysed), so a
+    # small --val_every writes a 3.2 GB checkpoint per validation and keeps every one: 18 files
+    # and 55 GB in 74 minutes killed the first overfit run on a quota. 0 = follow --val_every,
+    # preserving the previous behaviour exactly for every existing launcher.
+    ap.add_argument("--ckpt_every", type=int, default=0,
+                    help="checkpoint every N optimizer steps (0 = same as --val_every)")
     ap.add_argument("--warmup", type=int, default=1000)
     # 0 disables validation structure dumping entirely. The dump runs on RANK 0 ONLY
     # and logs a metric no other rank logs, so it is the prime suspect for the 2-GPU
@@ -131,7 +138,7 @@ def main():
         if args.overfit else dict(monitor="val/loss", mode="min", save_top_k=3)
     ckpt_cb = ModelCheckpoint(
         dirpath=os.path.join(args.store, args.name), **keep,
-        save_last=True, every_n_train_steps=args.val_every,
+        save_last=True, every_n_train_steps=(args.ckpt_every or args.val_every),
         # ⛔⛔ Without this, Lightning's version counter writes `last-v1.ckpt` whenever `last.ckpt`
         # already exists from a PREVIOUS chain segment -- so the resume anchor below freezes at the
         # step the first segment reached and every requeue silently rewinds to it. Measured: the
