@@ -104,7 +104,7 @@ def main():
     # same label and silently destroy the mechanism, while every shape still matched.
     mc = {**CFG, "p_mirror": 0.5, "diff_chunk": 2}
     torch.manual_seed(0)
-    m_ch = ContactToCoord(**mc, n_ref_feats=N_REF_FEATS)
+    m_ch = ContactToCoord(**mc).eval()
     b2 = batch()
     torch.manual_seed(7)
     o_ch = m_ch(b2)
@@ -120,7 +120,7 @@ def main():
     # ⛔ The original branch built `hand = ones` unconditionally and passed it even at p_mirror=0,
     # so to_hand_s(1) entered during TRAINING while inference passed None -- a train/test skew on
     # the path EVERY other run uses. Assert the off state is really off.
-    m0b = ContactToCoord(**{**CFG, "p_mirror": 0.0, "diff_chunk": 2}, n_ref_feats=N_REF_FEATS)
+    m0b = ContactToCoord(**{**CFG, "p_mirror": 0.0, "diff_chunk": 2}).eval()
     torch.manual_seed(3)
     off = m0b(batch())
     check("p_mirror=0 passes NO hand into the graph (chunked too)", off.get("hand") is None)
