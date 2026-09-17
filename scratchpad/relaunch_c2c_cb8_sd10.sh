@@ -24,7 +24,17 @@
 #   [ckpt] interval 200 -> 10          => VAL_EVERY=200
 #   n_dump=2 (default) -- verified from the dumped filenames val00_00/val00_01/val01_00/val01_01,
 #           i.e. 2 BATCHES x batch_size 2, since n_dump gates on batch_idx not structure count.
-# ⚠️ batch_size 2 travels in EXTRA: train_c2c.sbatch does NOT pass --batch_size itself.
+# ⚠️ batch_size travels in EXTRA: train_c2c.sbatch does NOT pass --batch_size itself.
+#
+# ⛔⛔ CHANGED 2026-09-17: bs 2 x accum 4  ->  bs 1 x accum 8. The EFFECTIVE batch is IDENTICAL
+# at 8 structures/step, so the experiment is unchanged; only the micro-batching differs.
+# WHY: measured (job 22906126) that throughput is EXACTLY FLAT in batch size --
+#   bs 1/2/4 all give 0.133 structures/s, with s/pass scaling 7.53/15.09/30.10, i.e. linearly.
+# n_diff=48 already presents a 48-wide batch to the diffusion module, so the GPU is saturated
+# at bs=1 and a larger batch buys NOTHING. bs=1 additionally peaks at 45.5 GiB against bs=2 at
+# 57.9, and it matches c2c_cb8_tbeta and both FAPE arms -- so this unifies 4 runs on one value.
+# ⚠️ sd10 trained its first 600 steps at bs 2 x accum 4. Same effective batch, but the
+# micro-batch composition changes at this resume; note it before reading any step in its curves.
 set -uo pipefail
 NAME=c2c_cb8_sd10
 S=/orcd/scratch/orcd/011/chenxiou/c2c_store
@@ -52,8 +62,8 @@ PY
 [ $? -eq 0 ] || { echo "FATAL: checkpoint unreadable or at an unexpected step"; exit 6; }
 
 echo "relaunching $NAME with SIGMA_DATA=10.31"
-env CHAIN=38 DEVICES=1 ACCUM=4 NDIFF=48 LR=0.0003 PRECISION=bf16-mixed VAL_EVERY=200 WARMUP=2000 \
+env CHAIN=38 DEVICES=1 ACCUM=8 NDIFF=48 LR=0.0003 PRECISION=bf16-mixed VAL_EVERY=200 WARMUP=2000 \
     REPO="$REPO" GRES=gpu:h200:1 INIT_FROM="$BP" SIGMA_DATA=10.31 \
-    EXTRA="--name $NAME --no_lddt --batch_size 2 --diff_chunk 8 --t_beta 1.3,2.0 --dataset pdb_train_contact-CB8_S25_max384_purge-test_cutoff-190828" \
+    EXTRA="--name $NAME --no_lddt --batch_size 1 --diff_chunk 8 --t_beta 1.3,2.0 --dataset pdb_train_contact-CB8_S25_max384_purge-test_cutoff-190828" \
     sbatch --parsable -J "$NAME" -p mit_preemptable --gres=gpu:h200:1 --time="${TIME:-2-00:00:00}" --cpus-per-task=8 --mem=160G "$L"
 squeue -h -u chenxiou -n "$NAME" -o "%i %j %T %P %b %l %R"
