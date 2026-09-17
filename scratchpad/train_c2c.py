@@ -97,6 +97,16 @@ def main():
     # already a constant of this model rather than a new number. <=0 disables the gate.
     ap.add_argument("--fape_sigma_max", type=float, default=SIGMA_DATA,
                     help="apply FAPE only to diffusion samples with sigma <= this (<=0 = no gate)")
+    # ⛔⛔ RoseTTAFold-style handedness label (fix D), ported from the `mirror-augmentation` branch.
+    # Reflect this fraction of TRAINING TARGETS and tell the model which hand it is being asked for;
+    # at inference ALWAYS ask for +1. 0.0 = OFF and exactly the pre-change behaviour.
+    # ⛔ NO GROUNDED VALUE for a GLOBAL-FOLD mirror fraction. RoseTTAFold3's "invert the chirality in
+    # 2% of PDB examples" (AtomWorks, PMC12363939) is PER-ATOM chiral centres, which this model
+    # already gets right (frac-L 0.9988). The user was told this twice and chose 0.02 anyway
+    # (2026-09-08, reaffirmed 2026-09-17); their call, recorded with the run.
+    ap.add_argument("--p_mirror", type=float, default=0.0,
+                    help="fraction of TRAINING TARGETS reflected, with a +-1 hand label fed to the "
+                         "model; inference always asks +1. 0.0 disables fix D entirely.")
     # Overfit ONE structure: the trainer pins its first training batch and reuses it for every
     # train/val step (saved to <run>/overfit_batch.pt). Every other hyperparameter is untouched.
     ap.add_argument("--overfit", action="store_true", help="pin the first batch; one-structure run")
@@ -108,6 +118,7 @@ def main():
     assert not (args.overfit and args.devices > 1), "--overfit requires --devices 1"
     MODEL_CFG["n_diffusion_samples"] = args.n_diff
     MODEL_CFG["diff_chunk"] = args.diff_chunk
+    MODEL_CFG["p_mirror"] = args.p_mirror
     MODEL_CFG["t_beta"] = (tuple(float(v) for v in args.t_beta.split(","))
                            if args.t_beta else None)
 
@@ -142,7 +153,7 @@ def main():
           f"t_beta={MODEL_CFG['t_beta']}, diff_chunk={args.diff_chunk}, smooth_lddt={not args.no_lddt}, "
           f"overfit={args.overfit}, seed={args.seed}, w_chiral={args.w_chiral}, "
           f"w_fape={args.w_fape}, fape_chunk={args.fape_chunk}, "
-          f"fape_sigma_max={args.fape_sigma_max}", flush=True)
+          f"fape_sigma_max={args.fape_sigma_max}, p_mirror={args.p_mirror}", flush=True)
     # ⛔ Echo the DATASET. --dataset arrives inside the launcher's EXTRA variable and was the one
     # setting no artifact recorded: c2c_cb8 22505379 had to be argued for from four sibling flags,
     # because the default is the OLD ConFind dataset and a dropped flag would train the wrong
@@ -237,7 +248,11 @@ def main():
         # (fix A's reference-offset block). A blanket strict=False would silently accept a renamed
         # or reshaped parameter and warm-start from a model that is quietly half-initialised, so
         # every missing key must match a known-new module and NOTHING may be unexpected.
-        allowed = ("atom_enc.dist_proj", "atom_enc.valid_proj", "atom_enc.pair_mlp")
+        # `to_hand_s` is new with fix D, so ANY warm start from a pre-fix-D checkpoint reports it
+        # missing. It is a single Linear(1, c_s, bias=False); admitting it here keeps the assert
+        # meaningful for every OTHER key.
+        allowed = ("atom_enc.dist_proj", "atom_enc.valid_proj", "atom_enc.pair_mlp",
+                   "model.to_hand_s", "to_hand_s")
         bad = [k for k in missing if not any(k.startswith(a) for a in allowed)]
         assert not bad, f"warm-start would leave PRE-EXISTING params uninitialised: {bad[:8]}"
         # ⛔ `pair_to_atompair` is the ONE key allowed to be dropped: it was the decoder's own trunk

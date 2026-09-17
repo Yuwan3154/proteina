@@ -102,6 +102,7 @@ class ContactToCoord(nn.Module):
         n_diffusion_samples: int = 48,
         t_beta=None,
         diff_chunk: int = 0,
+        p_mirror: float = 0.0,
     ):
         super().__init__()
         # Run the diffusion module over the expanded (B x n_diffusion_samples) batch in slices of
@@ -117,6 +118,14 @@ class ContactToCoord(nn.Module):
         # i.e. exactly the current behaviour. Adds NO parameters, so warm starts still load strict.
         assert t_beta is None or len(t_beta) == 2, f"t_beta must be (p1, p2) or None, got {t_beta}"
         self.t_beta = tuple(float(v) for v in t_beta) if t_beta is not None else None
+        # ⛔⛔ p_mirror HAS NO GROUNDED VALUE AND NO NON-ZERO DEFAULT ON PURPOSE.
+        # 0.0 disables mirror augmentation entirely, reproducing the pre-fix-D behaviour exactly, so
+        # nothing about the current model changes unless a value is supplied deliberately.
+        # RoseTTAFold3 ships "we invert the chirality in 2% of PDB examples" (AtomWorks, PMC12363939)
+        # -- ⛔ that is PER-ATOM CHIRAL CENTRES, which this model already gets right at frac-L 0.9988.
+        # It does NOT ground a GLOBAL-FOLD mirror fraction; do not copy 0.02 across.
+        assert 0.0 <= p_mirror <= 1.0, f"p_mirror must be a probability, got {p_mirror}"
+        self.p_mirror = p_mirror
 
         # ── inputs ────────────────────────────────────────────────────────────────────────────
         # The contact map enters as a 2-way embedding rather than a scalar: a contact and a
@@ -136,6 +145,11 @@ class ContactToCoord(nn.Module):
         self.fourier = FourierEmbedding(c_noise_embedding)
         self.norm_noise = nn.LayerNorm(c_noise_embedding)
         self.to_noise_s = nn.Linear(c_noise_embedding, c_s, bias=False)
+        # Hand label (+1 right-handed / -1 mirrored) -> c_s, mirroring the noise-level pathway above.
+        # bias=False is deliberate: a bias term would be a constant added for BOTH label values and
+        # therefore carry no information about the hand, exactly the degeneracy that kills a
+        # constant "be right-handed" flag.
+        self.to_hand_s = nn.Linear(1, c_s, bias=False)
         self.norm_s = nn.LayerNorm(c_s)
 
         self.atom_enc = AtomAttentionEncoder(
@@ -182,10 +196,18 @@ class ContactToCoord(nn.Module):
 
     # ── EDM-preconditioned denoiser over ATOMS ────────────────────────────────────────────────
     def _f_forward(self, r_noisy, sigma, s, z, mask, ref_feats, ref_pos, atom_to_token, atom_mask,
-                   ref_space_uid):
+                   ref_space_uid, hand=None):
         c_noise = torch.log(sigma / SIGMA_DATA) / 4.0
         n = self.to_noise_s(self.norm_noise(self.fourier(c_noise)))
         s_cond = self.norm_s(s) + n[:, None, :]
+        # ⭐ The HAND LABEL enters exactly the way the noise level already does: a linear map to c_s
+        # added to the per-token conditioning. Following the existing sigma pathway rather than
+        # inventing a new injection point.
+        # ⛔ This is the ONLY input that can carry global fold handedness. Measured: the sampler is
+        # reflection-equivariant, so with mirrored targets in training the label becomes the sole
+        # predictor of the target's hand at high sigma, which is where the model must otherwise guess.
+        if hand is not None:
+            s_cond = s_cond + self.to_hand_s(hand.reshape(-1, 1))[:, None, :]
 
         a_token, q_atom, enc_pair = self.atom_enc(
             ref_feats, ref_pos, atom_to_token, s_cond, z, atom_mask, noisy_pos=r_noisy,
@@ -206,20 +228,25 @@ class ContactToCoord(nn.Module):
         )
 
     def denoise(self, x_noisy, sigma, s, z, mask, ref_feats, ref_pos, atom_to_token, atom_mask,
-                ref_space_uid):
+                ref_space_uid, hand=None):
         b = sigma[:, None, None]
         r_noisy = x_noisy / torch.sqrt(SIGMA_DATA ** 2 + b ** 2)
         upd = self._f_forward(r_noisy, sigma, s, z, mask, ref_feats, ref_pos, atom_to_token,
-                              atom_mask, ref_space_uid)
+                              atom_mask, ref_space_uid, hand=hand)
         ratio = b / SIGMA_DATA
         return x_noisy / (1.0 + ratio ** 2) + upd * b / torch.sqrt(1.0 + ratio ** 2)
 
     def _denoise_masked(self, x_noisy, sigma, s, z, mask, ref_feats, ref_pos, atom_to_token,
-                        atom_mask, ref_space_uid):
+                        atom_mask, ref_space_uid, hand=None):
         """denoise() with padded atoms zeroed; a plain function of its inputs so it can be
-        activation-checkpointed per sample chunk."""
+        activation-checkpointed per sample chunk.
+
+        ⛔ `hand` is sliced per CHUNK by the caller, exactly like x_noisy and sigma. It is a
+        per-expanded-row quantity (B*n), NOT a per-structure one, so gathering it with `bidx` like
+        the trunk tensors would hand every replica of a structure the same label and destroy the
+        within-structure variance the label depends on."""
         return self.denoise(x_noisy, sigma, s, z, mask, ref_feats, ref_pos, atom_to_token,
-                            atom_mask, ref_space_uid) * atom_mask[..., None]
+                            atom_mask, ref_space_uid, hand=hand) * atom_mask[..., None]
 
     def forward(self, batch: Dict[str, torch.Tensor], run_rollout: bool = False):
         contacts, aatype, mask = batch["contacts"], batch["aatype"], batch["mask"]
@@ -263,6 +290,29 @@ class ContactToCoord(nn.Module):
             # s_trans = 1.0 A is AF3's published value (Protenix utils.py:31), not a choice here.
             x_rep = centre_random_augmentation(x_gt, atom_mask, n_sample=n).reshape(B * n, A, 3)
             sig_flat = sigma.reshape(B * n)
+            # ⭐⭐ MIRROR AUGMENTATION (fix D). Reflect a fraction of the TARGETS and tell the model
+            # which hand it is being asked for. This is the only intervention that can work, because
+            # the sampler was MEASURED exactly reflection-equivariant (job 22250760): its output hand
+            # is read out of the input noise, so no achiral input and no reweighting of a loss on
+            # all-right-handed data can break the tie. Mirroring the targets is what creates the
+            # variance that makes the label informative.
+            # ⛔ Reflection is through z (det = -1); a PROPER rotation could never produce a mirror.
+            # ⛔ PER REPLICA, not per structure: each of the n diffusion samples gets its own draw, so
+            # one trunk pass sees both hands and the label cannot be confounded with the chain.
+            # ⛔⛔ hand stays None when the feature is OFF. The original fix-D branch built
+            # `hand = ones` unconditionally and passed it even at p_mirror=0, which (a) made
+            # p_mirror=0 NOT byte-identical to the pre-fix model, since to_hand_s(1) is a learned
+            # constant added to s_cond, and worse (b) created a TRAIN/TEST SKEW: inference passes
+            # hand=None at p_mirror=0 while training passed ones, so the model would learn to expect
+            # a constant it never receives at sampling time. Every other run we have uses p_mirror=0,
+            # so that path is the common one and must be exactly inert.
+            hand = None
+            if self.p_mirror > 0.0:
+                hand = torch.ones(B * n, device=x_gt.device, dtype=x_gt.dtype)
+                flip = torch.rand(B * n, device=x_gt.device) < self.p_mirror
+                hand = torch.where(flip, -hand, hand)
+                refl = torch.stack([torch.ones_like(hand), torch.ones_like(hand), hand], dim=-1)
+                x_rep = x_rep * refl[:, None, :]
             x_noisy = x_rep + torch.randn_like(x_rep) * sig_flat[:, None, None]
             # The trunk runs ONCE; only the diffusion module sees the expanded batch.
             # bidx maps each expanded row to its structure, so per-chunk gathers replace a full
@@ -273,24 +323,33 @@ class ContactToCoord(nn.Module):
             parts = []
             for i in range(0, B * n, step):
                 sl = slice(i, i + step)
-                args = (x_noisy[sl], sig_flat[sl]) + tuple(t[bidx[sl]] for t in trunk)
+                # ⛔ hand is sliced like x_noisy/sig_flat (per expanded ROW), never gathered with
+                # bidx like the trunk tensors -- bidx would give every replica of a structure the
+                # same label and erase the per-replica variance the whole mechanism rests on.
+                args = ((x_noisy[sl], sig_flat[sl]) + tuple(t[bidx[sl]] for t in trunk)
+                        + (None if hand is None else hand[sl],))
                 if step < B * n and torch.is_grad_enabled():
                     parts.append(checkpoint(self._denoise_masked, *args, use_reentrant=False))
                 else:
                     parts.append(self._denoise_masked(*args))
             out["x_denoised"] = torch.cat(parts, dim=0)
+            out["hand"] = hand
             out["atom_mask_rep"] = atom_mask[bidx]
             out["x_gt_rep"] = x_rep
             out["sigma"] = sig_flat
         if run_rollout or x_gt is None:
+            # ⛔ Inference ALWAYS asks for the right-handed branch. +1 is not a tuned value, it is
+            # the label's definition; only p_mirror is a free parameter, and it has no default.
+            ask = (torch.ones(s.shape[0], device=s.device, dtype=s.dtype)
+                   if self.p_mirror > 0.0 else None)
             out["coords"] = self.rollout(s, z, mask, ref_feats, ref_pos, atom_to_token, atom_mask,
-                                         ref_space_uid)
+                                         ref_space_uid, hand=ask)
         return out
 
     @torch.no_grad()
     def rollout(self, s, z, mask, ref_feats, ref_pos, atom_to_token, atom_mask, ref_space_uid,
                 n_steps: int = MINI_ROLLOUT_STEPS, augment_steps: bool = False, x_init=None,
-                churn_noise=None, record=None, s_max=None):
+                churn_noise=None, record=None, s_max=None, hand=None):
         """SI Alg. 18. Defaults to the 20-step mini-rollout; pass 200 for full inference."""
         B, A = atom_mask.shape
         dev = s.device
@@ -333,7 +392,8 @@ class ContactToCoord(nn.Module):
             eps = torch.randn_like(x) if churn_noise is None else churn_noise[i]
             x_noisy = x + 1.003 * torch.sqrt((t_hat ** 2 - s_prev ** 2).clamp_min(0)) * eps * m
             d = self.denoise(x_noisy, t_hat.expand(B), s, z, mask,
-                             ref_feats, ref_pos, atom_to_token, atom_mask, ref_space_uid) * m
+                             ref_feats, ref_pos, atom_to_token, atom_mask, ref_space_uid,
+                             hand=hand) * m
             x = (x_noisy + 1.5 * (s_cur - t_hat) * (x_noisy - d) / t_hat) * m
             # `record` collects the DENOISED estimate x0_hat per step, not the noisy iterate: at high
             # sigma the iterate is mostly noise and its handedness is meaningless, whereas x0_hat is
