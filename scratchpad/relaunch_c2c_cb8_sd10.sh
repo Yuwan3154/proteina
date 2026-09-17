@@ -55,5 +55,5 @@ echo "relaunching $NAME with SIGMA_DATA=10.31"
 env CHAIN=38 DEVICES=1 ACCUM=4 NDIFF=48 LR=0.0003 PRECISION=bf16-mixed VAL_EVERY=200 WARMUP=2000 \
     REPO="$REPO" GRES=gpu:h200:1 INIT_FROM="$BP" SIGMA_DATA=10.31 \
     EXTRA="--name $NAME --no_lddt --batch_size 2 --diff_chunk 8 --t_beta 1.3,2.0 --dataset pdb_train_contact-CB8_S25_max384_purge-test_cutoff-190828" \
-    sbatch --parsable -J "$NAME" -p mit_preemptable --gres=gpu:h200:1 --time=6:00:00 --cpus-per-task=8 --mem=160G "$L"
+    sbatch --parsable -J "$NAME" -p mit_preemptable --gres=gpu:h200:1 --time="${TIME:-2-00:00:00}" --cpus-per-task=8 --mem=160G "$L"
 squeue -h -u chenxiou -n "$NAME" -o "%i %j %T %P %b %l %R"

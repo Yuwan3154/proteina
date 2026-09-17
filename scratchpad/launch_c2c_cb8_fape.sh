@@ -55,11 +55,20 @@ FAPE_CHUNK="${FAPE_CHUNK:-8}"
 T_BETA="${T_BETA:-1.3,2.0}"
 LR="${LR:-0.0003}"
 WARMUP="${WARMUP:-2000}"
+# mit_preemptable ceiling is 2-00:00:00, not the 6 h originally copied from sd10. A short limit
+# forces a voluntary restart and a RE-ENTRY into a queue where waits have been 12+ h.
+TIME="${TIME:-2-00:00:00}"
+# afterany:<jobid> when replacing a queued successor mid-chain, so the chain is not broken.
+DEP="${DEP:-}"
+# 1 = this run already has a last.ckpt and is MEANT to resume (replacing a chained successor).
+ALLOW_RESUME="${ALLOW_RESUME:-0}"
 
 bash -n "$L" || exit 1
 git -C "$REPO" log --oneline -1
 [ -e "$BP" ] || { echo "FATAL: branch point $BP missing -- run freeze_branch_point.sbatch first"; exit 2; }
-[ -e "$S/$NAME/last.ckpt" ] && { echo "FATAL: $S/$NAME/last.ckpt exists -- would RESUME, not start fresh"; exit 3; }
+if [ "$ALLOW_RESUME" != "1" ] && [ -e "$S/$NAME/last.ckpt" ]; then
+    echo "FATAL: $S/$NAME/last.ckpt exists -- would RESUME, not start fresh (ALLOW_RESUME=1 if intended)"; exit 3
+fi
 [ -e "$S/.run.lock.$NAME" ] && { echo "FATAL: stale lock $S/.run.lock.$NAME"; exit 4; }
 squeue -h -u chenxiou -n "$NAME" -o "%i %T" | grep -q . && { echo "FATAL: $NAME already queued"; exit 5; }
 # ⛔ The FAPE code must actually be present in the checkout this job will run.
@@ -70,5 +79,6 @@ echo "branch point: $BP"
 env CHAIN=38 DEVICES=1 ACCUM=8 NDIFF=48 LR="$LR" PRECISION=bf16-mixed VAL_EVERY=500 WARMUP="$WARMUP" REPO="$REPO" \
     GRES=gpu:h200:1 INIT_FROM="$BP" \
     EXTRA="--name $NAME --no_lddt --n_dump 16 --diff_chunk $DIFF_CHUNK --t_beta $T_BETA --w_fape $W_FAPE --fape_chunk $FAPE_CHUNK --dataset pdb_train_contact-CB8_S25_max384_purge-test_cutoff-190828" \
-    sbatch --parsable -J "$NAME" -p mit_preemptable --gres=gpu:h200:1 --time=6:00:00 --cpus-per-task=8 --mem=160G "$L"
+    sbatch --parsable -J "$NAME" -p mit_preemptable --gres=gpu:h200:1 --time="$TIME" \
+           ${DEP:+--dependency=afterany:$DEP} --cpus-per-task=8 --mem=160G "$L"
 squeue -h -u chenxiou -n "$NAME" -o "%i %j %T %P %b %l %R"
