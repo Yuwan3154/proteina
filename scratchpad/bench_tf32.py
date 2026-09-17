@@ -72,8 +72,13 @@ model.train()
 # batch per arm would let data variation masquerade as a precision effect.
 batch = next(iter(dm.train_dataloader())).to("cuda")
 
+# ⛔⛔ ORDER CONTROL. The first arm pays one-time costs the second inherits for free: cuDNN autotune
+# caches, CUDA allocator growth, lazy module init. Running highest-then-high ONCE credited TF32 with
+# +37.6%, which is implausible for a loss region that is O(atoms) with a 3x3 SVD. Run each arm TWICE
+# in alternating order and compare the SECOND occurrences, when both are equally warm.
 results = {}
-for mode in ("highest", "high"):
+rounds = {}
+for rnd, mode in enumerate(("highest", "high", "highest", "high")):
     torch.set_float32_matmul_precision(mode)
     tf32 = torch.backends.cuda.matmul.allow_tf32
     # numerics first, on an identical noise draw
@@ -95,16 +100,24 @@ for mode in ("highest", "high"):
     torch.cuda.synchronize()
     dt = (time.time() - t0) / args.steps
     results[mode] = (dt, loss_val, mse_val, rmsd_val, tf32)
-    print(f"  {mode:>8}  allow_tf32={tf32!s:>5}  {dt:>7.3f} s/pass   "
+    rounds.setdefault(mode, []).append(dt)
+    print(f"  round {rnd} {mode:>8}  allow_tf32={tf32!s:>5}  {dt:>7.3f} s/pass   "
           f"loss={loss_val:.8f}  mse={mse_val:.8f}  rmsd={rmsd_val:.6f}", flush=True)
 
-dt_hi, l_hi, m_hi, r_hi, _ = results["highest"]
-dt_tf, l_tf, m_tf, r_tf, _ = results["high"]
+_, l_hi, m_hi, r_hi, _ = results["highest"]
+_, l_tf, m_tf, r_tf, _ = results["high"]
+# ⭐ SECOND occurrence of each -- both fully warm, so the comparison is not a warmup artefact.
+dt_hi, dt_tf = rounds["highest"][-1], rounds["high"][-1]
 
 print(f"\n=== speed ===")
+print(f"  highest rounds: {['%.3f' % v for v in rounds['highest']]}")
+print(f"  high    rounds: {['%.3f' % v for v in rounds['high']]}")
+print(f"  ⭐ comparing the SECOND of each (both warm):")
 print(f"  highest (fp32 cores) : {dt_hi:.3f} s/pass")
 print(f"  high    (TF32 cores) : {dt_tf:.3f} s/pass")
 print(f"  speedup              : {dt_hi/dt_tf:.4f}x  ({100*(dt_hi-dt_tf)/dt_hi:+.2f}% time)")
+warm_drop = 100 * (rounds['highest'][0] - rounds['highest'][1]) / rounds['highest'][0]
+print(f"  ⚠️ warmup artefact size: 'highest' alone dropped {warm_drop:+.1f}% between its two rounds")
 
 print(f"\n=== numerics on an IDENTICAL batch and noise draw ===")
 for nm, a, b in (("loss", l_hi, l_tf), ("mse", m_hi, m_tf), ("rmsd", r_hi, r_tf)):
