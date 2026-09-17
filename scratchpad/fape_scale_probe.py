@@ -42,6 +42,10 @@ ap.add_argument("--dataset", default="pdb_train_contact-CB8_S25_max384_purge-tes
 ap.add_argument("--n_batches", type=int, default=4)
 ap.add_argument("--n_diff", type=int, default=8)
 ap.add_argument("--fape_chunk", type=int, default=4)
+# ⛔ Default ON, matching every production c2c run (they all pass --no_lddt). The probe must
+# mirror the run it is calibrating, not the library default.
+ap.add_argument("--no_lddt", action="store_true", default=True)
+ap.add_argument("--with_lddt", dest="no_lddt", action="store_false")
 args = ap.parse_args()
 
 CFG_DIR = os.path.join(REPO, "configs", "datasets_config", "pdb")
@@ -58,7 +62,13 @@ MODEL_CFG["n_diffusion_samples"] = args.n_diff
 MODEL_CFG["diff_chunk"] = 0
 MODEL_CFG["t_beta"] = (1.3, 2.0)
 # w_fape=1.0 so the RAW term is logged; the weight is derived afterwards, not applied here.
-model = ContactToCoordTrainer(model_cfg=MODEL_CFG, w_fape=1.0, fape_chunk=args.fape_chunk)
+# ⛔⛔ use_smooth_lddt MUST match the run being calibrated for. The first version of this probe left
+# it at the default True while every production run uses --no_lddt, so the measured diffusion loss
+# was 0.8838 (WITH the achiral lDDT term) against the run's real 0.1604 -- a 5.5x overestimate that
+# propagated straight into w_fape and made FAPE 127% of the diffusion term instead of the intended
+# 24%. Calibrating against a configuration the run does not use is worse than not calibrating.
+model = ContactToCoordTrainer(model_cfg=MODEL_CFG, w_fape=1.0, fape_chunk=args.fape_chunk,
+                              use_smooth_lddt=not args.no_lddt)
 ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
 if "ema" in ck:
     missing, unexpected = model.model.load_state_dict(
