@@ -18,7 +18,12 @@ cd "$REPO"
 ENV_DIR=/home/chenxiou/cue-openfold-env-sm120
 module load cuda/12.8 2>/dev/null || module load cuda/12.6 2>/dev/null || true
 export CUE_HOST=engaging
-export TORCH_CUDA_ARCH_LIST="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d ' ')"
+# ⛔ This benchmark uses NO GPU -- it times the dataloader only. Submitting it with --gres put
+# it behind QOSMaxGRESPerUser (preemptable cap 4, and tri alone holds 2), so it could never
+# start. Run it GRES-free. activate.sh still demands TORCH_CUDA_ARCH_LIST, so default it when
+# nvidia-smi is absent; it is inert here because nothing CUDA is compiled or launched.
+export TORCH_CUDA_ARCH_LIST="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')"
+[ -z "$TORCH_CUDA_ARCH_LIST" ] && export TORCH_CUDA_ARCH_LIST=9.0
 source "$ENV_DIR/.venv/bin/activate"
 source "$ENV_DIR/activate.sh"
 export DATA_PATH=/orcd/pool/006/chenxiou/proteina/data
@@ -27,7 +32,7 @@ export TMPDIR=/orcd/scratch/orcd/011/chenxiou/.tmp
 mkdir -p "$TMPDIR"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-nvidia-smi --query-gpu=name,memory.total,clocks.max.sm --format=csv,noheader
+nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo "(no GPU -- expected)"
 echo "node=$(hostname)  other jobs on this node:"
 squeue -w "$(hostname -s)" -h -O "JobID:11,UserName:11,tres-alloc:34" | grep -v "^$SLURM_JOB_ID" || true
 
