@@ -47,7 +47,8 @@ class ContactToCoordTrainer(L.LightningModule):
                  aug_mode: str = "balanced", lr: float = BASE_LR,
                  dump_dir: str = None, n_dump: int = 2, ema_decay: float = EMA_DECAY,
                  warmup_steps: int = WARMUP_STEPS, use_smooth_lddt: bool = True,
-                 overfit_batch_path: str = None, w_chiral: float = 0.0):
+                 overfit_batch_path: str = None, w_chiral: float = 0.0,
+                 w_fape: float = 0.0, fape_chunk: int = 0):
         super().__init__()
         self.save_hyperparameters()
         self.model = ContactToCoord(**model_cfg, n_ref_feats=N_REF_FEATS)
@@ -62,6 +63,14 @@ class ContactToCoordTrainer(L.LightningModule):
         # byte-identical. There is no published value for this weight; it is set per experiment and
         # the chosen value must be recorded with the run, never inferred here.
         self.w_chiral = w_chiral
+        # ⛔ DEFAULT 0.0 => absent from the graph, every existing run byte-identical. FAPE's own
+        # constants (10 A clamp, 10 A length scale) ARE published (AF2 SI Alg. 28), but the weight
+        # relative to THIS model's diffusion loss is not -- it is set per experiment and recorded.
+        self.w_fape = w_fape
+        # FAPE is O(L^2) per diffusion sample. At L=384 with n_diffusion_samples=48 the [S,L,L,3]
+        # intermediates are ~1 GB each in fp32 before autograd saves them. Chunk over the SAMPLE
+        # axis to bound that; 0 = one shot (fine at small L or small n_diff).
+        self.fape_chunk = fape_chunk
         # Overfit-one-structure mode: pin the FIRST training batch and reuse it for every train and
         # val step. Not Lightning's overfit_batches: that only swaps a RandomSampler for a
         # SequentialSampler, and our ClusterSampler would hand it a different chain every epoch.
@@ -187,6 +196,76 @@ class ContactToCoordTrainer(L.LightningModule):
         n = win_m.sum(-1).clamp_min(1)
         return se.sum(-1) / n, (sp.detach(), st.detach(), win_m)
 
+    @staticmethod
+    def _frames_from_backbone(n, ca, c, eps: float = 1e-8):
+        """Gram-Schmidt residue frames from N/CA/C (AF2 SI Alg. 21, rigidFrom3Points).
+
+        Returns (R, t) with R[..., :, k] = e_k, i.e. R maps LOCAL -> GLOBAL, so the global -> local
+        map is R^T. t is the CA position.
+
+        ⭐⭐ THIS IS WHERE THE CHIRALITY LIVES. e3 = e1 x e2 is a CROSS PRODUCT, so R is always a
+        PROPER rotation (det = +1). Reflect the structure and the reflected frame is NOT the
+        reflection of the frame -- the handedness cannot be absorbed into R. That is precisely why
+        FAPE separates a structure from its mirror while any distance-only term cannot.
+        """
+        v1 = c - ca
+        v2 = n - ca
+        e1 = v1 / v1.norm(dim=-1, keepdim=True).clamp_min(eps)
+        u2 = v2 - e1 * (e1 * v2).sum(-1, keepdim=True)
+        e2 = u2 / u2.norm(dim=-1, keepdim=True).clamp_min(eps)
+        e3 = torch.cross(e1, e2, dim=-1)
+        return torch.stack([e1, e2, e3], dim=-1), ca
+
+    def _fape_pairs(self, xp, xt, frame_m, atom_m, clamp: float, z: float):
+        """FAPE over one chunk. xp/xt [S, L, 14, 3]; returns (sum_of_clamped_d, n_valid_pairs)."""
+        Rp, tp = self._frames_from_backbone(xp[:, :, 0], xp[:, :, 1], xp[:, :, 2])
+        Rt, tt = self._frames_from_backbone(xt[:, :, 0], xt[:, :, 1], xt[:, :, 2])
+        cap, cat = xp[:, :, 1, :], xt[:, :, 1, :]
+        # d[s, i, j] = x_j - t_i ; then local = R_i^T d  (R[..., c, k] = e_k component c)
+        dp = cap[:, None, :, :] - tp[:, :, None, :]
+        dt = cat[:, None, :, :] - tt[:, :, None, :]
+        lp = torch.einsum("sick,sijc->sijk", Rp, dp)
+        lt = torch.einsum("sick,sijc->sijk", Rt, dt)
+        d = (lp - lt).norm(dim=-1)
+        pair_m = frame_m[:, :, None] & atom_m[:, None, :]
+        return (d.clamp(max=clamp) * pair_m).sum(), pair_m.sum()
+
+    def _fape_loss(self, x_denoised, x_gt, atom_mask_rep, L,
+                   clamp: float = 10.0, z: float = 10.0):
+        """Backbone FAPE: every residue's CA expressed in every residue's frame (AF2 SI Alg. 28).
+
+        ⛔ BACKBONE, not all-atom, and that is a memory decision not a modelling preference. All-atom
+        FAPE is O(L x 14L): at L=384 with 48 diffusion samples the pair tensor alone is ~1.2 GB in
+        fp32 before autograd saves anything. Backbone FAPE is O(L x L), 14x smaller, and it is the
+        term AF2 uses to drive GLOBAL structure -- which is the thing that is mirrored here.
+
+        ⛔ clamp = 10 A and z = 10 A are AF2's published constants (SI 1.9.2), not invented. The
+        clamp is what makes FAPE care about getting the fold roughly right rather than chasing
+        already-hopeless pairs; z just puts the loss in units of "fraction of 10 A".
+
+        ⚠️ Frames come from PREDICTED N/CA/C, so early in training, when the backbone is noise, the
+        frames are noisy too. That is a real effect (a 1 A coordinate error rotates a frame ~83 deg)
+        and it is why this is a FINE-TUNE term applied to an already-folding model, not a
+        from-scratch one. AF2 does not pay this cost the same way: its IPA emits frames directly.
+        """
+        xp = x_denoised.reshape(-1, L, 14, 3)
+        xt = x_gt.reshape(-1, L, 14, 3)
+        m = atom_mask_rep.reshape(-1, L, 14)
+        # ⛔ MASK, not shape. A frame needs all three of N/CA/C real; a target atom needs CA real.
+        frame_m = (m[:, :, 0] > 0.5) & (m[:, :, 1] > 0.5) & (m[:, :, 2] > 0.5)
+        atom_m = m[:, :, 1] > 0.5
+
+        S = xp.shape[0]
+        step = self.fape_chunk if self.fape_chunk and self.fape_chunk > 0 else S
+        tot = xp.new_zeros(())
+        cnt = xp.new_zeros(())
+        for a in range(0, S, step):
+            b_ = slice(a, min(a + step, S))
+            s_, n_ = self._fape_pairs(xp[b_], xt[b_], frame_m[b_], atom_m[b_], clamp, z)
+            tot = tot + s_
+            cnt = cnt + n_
+        return tot / cnt.clamp_min(1) / z
+
     def _step(self, batch, train: bool):
         b = self._prepare(batch, train)
         out = self.model(b)
@@ -213,6 +292,11 @@ class ContactToCoordTrainer(L.LightningModule):
             # directly comparable to the detector's helix_pos_frac.
             wrong = ((sp * st) < 0) & wm
             metrics["chiral_sign_wrong"] = wrong.sum() / wm.sum().clamp_min(1)
+        if self.w_fape > 0.0:
+            L = int(b["mask"].shape[1])
+            fp = self._fape_loss(out["x_denoised"], out["x_gt_rep"], out["atom_mask_rep"], L)
+            loss = loss + self.w_fape * fp
+            metrics["fape"] = fp
         return loss, metrics
 
     def _pin(self, batch):

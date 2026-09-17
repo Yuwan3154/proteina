@@ -82,6 +82,13 @@ def main():
     # recorded with the run.
     ap.add_argument("--w_chiral", type=float, default=0.0,
                     help="weight on the local CA sin-dihedral chirality loss (0 = off)")
+    # ⛔ FAPE's own constants (10 A clamp / 10 A scale) are AF2's published ones, but its weight
+    # RELATIVE to this model's diffusion loss is not published and must be recorded per run.
+    # 0.0 keeps every existing run byte-identical.
+    ap.add_argument("--w_fape", type=float, default=0.0,
+                    help="weight on backbone FAPE (0 = off); chirality-sensitive via proper frames")
+    ap.add_argument("--fape_chunk", type=int, default=0,
+                    help="chunk FAPE over diffusion samples to bound the O(L^2) pair tensor (0 = one shot)")
     # Overfit ONE structure: the trainer pins its first training batch and reuses it for every
     # train/val step (saved to <run>/overfit_batch.pt). Every other hyperparameter is untouched.
     ap.add_argument("--overfit", action="store_true", help="pin the first batch; one-structure run")
@@ -112,6 +119,8 @@ def main():
     kw["warmup_steps"] = args.warmup
     kw["use_smooth_lddt"] = not args.no_lddt
     kw["w_chiral"] = args.w_chiral
+    kw["w_fape"] = args.w_fape
+    kw["fape_chunk"] = args.fape_chunk
     if args.overfit:
         os.makedirs(os.path.join(args.store, args.name), exist_ok=True)
         kw["overfit_batch_path"] = os.path.join(args.store, args.name, "overfit_batch.pt")
@@ -122,7 +131,8 @@ def main():
     print(f"[model] {n_par/1e6:.2f} M parameters, {MODEL_CFG['n_blocks']} diffusion blocks, "
           f"n_diffusion_samples={args.n_diff}, lr={model.lr}, warmup={model.warmup_steps}, "
           f"t_beta={MODEL_CFG['t_beta']}, diff_chunk={args.diff_chunk}, smooth_lddt={not args.no_lddt}, "
-          f"overfit={args.overfit}, seed={args.seed}, w_chiral={args.w_chiral}", flush=True)
+          f"overfit={args.overfit}, seed={args.seed}, w_chiral={args.w_chiral}, "
+          f"w_fape={args.w_fape}, fape_chunk={args.fape_chunk}", flush=True)
     # ⛔ Echo the DATASET. --dataset arrives inside the launcher's EXTRA variable and was the one
     # setting no artifact recorded: c2c_cb8 22505379 had to be argued for from four sibling flags,
     # because the default is the OLD ConFind dataset and a dropped flag would train the wrong
