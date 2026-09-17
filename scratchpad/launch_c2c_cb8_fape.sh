@@ -23,10 +23,15 @@
 #    saturation noise. The gate keeps the samples that carry handedness information.
 #  - clamp stays at AF2's published 10 A. Tightening it DESTROYS the gap rather than sharpening it:
 #    peak gap 0.539 -> 0.206 -> 0.040 -> 0.009 for clamp 10 -> 5 -> 2 -> 1 A (same job).
-#  - w_fape 1.4: job 22875900 measured the diffusion term's contribution at ALPHA_DIFFUSION x 0.8838
-#    = 3.5353, and FAPE inside the gate averages ~0.615, so 1.4 puts FAPE at ~24% of the diffusion
-#    term. ⛔ This is the ONE number here that is a CHOICE, not a measurement -- the user's
-#    "tune the loss magnitude" instruction. It is recorded with the run and trivially changed.
+#  - w_fape: the ONE number here that is a CHOICE, not a measurement (the user's "tune the loss
+#    magnitude" instruction). ⛔⛔ The original 1.4 was MIS-CALIBRATED: job 22875900 built the probe
+#    without use_smooth_lddt=False while every production run passes --no_lddt, so it measured the
+#    diffusion loss WITH the achiral lDDT term (0.8838) against the run's real 0.1604 -- a 5.5x
+#    overestimate. MEASURED FROM THE LIVE RUN at step 49: 4.0(0.1604) + 0.03(1.9005) + 1.4(0.5833)
+#    = 1.51521 vs logged 1.51520.
+#    ⇒ TWO ARMS, bracketing: 1.4 = FAPE at 127% of the diffusion term (HEAVY, AF2-like, since AF2
+#    makes FAPE its primary structure loss) and 0.25 = ~23% (LIGHT, the originally intended target).
+#    Both fork from the same branch point so the dose-response is clean.
 #
 # ⛔ mit_preemptable, NOT mit_normal_gpu: the two w_chiral arms have held the 2-GPU mit_normal_gpu
 # cap at Reason=Priority for 12+ h and are the user's own experiment -- this must not displace them.
