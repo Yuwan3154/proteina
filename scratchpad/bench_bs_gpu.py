@@ -23,6 +23,7 @@ Usage: bench_bs_gpu.py --batch_sizes 1,2,4 --steps 6
 """
 
 import argparse
+import contextlib
 import os
 import sys
 import time
@@ -94,7 +95,14 @@ for bs in SIZES:
                 torch.cuda.synchronize()
                 t0 = time.time()
             batch = next(it).to("cuda")
-            loss, _ = model._step(batch, True)
+            # ⛔⛔ AUTOCAST IS MANDATORY HERE. Calling _step() directly bypasses Lightning's
+            # bf16-mixed plugin, which installs this context around training_step. Without it the
+            # trunk runs in fp32 -- a DIFFERENT and much slower model than production. The first
+            # version of this benchmark omitted it, reported 7.53 s/pass instead of production's
+            # ~4.70, and separately credited TF32 with a +37.5% speedup that is pure fp32-vs-tensor-
+            # core and does not exist under bf16 (job 22911040).
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                loss, _ = model._step(batch, True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             opt.step()
