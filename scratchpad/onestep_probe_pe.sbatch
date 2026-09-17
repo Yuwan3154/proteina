@@ -37,11 +37,18 @@ nvidia-smi --query-gpu=name --format=csv,noheader
 
 # ⛔ Copy the checkpoint first -- c2c_cb8_tbeta is LIVE and rewrites its checkpoint directory at every
 # validation; reading one mid-write gives a truncated file.
+# ⛔ Cheap prechecks BEFORE the 3.2 GB copy. Job 22851194 copied the checkpoint and only then died on
+# a missing hydra config dir, burning the allocation for nothing.
+python -c "import os,sys; d=os.path.join('$REPO','configs','datasets_config','pdb'); sys.exit(0 if os.path.isdir(d) else 1)" \
+    || { echo "FATAL: hydra config dir missing under $REPO"; exit 78; }
+python -c "import hydra, torch, proteinfoundation" \
+    || { echo "FATAL: imports unavailable in this env"; exit 79; }
+
 SRC="${CKPT:-/orcd/scratch/orcd/011/chenxiou/c2c_store/c2c_cb8_tbeta/last.ckpt}"
 CK="$TMPDIR/onestep-$SLURM_JOB_ID.ckpt"
 cp "$SRC" "$CK" || { echo "FATAL: cannot copy $SRC"; exit 77; }
 echo "checkpoint copied from $SRC"
 
-python /orcd/scratch/orcd/011/chenxiou/onestep_probe.py --ckpt "$CK" --steps 1,2,5,20,200 --n_batches 2
+python scratchpad/onestep_probe.py --ckpt "$CK" --steps 1,2,5,20,200 --n_batches 2
 echo "ONESTEP_EXIT=$?"
 rm -f "$CK"
