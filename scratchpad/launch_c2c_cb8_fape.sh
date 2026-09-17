@@ -69,8 +69,14 @@ git -C "$REPO" log --oneline -1
 if [ "$ALLOW_RESUME" != "1" ] && [ -e "$S/$NAME/last.ckpt" ]; then
     echo "FATAL: $S/$NAME/last.ckpt exists -- would RESUME, not start fresh (ALLOW_RESUME=1 if intended)"; exit 3
 fi
-[ -e "$S/.run.lock.$NAME" ] && { echo "FATAL: stale lock $S/.run.lock.$NAME"; exit 4; }
-squeue -h -u chenxiou -n "$NAME" -o "%i %T" | grep -q . && { echo "FATAL: $NAME already queued"; exit 5; }
+# ⛔ When DEP is set we are queueing a SUCCESSOR while its parent is still RUNNING, so the
+# single-writer lock is legitimately HELD, not stale. Only treat it as fatal for a fresh start.
+if [ -z "$DEP" ] && [ -e "$S/.run.lock.$NAME" ]; then
+    echo "FATAL: stale lock $S/.run.lock.$NAME"; exit 4
+fi
+if [ -z "$DEP" ] && squeue -h -u chenxiou -n "$NAME" -o "%i %T" | grep -q .; then
+    echo "FATAL: $NAME already queued"; exit 5
+fi
 # ⛔ The FAPE code must actually be present in the checkout this job will run.
 grep -q "fape_sigma_max" "$REPO/scratchpad/train_c2c.py" || { echo "FATAL: repo lacks --fape_sigma_max; git pull"; exit 6; }
 
