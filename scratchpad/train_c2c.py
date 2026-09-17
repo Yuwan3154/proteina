@@ -143,15 +143,15 @@ def main():
     # c2c_cb8_sd10 segment 2: ran 09:52->15:53, last checkpoint 14:51 => 62 minutes thrown away.
     # At the measured 1.34 steps/min a 200-step interval risks ~2.5 h per segment.
     # The write is cheap: this scratch tier measures 854 MB/s with fsync (job 22851745), so a
-    # 3.2 GB checkpoint lands in ~3.9 s. At a 20-step interval (~15 min) that is <1% of throughput.
+    # 3.2 GB checkpoint lands in ~3.9 s. At a 10-step interval (~7.5 min) that is 0.87% of throughput.
     # ⛔⛔ NOT applied to OVERFIT runs. There save_top_k=-1 keeps EVERY checkpoint on purpose, so a
-    # 20-step interval would write ~100 files / ~320 GB over a 2000-step run -- the same quota kill
+    # 10-step interval would write ~200 files / ~640 GB over a 2000-step run -- the same quota kill
     # that already destroyed the first overfit run (18 files / 55 GB in 74 min), only far worse.
     # ⭐ Bounding last.ckpt is what matters, and it is monitor-independent: Lightning's
     # _save_last_checkpoint (model_checkpoint.py:679) returns early only on `not self.save_last`
     # and never consults `monitor`, so last.ckpt is written on every interval hit even between
     # validations, when val/loss is stale. Verified in the installed source, not assumed.
-    CKPT_INTERVAL_CAP = 20
+    CKPT_INTERVAL_CAP = 10
     ckpt_every = args.ckpt_every or args.val_every
     if not args.overfit and ckpt_every > CKPT_INTERVAL_CAP:
         print(f"[ckpt] interval {ckpt_every} -> {CKPT_INTERVAL_CAP} steps "
