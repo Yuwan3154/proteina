@@ -37,7 +37,9 @@
 # If it collapses toward 0 the term is silently absent and the run would look healthy while testing
 # nothing. Expect roughly 0.2 under t_beta(1.3,2.0).
 set -uo pipefail
-NAME=c2c_cb8_fape
+# NAME and W_FAPE are overridable so the LIGHT arm forks from the SAME branch point as the
+# heavy one -- both must start from c2c_cb8_tbeta_fape.ckpt or the dose-response is confounded.
+NAME="${NAME:-c2c_cb8_fape}"
 S=/orcd/scratch/orcd/011/chenxiou/c2c_store
 REPO=/orcd/scratch/orcd/011/chenxiou/proteina_tri
 L="$REPO/scratchpad/train_c2c.sbatch"
