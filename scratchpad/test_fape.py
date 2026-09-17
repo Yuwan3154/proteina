@@ -159,5 +159,42 @@ for s in (0.0, 0.1, 0.3, 1.0, 3.0):
 check("clamped: FAPE cannot exceed clamp/z = 1.0",
       float(fape(xt + torch.randn_like(xt) * 500.0, xt, m)) <= 1.0 + 1e-9)
 
+# ═══ H. the sigma gate ════════════════════════════════════════════════════════════════════════
+# ⛔ A default-OFF branch until a run sets it, and its failure mode is silent: a gate that drops
+# everything makes the term vanish while the run still logs a healthy-looking loss.
+print("\n== H. sigma gate ==")
+S = 6
+xt_g = xt.repeat(S, 1, 1, 1)
+m_g = m.repeat(S, 1, 1)
+xp_g = xt_g @ refl.T                              # all mirrored => ungated FAPE is large
+sig = torch.tensor([0.5, 2.0, 8.0, 40.0, 400.0, 4000.0])
+
+
+def fape_gated(pred, true, mask, sigma, smax, chunk=0):
+    s = Stub()
+    s.fape_chunk = chunk
+    return ContactToCoordTrainer._fape_loss(s, pred, true, mask, L, sigma=sigma, sigma_max=smax)
+
+
+f_all = fape_gated(xp_g, xt_g, m_g, sig, None)
+check("no gate (sigma_max=None) uses every sample", float(f_all) > 0.1, f"{float(f_all):.4f}")
+f_gate = fape_gated(xp_g, xt_g, m_g, sig, 16.0)
+check("gate keeps the low-sigma samples and still sees the mirror", float(f_gate) > 0.1,
+      f"{float(f_gate):.4f}")
+# with identical geometry in the kept subset the gate must select, not merely rescale
+xp_mix = xt_g.clone()
+xp_mix[3:] = (xt_g[3:] @ refl.T)                  # mirror ONLY the high-sigma half
+f_lowgood = fape_gated(xp_mix, xt_g, m_g, sig, 16.0)
+check("gate EXCLUDES high-sigma samples (mirrored ones ignored)", float(f_lowgood) < 1e-12,
+      f"{float(f_lowgood):.3e}")
+f_nogate = fape_gated(xp_mix, xt_g, m_g, sig, None)
+check("...and without the gate those same samples DO contribute", float(f_nogate) > 0.1,
+      f"{float(f_nogate):.4f}")
+f_none = fape_gated(xp_g, xt_g, m_g, sig, 0.01)   # nothing clears the gate
+check("gate that admits nothing returns 0, not NaN", float(f_none) == 0.0
+      and torch.isfinite(torch.as_tensor(f_none)), f"{float(f_none):.3e}")
+check("gate composes with chunking", torch.allclose(fape_gated(xp_g, xt_g, m_g, sig, 16.0, chunk=1),
+                                                    f_gate, atol=1e-12))
+
 print("\nRESULT:", "ALL PASS" if ok else "FAILURE")
 sys.exit(0 if ok else 1)

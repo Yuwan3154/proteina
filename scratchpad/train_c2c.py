@@ -21,6 +21,7 @@ from omegaconf import OmegaConf
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from proteinfoundation.nn.af3_diffusion import SIGMA_DATA
 from proteinfoundation.proteinflow.contact2coord_trainer import GRAD_CLIP, ContactToCoordTrainer
 
 # AF3 widths and depth throughout (SI Alg. 23); user directive 2026-09-04 fixed depth at 24.
@@ -89,6 +90,13 @@ def main():
                     help="weight on backbone FAPE (0 = off); chirality-sensitive via proper frames")
     ap.add_argument("--fape_chunk", type=int, default=0,
                     help="chunk FAPE over diffusion samples to bound the O(L^2) pair tensor (0 = one shot)")
+    # ⛔⛔ MEASURED (job 22876261): FAPE's mirror gap is +0.539 at sigma<1 and +0.0001 by sigma>256 --
+    # at high noise both hands sit against the clamp, so the term carries NO handedness information
+    # there. t_beta(1.3,2.0) puts ~75% of samples above sigma 256, so an ungated FAPE is mostly
+    # saturation noise. Default to SIGMA_DATA: the EDM scale where signal and noise are equal, and
+    # already a constant of this model rather than a new number. <=0 disables the gate.
+    ap.add_argument("--fape_sigma_max", type=float, default=SIGMA_DATA,
+                    help="apply FAPE only to diffusion samples with sigma <= this (<=0 = no gate)")
     # Overfit ONE structure: the trainer pins its first training batch and reuses it for every
     # train/val step (saved to <run>/overfit_batch.pt). Every other hyperparameter is untouched.
     ap.add_argument("--overfit", action="store_true", help="pin the first batch; one-structure run")
@@ -121,6 +129,7 @@ def main():
     kw["w_chiral"] = args.w_chiral
     kw["w_fape"] = args.w_fape
     kw["fape_chunk"] = args.fape_chunk
+    kw["fape_sigma_max"] = args.fape_sigma_max if args.fape_sigma_max > 0 else None
     if args.overfit:
         os.makedirs(os.path.join(args.store, args.name), exist_ok=True)
         kw["overfit_batch_path"] = os.path.join(args.store, args.name, "overfit_batch.pt")
@@ -132,7 +141,8 @@ def main():
           f"n_diffusion_samples={args.n_diff}, lr={model.lr}, warmup={model.warmup_steps}, "
           f"t_beta={MODEL_CFG['t_beta']}, diff_chunk={args.diff_chunk}, smooth_lddt={not args.no_lddt}, "
           f"overfit={args.overfit}, seed={args.seed}, w_chiral={args.w_chiral}, "
-          f"w_fape={args.w_fape}, fape_chunk={args.fape_chunk}", flush=True)
+          f"w_fape={args.w_fape}, fape_chunk={args.fape_chunk}, "
+          f"fape_sigma_max={args.fape_sigma_max}", flush=True)
     # ⛔ Echo the DATASET. --dataset arrives inside the launcher's EXTRA variable and was the one
     # setting no artifact recorded: c2c_cb8 22505379 had to be argued for from four sibling flags,
     # because the default is the OLD ConFind dataset and a dropped flag would train the wrong

@@ -48,7 +48,7 @@ class ContactToCoordTrainer(L.LightningModule):
                  dump_dir: str = None, n_dump: int = 2, ema_decay: float = EMA_DECAY,
                  warmup_steps: int = WARMUP_STEPS, use_smooth_lddt: bool = True,
                  overfit_batch_path: str = None, w_chiral: float = 0.0,
-                 w_fape: float = 0.0, fape_chunk: int = 0):
+                 w_fape: float = 0.0, fape_chunk: int = 0, fape_sigma_max: float = None):
         super().__init__()
         self.save_hyperparameters()
         self.model = ContactToCoord(**model_cfg, n_ref_feats=N_REF_FEATS)
@@ -71,6 +71,11 @@ class ContactToCoordTrainer(L.LightningModule):
         # intermediates are ~1 GB each in fp32 before autograd saves them. Chunk over the SAMPLE
         # axis to bound that; 0 = one shot (fine at small L or small n_diff).
         self.fape_chunk = fape_chunk
+        # ⛔ Grounded, not invented: SIGMA_DATA is the EDM scale at which signal and noise are equal,
+        # and it is already a constant of this model. Measured gap (job 22876261) is +0.11 at the
+        # 4-16 bin and collapses above it, so this is also where the data says the term stops
+        # carrying handedness information. None = no gate (the pre-change behaviour).
+        self.fape_sigma_max = fape_sigma_max
         # Overfit-one-structure mode: pin the FIRST training batch and reuse it for every train and
         # val step. Not Lightning's overfit_batches: that only swaps a RandomSampler for a
         # SequentialSampler, and our ClusterSampler would hand it a different chain every epoch.
@@ -231,7 +236,7 @@ class ContactToCoordTrainer(L.LightningModule):
         return (d.clamp(max=clamp) * pair_m).sum(), pair_m.sum()
 
     def _fape_loss(self, x_denoised, x_gt, atom_mask_rep, L,
-                   clamp: float = 10.0, z: float = 10.0):
+                   clamp: float = 10.0, z: float = 10.0, sigma=None, sigma_max: float = None):
         """Backbone FAPE: every residue's CA expressed in every residue's frame (AF2 SI Alg. 28).
 
         ⛔ BACKBONE, not all-atom, and that is a memory decision not a modelling preference. All-atom
@@ -254,6 +259,22 @@ class ContactToCoordTrainer(L.LightningModule):
         # ⛔ MASK, not shape. A frame needs all three of N/CA/C real; a target atom needs CA real.
         frame_m = (m[:, :, 0] > 0.5) & (m[:, :, 1] > 0.5) & (m[:, :, 2] > 0.5)
         atom_m = m[:, :, 1] > 0.5
+
+        # ⛔⛔ SIGMA GATE. MEASURED (job 22876261, 288 samples at tbeta step 8076): FAPE's mirror gap
+        # is +0.5389 for sigma<1 and decays monotonically to +0.0001 by sigma>256, because at high
+        # noise BOTH the right-handed and the mirrored structure sit against the clamp ceiling. The
+        # t_beta(1.3,2.0) schedule puts ~75% of samples above sigma 256, so an UNGATED FAPE would be
+        # three-quarters saturation noise carrying no handedness information at all.
+        # ⛔ Tightening the clamp does NOT rescue this -- it makes it worse: the peak gap falls
+        # 0.539 -> 0.206 -> 0.040 -> 0.009 as clamp goes 10 -> 5 -> 2 -> 1 A. Keep AF2's 10 A.
+        if sigma is not None and sigma_max is not None:
+            keep = sigma.reshape(-1) <= sigma_max
+            if not bool(keep.any()):
+                # No low-noise sample this step. Return a real zero that still carries a gradient
+                # path, never a bare constant that would detach the term from the graph.
+                return (xp.sum() * 0.0)
+            xp, xt = xp[keep], xt[keep]
+            frame_m, atom_m = frame_m[keep], atom_m[keep]
 
         S = xp.shape[0]
         step = self.fape_chunk if self.fape_chunk and self.fape_chunk > 0 else S
@@ -294,9 +315,15 @@ class ContactToCoordTrainer(L.LightningModule):
             metrics["chiral_sign_wrong"] = wrong.sum() / wm.sum().clamp_min(1)
         if self.w_fape > 0.0:
             L = int(b["mask"].shape[1])
-            fp = self._fape_loss(out["x_denoised"], out["x_gt_rep"], out["atom_mask_rep"], L)
+            fp = self._fape_loss(out["x_denoised"], out["x_gt_rep"], out["atom_mask_rep"], L,
+                                 sigma=out["sigma"], sigma_max=self.fape_sigma_max)
             loss = loss + self.w_fape * fp
             metrics["fape"] = fp
+            # ⭐ Log how many samples actually cleared the sigma gate. If this collapses toward 0
+            # the term is silently absent and the run would look healthy while testing nothing.
+            if self.fape_sigma_max is not None:
+                metrics["fape_frac"] = (out["sigma"].reshape(-1)
+                                        <= self.fape_sigma_max).float().mean()
         return loss, metrics
 
     def _pin(self, batch):
