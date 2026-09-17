@@ -80,26 +80,53 @@ for st, slot, why in skipped[:20]:
     print(f"    step {st} {slot}: {why}")
 
 # ── the assumption, checked ──────────────────────────────────────────────────────────────────
+# ⛔ MEASURED: slot j is NOT a fixed chain. Every slot carries a different target each round, so
+# grouping by slot would average over different chains and manufacture a coin-flip picture.
 stable, unstable = [], []
 for slot, sigs in gt_sig.items():
     uniq = set(s for _, s in sigs)
     (stable if len(uniq) == 1 else unstable).append(slot)
 print(f"\n=== slot stability (is slot j the same chain every round?) ===")
 print(f"  stable slots  : {len(stable)}")
-print(f"  UNSTABLE slots: {len(unstable)}  {sorted(unstable)[:8]}")
-if unstable:
-    print("  ⛔ unstable slots are EXCLUDED -- their per-target rate would mix different chains")
-assert stable, "no slot is stable across rounds -- this analysis cannot be done on these dumps"
+print(f"  UNSTABLE slots: {len(unstable)}")
+print("  ⇒ grouping by SLOT is invalid here; regrouping by target SIGNATURE instead.")
 
-# ── per-target rates ────────────────────────────────────────────────────────────────────────
+# ── regroup by target, not by slot ───────────────────────────────────────────────────────────
+# The validation loader hands out different chains per round, so match a target across rounds by its
+# own ground-truth signature. If the loader also crops randomly, the same chain yields a DIFFERENT
+# signature each round and nothing will recur -- which the recurrence histogram below will show
+# plainly rather than hiding behind an average.
+by_target = defaultdict(list)
+for slot in gt_sig:
+    for (st, sig), (st2, v) in zip(gt_sig[slot], sign[slot]):
+        assert st == st2, "step misalignment between signature and sign lists"
+        by_target[sig].append((st, v))
+
+occur = defaultdict(int)
+for sig, v in by_target.items():
+    occur[len(v)] += 1
+print(f"\n=== target recurrence across the {len(rounds)} rounds ===")
+print(f"  distinct targets seen: {len(by_target)}")
+for k_ in sorted(occur):
+    print(f"    seen in {k_} round(s): {occur[k_]} targets")
+
+MIN_ROUNDS = 3
+rep = {s: v for s, v in by_target.items() if len(v) >= MIN_ROUNDS}
+if not rep:
+    print(f"\n⛔ NO target recurs in >= {MIN_ROUNDS} rounds. The question 'is the mirror a stable")
+    print("   per-target property' CANNOT be answered from these dumps: validation draws fresh")
+    print("   chains (and/or fresh crops) every round, so no target is ever revisited.")
+    print("   ⇒ This is a DATA LIMITATION, not a null result. Answering it needs a fixed")
+    print("     validation subset re-sampled across rounds.")
+    sys.exit(0)
+
 rates, counts = [], []
-print(f"\n=== per-target reflection rate, {len(stable)} stable targets ===")
-print(f"{'slot':<12} {'len':>5} {'rounds':>7} {'mirrored':>9} {'rate':>6}")
-for slot in sorted(stable):
-    v = [x for _, x in sign[slot]]
-    L = gt_sig[slot][0][1][0]
+print(f"\n=== per-target reflection rate, {len(rep)} targets seen in >= {MIN_ROUNDS} rounds ===")
+print(f"{'len':>5} {'rounds':>7} {'mirrored':>9} {'rate':>6}")
+for sig in sorted(rep, key=lambda s: -len(rep[s])):
+    v = [x for _, x in rep[sig]]
     rates.append(np.mean(v)); counts.append(len(v))
-    print(f"{slot:<12} {L:>5} {len(v):>7} {sum(v):>9} {np.mean(v):>6.2f}")
+    print(f"{sig[0]:>5} {len(v):>7} {sum(v):>9} {np.mean(v):>6.2f}")
 
 rates = np.array(rates)
 k = int(min(counts))
