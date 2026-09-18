@@ -149,7 +149,16 @@ class ContactToCoord(nn.Module):
         # bias=False is deliberate: a bias term would be a constant added for BOTH label values and
         # therefore carry no information about the hand, exactly the degeneracy that kills a
         # constant "be right-handed" flag.
-        self.to_hand_s = nn.Linear(1, c_s, bias=False)
+        # ⛔⛔ CREATED ONLY WHEN THE FEATURE IS ON. Creating it unconditionally added
+        # `model.to_hand_s.weight` to every state_dict, so a STRICT resume of any checkpoint written
+        # BEFORE this feature existed died with `Missing key(s) ... "model.to_hand_s.weight"`. That
+        # killed the c2c_cb8_tbeta restart from step 10,290 on 2026-09-18 (jobs 23021859/23021923),
+        # and it would have taken the whole 36-deep chain down with it, one ~1 min failure at a time.
+        # At p_mirror=0 `hand` is None and this layer is never called, so it was pure harm --
+        # and omitting it is what actually makes p_mirror=0 parameter-identical to the pre-fix model,
+        # which is the invariant the forward pass below already tries to preserve.
+        if p_mirror > 0.0:
+            self.to_hand_s = nn.Linear(1, c_s, bias=False)
         self.norm_s = nn.LayerNorm(c_s)
 
         self.atom_enc = AtomAttentionEncoder(
