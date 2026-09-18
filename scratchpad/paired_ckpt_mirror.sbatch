@@ -82,6 +82,7 @@ fi
 python scratchpad/paired_ckpt_mirror.py \
     --ckpts "$SPEC" \
     --steps "${STEPS:-20}" --n_chains "${NCHAINS:-16}" --weights "${WEIGHTS:-ema}" \
+    --n_seeds "${NSEEDS:-1}" \
     --out "$STORE/logs/${SLURM_JOB_NAME:-pairmirror}-$SLURM_JOB_ID.jsonl"
 echo "PAIRMIRROR_EXIT=$?"
 rm -f "$ARM"

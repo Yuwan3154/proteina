@@ -53,6 +53,10 @@ ap.add_argument("--ckpts", required=True, help="';'-separated list of label=path
 ap.add_argument("--dataset", default="pdb_train_contact-CB8_S25_max384_purge-test_cutoff-190828")
 ap.add_argument("--steps", type=int, default=20)
 ap.add_argument("--n_chains", type=int, default=16)
+ap.add_argument("--n_seeds", type=int, default=1,
+                help="rollouts per chain from DIFFERENT starting noise. >1 turns the fixed-seed "
+                     "design into a per-chain RATE, which is what the per-target-vs-coin-flip "
+                     "question needs; seed_idx 0 reproduces the single-seed runs exactly.")
 ap.add_argument("--weights", choices=("ema", "raw"), default="ema")
 ap.add_argument("--out", required=True)
 args = ap.parse_args()
@@ -128,38 +132,44 @@ with open(args.out, "w") as fh:
             L = b["mask"].shape[1]
             with torch.no_grad():
                 s, z, _ = model.model.encode(b["contacts"], b["aatype"], b["mask"])
-                torch.manual_seed(1234 + bi)          # identical starting noise across checkpoints
-                coords = model.model.rollout(
-                    s, z, b["mask"], b["ref_feats"], b["ref_pos"], b["atom_to_token"],
-                    b["atom_mask"], b["ref_space_uid"], n_steps=args.steps)
-            gen_all = coords.reshape(-1, L, 14, 3)
+                per_seed = []
+                for si in range(args.n_seeds):
+                    # ⛔ si=0 MUST give 1234+bi so multi-seed runs stay bit-comparable with every
+                    # single-seed run already recorded. The offset only kicks in for si>=1.
+                    torch.manual_seed(1234 + bi + si * 1_000_000)
+                    per_seed.append(model.model.rollout(
+                        s, z, b["mask"], b["ref_feats"], b["ref_pos"], b["atom_to_token"],
+                        b["atom_mask"], b["ref_space_uid"], n_steps=args.steps))
             gt_all = b["atom_pos"].reshape(-1, L, 14, 3)
-            for j in range(gen_all.shape[0]):
-                m = b["mask"][j].bool().cpu().numpy()
-                g = gen_all[j, :, 1, :].float().cpu().numpy()[m]
-                t = gt_all[j, :, 1, :].float().cpu().numpy()[m]
-                if len(g) < 10:
-                    continue
-                key = f"{bi}_{j}"
-                fp = hashlib.sha1(np.ascontiguousarray(t).tobytes()).hexdigest()[:12]
-                # ⛔ SAME POPULATION, asserted rather than assumed: a checkpoint scored on a
-                # different chain than its predecessor would make the pairing a lie.
-                if key in fingerprints:
-                    assert fingerprints[key] == fp, f"chain {key} CHANGED between checkpoints"
-                else:
-                    fingerprints[key] = fp
-                h = handedness_metrics(g, t)
-                if not h:
-                    continue
-                dmae = float(np.abs(np.linalg.norm(g[:, None] - g[None], axis=-1)
-                                    - np.linalg.norm(t[:, None] - t[None], axis=-1)).mean())
-                rec = dict(label=label, global_step=gstep, chain=key, fp=fp, n_res=int(m.sum()),
-                           rmsd_proper=float(h["rmsd_proper"]),
-                           rmsd_reflected=float(h["rmsd_reflected"]),
-                           dist_mae=dmae, is_mirrored=float(h["is_mirrored"]),
-                           refl_sign=1.0 if h["rmsd_proper"] > h["rmsd_reflected"] else 0.0)
-                rows.append(rec)
-                fh.write(json.dumps(rec) + "\n")
+            for si, coords in enumerate(per_seed):
+                gen_all = coords.reshape(-1, L, 14, 3)
+                for j in range(gen_all.shape[0]):
+                    m = b["mask"][j].bool().cpu().numpy()
+                    g = gen_all[j, :, 1, :].float().cpu().numpy()[m]
+                    t = gt_all[j, :, 1, :].float().cpu().numpy()[m]
+                    if len(g) < 10:
+                        continue
+                    key = f"{bi}_{j}"
+                    fp = hashlib.sha1(np.ascontiguousarray(t).tobytes()).hexdigest()[:12]
+                    # ⛔ SAME POPULATION, asserted rather than assumed: a checkpoint scored on a
+                    # different chain than its predecessor would make the pairing a lie.
+                    if key in fingerprints:
+                        assert fingerprints[key] == fp, f"chain {key} CHANGED between checkpoints"
+                    else:
+                        fingerprints[key] = fp
+                    h = handedness_metrics(g, t)
+                    if not h:
+                        continue
+                    dmae = float(np.abs(np.linalg.norm(g[:, None] - g[None], axis=-1)
+                                        - np.linalg.norm(t[:, None] - t[None], axis=-1)).mean())
+                    rec = dict(label=label, global_step=gstep, chain=key, seed_idx=si, fp=fp,
+                               n_res=int(m.sum()),
+                               rmsd_proper=float(h["rmsd_proper"]),
+                               rmsd_reflected=float(h["rmsd_reflected"]),
+                               dist_mae=dmae, is_mirrored=float(h["is_mirrored"]),
+                               refl_sign=1.0 if h["rmsd_proper"] > h["rmsd_reflected"] else 0.0)
+                    rows.append(rec)
+                    fh.write(json.dumps(rec) + "\n")
         fh.flush()
         os.fsync(fh.fileno())
         results[label] = rows
@@ -190,9 +200,12 @@ def exact_two_sided(b, c):
 
 print("\nPAIRED refl-sign vs the first checkpoint (McNemar, exact two-sided):")
 base_label = SPECS[0][0]
-base = {x["chain"]: x for x in results.get(base_label, [])}
+# ⛔ Key on (chain, seed_idx), NOT chain alone: with --n_seeds > 1 a chain-only key would silently
+# keep just the last seed and quietly discard the rest of the sample.
+pkey = lambda x: (x["chain"], x.get("seed_idx", 0))
+base = {pkey(x): x for x in results.get(base_label, [])}
 for label, _ in SPECS[1:]:
-    cur = {x["chain"]: x for x in results.get(label, [])}
+    cur = {pkey(x): x for x in results.get(label, [])}
     shared = sorted(set(base) & set(cur))
     b = sum(1 for k in shared if base[k]["refl_sign"] > cur[k]["refl_sign"])   # mirror -> fixed
     c = sum(1 for k in shared if base[k]["refl_sign"] < cur[k]["refl_sign"])   # fixed -> mirror
