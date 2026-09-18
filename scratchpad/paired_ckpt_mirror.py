@@ -53,6 +53,9 @@ ap.add_argument("--ckpts", required=True, help="';'-separated list of label=path
 ap.add_argument("--dataset", default="pdb_train_contact-CB8_S25_max384_purge-test_cutoff-190828")
 ap.add_argument("--steps", type=int, default=20)
 ap.add_argument("--n_chains", type=int, default=16)
+ap.add_argument("--skip_chains", type=int, default=0,
+                help="discard this many validation batches BEFORE collecting, giving a DISJOINT "
+                     "chain set for an independent replication. Protocol is otherwise identical.")
 ap.add_argument("--n_seeds", type=int, default=1,
                 help="rollouts per chain from DIFFERENT starting noise. >1 turns the fixed-seed "
                      "design into a per-chain RATE, which is what the per-target-vs-coin-flip "
@@ -85,9 +88,12 @@ dm.setup("fit")
 # Pull the chains ONCE and keep them on CPU. Every checkpoint is then scored on these same tensors.
 raw_batches = []
 it = iter(dm.val_dataloader())
+for _ in range(args.skip_chains):
+    next(it)
 while len(raw_batches) < args.n_chains:
     raw_batches.append(next(it))
-print(f"[data] cached {len(raw_batches)} validation batches (fixed across all checkpoints)", flush=True)
+print(f"[data] cached {len(raw_batches)} validation batches after skipping {args.skip_chains} "
+      f"(fixed across all checkpoints)", flush=True)
 
 dev = "cuda"
 model = ContactToCoordTrainer(model_cfg=MODEL_CFG).to(dev).eval()
