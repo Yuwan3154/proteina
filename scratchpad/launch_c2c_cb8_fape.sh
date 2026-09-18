@@ -55,6 +55,11 @@ FAPE_CHUNK="${FAPE_CHUNK:-8}"
 T_BETA="${T_BETA:-1.3,2.0}"
 LR="${LR:-0.0003}"
 WARMUP="${WARMUP:-2000}"
+# ⛔ VAL_EVERY sets the STATISTICS RATE, which is the binding constraint on deciding FAPE:
+# at ~1.4 steps/min a round is 16 generations, so 500 gave ONE round per 6 h segment and the
+# pre-registered criterion needs the good-fit bins at 50+ generations. 250 doubles the rate.
+# Cost is real but bounded: a round is n_dump=16 structures x 200 rollout steps.
+VAL_EVERY="${VAL_EVERY:-250}"
 # mit_preemptable ceiling is 2-00:00:00, not the 6 h originally copied from sd10. A short limit
 # forces a voluntary restart and a RE-ENTRY into a queue where waits have been 12+ h.
 TIME="${TIME:-2-00:00:00}"
@@ -80,9 +85,9 @@ fi
 # ⛔ The FAPE code must actually be present in the checkout this job will run.
 grep -q "fape_sigma_max" "$REPO/scratchpad/train_c2c.py" || { echo "FATAL: repo lacks --fape_sigma_max; git pull"; exit 6; }
 
-echo "w_fape=$W_FAPE lr=$LR warmup=$WARMUP diff_chunk=$DIFF_CHUNK fape_chunk=$FAPE_CHUNK t_beta=$T_BETA"
+echo "w_fape=$W_FAPE lr=$LR warmup=$WARMUP val_every=$VAL_EVERY diff_chunk=$DIFF_CHUNK fape_chunk=$FAPE_CHUNK t_beta=$T_BETA"
 echo "branch point: $BP"
-env CHAIN=38 DEVICES=1 ACCUM=8 NDIFF=48 LR="$LR" PRECISION=bf16-mixed VAL_EVERY=500 WARMUP="$WARMUP" REPO="$REPO" \
+env CHAIN=38 DEVICES=1 ACCUM=8 NDIFF=48 LR="$LR" PRECISION=bf16-mixed VAL_EVERY="$VAL_EVERY" WARMUP="$WARMUP" REPO="$REPO" \
     GRES=gpu:h200:1 INIT_FROM="$BP" \
     EXTRA="--name $NAME --no_lddt --n_dump 16 --diff_chunk $DIFF_CHUNK --t_beta $T_BETA --w_fape $W_FAPE --fape_chunk $FAPE_CHUNK --dataset pdb_train_contact-CB8_S25_max384_purge-test_cutoff-190828" \
     sbatch --parsable -J "$NAME" -p mit_preemptable --gres=gpu:h200:1 --time="$TIME" \
