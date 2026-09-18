@@ -46,32 +46,40 @@ python -c "import os,sys; d=os.path.join('$REPO','configs','datasets_config','pd
 python -c "import hydra, torch, proteinfoundation" \
     || { echo "FATAL: imports unavailable in this env"; exit 79; }
 
-# ⛔ DISK GATE. Recorded facts: personal scratch quota is 1 TB, and on 2026-09-17 a write at 1022 G
-# killed three running jobs. A 3.2 GB checkpoint needs 2x its size free. Refuse rather than repeat it.
-USED_GB=$(du -sm /orcd/scratch/orcd/011/chenxiou 2>/dev/null | awk '{printf "%d", $1/1024}')
-FREE_GB=$((1024 - USED_GB))
-echo "[disk] scratch used ${USED_GB} G of 1024 G quota; ${FREE_GB} G free"
-if [ "$FREE_GB" -lt 7 ]; then
-    echo "FATAL: only ${FREE_GB} G free; a 3.2 GB copy needs 7 G (2x + margin). Refusing."
-    exit 76
-fi
-
 ANC="$STORE/branch_points/c2c_cb8_tbeta_fape.ckpt"
 RES="$STORE/c2c_cb8_tbeta/epoch=5-step=9750.ckpt"
 CTRL="$STORE/c2c_cb8_tbeta/epoch=5-step=8500.ckpt"
 ARM_SRC="$STORE/c2c_cb8_fapelo/last.ckpt"
 ARM="$TMPDIR/pairmirror-arm-$SLURM_JOB_ID.ckpt"
 
-# ⛔ Only the ARM is copied. c2c_cb8_tbeta is CANCELLED so its directory is static, and the branch
-# point is frozen by design -- neither can be read mid-write. c2c_cb8_fapelo is queued and WILL
-# rewrite last.ckpt the moment it gets a GPU, so that one must be snapshotted.
-cp "$ARM_SRC" "$ARM" || { echo "FATAL: cannot copy $ARM_SRC"; exit 77; }
-echo "[copy] arm snapshot taken from $ARM_SRC"
+# ⭐ CKPTS overrides the default list (';'-separated label=path -- NEVER commas, --export splits on
+# those). An override is assumed to name only STATIC checkpoints, so it needs no snapshot and
+# touches no disk at all; that is why the disk gate below runs only on the default path.
+if [ -n "${CKPTS:-}" ]; then
+    SPEC="$CKPTS"
+    echo "[ckpts] override supplied; no snapshot needed, zero disk written"
+else
+    # ⛔ DISK GATE, default path only. Recorded facts: scratch quota is 1 TB, and on 2026-09-17 a
+    # write at 1022 G killed three running jobs. A 3.2 GB checkpoint needs 2x its size free.
+    USED_GB=$(du -sm /orcd/scratch/orcd/011/chenxiou 2>/dev/null | awk '{printf "%d", $1/1024}')
+    FREE_GB=$((1024 - USED_GB))
+    echo "[disk] scratch used ${USED_GB} G of 1024 G quota; ${FREE_GB} G free"
+    if [ "$FREE_GB" -lt 7 ]; then
+        echo "FATAL: only ${FREE_GB} G free; a 3.2 GB copy needs 7 G (2x + margin). Refusing."
+        exit 76
+    fi
+    # ⛔ Only the ARM is copied. c2c_cb8_tbeta is CANCELLED so its directory is static, and the
+    # branch point is frozen by design -- neither can be read mid-write. c2c_cb8_fapelo is queued
+    # and WILL rewrite last.ckpt the moment it gets a GPU, so that one must be snapshotted.
+    cp "$ARM_SRC" "$ARM" || { echo "FATAL: cannot copy $ARM_SRC"; exit 77; }
+    echo "[copy] arm snapshot taken from $ARM_SRC"
+    SPEC="anc8076=$ANC;resolved9750=$RES;fapelo_arm=$ARM;ctrl8500=$CTRL"
+fi
 
 python scratchpad/paired_ckpt_mirror.py \
-    --ckpts "anc8076=$ANC;resolved9750=$RES;fapelo_arm=$ARM;ctrl8500=$CTRL" \
+    --ckpts "$SPEC" \
     --steps "${STEPS:-20}" --n_chains "${NCHAINS:-16}" \
     --out "$STORE/logs/pairmirror-$SLURM_JOB_ID.jsonl"
 echo "PAIRMIRROR_EXIT=$?"
 rm -f "$ARM"
-echo "[cleanup] arm snapshot removed"
+echo "[cleanup] done"
