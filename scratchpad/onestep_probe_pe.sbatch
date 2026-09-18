@@ -49,6 +49,10 @@ CK="$TMPDIR/onestep-$SLURM_JOB_ID.ckpt"
 cp "$SRC" "$CK" || { echo "FATAL: cannot copy $SRC"; exit 77; }
 echo "checkpoint copied from $SRC"
 
-python scratchpad/onestep_probe.py --ckpt "$CK" --steps 1,2,5,20,200 --n_batches 2
+# ⭐ STEPS/NBATCH overridable. The n=2 run answered "can it do ONE step" (no: 2210 A), but it
+# also threw up an OPEN LEAD -- 20 steps BEAT 200 on proper RMSD (5.65 vs 10.29) and was
+# unmirrored where 200 was half-mirrored. If that survives a real n it is a FREE inference-time
+# fix, so the sweep needs to be re-runnable at higher n and a denser step list.
+python scratchpad/onestep_probe.py --ckpt "$CK" --steps "${STEPS:-1,2,5,20,200}" --n_batches "${NBATCH:-2}"
 echo "ONESTEP_EXIT=$?"
 rm -f "$CK"
