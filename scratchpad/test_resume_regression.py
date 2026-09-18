@@ -39,12 +39,14 @@ def check(name, ok, extra=""):
 
 
 print("1. p_mirror=0 must NOT create to_hand_s")
-m0 = ContactToCoordTrainer(model_cfg=MODEL_CFG, p_mirror=0.0)
+# ⛔ p_mirror is NOT a trainer kwarg -- it travels inside model_cfg, exactly as
+# train_c2c.py does it (`MODEL_CFG["p_mirror"] = args.p_mirror`, default 0.0).
+m0 = ContactToCoordTrainer(model_cfg={**MODEL_CFG, "p_mirror": 0.0})
 k0 = [k for k in m0.state_dict() if "to_hand_s" in k]
 check("no to_hand_s key at p_mirror=0", k0 == [], f"found {k0}")
 
 print("2. p_mirror>0 must still create it (feature intact)")
-m1 = ContactToCoordTrainer(model_cfg=MODEL_CFG, p_mirror=0.02)
+m1 = ContactToCoordTrainer(model_cfg={**MODEL_CFG, "p_mirror": 0.02})
 k1 = [k for k in m1.state_dict() if "to_hand_s" in k]
 check("to_hand_s present at p_mirror=0.02", len(k1) == 1, f"found {k1}")
 
