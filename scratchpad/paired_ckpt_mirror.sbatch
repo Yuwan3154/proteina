@@ -81,7 +81,7 @@ fi
 # looking for a completed job's artefact in the wrong file. Same trap as %x, opposite direction.
 python scratchpad/paired_ckpt_mirror.py \
     --ckpts "$SPEC" \
-    --steps "${STEPS:-20}" --n_chains "${NCHAINS:-16}" \
+    --steps "${STEPS:-20}" --n_chains "${NCHAINS:-16}" --weights "${WEIGHTS:-ema}" \
     --out "$STORE/logs/${SLURM_JOB_NAME:-pairmirror}-$SLURM_JOB_ID.jsonl"
 echo "PAIRMIRROR_EXIT=$?"
 rm -f "$ARM"

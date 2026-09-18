@@ -53,6 +53,7 @@ ap.add_argument("--ckpts", required=True, help="';'-separated list of label=path
 ap.add_argument("--dataset", default="pdb_train_contact-CB8_S25_max384_purge-test_cutoff-190828")
 ap.add_argument("--steps", type=int, default=20)
 ap.add_argument("--n_chains", type=int, default=16)
+ap.add_argument("--weights", choices=("ema", "raw"), default="ema")
 ap.add_argument("--out", required=True)
 args = ap.parse_args()
 
@@ -93,14 +94,26 @@ results = {}
 with open(args.out, "w") as fh:
     for label, path in SPECS:
         ck = torch.load(path, map_location="cpu", weights_only=False)
-        if "ema" in ck:
+        # ⛔⛔ WHY --weights MATTERS, measured 2026-09-18. A warm-started arm re-initialises its EMA
+        # FROM the parent, so at decay 0.999 the PARENT's coefficient in the arm's EMA is 0.999^t --
+        # 72.6% at 320 steps, 58.8% at 530. Reading the EMA of a young arm therefore measures mostly
+        # the PARENT, which is exactly how both FAPE arms came out indistinguishable from their
+        # ancestor while a same-era control differed on 16 of 64 chains. The control's own EMA has
+        # been running 8,500 steps and carries no such init, so EMA-vs-EMA is NOT apples to apples
+        # here. Use --weights raw to read what the arm's own gradients actually did.
+        if args.weights == "ema" and "ema" in ck:
             sd = dict(ck["ema"]["params"])
             missing, unexpected = model.model.load_state_dict(sd, strict=False)
-            src = f"EMA(decay={ck['ema'].get('decay')})"
+            decay = ck["ema"].get("decay")
+            src = f"EMA(decay={decay})"
+            gs = ck.get("global_step")
+            if isinstance(decay, float) and isinstance(gs, int) and gs > 0:
+                # decay**steps_since_warm_start = how much of this EMA is still the PARENT's weights
+                src += f" parent_coeff={decay ** gs:.3f}"
         else:
             sd = ck["state_dict"] if "state_dict" in ck else ck
             missing, unexpected = model.load_state_dict(sd, strict=False)
-            src = "state_dict"
+            src = "RAW state_dict"
         gstep = ck.get("global_step")
         # to_hand_s exists only in the p_mirror-capable arms; it is UNUSED at p_mirror=0, so its
         # absence from the tbeta checkpoints is expected and harmless.
