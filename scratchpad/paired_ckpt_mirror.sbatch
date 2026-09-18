@@ -76,10 +76,13 @@ else
     SPEC="anc8076=$ANC;resolved9750=$RES;fapelo_arm=$ARM;ctrl8500=$CTRL"
 fi
 
+# ⛔ Name the JSONL after the JOB NAME, matching what %x puts in --output. With a hardcoded prefix a
+# `-J pairdose` run wrote its log to pairdose-*.out but its data to pairmirror-*.jsonl, and I went
+# looking for a completed job's artefact in the wrong file. Same trap as %x, opposite direction.
 python scratchpad/paired_ckpt_mirror.py \
     --ckpts "$SPEC" \
     --steps "${STEPS:-20}" --n_chains "${NCHAINS:-16}" \
-    --out "$STORE/logs/pairmirror-$SLURM_JOB_ID.jsonl"
+    --out "$STORE/logs/${SLURM_JOB_NAME:-pairmirror}-$SLURM_JOB_ID.jsonl"
 echo "PAIRMIRROR_EXIT=$?"
 rm -f "$ARM"
 echo "[cleanup] done"
