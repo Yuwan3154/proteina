@@ -17,7 +17,7 @@ import torch.nn.functional as F
 
 from proteinfoundation.datasets.atom_features import N_REF_FEATS, atom14_features
 from proteinfoundation.datasets.contact_augment import augment_contacts
-from proteinfoundation.nn.af3_diffusion import FULL_INFERENCE_STEPS, diffusion_loss
+from proteinfoundation.nn.af3_diffusion import C2C_INFERENCE_STEPS, diffusion_loss
 from proteinfoundation.nn.contact2coord import ContactToCoord
 from proteinfoundation.utils.c2c_dump import dump_sample
 
@@ -368,7 +368,7 @@ class ContactToCoordTrainer(L.LightningModule):
         s, z, _ = self.model.encode(b["contacts"], b["aatype"], b["mask"])
         coords = self.model.rollout(s, z, b["mask"], b["ref_feats"], b["ref_pos"],
                                     b["atom_to_token"], b["atom_mask"], b["ref_space_uid"],
-                                    n_steps=FULL_INFERENCE_STEPS)
+                                    n_steps=C2C_INFERENCE_STEPS)
         L = b["mask"].shape[1]
         gen_all = coords.reshape(-1, L, 14, 3)
         gt_all = b["atom_pos"].reshape(-1, L, 14, 3)

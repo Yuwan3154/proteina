@@ -50,6 +50,11 @@ NOISE_SCALE = 1.003        # SI Alg. 18 (lambda)
 STEP_SCALE = 1.5           # SI Alg. 18 (eta)
 MINI_ROLLOUT_STEPS = 20    # SI 4.1
 FULL_INFERENCE_STEPS = 200  # SI 3.7.1; DeepMind diffusion_head.py:126
+# ⭐ OUR adopted inference default (user decision 2026-09-18). Measured on 16 chains, job 22957243:
+# 20 steps beats 200 on BOTH quality metrics -- proper RMSD 3.40 vs 3.79 A, dist_mae 1.50 vs 1.88 --
+# and is 10x cheaper, monotone through 50/100/200. FULL_INFERENCE_STEPS stays 200 because it records
+# AF3's PUBLISHED value and is asserted by test_structure_head.py; this constant is what WE use.
+C2C_INFERENCE_STEPS = 20
 S_TRANS = 1.0              # SI Alg. 19 per-step random translation, Angstrom
 
 
@@ -280,8 +285,10 @@ class AF3DiffusionHead(nn.Module):
     @torch.no_grad()
     def rollout(self, s, z, mask, n_steps: int = MINI_ROLLOUT_STEPS, generator=None):
         """SI Alg. 18 sampler. Defaults to the 20-step MINI-ROLLOUT (SI 4.1), which is used to make
-        coordinates for the confidence heads and carries NO gradients. Pass
-        n_steps=FULL_INFERENCE_STEPS for real sampling.
+        coordinates for the confidence heads and carries NO gradients.
+        ⭐ For real sampling pass n_steps=C2C_INFERENCE_STEPS (=20, our measured default since
+        2026-09-18), NOT FULL_INFERENCE_STEPS: on 16 chains 20 steps beat AF3's published 200 on
+        proper RMSD (3.40 vs 3.79 A) and dist_mae (1.50 vs 1.88) at a tenth of the cost.
         """
         B, L = mask.shape
         device = s.device

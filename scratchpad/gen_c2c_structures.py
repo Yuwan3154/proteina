@@ -30,7 +30,7 @@ from omegaconf import OmegaConf
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from proteinfoundation.nn.af3_diffusion import FULL_INFERENCE_STEPS
+from proteinfoundation.nn.af3_diffusion import C2C_INFERENCE_STEPS
 from proteinfoundation.proteinflow.contact2coord_trainer import ContactToCoordTrainer
 from proteinfoundation.utils.c2c_dump import chirality_agreement, write_atom14_pdb
 
@@ -84,7 +84,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--n", type=int, default=6)
-    ap.add_argument("--steps", type=int, default=FULL_INFERENCE_STEPS)
+    ap.add_argument("--steps", type=int, default=C2C_INFERENCE_STEPS)
     ap.add_argument("--out", default="/orcd/scratch/orcd/011/chenxiou/c2c_gen")
     ap.add_argument("--usalign", default="USalign")
     # ⭐ AF3 SI Alg. 18 / Protenix generator.py:201 re-apply the full rigid augmentation at the top
