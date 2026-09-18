@@ -175,6 +175,13 @@ with open(args.out, "w") as fh:
         results[label] = rows
         print(f"[done] {label}: n={len(rows)} written", flush=True)
 
+if torch.cuda.is_available():
+    # Recorded so the real GPU-memory bound for this payload is known rather than estimated -- it
+    # decides whether a 48 GB card can host this assay at all.
+    print(f"\n[gpu] {torch.cuda.get_device_name(0)}  peak allocated "
+          f"{torch.cuda.max_memory_allocated() / 1024**3:.2f} GiB, peak reserved "
+          f"{torch.cuda.max_memory_reserved() / 1024**3:.2f} GiB", flush=True)
+
 print(f"\n{'checkpoint':>26} {'step':>7} {'n':>4} {'proper':>8} {'refl':>8} {'distMAE':>8} "
       f"{'refl-sign':>10} {'is_mirr':>8}")
 for label, _ in SPECS:
