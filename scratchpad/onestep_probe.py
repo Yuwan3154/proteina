@@ -108,17 +108,23 @@ for bi in range(args.n_batches):
                     continue
                 dm_ = float(np.abs(np.linalg.norm(g[:, None] - g[None], axis=-1)
                                    - np.linalg.norm(t[:, None] - t[None], axis=-1)).mean())
-                rows[n].append((h["rmsd_proper"], h["rmsd_reflected"], dm_, h["is_mirrored"]))
+                # ⛔ is_mirrored needs proper > 2x reflected, so it CANNOT fire on a mediocre
+                # structure where both superpositions land similarly -- exactly the regime
+                # here (20 steps: proper 3.40 == reflected 3.40). refl-sign (proper >
+                # reflected) is the sensitive read and is what every cross-run claim uses.
+                rows[n].append((h["rmsd_proper"], h["rmsd_reflected"], dm_, h["is_mirrored"],
+                                1.0 if h["rmsd_proper"] > h["rmsd_reflected"] else 0.0))
     print(f"  batch {bi} done")
 
-print(f"\n{'steps':>6} {'n':>4} {'proper RMSD':>12} {'refl RMSD':>11} {'dist MAE':>10} {'mirrored':>9}")
+print(f"\n{'steps':>6} {'n':>4} {'proper RMSD':>12} {'refl RMSD':>11} {'dist MAE':>10} "
+      f"{'mirrored':>9} {'refl-sign':>10}")
 for n in STEPS:
     a = np.array(rows[n])
     if not len(a):
         print(f"{n:>6} {'-':>4}")
         continue
     print(f"{n:>6} {len(a):>4} {a[:,0].mean():>12.2f} {a[:,1].mean():>11.2f} "
-          f"{a[:,2].mean():>10.2f} {a[:,3].mean():>9.3f}")
+          f"{a[:,2].mean():>10.2f} {a[:,3].mean():>9.3f} {a[:,4].mean():>10.3f}")
 
 base = np.array(rows[max(STEPS)])
 one = np.array(rows[min(STEPS)])
