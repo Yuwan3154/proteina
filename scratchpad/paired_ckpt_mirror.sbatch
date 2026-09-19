@@ -57,7 +57,26 @@ ARM="$TMPDIR/pairmirror-arm-$SLURM_JOB_ID.ckpt"
 # touches no disk at all; that is why the disk gate below runs only on the default path.
 if [ -n "${CKPTS:-}" ]; then
     SPEC="$CKPTS"
-    echo "[ckpts] override supplied; no snapshot needed, zero disk written"
+    # ⭐ SNAPSHOT_SRC lets an override include a LIVE checkpoint. `last.ckpt` of a running job is
+    # rewritten every ckpt interval (~6 min for tbeta), so reading it in place can catch a partial
+    # write. Copy it once, then substitute the literal token @SNAP@ in CKPTS with the copy.
+    # ⛔ Only ONE live file is supported on purpose: needing two means the design is wrong.
+    if [ -n "${SNAPSHOT_SRC:-}" ]; then
+        USED_GB=$(du -sm /orcd/scratch/orcd/011/chenxiou 2>/dev/null | awk '{printf "%d", $1/1024}')
+        FREE_GB=$((1024 - USED_GB))
+        echo "[disk] scratch ${USED_GB} G of 1024 G; ${FREE_GB} G free"
+        [ "$FREE_GB" -ge 7 ] || { echo "FATAL: ${FREE_GB} G free; a 3.2 GB snapshot needs 7 G"; exit 76; }
+        SNAP="$TMPDIR/snap-$SLURM_JOB_ID.ckpt"
+        cp "$SNAPSHOT_SRC" "$SNAP" || { echo "FATAL: cannot snapshot $SNAPSHOT_SRC"; exit 77; }
+        echo "[snapshot] $SNAPSHOT_SRC -> $SNAP"
+        SPEC="${SPEC//@SNAP@/$SNAP}"
+        case "$SPEC" in
+            *@SNAP@*) echo "FATAL: @SNAP@ still unresolved in CKPTS"; exit 75 ;;
+        esac
+        trap 'rm -f "$SNAP"' EXIT
+    else
+        echo "[ckpts] override supplied; no snapshot needed, zero disk written"
+    fi
 else
     # ⛔ DISK GATE, default path only. Recorded facts: scratch quota is 1 TB, and on 2026-09-17 a
     # write at 1022 G killed three running jobs. A 3.2 GB checkpoint needs 2x its size free.
