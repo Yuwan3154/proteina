@@ -9,9 +9,20 @@ its contacts. So native alpha-L segments separate "reproduces the handedness the
 contact-map definition it must match is NOT the module default: the c2c dataset sets
 `cb_fill: "pseudo_cb"` while ContactMapTransform defaults to "ca". Building on the default would
 feed the model an off-distribution map that still looks plausible and the handedness verdict would
-be meaningless. So --control first takes a chain from the REAL dataloader, rebuilds it through this
-script's path, and asserts the two contact maps are IDENTICAL. Sampling refuses to run unless that
-passes. [[feedback_pin_the_definition_in_the_data]]
+be meaningless. So the control takes a chain from the REAL dataloader, rebuilds it through this
+script's path, and compares. Sampling refuses to run unless it passes.
+[[feedback_pin_the_definition_in_the_data]]
+
+⛔⛔ THE CONTROL TESTS THE DEFINITION, NOT BIT-IDENTITY -- and that distinction was MEASURED, not
+assumed. A first version demanded identical maps and failed at 1080/147456 entries (0.73%).
+Diagnosis on 6kn9_B: same chain, same masks, same residue_type, and applying ALL SEVEN config
+transforms gave the identical diff as applying two, so the transform chain was NOT the cause. The
+CA distance matrix differed by up to 0.044 A in float32 -- the pipeline's GlobalRotationTransform
+applies a RANDOM rotation, and the contact map is a hard threshold at exactly 8.0 A, so every pair
+within that of the cutoff flips. ⇒ The training contact maps are NOT deterministic for a given
+chain; ~0.7% of entries depend on the draw. Bit-identity could therefore never pass. The control
+now requires every disagreement to sit at the 8.0 A boundary, which is what actually distinguishes
+"same definition, threshold jitter" from "different contact rule".
 
 ⛔ A local handedness verdict is only interpretable if the GLOBAL fold was reproduced. Each row
 reports proper/reflected RMSD so a failed generation cannot be read as a handedness result.
@@ -112,13 +123,36 @@ def main():
     a = ref["contact_map"].float()[0]
     b = mine_b["contact_map"].float()[0]
     n = min(a.shape[0], b.shape[0])
-    same = torch.equal(a[:n, :n], b[:n, :n])
     diff = int((a[:n, :n] != b[:n, :n]).sum())
-    print(f"[control] contact_map identical={same} (differing entries={diff} of {n*n})", flush=True)
-    if not same:
-        raise SystemExit("CONTROL FAILED: constructed contact map != dataloader's. "
-                         "A handedness verdict built on this would be meaningless. Refusing.")
-    print("[control] PASS -- constructed input matches the real pipeline\n", flush=True)
+    # ⛔⛔ BIT-IDENTITY IS THE WRONG CONTROL HERE AND CAN NEVER PASS. The pipeline applies
+    # GlobalRotationTransform, a RANDOM rotation, and the contact map is a hard threshold at
+    # exactly 8.0 A. MEASURED on 6kn9_B: same chain, same masks, same residue_type, but the CA
+    # distance matrix differs by up to 0.044 A in float32 after rotation -- so every pair sitting
+    # within that of the cutoff flips. That is 1080/147456 = 0.73% of entries, and it is a property
+    # of the DATA PIPELINE, not of this reconstruction.
+    # ⇒ The meaningful control is that the DEFINITION matches: every disagreement must be a pair
+    # whose distance sits at the 8.0 A boundary. A disagreement far from the boundary would mean a
+    # genuinely different contact rule, which is what we must refuse to sample on.
+    rm = ref["mask_dict"]["coords"][0][..., 0, 0].bool()
+    ca = ref["coords"][0].float()[:, CA, :]
+    D = torch.cdist(ca, ca)
+    mism = (a[:n, :n] != b[:n, :n]).nonzero()
+    frac = diff / float(n * n)
+    if diff:
+        dd = torch.tensor([D[int(i), int(j)] for i, j in mism])
+        off = (dd - 8.0).abs()
+        far = int((off > 0.25).sum())
+        print(f"[control] {diff} of {n*n} entries differ ({100*frac:.2f}%); "
+              f"distance-to-cutoff of the disagreements: median {off.median():.4f} A, "
+              f"max {off.max():.4f} A, beyond 0.25 A: {far}", flush=True)
+        if far:
+            raise SystemExit(f"CONTROL FAILED: {far} disagreements are NOT at the 8.0 A boundary, "
+                             "so the contact DEFINITION differs. Refusing to sample.")
+        if frac > 0.02:
+            raise SystemExit(f"CONTROL FAILED: {100*frac:.2f}% of entries differ -- too many for "
+                             "threshold jitter alone. Refusing to sample.")
+    print("[control] PASS -- every disagreement is threshold jitter at the 8.0 A cutoff caused by "
+          "the pipeline's random rotation; the contact DEFINITION matches.\n", flush=True)
 
     # ── model ──────────────────────────────────────────────────────────────────────────────────
     from scratchpad.gen_c2c_structures import MODEL_CFG  # single source for the arch
