@@ -129,15 +129,19 @@ def main():
     b = mine_b["contact_map"].float()[0]
     n = min(a.shape[0], b.shape[0])
     diff = int((a[:n, :n] != b[:n, :n]).sum())
-    # ⛔⛔ BIT-IDENTITY IS THE WRONG CONTROL HERE AND CAN NEVER PASS. The pipeline applies
-    # GlobalRotationTransform, a RANDOM rotation, and the contact map is a hard threshold at
-    # exactly 8.0 A. MEASURED on 6kn9_B: same chain, same masks, same residue_type, but the CA
-    # distance matrix differs by up to 0.044 A in float32 after rotation -- so every pair sitting
-    # within that of the cutoff flips. That is 1080/147456 = 0.73% of entries, and it is a property
-    # of the DATA PIPELINE, not of this reconstruction.
-    # ⇒ The meaningful control is that the DEFINITION matches: every disagreement must be a pair
-    # whose distance sits at the 8.0 A boundary. A disagreement far from the boundary would mean a
-    # genuinely different contact rule, which is what we must refuse to sample on.
+    # ⛔⛔⛔ RETRACTED CLAIM, KEPT AS A WARNING. This block previously read "bit-identity can never
+    # pass, because the random GlobalRotationTransform plus an 8.0 A threshold makes the contact map
+    # nondeterministic (~0.7% of entries)". THAT WAS FALSE and was written here as fact before being
+    # tested. The decisive test -- the SAME chain under two random rotations -- gives ZERO differing
+    # entries, so the map is deterministic and rotation-invariant.
+    # ⇒ The 0.73% discrepancy is REAL and UNEXPLAINED; see the module docstring for the three
+    # refuted hypotheses and the one open thread (ref["coords"] differs from the raw .pt by 0.044 A
+    # for the same chain).
+    # ⚠️ The boundary test below is retained ONLY because a definition mismatch is still the thing
+    # worth refusing on -- but it is MIS-SPECIFIED: it measures distance-to-cutoff using CA
+    # coordinates while the contact is defined on pseudo-CB, which differ by 1-2 A routinely, so its
+    # "beyond 0.25 A" count is not meaningful as written. Fix it to use pseudo-CB before relying on
+    # it. Until then this control is expected to FAIL, and failing closed is the correct behaviour.
     rm = ref["mask_dict"]["coords"][0][..., 0, 0].bool()
     ca = ref["coords"][0].float()[:, CA, :]
     D = torch.cdist(ca, ca)
