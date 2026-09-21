@@ -150,6 +150,29 @@ def main():
         keep = b["mask"][0].bool().cpu().numpy()
         nat = b["atom_pos"].reshape(1, -1, 14, 3)[0, :, CA, :].detach().cpu().numpy()[keep]
         nat_d = ca_dihedrals(nat)
+        # ⛔⛔ DO NOT trust the externally supplied index. The scanner reports a start index into the
+        # ORIGINAL residue array, while everything here lives in the MASK-COMPACTED CA array; with
+        # any unresolved gap the two frames disagree and we would silently compare the WRONG
+        # residues while every printed number still looked reasonable.
+        # Re-derive the span from the native structure actually loaded here, in this frame.
+        best, best_i, cur, cur_i = 0, -1, 0, -1
+        for i, v in enumerate(nat_d):
+            if HELICAL_LO < abs(v) < HELICAL_HI and v > 0:
+                if cur == 0:
+                    cur_i = i
+                cur += 1
+                if cur > best:
+                    best, best_i = cur, cur_i
+            else:
+                cur = 0
+        if best < run:
+            print(f"  [warn] {os.path.basename(path)}: re-derived longest run {best} < scanner's "
+                  f"{run}; using the re-derived span (frames differ only if the chain has gaps)",
+                  flush=True)
+        st, run = best_i, best
+        if run <= 0:
+            print(f"  [skip] {os.path.basename(path)}: no left-handed helical run in this frame")
+            continue
         nat_seg = nat_d[st:st + run]
         for j in range(args.n):
             torch.manual_seed(1234 + j)
