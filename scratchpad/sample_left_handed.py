@@ -175,8 +175,11 @@ def main():
     assert len(chains) == len(spans), "one span per chain"
 
     fh = open(args.out, "w")
-    print(f"{'chain':>10} {'smp':>4} {'prop_rmsd':>10} {'refl_rmsd':>10} {'gap':>7} "
-          f"{'nat_pos':>8} {'gen_pos':>8} {'verdict':>22}")
+    print(f"{'chain':>10} {'smp':>4} {'propRMSD':>10} {'gap':>6} "
+          f"{'natL':>7} {'genL':>7} | {'natR':>7} {'genR':>7} | {'natHPF':>7} {'genHPF':>7}  "
+          f"{'verdict':>20}")
+    print(f"{'':>10} {'':>4} {'':>10} {'':>6} {'(=1 by constr)':>15} | "
+          f"{'(=0 by constr)':>17} | {'native~0.12':>15}")
     for path, (st, run) in zip(chains, spans):
         d = load_and_build(path, tfs)
         batch = dense_padded_from_data_list([d])
@@ -226,6 +229,36 @@ def main():
             gen_seg = gen_d[st:st + run]
             nat_pos = float((nat_seg > 0).mean())
             gen_pos = float((gen_seg > 0).mean())
+            # ⛔⛔ NEGATIVE CONTROL. nat_pos is 1.00 BY CONSTRUCTION (the span was chosen as the
+            # longest all-positive run), so "gen_pos == 1.00" is only meaningful if the model is
+            # NOT emitting positive dihedrals everywhere. A globally mirrored generation would
+            # score 1.00 here too and the table would look identical -- a vacuous pass.
+            # So also score a matched RIGHT-handed span (same length, all-negative in the native)
+            # and the chain-wide fraction. A real success needs: left span kept positive AND right
+            # span kept negative AND chain-wide fraction near the 0.12 native band.
+            rbest, rbest_i, rcur, rcur_i = 0, -1, 0, -1
+            for i2, v2 in enumerate(nat_d):
+                if HELICAL_LO < abs(v2) < HELICAL_HI and v2 < 0:
+                    if rcur == 0:
+                        rcur_i = i2
+                    rcur += 1
+                    if rcur > rbest:
+                        rbest, rbest_i = rcur, rcur_i
+                else:
+                    rcur = 0
+            rlen = min(rbest, run) if rbest else 0
+            if rlen:
+                nat_rseg = nat_d[rbest_i:rbest_i + rlen]
+                gen_rseg = gen_d[rbest_i:rbest_i + rlen]
+                nat_rpos = float((nat_rseg > 0).mean())
+                gen_rpos = float((gen_rseg > 0).mean())
+            else:
+                nat_rpos = gen_rpos = float("nan")
+
+            def _hpf(d):
+                h = d[(np.abs(d) > HELICAL_LO) & (np.abs(d) < HELICAL_HI)]
+                return float((h > 0).mean()) if len(h) else float("nan")
+            nat_hpf, gen_hpf = _hpf(nat_d), _hpf(gen_d)
             # ⛔ only a well-reproduced global fold makes the local verdict meaningful
             if p > 8.0:
                 verdict = "fold not reproduced"
@@ -235,11 +268,16 @@ def main():
                 verdict = "flipped to RIGHT"
             else:
                 verdict = "mixed"
-            print(f"{os.path.basename(path)[:10]:>10} {j:4d} {p:10.2f} {r:10.2f} {p-r:7.2f} "
-                  f"{nat_pos:8.2f} {gen_pos:8.2f} {verdict:>22}", flush=True)
+            print(f"{os.path.basename(path)[:10]:>10} {j:4d} {p:10.2f} {p-r:6.2f} "
+                  f"{nat_pos:7.2f} {gen_pos:7.2f} | {nat_rpos:7.2f} {gen_rpos:7.2f} | "
+                  f"{nat_hpf:7.3f} {gen_hpf:7.3f}  {verdict:>20}", flush=True)
             fh.write(json.dumps({"chain": os.path.basename(path), "sample": j,
                                  "rmsd_proper": p, "rmsd_reflected": r,
                                  "native_pos_frac_seg": nat_pos, "gen_pos_frac_seg": gen_pos,
+                                 "native_pos_frac_RIGHTseg": nat_rpos,
+                                 "gen_pos_frac_RIGHTseg": gen_rpos,
+                                 "native_helix_pos_frac_chain": nat_hpf,
+                                 "gen_helix_pos_frac_chain": gen_hpf,
                                  "native_seg_deg": nat_seg.tolist(),
                                  "gen_seg_deg": gen_seg.tolist(),
                                  "span_start": st, "span_len": run,
