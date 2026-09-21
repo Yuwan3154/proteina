@@ -13,21 +13,21 @@ be meaningless. So the control takes a chain from the REAL dataloader, rebuilds 
 script's path, and compares. Sampling refuses to run unless it passes.
 [[feedback_pin_the_definition_in_the_data]]
 
-⛔⛔⛔ THIS SCRIPT DOES NOT CURRENTLY PASS ITS OWN CONTROL. DO NOT TRUST ANY OUTPUT FROM IT UNTIL
-IT DOES. Status as of 2026-09-21: the reconstructed contact map differs from the dataloader's by
-1080/147456 entries (0.73%) on 6kn9_B, and the cause is UNKNOWN. Three hypotheses were tested and
-all three are dead:
-  1. wrong transform subset -- REFUTED: all SEVEN config transforms give the identical diff as two.
-  2. cb_fill default "ca" vs config "pseudo_cb" -- NOT the cause: the config resolves correctly.
-  3. random rotation -> 8.0 A threshold jitter -- REFUTED by the decisive test: the SAME chain
-     under two random rotations gives ZERO differing entries. The contact map IS deterministic and
-     rotation-invariant. (An earlier version of this docstring asserted the opposite as fact
-     before testing it. It was wrong.)
-Established: same chain, identical residue_type and coord_mask, 224 resolved both sides -- but the
-dataloader's CA distance matrix differs from the raw .pt's by up to 0.044 A, ~400x float32 rotation
-error. THAT is the open thread: find why ref["coords"] differs from the raw .pt for the same chain.
-⚠️ The boundary check below is ALSO mis-specified: it measures distance-to-cutoff in CA space while
-the contact is defined on pseudo-CB (routinely 1-2 A apart). Fix that before reading its numbers.
+⭐ ROOT CAUSE, FOUND 2026-09-21 AND FIXED (this cost four wrong hypotheses, recorded so nobody
+repeats them). An earlier version of this script omitted the PDB->openfold atom reindex that
+`pdb_data.py:1018-1019` applies to EVERY sample before the transforms. The .pt on disk is PDB-ordered
+(N, CA, C, O, CB); openfold ordering is (N, CA, C, CB, O). ContactMapTransform reads index 3 as CB,
+so without the reindex it silently built an OXYGEN-8A contact map: 1080/147456 entries (0.73%) wrong.
+Three checks that FAILED to catch it, and why:
+  - "the config resolves cb_fill=pseudo_cb" -- it parsed fine, but coord_mask[:,3] was then the
+    OXYGEN mask (resolved almost everywhere), so missing_cb was all-False and pseudo_cb never fired.
+    A config echo proves PARSING, not PARTICIPATION.
+  - "coord_mask is IDENTICAL" -- the check read atom index 0 (N), a FIXED POINT of the permutation.
+    Vacuous by construction. Any residue-level reduction (.any(-1), .sum()) is permutation-invariant too.
+  - "CA distances differ by 0.044 A, ~400x float32 error" -- that was a torch.cdist artifact, not a
+    coordinate difference: cdist uses the matmul identity and cancels catastrophically near d=0, with
+    the max error on the DIAGONAL. Real rotation round-off is ~2e-5 A. CA is index 1, a fixed point,
+    so CA coords were never affected at all.
 
 ⛔ A local handedness verdict is only interpretable if the GLOBAL fold was reproduced. Each row
 reports proper/reflected RMSD so a failed generation cannot be read as a handedness result.
@@ -43,6 +43,7 @@ import torch
 from omegaconf import OmegaConf
 
 from proteinfoundation.proteinflow.contact2coord_trainer import ContactToCoordTrainer
+from proteinfoundation.utils.constants import PDB_TO_OPENFOLD_INDEX_TENSOR
 from proteinfoundation.utils.dense_padding_data_loader import dense_padded_from_data_list
 
 CA = 1
@@ -79,7 +80,21 @@ def build_transforms(cfg):
 
 
 def load_and_build(path, transforms):
+    """Reproduce PDBDataset.__getitem__ before applying transforms.
+
+    ⛔⛔ THE REINDEX IS NOT OPTIONAL, AND OMITTING IT FAILS SILENTLY. The .pt on disk is in PDB atom
+    ordering (N=0, CA=1, C=2, O=3, CB=4); the rest of the codebase expects openfold ordering
+    (N, CA, C, CB, O), and `pdb_data.py:1018-1019` converts it for EVERY sample before the
+    transforms run. `ContactMapTransform` then reads index 3 as CB.
+    Skip this and index 3 is the backbone OXYGEN, so you silently build an oxygen-8A contact map
+    instead of a pseudo-CB-8A one -- and because coord_mask[:,3] is then the oxygen mask (resolved
+    almost everywhere), `missing_cb` is all-False and cb_fill="pseudo_cb" NEVER FIRES even though
+    the config parsed it correctly. Measured cost: 1080/147456 entries (0.73%) wrong, with the
+    config echo still printing the right thing. [[feedback_config_echo_proves_parsing_not_participation]]
+    """
     d = torch.load(path, map_location="cpu", weights_only=False)
+    d.coords = d.coords[:, PDB_TO_OPENFOLD_INDEX_TENSOR, :]
+    d.coord_mask = d.coord_mask[:, PDB_TO_OPENFOLD_INDEX_TENSOR]
     for _, tf in transforms:
         d = tf(d)
     return d
@@ -129,39 +144,18 @@ def main():
     b = mine_b["contact_map"].float()[0]
     n = min(a.shape[0], b.shape[0])
     diff = int((a[:n, :n] != b[:n, :n]).sum())
-    # ⛔⛔⛔ RETRACTED CLAIM, KEPT AS A WARNING. This block previously read "bit-identity can never
-    # pass, because the random GlobalRotationTransform plus an 8.0 A threshold makes the contact map
-    # nondeterministic (~0.7% of entries)". THAT WAS FALSE and was written here as fact before being
-    # tested. The decisive test -- the SAME chain under two random rotations -- gives ZERO differing
-    # entries, so the map is deterministic and rotation-invariant.
-    # ⇒ The 0.73% discrepancy is REAL and UNEXPLAINED; see the module docstring for the three
-    # refuted hypotheses and the one open thread (ref["coords"] differs from the raw .pt by 0.044 A
-    # for the same chain).
-    # ⚠️ The boundary test below is retained ONLY because a definition mismatch is still the thing
-    # worth refusing on -- but it is MIS-SPECIFIED: it measures distance-to-cutoff using CA
-    # coordinates while the contact is defined on pseudo-CB, which differ by 1-2 A routinely, so its
-    # "beyond 0.25 A" count is not meaningful as written. Fix it to use pseudo-CB before relying on
-    # it. Until then this control is expected to FAIL, and failing closed is the correct behaviour.
-    rm = ref["mask_dict"]["coords"][0][..., 0, 0].bool()
-    ca = ref["coords"][0].float()[:, CA, :]
-    D = torch.cdist(ca, ca)
-    mism = (a[:n, :n] != b[:n, :n]).nonzero()
-    frac = diff / float(n * n)
+    # ⛔ STRICT equality is the right control now. The contact map is deterministic and
+    # rotation-invariant (measured: the same chain under two random rotations gives ZERO differing
+    # entries), so once the atom reindex is applied there is no legitimate source of disagreement.
+    # Anything non-zero here means the reconstruction diverges from the pipeline again.
     if diff:
-        dd = torch.tensor([D[int(i), int(j)] for i, j in mism])
-        off = (dd - 8.0).abs()
-        far = int((off > 0.25).sum())
-        print(f"[control] {diff} of {n*n} entries differ ({100*frac:.2f}%); "
-              f"distance-to-cutoff of the disagreements: median {off.median():.4f} A, "
-              f"max {off.max():.4f} A, beyond 0.25 A: {far}", flush=True)
-        if far:
-            raise SystemExit(f"CONTROL FAILED: {far} disagreements are NOT at the 8.0 A boundary, "
-                             "so the contact DEFINITION differs. Refusing to sample.")
-        if frac > 0.02:
-            raise SystemExit(f"CONTROL FAILED: {100*frac:.2f}% of entries differ -- too many for "
-                             "threshold jitter alone. Refusing to sample.")
-    print("[control] PASS -- every disagreement is threshold jitter at the 8.0 A cutoff caused by "
-          "the pipeline's random rotation; the contact DEFINITION matches.\n", flush=True)
+        raise SystemExit(
+            f"CONTROL FAILED: {diff} of {n*n} contact entries differ from the dataloader's. "
+            "Refusing to sample -- a handedness verdict on an unverified input is meaningless. "
+            "First thing to check: is the PDB->openfold atom reindex still applied in "
+            "load_and_build (pdb_data.py:1018-1019)?")
+    print(f"[control] PASS -- contact map matches the dataloader EXACTLY "
+          f"(0 of {n*n} entries differ).\n", flush=True)
 
     # ── model ──────────────────────────────────────────────────────────────────────────────────
     from scratchpad.gen_c2c_structures import MODEL_CFG  # single source for the arch
