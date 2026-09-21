@@ -13,16 +13,21 @@ be meaningless. So the control takes a chain from the REAL dataloader, rebuilds 
 script's path, and compares. Sampling refuses to run unless it passes.
 [[feedback_pin_the_definition_in_the_data]]
 
-⛔⛔ THE CONTROL TESTS THE DEFINITION, NOT BIT-IDENTITY -- and that distinction was MEASURED, not
-assumed. A first version demanded identical maps and failed at 1080/147456 entries (0.73%).
-Diagnosis on 6kn9_B: same chain, same masks, same residue_type, and applying ALL SEVEN config
-transforms gave the identical diff as applying two, so the transform chain was NOT the cause. The
-CA distance matrix differed by up to 0.044 A in float32 -- the pipeline's GlobalRotationTransform
-applies a RANDOM rotation, and the contact map is a hard threshold at exactly 8.0 A, so every pair
-within that of the cutoff flips. ⇒ The training contact maps are NOT deterministic for a given
-chain; ~0.7% of entries depend on the draw. Bit-identity could therefore never pass. The control
-now requires every disagreement to sit at the 8.0 A boundary, which is what actually distinguishes
-"same definition, threshold jitter" from "different contact rule".
+⛔⛔⛔ THIS SCRIPT DOES NOT CURRENTLY PASS ITS OWN CONTROL. DO NOT TRUST ANY OUTPUT FROM IT UNTIL
+IT DOES. Status as of 2026-09-21: the reconstructed contact map differs from the dataloader's by
+1080/147456 entries (0.73%) on 6kn9_B, and the cause is UNKNOWN. Three hypotheses were tested and
+all three are dead:
+  1. wrong transform subset -- REFUTED: all SEVEN config transforms give the identical diff as two.
+  2. cb_fill default "ca" vs config "pseudo_cb" -- NOT the cause: the config resolves correctly.
+  3. random rotation -> 8.0 A threshold jitter -- REFUTED by the decisive test: the SAME chain
+     under two random rotations gives ZERO differing entries. The contact map IS deterministic and
+     rotation-invariant. (An earlier version of this docstring asserted the opposite as fact
+     before testing it. It was wrong.)
+Established: same chain, identical residue_type and coord_mask, 224 resolved both sides -- but the
+dataloader's CA distance matrix differs from the raw .pt's by up to 0.044 A, ~400x float32 rotation
+error. THAT is the open thread: find why ref["coords"] differs from the raw .pt for the same chain.
+⚠️ The boundary check below is ALSO mis-specified: it measures distance-to-cutoff in CA space while
+the contact is defined on pseudo-CB (routinely 1-2 A apart). Fix that before reading its numbers.
 
 ⛔ A local handedness verdict is only interpretable if the GLOBAL fold was reproduced. Each row
 reports proper/reflected RMSD so a failed generation cannot be read as a handedness result.
