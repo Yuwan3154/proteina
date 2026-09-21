@@ -189,15 +189,39 @@ def main():
               f"(bounds resume loss; ~3.9 s per 3.2 GB write on this tier)", flush=True)
         ckpt_every = CKPT_INTERVAL_CAP
 
-    ckpt_cb = ModelCheckpoint(
-        dirpath=os.path.join(args.store, args.name), **keep,
+    # ⛔⛔ TWO callbacks, not one. A single ModelCheckpoint carrying BOTH `every_n_train_steps` and
+    # `monitor` silently corrupts top-k: `on_train_batch_end` calls `_save_topk_checkpoint` on EVERY
+    # step-interval hit, and `_monitor_candidates` is `deepcopy(trainer.callback_metrics)`, which
+    # RETAINS the last `val/loss` between validations. So ~50 saves per validation window are all
+    # ranked on the SAME stale number and "best 3" degenerates into "most recent 3".
+    # MEASURED on this very run: the top-k set was 14,660 / 14,670 / 14,680 -- three consecutive
+    # 10-step saves, not three good checkpoints. That is also how the step-9,750 reference was
+    # EVICTED in the middle of a multi-day measurement series.
+    # ⇒ Split the two jobs that were fighting each other:
+    #   last_cb  resume anchor. save_top_k=0 makes `_save_topk_checkpoint` return immediately, so
+    #            it writes ONLY last.ckpt -- no numbered files, hence no filename collision.
+    #   best_cb  genuine top-k. No `every_n_train_steps`, so it fires from `on_validation_end`
+    #            (verified: `_should_save_on_train_epoch_end` returns `val_check_interval == 1.0`,
+    #            and ours is val_every*accum, so it is False) where val/loss is FRESH.
+    # ⛔ The three trigger kwargs are mutually exclusive in Lightning's own validator, so best_cb
+    # must NOT also take every_n_train_steps.
+    # ⛔⛔ `enable_version_counter=False` on BOTH: without it the version counter writes
+    # `last-v1.ckpt` whenever `last.ckpt` already exists from a PREVIOUS chain segment, so the
+    # resume anchor freezes at the step the first segment reached and every requeue silently
+    # rewinds to it. Measured: the run was at step 1422 in `last-v1.ckpt` while `last.ckpt` still
+    # held step 1022.
+    last_cb = ModelCheckpoint(
+        dirpath=os.path.join(args.store, args.name),
+        monitor=None, save_top_k=0,
         save_last=True, every_n_train_steps=ckpt_every,
-        # ⛔⛔ Without this, Lightning's version counter writes `last-v1.ckpt` whenever `last.ckpt`
-        # already exists from a PREVIOUS chain segment -- so the resume anchor below freezes at the
-        # step the first segment reached and every requeue silently rewinds to it. Measured: the
-        # run was at step 1422 in `last-v1.ckpt` while `last.ckpt` still held step 1022.
         enable_version_counter=False,
     )
+    best_cb = ModelCheckpoint(
+        dirpath=os.path.join(args.store, args.name), **keep,
+        save_last=False,
+        enable_version_counter=False,
+    )
+    ckpt_cbs = [last_cb, best_cb]
     logger = WandbLogger(project="contact2coord", name=args.name,
                          save_dir=args.store, offline=args.smoke)
 
@@ -208,7 +232,7 @@ def main():
         max_epochs=-1,
         accumulate_grad_batches=args.accum,
         gradient_clip_val=GRAD_CLIP,     # AF3 SI §5.6, global norm 10
-        logger=logger, callbacks=[ckpt_cb],
+        logger=logger, callbacks=ckpt_cbs,
         enable_progress_bar=False,
         limit_train_batches=8 if args.smoke else 1.0,
         limit_val_batches=4 if args.smoke else 64,
