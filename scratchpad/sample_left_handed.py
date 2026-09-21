@@ -180,8 +180,9 @@ def main():
     for path, (st, run) in zip(chains, spans):
         d = load_and_build(path, tfs)
         batch = dense_padded_from_data_list([d])
-        batch = {k: (v.to("cuda") if torch.is_tensor(v) else v) for k, v in batch.to_dict().items()} \
-            if hasattr(batch, "to_dict") else batch
+        # ⛔ Do NOT move the batch to cuda before _prepare: `mask_dict` is NESTED, so a flat
+        # comprehension moves `aatype` but leaves `mask_dict["coords"]` on CPU, and
+        # atom14_features then mixes devices. Build on CPU, move the RESULT.
         b = model._prepare(batch, train=False)
         b = {k: (v.to("cuda") if torch.is_tensor(v) else v) for k, v in b.items()}
         keep = b["mask"][0].bool().cpu().numpy()
