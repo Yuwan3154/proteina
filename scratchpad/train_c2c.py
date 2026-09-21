@@ -222,8 +222,18 @@ def main():
         enable_version_counter=False,
     )
     ckpt_cbs = [last_cb, best_cb]
-    logger = WandbLogger(project="contact2coord", name=args.name,
+    # ⛔⛔ `entity` MUST be explicit. Omitting it silently falls back to the wandb API key's DEFAULT
+    # entity, which here is `DP_CO_AFdiffusion` -- the wrong place, and wrong SILENTLY: the run
+    # trains, logs and looks healthy while its history lands outside the project's own entity.
+    # Measured cost: every c2c_cb8_tbeta segment through 2026-09-21 logged to DP_CO_AFdiffusion, so
+    # fetching its curves needed a separate entity from tri's and the two models' histories could
+    # not be read from one place.
+    # ⭐ The value is NOT a guess: it is the entity the working tri path already pins at
+    # `proteinfoundation/train.py:572`, so both models now log under the same entity.
+    WANDB_ENTITY = "kryst3154-massachusetts-institute-of-technology"
+    logger = WandbLogger(entity=WANDB_ENTITY, project="contact2coord", name=args.name,
                          save_dir=args.store, offline=args.smoke)
+    print(f"[wandb] entity={WANDB_ENTITY} project=contact2coord name={args.name}", flush=True)
 
     trainer = L.Trainer(
         accelerator="gpu", devices=args.devices, num_nodes=1,
