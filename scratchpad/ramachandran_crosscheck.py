@@ -40,10 +40,28 @@ HELICAL_LO, HELICAL_HI = 30.0, 90.0
 
 
 def dihedral(p0, p1, p2, p3):
-    b0, b1, b2 = p1 - p0, p2 - p1, p3 - p2
-    n1, n2 = np.cross(b0, b1), np.cross(b1, b2)
-    m = np.cross(n1, b1 / np.linalg.norm(b1, axis=-1, keepdims=True))
-    return np.degrees(np.arctan2((m * n2).sum(-1), (n1 * n2).sum(-1)))
+    """IUPAC-signed torsion in degrees (standard 'praxeolitic' formulation).
+
+    ⛔⛔ THE LEADING NEGATION ON b0 IS THE WHOLE SIGN CONVENTION. Omitting it flips every angle,
+    and the first version of this script did exactly that: it reported 93.8% of residues with
+    phi > 0 where real proteins are ~90% phi < 0. The self-validation below caught it.
+    ⚠️ Note the second self-check ("median phi in the (-90,-30) basin ~ -60") PASSED anyway while
+    the code was wrong -- selecting on a flipped phi, that window captured the alpha-L population,
+    whose median sits near -65 in the flipped frame. One criterion alone would have waved the bug
+    through; it took the pair.
+    ⚠️ `ca_dihedrals` below deliberately KEEPS the repo's own convention (no negation), because
+    helix_pos_frac's 0.12-native calibration is defined in that frame. The two functions therefore
+    carry OPPOSITE signs on purpose -- do not "harmonise" them.
+    """
+    b0 = -(p1 - p0)
+    b1 = p2 - p1
+    b2 = p3 - p2
+    b1 = b1 / np.linalg.norm(b1, axis=-1, keepdims=True)
+    v = b0 - (b0 * b1).sum(-1, keepdims=True) * b1
+    w = b2 - (b2 * b1).sum(-1, keepdims=True) * b1
+    x = (v * w).sum(-1)
+    y = (np.cross(b1, v) * w).sum(-1)
+    return np.degrees(np.arctan2(y, x))
 
 
 def ca_dihedrals(ca):
