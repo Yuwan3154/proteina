@@ -34,6 +34,8 @@ python $HERE/ref_availability.py --repo $B/proteina_tri --mode new \
     --index $SYNTH_INDEX_DIR/topology_index_cb8_synth.pt --csv $D/$ID.csv --splits_dir $V/splits --stems $STEMS \
     --out "$OUT/ref_new.tsv"; echo "NEW_RC=$?"
 
+# MMSEQS=0 skips the sequence search so the reference part fits a 15-min mit_quicktest slot.
+if [ "${MMSEQS:-1}" != 1 ]; then echo "[mmseqs] skipped (MMSEQS=${MMSEQS})"; echo "[done] $OUT"; exit 0; fi
 FA=$D/seq_$ID.fasta
 awk 'NR==FNR{k[">"$1]=1;next} /^>/{p=($1 in k)} p' <(cat $V/splits/val_chain_ids.txt $V/splits/test_chain_ids.txt) $FA > "$OUT/q.fa"
 awk 'NR==FNR{k[">"$1]=1;next} /^>/{p=($1 in k)} p' $V/splits/train_chain_ids.txt $FA > "$OUT/t.fa"
