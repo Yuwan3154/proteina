@@ -19,6 +19,7 @@ non-self reference regardless of cluster size; a chain that still has none falls
 unconditional MASK reference and says so loudly (topology_missing_ref = 1 + a warning).
 """
 
+import zlib
 from typing import Dict, Optional, Sequence, Tuple
 
 import torch
@@ -429,6 +430,28 @@ class TopologyReferenceTransform(T.BaseTransform):
         if t_row < 0 or t_row == row or not self._runs_for(t_row):
             return None
         return self._build_reference(t_row, length, augment=False), str(self._index["ids"][t_row])
+
+    def masked_reference(self, stem: str, length: int, seed: int = 0) -> Dict[str, torch.Tensor]:
+        """This model's TRAINING-TIME no-reference case (``_set_empty``), served as a validation
+        reference for the unconditional ("mask") arm.
+
+        ⭐ A dropped reference in training is a variable-length, fully masked reference of
+        ``drop_ref_len_range`` elements spread over the query -- never a single MASK token. Sampling
+        with no topology keys feeds ONE MASK token at position 0 instead (contact_map_tri's None
+        path), which is the OLD model's convention, so a floor measured that way is out of this
+        model's training distribution (user 2026-09-22). Built by ``_set_empty`` itself so the two
+        cannot drift apart; seeded per (seed, stem) so every pass draws the same element count.
+        """
+        g = Data()
+        saved = self._generator
+        self._generator = torch.Generator().manual_seed((seed + zlib.crc32(stem.encode())) % (2**63))
+        try:
+            self._set_empty(g, L=int(length))
+        finally:
+            self._generator = saved
+        return {k: getattr(g, k) for k in (
+            "topology_tokens", "topology_pos", "topology_pos_raw", "topology_he_tokens",
+            "topology_he_pos", "topology_he_pos_raw", "topology_he_contact", "topology_he_feat")}
 
     def forward(self, graph: Data) -> Data:
         self._ensure_loaded()

@@ -2889,6 +2889,18 @@ class ModelTrainerBase(L.LightningModule):
                     "different experiment. Sampling UNCONDITIONED instead."
                 )
                 return None
+            # ⭐ mask arm under THIS model's own no-reference convention (variable-length, fully
+            # masked; see TopologyReferenceTransform.masked_reference). Opt-in; default off.
+            if self.cfg_exp.validation_sampling.get("topology_masked", False):
+                ref = transform.masked_reference(
+                    stem, int(mask[s].sum()),
+                    seed=int(self.cfg_exp.validation_sampling.get("topology_nonself_seed", 0)),
+                )
+                logger.info(f"validation_sampling[masked]: {stem} L={int(mask[s].sum())} "
+                            f"n_el={int(ref['topology_he_tokens'].numel())}")
+                self._last_sampling_ref_ids.append("__masked__")
+                refs.append(ref)
+                continue
             # ⭐ nonself arm: condition on a RETRIEVED template instead of the chain's own
             # topology. self_reference hands the model the correct answer, which makes the headline
             # sampling metric a CEILING rather than a measurement of the realistic task. The arm is

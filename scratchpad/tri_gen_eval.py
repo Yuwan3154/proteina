@@ -21,6 +21,16 @@ quiet accuracy drop rather than an error. Correct handling = old ckpt + old repo
 
 Usage (one model, one arm):
     python scratchpad/tri_gen_eval.py --config_name <cfg> --ema_ckpt <path> --arm self|nonself
+
+Directive-B additions (2026-09-22), all opt-in; without them the harness behaves exactly as before:
+  --seed S             L.seed_everything(S) before validate: two passes differing only in weights
+                       then see the SAME diffusion noise (paired design).
+  --dump_dir D         per-sample maps + samples.jsonl (per-chain metrics); one fresh dir per pass.
+  --zero_ca_features   zero cell_in's min_ca_dist / mean_ca_dist columns (OLD checkout only). The
+                       features are standardised and reach the net only through that Linear, so this
+                       is an exact removal of their linear term (bias kept).
+  --mask_regime variable   mask arm under the NEW model's own training convention (a variable-length
+                       fully masked reference); `single` = one MASK token = the OLD convention.
 """
 
 import argparse
@@ -104,7 +114,18 @@ def main():
     # and the fourth on an unconditioned-contaminated mixture. Pass val_fixed_nonself.txt to restrict
     # every arm to the 22 chains that actually have a different-sequence mate.
     ap.add_argument("--fixed_chain_list", default=None)
+    ap.add_argument("--seed", type=int, default=None, help="seed_everything before validate")
+    ap.add_argument("--dump_dir", default=None, help="write per-sample maps + samples.jsonl here")
+    ap.add_argument("--zero_ca_features", action="store_true",
+                    help="zero cell_in's min_ca_dist/mean_ca_dist columns (old checkout only)")
+    ap.add_argument("--mask_regime", choices=["single", "variable"], default="single")
     args = ap.parse_args()
+    assert args.mask_regime == "single" or args.arm == "mask", "--mask_regime applies to --arm mask"
+    if args.dump_dir is not None:
+        # samples.jsonl APPENDS and the per-stem counter restarts per process: a reused dir would
+        # silently mix passes.
+        assert not (os.path.isdir(args.dump_dir) and os.listdir(args.dump_dir)), \
+            f"dump dir {args.dump_dir} is not empty"
 
     with hydra.initialize("../configs/experiment_config", version_base=hydra.__version__):
         cfg_exp = hydra.compose(config_name=args.config_name)
@@ -120,7 +141,16 @@ def main():
     cfg_exp.validation_sampling.topology_nonself_seed = args.nonself_seed
     if args.fixed_chain_list is not None:
         cfg_exp.validation_sampling.fixed_chain_list = args.fixed_chain_list
-    if args.arm == "mask":
+    if args.dump_dir is not None:
+        cfg_exp.validation_sampling.contact_dump_dir = args.dump_dir
+    if args.arm == "mask" and args.mask_regime == "variable":
+        from proteinfoundation.datasets.topology_reference import TopologyReferenceTransform
+        # ⛔ The OLD checkout lacks this path and would silently run the SELF arm instead.
+        assert hasattr(TopologyReferenceTransform, "masked_reference"), \
+            "this checkout has no masked_reference -- variable mask regime unavailable"
+        cfg_exp.validation_sampling.topology_masked = True
+        print("[arm] mask (variable): every chain gets this model's training-time dropped reference")
+    elif args.arm == "mask":
         # ⭐ The UNCONDITIONAL arm, and the discriminator the 2x2 cannot supply on its own: a model
         # whose score barely moves between `self` and `nonself` is either robust to the reference or
         # IGNORING it, and only the no-reference floor tells those apart.
@@ -153,10 +183,27 @@ def main():
         print(f"[EMA load] missing: {n}")
     for n in list(unexpected)[:5]:
         print(f"[EMA load] unexpected: {n}")
+    if args.zero_ca_features:
+        from proteinfoundation.datasets.sse_topology import PAIR_FEATURE_NAMES
+        ca = ("min_ca_dist", "mean_ca_dist")
+        assert all(n in PAIR_FEATURE_NAMES for n in ca), "this checkout has no CA pair features"
+        # nn_sc would be a deep copy that keeps the old weights (proteina.py load_state_dict)
+        assert getattr(model, "nn_sc", None) is None, "nn_sc copy present; zero it too"
+        idx = [int(i) for i in model.nn.pair_feat_idx]
+        cols = [2 + idx.index(PAIR_FEATURE_NAMES.index(n)) for n in ca]
+        w = model.nn.cell_in.weight
+        assert w.shape[1] == 2 + len(idx), f"cell_in width {w.shape[1]} != 2 + {len(idx)}"
+        print(f"[zero_ca] cols={cols} |W| before={[round(float(w[:, c].norm()), 4) for c in cols]}")
+        with torch.no_grad():
+            w[:, cols] = 0.0
+        print(f"[zero_ca] cols={cols} |W| after={[round(float(w[:, c].norm()), 4) for c in cols]}")
 
     dm = hydra.utils.instantiate(cfg_data.datamodule)
     trainer = L.Trainer(accelerator="gpu", devices=1, num_nodes=1, logger=_NullLogger(),
                         enable_progress_bar=False, limit_val_batches=args.limit_val_batches)
+    if args.seed is not None:
+        L.seed_everything(args.seed)
+        print(f"[seed] seed_everything({args.seed}) before validate")
     trainer.validate(model, datamodule=dm)
 
     cm = {k: float(v) for k, v in trainer.callback_metrics.items()}
@@ -166,7 +213,8 @@ def main():
         print("\n⛔ FATAL: no validation_sampling/contact_* metrics were produced. The sampling "
               "trajectory did not run -- check the logger gate and tmscore_n_samples.")
         return 2
-    print(f"\n===== config={args.config_name}  arm={args.arm} =====")
+    print(f"\n===== config={args.config_name}  arm={args.arm}  mask_regime={args.mask_regime}  "
+          f"zero_ca={args.zero_ca_features}  seed={args.seed} =====")
     for key, label in REPORT:
         hits = [v for k, v in cm.items() if k.endswith(key)]
         print(f"  {label:<34s} {hits[0]:.4f}" if hits else f"  {label:<34s} (absent)")
