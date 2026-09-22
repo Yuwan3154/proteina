@@ -55,12 +55,13 @@ df = run.history(samples=200000, pandas=True)
 print(f"[history] {len(df)} rows x {len(df.columns)} cols", file=sys.stderr)
 
 df["epoch"] = df["epoch"].ffill()
-df["trainer/global_step"] = df["trainer/global_step"].ffill()
 
+# ⛔ trainer/global_step is NOT exported as a run-level figure: it resets on resume, so its last
+# value is a SEGMENT offset, not the run's step count. The cumulative step belongs to the lineage
+# and must be read from the live job, not from this column.
 out = {
     "run": run.name,
     "state": run.state,
-    "global_step": float(df["trainer/global_step"].dropna().iloc[-1]),
     "epoch": float(df["epoch"].dropna().iloc[-1]),
     "onestep_by_epoch": {},
     "sampling": {},
@@ -69,26 +70,32 @@ out = {
 
 # ---- one-step P@L + noisy floor, aggregated per epoch -----------------------------------------
 for key in ONESTEP + FLOOR:
-    sub = df[[key, "epoch", "trainer/global_step"]].dropna(subset=[key])
+    sub = df[[key, "epoch"]].dropna(subset=[key])
     out["strata_counts"][key] = int(len(sub))
     if not len(sub):
         print(f"  {key:70} EMPTY", file=sys.stderr)
         out["onestep_by_epoch"][key] = []
         continue
-    g = sub.groupby("epoch").agg(
-        mean=(key, "mean"), n=(key, "size"), step=("trainer/global_step", "max"))
+    # no trainer/global_step here either -- see the x-axis note below; epoch IS the axis
+    g = sub.groupby("epoch").agg(mean=(key, "mean"), n=(key, "size"))
     out["onestep_by_epoch"][key] = [
-        [int(e), round(float(r["mean"]), 6), int(r["n"]), int(r["step"])]
-        for e, r in g.iterrows()
+        [int(e), round(float(r["mean"]), 6), int(r["n"])] for e, r in g.iterrows()
     ]
     print(f"  {key:70} rows={len(sub):>5} epochs={len(g):>4} last={g['mean'].iloc[-1]:.4f}",
           file=sys.stderr)
 
 # ---- sampling P@L, already one row per validation-sampling round -------------------------------
+# ⛔⛔ X-AXIS IS **epoch**, NOT trainer/global_step. Measured 2026-09-22: trainer/global_step RESETS
+# on every resume and this run has eight of them -- at history _step 68696 it reads 63.0 while the
+# epoch there is 113, and the column has backward jumps from the very start (99->64, 127->99, ...).
+# Plotting against it would have drawn the last third of training on top of the first. epoch is
+# monotone 0..127 and is already the x-axis the report's other tri charts use.
+# Same family as [[feedback_align_warm_started_runs_on_the_lineage]]: a resumed run's step counter
+# is not the lineage's step counter.
 for key in SAMPLING:
-    sub = df[[key, "trainer/global_step"]].dropna(subset=[key])
-    out["sampling"][key] = [[int(s), round(float(v), 6)]
-                            for v, s in zip(sub[key], sub["trainer/global_step"])]
+    sub = df[[key, "epoch"]].dropna(subset=[key])
+    out["sampling"][key] = [[int(e), round(float(v), 6)]
+                            for v, e in zip(sub[key], sub["epoch"])]
     print(f"  {key:70} n={len(sub)}", file=sys.stderr)
 
 empty = [k for k, v in list(out["onestep_by_epoch"].items()) + list(out["sampling"].items()) if not v]
