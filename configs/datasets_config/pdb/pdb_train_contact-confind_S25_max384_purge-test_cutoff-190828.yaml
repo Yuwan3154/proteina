@@ -1,7 +1,9 @@
-# max384 dataset for the contact-to-coordinate (c2c) model with CB-8 A contacts in ContactEBM's convention
-# (CB where resolved else CA, d <= 8, diagonal 1). Clone of pdb_train_contact-CB8-synthtopo_* WITHOUT the
-# topology-reference transform and the eligible-ids restriction: c2c reads only contact_map, and it
-# trains on every cluster.
+# max384 dataset for the ConFind c2c TWIN of c2c_cb8_tbeta (Directive B, user 2026-09-22): a byte-for-byte
+# clone of pdb_train_contact-CB8_S25_max384_purge-test_cutoff-190828.yaml with ONLY the ContactMapTransform
+# block switched to ConFind. Selector/splitter identical => the same max384 split as every other model.
+# ⛔ The existing pdb_train_contact-confind-topology_* yaml cannot be used under current code: its
+#    TopologyReferenceTransform rejects the 10-feature topology_index.pt (c2c_lr3e4_w2000 logged 13,211
+#    transform failures in 249 steps), and c2c reads only contact_map anyway.
 datamodule:
   _target_: "proteinfoundation.datasets.pdb_data.PDBLightningDataModule"
   data_dir: ${oc.env:DATA_PATH}/pdb_train/ # Directory where the dataset is stored
@@ -23,22 +25,12 @@ datamodule:
       cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/
     - _target_: "proteinfoundation.datasets.transforms.DSSPTargetTransform"  # 3-state secondary structure for DSSP aux loss
     - _target_: "proteinfoundation.datasets.transforms.ContactMapTransform"  # Required for contact_map_mode training
-      # ContactEBM's CB-8 definition (contact_ebm/data/contact_targets.py): CB atom where resolved,
-      # else CA; d <= 8.0 A; symmetric; diagonal 1; no sequence-separation filter.
-      contact_method: distance
-      contact_atom_type: "CB"
-      contact_distance_cutoff: 8.0
-      # RoseTTAFold virtual CB where CB is absent (glycine / unresolved side chain), replacing the
-      # old fallback to CA which parked every glycine's contact centre exactly on its CA.
-      # Validated against real CB to 0.056 A mean (scratchpad/test_pseudo_cb.py).
-      # ⚠️ SWITCHED ON 2026-09-16 with the user's explicit agreement to accept a mid-run target
-      # change. Changeover points, for reading the curves later:
-      #   c2c_cb8_tbeta  yaml edited at global_step 7076; took effect at the NEXT segment start,
-      #                  step 9,500 (training composes its config once, at process start)
-      #   c2c_cb8_sd10   global_step 200
-      #   tri_cb8synth_v5 / c2c_cb8_wch03 / c2c_cb8_wch10 -- not running at the time, so they pick
-      #   this up from their first segment with no discontinuity.
-      cb_fill: "pseudo_cb"
+      # ConFind contacts, values copied verbatim from pdb_train_contact-confind-topology_* (the
+      # definition tri_full384 trained on). cb_fill is irrelevant here: it is read only on the
+      # distance path (transforms.py _contact_map_from_distance).
+      contact_method: confind  # Expects precomputed contact_map_confind in processed .pt files
+      confind_rotamer_lib: ${oc.env:DATA_PATH}/rotlibs
+      confind_contact_threshold: 0.01
     - _target_: "proteinfoundation.datasets.transforms.PaddingTransform"
       max_size: 384
   batch_size: 1 # MEASURED on a 95 GB RTX PRO 6000: the tri model fits batch 1 only, at every
