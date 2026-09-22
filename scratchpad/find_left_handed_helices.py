@@ -19,6 +19,17 @@ above a number I chose".
 contiguous resolved stretches, or a break would fabricate a spurious angle.
 
 ⛔ Writes JSONL incrementally so a wall-clock kill still leaves usable results.
+
+⛔⛔ CA-TORSION SPANS NEED RAMACHANDRAN CONFIRMATION -- MEASURED, NOT ASSUMED. On 2026-09-22 the
+phi>0 cross-check (job 23460499) found **2 of 13** CA-torsion alpha-L spans were FALSE POSITIVES:
+7txa_W (median phi -80.2) and 1g1q_B (-107.2) sit firmly in NEGATIVE phi, i.e. not left-handed at
+all. That is a ~15% span-level false-positive rate.
+=> helix_pos_frac is sound as a CHAIN-LEVEL handedness statistic (vindicated on 399 chains,
+Pearson r=+0.648 vs frac(phi>0), spans with median phi ~+55 deg) but it is NOT reliable for
+locating an INDIVIDUAL segment. So this scanner now reports span_phi_pos_frac and span_median_phi
+alongside the CA-torsion run; a caller selecting alpha-L chains should filter on the phi evidence,
+not on longest_L_run alone. One of those false positives was a probe in the memorisation
+experiment and had to be retracted after the fact.
 """
 
 import argparse
@@ -31,7 +42,10 @@ import time
 import numpy as np
 import torch
 
+from proteinfoundation.utils.constants import PDB_TO_OPENFOLD_INDEX_TENSOR
+
 CA = 1  # atom37 index
+N_IDX, C_IDX = 0, 2  # N, CA, C are fixed points of the PDB<->openfold permutation
 HELICAL_LO, HELICAL_HI = 30.0, 90.0  # the mirror detector's helical window, unchanged
 
 
@@ -77,20 +91,54 @@ def longest_positive_run(d):
     return best, best_i
 
 
+def dihedral_iupac(p0, p1, p2, p3):
+    """IUPAC-signed torsion, degrees. The leading negation on b0 IS the sign convention: omitting it
+    flips every angle, which is how an earlier version reported 93.8% of residues at phi>0 when real
+    proteins are ~90% phi<0."""
+    b0 = -(p1 - p0)
+    b1 = p2 - p1
+    b2 = p3 - p2
+    b1 = b1 / np.linalg.norm(b1, axis=-1, keepdims=True)
+    v = b0 - (b0 * b1).sum(-1, keepdims=True) * b1
+    w = b2 - (b2 * b1).sum(-1, keepdims=True) * b1
+    return np.degrees(np.arctan2((np.cross(b1, v) * w).sum(-1), (v * w).sum(-1)))
+
+
+def span_phi(xyz, ok, res_idx):
+    """phi over the residues a CA-torsion span covers. Returns (frac phi>0, median phi, n).
+
+    A CA dihedral j involves CA residues j..j+3, so a run of k dihedrals covers k+3 residues.
+    phi(i) needs C(i-1), so residue i is skipped unless i-1 is resolved too.
+    """
+    have = ok[:, N_IDX] & ok[:, CA] & ok[:, C_IDX]
+    vals = []
+    for i in res_idx:
+        if i >= 1 and have[i] and have[i - 1]:
+            vals.append(dihedral_iupac(xyz[i - 1, C_IDX], xyz[i, N_IDX],
+                                       xyz[i, CA], xyz[i, C_IDX]))
+    if not vals:
+        return None, None, 0
+    a = np.asarray(vals)
+    return float((a > 0).mean()), float(np.median(a)), int(len(a))
+
+
 def scan_one(path):
     obj = torch.load(path, map_location="cpu", weights_only=False)
     coords = obj["coords"] if hasattr(obj, "keys") else obj.coords
-    ca = np.asarray(coords[:, CA, :], dtype=np.float64)
+    xyz = np.asarray(coords, dtype=np.float64)          # full atom37, needed for phi
+    ca = xyz[:, CA, :]
     if hasattr(obj, "keys") and "coord_mask" in obj:
         cm = obj["coord_mask"]
     else:
         cm = getattr(obj, "coord_mask", None)
     if cm is None:
-        resolved = np.isfinite(ca).all(-1)
+        ok = np.isfinite(xyz).all(-1)
     else:
         cm = np.asarray(cm)
-        resolved = cm[:, CA].astype(bool) if cm.ndim == 2 else cm.astype(bool)
-        resolved &= np.isfinite(ca).all(-1)
+        ok = (cm.astype(bool) if cm.ndim == 2
+              else np.repeat(cm.astype(bool)[:, None], xyz.shape[1], axis=1))
+        ok = ok & np.isfinite(xyz).all(-1)
+    resolved = ok[:, CA]
 
     best, best_abs, n_pos, n_hel = 0, -1, 0, 0
     for s, e in contiguous_runs(resolved):
@@ -105,6 +153,17 @@ def scan_one(path):
         r, i = longest_positive_run(d)
         if r > best:
             best, best_abs = r, s + i
+
+    # RAMACHANDRAN CONFIRMATION of the CA-torsion span. Measured FP rate was 2/13 (~15%) without
+    # this, and one false positive reached a published experiment before being retracted.
+    # NOTE: run_start_ca indexes the ORIGINAL residue array (s + i above), which is the same frame
+    # phi is computed in -- do not mix it with mask-compacted indices.
+    sp_frac = sp_med = None
+    sp_n = 0
+    if best > 0:
+        res_idx = range(best_abs, min(best_abs + best + 3, xyz.shape[0]))
+        sp_frac, sp_med, sp_n = span_phi(xyz, ok, res_idx)
+
     cid = obj["id"] if hasattr(obj, "keys") and "id" in obj else getattr(obj, "id", os.path.basename(path))
     return {
         "id": str(cid),
@@ -114,6 +173,10 @@ def scan_one(path):
         "run_start_ca": int(best_abs),
         "helix_pos_frac": (n_pos / n_hel) if n_hel else None,
         "n_helical": int(n_hel),
+        # phi evidence for the span -- filter alpha-L candidates on THIS, not on longest_L_run
+        "span_phi_pos_frac": sp_frac,
+        "span_median_phi": sp_med,
+        "span_phi_n": sp_n,
     }
 
 
