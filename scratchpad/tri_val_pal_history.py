@@ -54,12 +54,37 @@ out = {"run": run.name, "state": run.state,
        "summary_global_step": run.summary.get("trainer/global_step"),
        "series": {}}
 
+# scan_history(keys=K) returns ONLY rows carrying every key in K. Asking for
+# trainer/global_step alongside the validation_loss/* keys returned ZERO rows for all eight of
+# them -- the validation scalars are logged on rows that do not carry trainer/global_step, so the
+# join killed the query. The metrics were there all along (the run summary shows them).
+# => scan each family on its OWN keys, keyed by _step (always present), and build the
+# _step -> global_step map from a separate scan. A failed query is not absence.
+stepmap = {}
+for r in run.scan_history(keys=["trainer/global_step"], page_size=10000):
+    if r.get("_step") is not None and r.get("trainer/global_step") is not None:
+        stepmap[int(r["_step"])] = int(r["trainer/global_step"])
+print(f"[scan] step map: {len(stepmap)} rows", file=sys.stderr)
+
+
+def x_for(row):
+    """global_step for a row: exact if logged, else the nearest earlier mapped _step."""
+    s = row.get("_step")
+    if s is None:
+        return None
+    s = int(s)
+    if s in stepmap:
+        return stepmap[s]
+    earlier = [k for k in stepmap if k <= s]
+    return stepmap[max(earlier)] if earlier else None
+
+
 for label, keys in (("onestep", ONESTEP), ("sampling", SAMPLING)):
-    rows = list(run.scan_history(keys=STEP_KEYS[:1] + keys, page_size=10000))
+    rows = list(run.scan_history(keys=keys, page_size=10000))
     print(f"[scan] {label}: {len(rows)} rows", file=sys.stderr)
     series = {k: [] for k in keys}
     for r in rows:
-        x = r.get("trainer/global_step")
+        x = x_for(r)
         if x is None:
             continue
         for k in keys:
@@ -69,6 +94,11 @@ for label, keys in (("onestep", ONESTEP), ("sampling", SAMPLING)):
     for k in keys:
         print(f"    {k:66} n={len(series[k])}", file=sys.stderr)
     out["series"].update(series)
+
+# ⛔ an empty series here means the QUERY is wrong, not that the metric is missing -- fail loudly
+empty = [k for k, v in out["series"].items() if not v]
+print(f"[check] {len(empty)} empty series" + (": " + ", ".join(empty) if empty else ""),
+      file=sys.stderr)
 
 # every series is reported, including empty ones -- an absent metric must be visible as absent
 # rather than silently missing from the payload
