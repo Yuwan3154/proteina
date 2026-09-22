@@ -110,12 +110,29 @@ print(prof.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=args
 # ⭐ The question is whether the two cards run the SAME kernels. Surface attention/matmul
 # kernel names explicitly rather than leaving them buried in the table.
 print("\n===== ATTENTION / MATMUL KERNELS ACTUALLY DISPATCHED =====", flush=True)
+def _self_dev_time(e):
+    """torch renamed self_cuda_time_total -> self_device_time_total (2.7). Support both."""
+    for attr in ("self_device_time_total", "self_cuda_time_total"):
+        v = getattr(e, attr, None)
+        if v is not None:
+            return v
+    return 0
+
+
+def _self_dev_mem(e):
+    for attr in ("self_device_memory_usage", "self_cuda_memory_usage"):
+        v = getattr(e, attr, None)
+        if v is not None:
+            return v
+    return 0
+
+
 seen = {}
 for e in prof.key_averages():
     n = e.key.lower()
     if any(k in n for k in ("attention", "sdpa", "flash", "gemm", "matmul", "bmm", "addmm",
                             "efficient", "cutlass", "triton")):
-        seen[e.key] = (e.self_cuda_time_total, getattr(e, "self_cuda_memory_usage", 0))
+        seen[e.key] = (_self_dev_time(e), _self_dev_mem(e))
 for k, (t, m) in sorted(seen.items(), key=lambda kv: -kv[1][0])[:args.top]:
     print(f"  {t/1000:10.1f} ms  {m/1024**2:9.1f} MiB  {k}", flush=True)
 
