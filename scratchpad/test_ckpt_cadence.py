@@ -42,7 +42,9 @@ for node in ast.walk(tree):
 print(f"== A. source constants ==\n  CKPT_INTERVAL_CAP = {cap}")
 check("CKPT_INTERVAL_CAP is defined and positive", isinstance(cap, int) and cap > 0)
 check("the cap is guarded by `not args.overfit`", "not args.overfit and ckpt_every >" in src)
-check("overfit still keeps every checkpoint (save_top_k=-1)", "save_top_k=-1" in src)
+# the overfit keep-all policy now lives in c2c_ckpt_callbacks.build_ckpt_callbacks (2026-09-22)
+cb_src = open(os.path.join(HERE, "c2c_ckpt_callbacks.py")).read()
+check("overfit still keeps every checkpoint (save_top_k=-1)", "save_top_k=-1" in cb_src)
 
 
 def cadence(ckpt_every, val_every, overfit):

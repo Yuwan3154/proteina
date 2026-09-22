@@ -15,12 +15,12 @@ import sys
 import hydra
 import lightning as L
 import torch
-from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from c2c_ckpt_callbacks import build_ckpt_callbacks  # scratchpad/, next to this file
 from proteinfoundation.nn.af3_diffusion import SIGMA_DATA
 from proteinfoundation.proteinflow.contact2coord_trainer import GRAD_CLIP, ContactToCoordTrainer
 
@@ -111,6 +111,11 @@ def main():
     # train/val step (saved to <run>/overfit_batch.pt). Every other hyperparameter is untouched.
     ap.add_argument("--overfit", action="store_true", help="pin the first batch; one-structure run")
     ap.add_argument("--seed", type=int, default=None, help="L.seed_everything; None = unseeded")
+    # Retention ladder (user 2026-09-22): keep these optimizer steps permanently, plus every
+    # --keep_every steps after the largest of them. Raw weights (step-triggered). Empty/0 = off.
+    ap.add_argument("--keep_steps", default="", help="comma list of steps to keep, e.g. 8000,8500")
+    ap.add_argument("--keep_every", type=int, default=0,
+                    help="also keep every N steps after max(--keep_steps) (0 = off)")
     args = ap.parse_args()
     if args.seed is not None:
         L.seed_everything(args.seed, workers=True)
@@ -163,10 +168,9 @@ def main():
           f"{dump_dir if args.n_dump > 0 else 'DISABLED (n_dump=0)'}", flush=True)
 
     os.makedirs(args.store, exist_ok=True)
-    # Overfit runs keep EVERY val_every checkpoint: on one structure val/loss falls monotonically,
-    # so top-k would silently delete the early ones and the mirror-rate TRAJECTORY with them.
-    keep = dict(monitor=None, save_top_k=-1, filename="step{step:07d}", auto_insert_metric_name=False) \
-        if args.overfit else dict(monitor="val/loss", mode="min", save_top_k=3)
+    # Overfit runs keep EVERY checkpoint (save_top_k=-1 in c2c_ckpt_callbacks): on one structure
+    # val/loss falls monotonically, so top-k would silently delete the early ones and the
+    # mirror-rate TRAJECTORY with them.
 
     # ── resume granularity ────────────────────────────────────────────────────────────────────
     # ⛔ A chain segment that dies (wall-clock TIMEOUT, or preemption on mit_preemptable) resumes
@@ -210,18 +214,16 @@ def main():
     # resume anchor freezes at the step the first segment reached and every requeue silently
     # rewinds to it. Measured: the run was at step 1422 in `last-v1.ckpt` while `last.ckpt` still
     # held step 1022.
-    last_cb = ModelCheckpoint(
-        dirpath=os.path.join(args.store, args.name),
-        monitor=None, save_top_k=0,
-        save_last=True, every_n_train_steps=ckpt_every,
-        enable_version_counter=False,
-    )
-    best_cb = ModelCheckpoint(
-        dirpath=os.path.join(args.store, args.name), **keep,
-        save_last=False,
-        enable_version_counter=False,
-    )
-    ckpt_cbs = [last_cb, best_cb]
+    # ⛔⛔ And NEITHER may save at validation end with raw-weight intent: the trainer has EMA swapped
+    # in until its own on_validation_end, which Lightning runs AFTER the callbacks, so such a save
+    # stores EMA as state_dict (measured, job 23498231). last_cb is therefore a TrainStepCheckpoint
+    # (train-step saves only); best_cb's validation-end files are EMA and named "ema-...". See
+    # c2c_ckpt_callbacks.py.
+    keep_steps = [int(s) for s in args.keep_steps.split(",") if s.strip()]
+    ckpt_cbs = build_ckpt_callbacks(os.path.join(args.store, args.name), args.overfit, ckpt_every,
+                                    keep_steps=keep_steps, keep_every=args.keep_every)
+    print(f"[ckpt] callbacks: {[type(c).__name__ for c in ckpt_cbs]}; ladder keep_steps={keep_steps} "
+          f"keep_every={args.keep_every}", flush=True)
     # ⛔⛔ `entity` MUST be explicit. Omitting it silently falls back to the wandb API key's DEFAULT
     # entity, which here is `DP_CO_AFdiffusion` -- the wrong place, and wrong SILENTLY: the run
     # trains, logs and looks healthy while its history lands outside the project's own entity.
