@@ -214,6 +214,7 @@ class ContactMapTriSiT(nn.Module):
 
         self.out_norm = nn.LayerNorm(self.dim)
         self.out = nn.Linear(self.dim, 1)
+        self.configure_compile(kwargs)
         nn.init.zeros_(self.out.weight)
         if self.freeze_trunk:
             self._freeze_trunk()
@@ -249,7 +250,108 @@ class ContactMapTriSiT(nn.Module):
                     mod.eval()
         return self
 
+    def configure_compile(self, kwargs) -> None:
+        """Opt-in torch.compile with padding to static shapes. All off by default (eager, no padding).
+
+        use_torch_compile / use_torch_compile_sc: compile the grad (training) / no-grad (self-conditioning,
+        validation) forward; two entry points so the two grad modes keep separate Dynamo caches.
+        pad_len_buckets / pad_topo_buckets: sorted edges; L (residues) and T (topology elements) are padded
+        up to the smallest edge >= the value, so compiled shapes repeat. A value past the last edge is left
+        unpadded.
+        """
+        self.use_torch_compile = bool(kwargs.get("use_torch_compile", False))
+        self.use_torch_compile_sc = bool(kwargs.get("use_torch_compile_sc", False))
+        self.compile_mode_train = kwargs.get("compile_mode_train", "default")
+        self.compile_mode_eval = kwargs.get("compile_mode_eval", "default")
+        self.pad_len_buckets = sorted(int(x) for x in (kwargs.get("pad_len_buckets") or []))
+        self.pad_topo_buckets = sorted(int(x) for x in (kwargs.get("pad_topo_buckets") or []))
+        self._compiled_train = None
+        self._compiled_eval = None
+        if self.use_torch_compile or self.use_torch_compile_sc:
+            import torch._dynamo
+            # one graph per (L bucket, T bucket, batch size, grad mode); the default limit of 8 would
+            # silently drop the rest back to eager
+            n = max(len(self.pad_len_buckets), 1) * max(len(self.pad_topo_buckets), 1)
+            need = 4 * n + 8
+            torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, need)
+            torch._dynamo.config.accumulated_cache_size_limit = max(
+                torch._dynamo.config.accumulated_cache_size_limit, 4 * need)
+
+    @staticmethod
+    def _bucket(x: int, edges) -> int:
+        for e in edges:
+            if x <= e:
+                return e
+        return x
+
+    def _pad_batch(self, batch: Dict, Lp: int, Tp: int) -> Dict:
+        """Zero-pad the per-residue (L) and per-element (T) inputs the forward reads; mask/tokens pad as invalid."""
+        L = batch["contact_map_t"].shape[1]
+        dl = Lp - L
+        out = dict(batch)
+        if dl > 0:
+            out["contact_map_t"] = F.pad(batch["contact_map_t"], (0, dl, 0, dl))
+            out["mask"] = F.pad(batch["mask"], (0, dl))
+            if batch.get("contact_map_sc") is not None:
+                out["contact_map_sc"] = F.pad(batch["contact_map_sc"], (0, dl, 0, dl))
+            if batch.get("residue_type") is not None:
+                out["residue_type"] = F.pad(batch["residue_type"], (0, dl))
+        tok = batch.get("topology_he_tokens")
+        if tok is not None and Tp > tok.shape[1]:
+            dt = Tp - tok.shape[1]
+            out["topology_he_tokens"] = F.pad(tok, (0, dt))  # 0 = invalid element (he_valid = tok > 0)
+            out["topology_he_pos_raw"] = F.pad(batch["topology_he_pos_raw"], (0, dt))
+            out["topology_he_feat"] = F.pad(batch["topology_he_feat"], (0, 0, 0, dt, 0, dt))
+        return out
+
+    @staticmethod
+    def _unpad_out(out: Dict, L: int, T: int) -> Dict:
+        res = dict(out)
+        for k in ("contact_map_logits", "contact_map_pred", "pair_logits"):
+            if k in res:
+                res[k] = res[k][:, :L, :L]
+        if "align_logits" in res:
+            res["align_logits"] = res["align_logits"][:, :L, :T]
+        if "align_none_logits" in res:
+            res["align_none_logits"] = res["align_none_logits"][:, :L]
+        if "mlm_logits" in res:
+            res["mlm_logits"] = res["mlm_logits"][:, :T]
+        return res
+
+    def _forward_impl_sc(self, batch: Dict) -> Dict:
+        # distinct code object => its own Dynamo cache for no-grad calls
+        return self._forward_impl(batch)
+
     def forward(self, batch: Dict, force_compile: bool = False) -> Dict:
+        if not hasattr(self, "use_torch_compile"):
+            self.configure_compile({})
+        L = batch["contact_map_t"].shape[1]
+        tok = batch.get("topology_he_tokens")
+        T = tok.shape[1] if tok is not None else 1
+        Lp, Tp = self._bucket(L, self.pad_len_buckets), self._bucket(T, self.pad_topo_buckets)
+        padded = (Lp, Tp) != (L, T)
+        if padded:
+            if self.structure_head is not None:
+                raise NotImplementedError("padding is not supported with the structure head")
+            batch = self._pad_batch(batch, Lp, Tp if tok is not None else T)
+        if torch.is_grad_enabled():
+            fn = self._forward_impl
+            if self.use_torch_compile:
+                if self._compiled_train is None:
+                    self._compiled_train = torch.compile(
+                        self._forward_impl, dynamic=False, mode=self.compile_mode_train)
+                fn = self._compiled_train
+        else:
+            fn = self._forward_impl
+            if self.use_torch_compile_sc or force_compile:
+                if self._compiled_eval is None:
+                    self._compiled_eval = torch.compile(
+                        self._forward_impl_sc, dynamic=False, mode=self.compile_mode_eval)
+                fn = self._compiled_eval
+        out = fn(batch)
+        return self._unpad_out(out, L, T) if padded else out
+
+    def _forward_impl(self, batch: Dict) -> Dict:
         cm_t = batch["contact_map_t"]
         B, L = cm_t.shape[0], cm_t.shape[1]
         device, dtype = cm_t.device, cm_t.dtype
