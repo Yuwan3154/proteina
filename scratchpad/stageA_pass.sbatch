@@ -55,5 +55,8 @@ print(f"[verify] samples {len(rows)}  chains listed {len(want)}  distinct sample
 assert sorted(want) == got, "sampled chains != listed chains"
 print("[verify] OK: one sample per listed chain")
 PY
-echo "VERIFY_RC=$?"
-exit $rc
+vrc=$?
+echo "VERIFY_RC=$vrc"
+# a failed artefact check must fail the job, or `afterok` gates nothing
+[ "$rc" -ne 0 ] && exit $rc
+exit $vrc
