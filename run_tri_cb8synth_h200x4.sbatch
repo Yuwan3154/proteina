@@ -47,14 +47,19 @@ RUN="${RUN:-tri_cb8synth}"
 NGPU="${NGPU:-4}"
 
 module load cuda/12.8 2>/dev/null || module load cuda/12.6 2>/dev/null || true
-export CUE_HOST=engaging TORCH_CUDA_ARCH_LIST=9.0
+# Arch from the allocated GPUs, not hard-coded: no kernel on the tri path needs a specific arch (pure PyTorch +
+# Triton), and TORCH_CUDA_ARCH_LIST only steers JIT extension builds. All GPUs of one job must share an arch.
+CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | tr -d ' ' | sort -u)
+[ -n "$CC" ] && [ "$(echo "$CC" | wc -l)" -eq 1 ] || { echo "FATAL: need exactly one GPU arch, got: '$CC'"; exit 79; }
+export CUE_HOST=engaging TORCH_CUDA_ARCH_LIST="$CC"
 source "$ENV_DIR/.venv/bin/activate"
 source "$ENV_DIR/activate.sh"
 
 export SKIP_CONFIND_PRECOMPUTE=1
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
-export TORCHINDUCTOR_CACHE_DIR=/orcd/scratch/orcd/011/chenxiou/torchinductor_cache_sm120
-export TRITON_CACHE_DIR=/orcd/scratch/orcd/011/chenxiou/triton_cache_sm120
+# compiled kernels are arch-specific, so each arch gets its own cache
+export TORCHINDUCTOR_CACHE_DIR=/orcd/scratch/orcd/011/chenxiou/torchinductor_cache_sm${CC/./}
+export TRITON_CACHE_DIR=/orcd/scratch/orcd/011/chenxiou/triton_cache_sm${CC/./}
 mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$REPO/logs"
 export TMPDIR=/orcd/scratch/orcd/011/chenxiou/.tmp
 mkdir -p "$TMPDIR"
