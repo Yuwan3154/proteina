@@ -56,10 +56,13 @@ case "$MODE" in
     export PYTHONPATH=$REPO CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
     B=(--contact-source confind --workers "${SLURM_CPUS_PER_TASK:-32}" --usalign /home/chenxiou/.local/bin/USalign)
     if [ "$MODE" = smoke ]; then
-      $PY build "${SEL[@]}" "${B[@]}" --f2c-maps "$OUT/smoke_maps" --part 0 --limit "${LIMIT:-20}" --selftest --out-dir "$OUT/smoke_parts"
+      # the same LIMIT chains built twice, ConFind and CB-8: rows/runs/alignments must agree, only contacts differ
+      $PY build "${SEL[@]}" "${B[@]}" --f2c-maps "${SMOKE_MAPS:-$MAPS}" --part 0 --limit "${LIMIT:-20}" --selftest --out-dir "$OUT/smoke_parts_confind"
       RC=$?
-      [ $RC -eq 0 ] && $PY merge --parts-dir "$OUT/smoke_parts" --n-parts 1 --out "$OUT/smoke_index.pt" \
-          --eligible-out "$OUT/smoke_eligible.txt" --tm-range 0.5 0.9
+      [ $RC -eq 0 ] && $PY build "${SEL[@]}" --contact-source cb8 --workers "${SLURM_CPUS_PER_TASK:-32}" \
+          --usalign /home/chenxiou/.local/bin/USalign --part 0 --limit "${LIMIT:-20}" --out-dir "$OUT/smoke_parts_cb8"
+      RC=$?
+      [ $RC -eq 0 ] && python "$REPO/scratchpad/compare_index_parts.py" "$OUT/smoke_parts_confind/part_0000.pt" "$OUT/smoke_parts_cb8/part_0000.pt"
       RC=$?
     elif [ "$MODE" = build ]; then
       $PY build "${SEL[@]}" "${B[@]}" --f2c-maps "$MAPS" --part "${SLURM_ARRAY_TASK_ID:?array task id}" --out-dir "$OUT/parts"
