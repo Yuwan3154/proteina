@@ -452,10 +452,11 @@ def cmd_f2c(args):
     t_infer = 0.0
 
     if args.native_check > 0:
-        from proteinfoundation.utils.precompute_frame2confind_maps import _graph_to_f2s_item
+        from proteinfoundation.utils.precompute_frame2confind_maps import _collate_items, _graph_to_f2s_item
         agree, jac, worst, n_chk = [], [], 0.0, 0
+        items = []
         for stem, pt, *_ in jobs:
-            if n_chk >= args.native_check:
+            if len(items) >= args.native_check:
                 break
             if not os.path.exists(pt):
                 continue
@@ -464,8 +465,16 @@ def cmd_f2c(args):
             it = _graph_to_f2s_item(g)
             if ref is None or it is None or it["length"] > F2C_MAX_LEN:
                 continue
-            pr = predictor.predict_batch(it["x_f2s"][None], it["mask"][None])[0].float().cpu()
-            ref = ref.float()
+            items.append((it, ref.float()))
+        # native_batch > 1 reproduces the backfill's batching: longest first, padded to the batch max
+        items.sort(key=lambda x: -x[0]["length"])
+        preds = []
+        for i in range(0, len(items), args.native_batch):
+            chunk = [x[0] for x in items[i:i + args.native_batch]]
+            col = _collate_items(chunk)
+            pb = predictor.predict_batch(col["x_f2s"], col["mask"]).float().cpu()
+            preds += [pb[j, :c["length"], :c["length"]] for j, c in enumerate(chunk)]
+        for pr, (_, ref) in zip(preds, items):
             worst = max(worst, (pr - ref).abs().max().item())
             a, b = pr >= CONFIND_THRESHOLD, ref >= CONFIND_THRESHOLD
             agree.append((a == b).float().mean().item())
@@ -473,7 +482,7 @@ def cmd_f2c(args):
             jac.append(((a & b).sum() / (a | b).sum().clamp_min(1)).item())
             n_chk += 1
         js = sorted(jac)
-        print(f"NATIVE_CHECK n={n_chk} amp={args.amp_dtype} cell-agreement min={min(agree):.6f} mean={sum(agree)/len(agree):.6f} "
+        print(f"NATIVE_CHECK n={n_chk} amp={args.amp_dtype} batch={args.native_batch} cell-agreement min={min(agree):.6f} mean={sum(agree)/len(agree):.6f} "
               f"| contact Jaccard min={js[0]:.4f} median={js[len(js)//2]:.4f} mean={sum(js)/len(js):.4f} "
               f"| max|prob diff|={worst:.4g}", flush=True)
 
@@ -678,6 +687,7 @@ def main():
     f.add_argument("--amp-dtype", default="bf16")
     f.add_argument("--batch-size", type=int, default=4, help="rungs per forward (the backfill used 4)")
     f.add_argument("--native-check", type=int, default=0, help="compare F2C on N natives vs their stored maps first")
+    f.add_argument("--native-batch", type=int, default=1, help="natives per forward in the check (backfill used 4)")
     m = sub.add_parser("merge")
     m.add_argument("--parts-dir", required=True)
     m.add_argument("--n-parts", type=int, required=True)

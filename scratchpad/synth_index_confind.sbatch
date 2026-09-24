@@ -43,7 +43,7 @@ case "$MODE" in
     export DATA_PATH=/orcd/pool/006/chenxiou/proteina/data SKIP_CONFIND_PRECOMPUTE=1 PYTHONPATH=$REPO
     [ "${CPU:-0}" = 1 ] || nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
     if [ "$MODE" = f2c_smoke ]; then
-      $PY f2c "${SEL[@]}" --part 0 --limit "${LIMIT:-20}" --native-check "${NATIVE_CHECK:-100}" --amp-dtype "${AMP:-bf16}" --maps-out "$OUT/smoke_maps${SMOKE_TAG:-}"
+      $PY f2c "${SEL[@]}" --part 0 --limit "${LIMIT:-20}" --native-check "${NATIVE_CHECK:-100}" --native-batch "${NATIVE_BATCH:-1}" --amp-dtype "${AMP:-bf16}" --maps-out "$OUT/smoke_maps${SMOKE_TAG:-}"
     else
       $PY f2c "${SEL[@]}" --part "${SLURM_ARRAY_TASK_ID:?array task id}" --maps-out "$MAPS"
     fi
