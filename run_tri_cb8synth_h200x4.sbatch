@@ -70,7 +70,9 @@ export PYTHONPATH=$REPO${PYTHONPATH:+:$PYTHONPATH}
 cd "$REPO"
 echo "[$(date)] host=$(hostname) jobid=${SLURM_JOB_ID:-?} config=$CONFIG run=$RUN ngpu=$NGPU align_w=$ALIGN_W mlm_w=$MLM_W index=$SYNTH_INDEX_DIR"
 git log --oneline -1
-[ -f "$SYNTH_INDEX_DIR/topology_index_cb8_synth.pt" ] || { echo "FATAL: no synthetic index at $SYNTH_INDEX_DIR"; exit 77; }
+# must name the file the dataset yaml's index_path reads (the ConFind twin uses topology_index_confind_synth.pt)
+INDEX_FILE="${INDEX_FILE:-topology_index_cb8_synth.pt}"
+[ -f "$SYNTH_INDEX_DIR/$INDEX_FILE" ] || { echo "FATAL: no synthetic index $INDEX_FILE at $SYNTH_INDEX_DIR"; exit 77; }
 [ -f "$SYNTH_INDEX_DIR/eligible_ids_tm0.5-0.9.txt" ] || { echo "FATAL: no eligible-ids list at $SYNTH_INDEX_DIR"; exit 77; }
 nvidia-smi --query-gpu=index,name,compute_cap,memory.total --format=csv
 python -c "import torch; print('torch', torch.__version__, '| arch', torch.cuda.get_arch_list())"
