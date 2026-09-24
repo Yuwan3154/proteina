@@ -448,10 +448,12 @@ def cmd_f2c(args):
     mine, jobs, roots = _enumerate_jobs(args)
     root_dirs = [r[0] for r in roots]
     skip_lines, n_done, n_maps = [], 0, 0
+    import time
+    t_infer = 0.0
 
     if args.native_check > 0:
         from proteinfoundation.utils.precompute_frame2confind_maps import _graph_to_f2s_item
-        agree, worst, n_chk = [], 0.0, 0
+        agree, jac, worst, n_chk = [], [], 0.0, 0
         for stem, pt, *_ in jobs:
             if n_chk >= args.native_check:
                 break
@@ -465,10 +467,15 @@ def cmd_f2c(args):
             pr = predictor.predict_batch(it["x_f2s"][None], it["mask"][None])[0].float().cpu()
             ref = ref.float()
             worst = max(worst, (pr - ref).abs().max().item())
-            agree.append(((pr >= CONFIND_THRESHOLD) == (ref >= CONFIND_THRESHOLD)).float().mean().item())
+            a, b = pr >= CONFIND_THRESHOLD, ref >= CONFIND_THRESHOLD
+            agree.append((a == b).float().mean().item())
+            # overlap of the CONTACTS themselves; cell agreement is inflated by the ~97% negatives
+            jac.append(((a & b).sum() / (a | b).sum().clamp_min(1)).item())
             n_chk += 1
-        print(f"NATIVE_CHECK n={n_chk} threshold-agreement min={min(agree):.6f} mean={sum(agree)/len(agree):.6f} "
-              f"max|prob diff|={worst:.4g}", flush=True)
+        js = sorted(jac)
+        print(f"NATIVE_CHECK n={n_chk} amp={args.amp_dtype} cell-agreement min={min(agree):.6f} mean={sum(agree)/len(agree):.6f} "
+              f"| contact Jaccard min={js[0]:.4f} median={js[len(js)//2]:.4f} mean={sum(js)/len(js):.4f} "
+              f"| max|prob diff|={worst:.4g}", flush=True)
 
     for stem, pt, npz_path, band_tm, _rw, band_slot, _ml, tm_min, tm_max, _st in jobs:
         if npz_path is None or band_tm is None:
@@ -496,7 +503,9 @@ def cmd_f2c(args):
             for j, k in enumerate(ks):
                 full[j][amask] = torch.from_numpy(tcoords[k]).float()
             x, mask = _f2c_inputs(full, amask)
+            t0 = time.perf_counter()
             probs = predictor.predict_batch(x, mask[None].expand(len(ks), -1))[:, :L, :L].float().cpu()
+            t_infer += time.perf_counter() - t0
             bits = (probs >= CONFIND_THRESHOLD).numpy().reshape(len(ks), -1)
             packed.append(np.packbits(bits, axis=1))
         os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -511,7 +520,8 @@ def cmd_f2c(args):
     os.makedirs(args.maps_out, exist_ok=True)
     with open(os.path.join(args.maps_out, f"f2c_skips_{args.part:04d}.tsv"), "w") as fh:
         fh.write("\n".join(skip_lines) + ("\n" if skip_lines else ""))
-    print(f"part {args.part}: {n_done} chains with maps, {n_maps} new maps, {len(skip_lines)} skips", flush=True)
+    print(f"part {args.part}: {n_done} chains with maps, {n_maps} new maps, {len(skip_lines)} skips; "
+          f"inference {t_infer:.1f} s = {t_infer / max(n_maps, 1):.4f} s/map", flush=True)
     print("F2C_PART_DONE", flush=True)
 
 
