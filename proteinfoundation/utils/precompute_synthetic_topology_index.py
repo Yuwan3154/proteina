@@ -423,7 +423,9 @@ def cmd_build(args):
 
 
 # ──────────────────────────────────────────── f2c ────────────────────────────────────────────
-F2C_MAX_LEN = 384                    # Frame2ConFind was trained to length 384
+# The winner rerun that wrote the stored maps ran every length (bands to 512/768/1024/4096,
+# backfill/winner_rerun.sh), so no cap here either: a cap would drop ~10% of template rows that v4 has.
+F2C_MAX_LEN = 4096
 
 
 def _f2c_inputs(full, amask):
@@ -463,7 +465,7 @@ def cmd_f2c(args):
             g = torch.load(pt, map_location="cpu", weights_only=False)
             ref = getattr(g, "contact_map_confind", None)
             it = _graph_to_f2s_item(g)
-            if ref is None or it is None or it["length"] > F2C_MAX_LEN:
+            if ref is None or it is None or it["length"] > args.max_len:
                 continue
             items.append((it, ref.float()))
         # native_batch > 1 reproduces the backfill's batching: longest first, padded to the batch max
@@ -496,8 +498,8 @@ def cmd_f2c(args):
         z = np.load(npz_path)
         tcoords, amask = z["coords"], torch.from_numpy(z["atom_mask"].astype(bool))
         L = int(amask.shape[0])
-        if L > F2C_MAX_LEN:
-            skip_lines.append(f"{stem}\ttemplates\tlen_gt_{F2C_MAX_LEN}:{L}")
+        if L > args.max_len:
+            skip_lines.append(f"{stem}\ttemplates\tlen_gt_{args.max_len}:{L}")
             continue
         slot_to_rung = {int(sl): r for r, sl in enumerate(band_slot.tolist()) if sl >= 0}
         rungs = [k for k in range(int(tcoords.shape[0]))
@@ -686,7 +688,8 @@ def main():
     f.add_argument("--checkpoint", default="~/Frame2ConFind/runs/f2s_v384_smoothap-pearson/best.pt")
     f.add_argument("--f2c-parent", default="~", help="directory containing the Frame2ConFind package")
     f.add_argument("--amp-dtype", default="bf16")
-    f.add_argument("--batch-size", type=int, default=4, help="rungs per forward (the backfill used 4)")
+    f.add_argument("--batch-size", type=int, default=8, help="rungs per forward (winner rerun: 8 up to L 512)")
+    f.add_argument("--max-len", type=int, default=F2C_MAX_LEN)
     f.add_argument("--native-check", type=int, default=0, help="compare F2C on N natives vs their stored maps first")
     f.add_argument("--native-batch", type=int, default=1, help="natives per forward in the check (backfill used 4)")
     m = sub.add_parser("merge")
