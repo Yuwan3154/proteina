@@ -19,17 +19,22 @@ source /home/chenxiou/cue-openfold-env-sm120/activate.sh
 export TMPDIR=$S/.tmp
 git -C "$NEW" log -1 --format="[new] %h"; git -C "$OLD" log -1 --format="[old] %h"
 PYTHONPATH=$NEW python $NEW/scratchpad/surgery_confind_tri.py "$OLD_CKPT" "$OUT" || exit 1
-PYTHONPATH=$OLD python $NEW/scratchpad/tri_forward_probe.py \
-    $OLD/configs/experiment_config/model/nn/contact_map_tri_30M.yaml "$OLD_CKPT" $S/.tmp/probe_old.pt || exit 1
-PYTHONPATH=$NEW python $NEW/scratchpad/tri_forward_probe.py \
-    $NEW/configs/experiment_config/model/nn/contact_map_tri_30M_cb8.yaml "$OUT" $S/.tmp/probe_new.pt || exit 1
+for MODE in mask ref; do
+  PYTHONPATH=$OLD python $NEW/scratchpad/tri_forward_probe.py \
+      $OLD/configs/experiment_config/model/nn/contact_map_tri_30M.yaml "$OLD_CKPT" $S/.tmp/probe_old_$MODE.pt $MODE || exit 1
+  PYTHONPATH=$NEW python $NEW/scratchpad/tri_forward_probe.py \
+      $NEW/configs/experiment_config/model/nn/contact_map_tri_30M_cb8.yaml "$OUT" $S/.tmp/probe_new_$MODE.pt $MODE || exit 1
+done
 python - <<'PY'
 import torch
-a = torch.load("/orcd/scratch/orcd/011/chenxiou/.tmp/probe_old.pt")["contact_map_logits"]
-b = torch.load("/orcd/scratch/orcd/011/chenxiou/.tmp/probe_new.pt")["contact_map_logits"]
-d = (a - b).abs().max().item()
-print(f"[gate] mask-arm contact logits, old code+old weights vs new code+surgered weights: max|diff| = {d:.3g} "
-      f"over {a.numel()} cells ({'PASS' if d == 0 else 'FAIL'}; logits abs-mean {a.abs().mean().item():.4f})")
-raise SystemExit(0 if d == 0 else 1)
+ok = True
+for mode in ("mask", "ref"):
+    a = torch.load(f"/orcd/scratch/orcd/011/chenxiou/.tmp/probe_old_{mode}.pt")["contact_map_logits"]
+    b = torch.load(f"/orcd/scratch/orcd/011/chenxiou/.tmp/probe_new_{mode}.pt")["contact_map_logits"]
+    d = (a - b).abs().max().item()
+    ok &= d == 0
+    print(f"[gate] {mode}-arm contact logits, old code+old weights vs new code+surgered weights: max|diff| = {d:.3g} "
+          f"over {a.numel()} cells ({'PASS' if d == 0 else 'FAIL'}; logits abs-mean {a.abs().mean().item():.4f})")
+raise SystemExit(0 if ok else 1)
 PY
 exit $?
