@@ -27,7 +27,7 @@ source /etc/profile >/dev/null 2>&1 || true
 set -uo pipefail
 trap 'echo "[$(date)] SIGUSR1 received; waiting for SIGTERM."' USR1
 
-REPO=/orcd/scratch/orcd/011/chenxiou/proteina_tri
+REPO="${REPO:-/orcd/scratch/orcd/011/chenxiou/proteina_tri}"  # overridable so a dev checkout can run the real launcher
 ENV_DIR=/home/chenxiou/cue-openfold-env-sm120
 export DATA_PATH=/orcd/pool/006/chenxiou/proteina/data
 # Default = the v4 index. ⛔ v3 and earlier are CORRUPT for training: they joined the template pool

@@ -73,6 +73,36 @@ CONTACT_DEF = "CB<=8.0A (CA where CB unresolved), diag 1; ContactEBM convention"
 
 # Set once per worker from the CLI (a module global survives the fork; argparse objects do not).
 _USALIGN = "/home/chenxiou/.local/bin/USalign"
+# contact definition of the index: "cb8" (default, the v4 build) or "confind" (Frame2ConFind maps >= threshold:
+# the native's stored contact_map_confind, the templates' maps from the `f2c` subcommand)
+_CONTACT_SOURCE = "cb8"
+_MAPS_ROOT = ""
+_ROOTS = []
+CONFIND_THRESHOLD = 0.01             # the `contact_method: confind` transform's threshold
+CONTACT_DEF_CONFIND = "ConFind via Frame2ConFind, prob >= 0.01 (native: stored contact_map_confind)"
+
+
+def f2c_map_path(maps_root, npz_path, roots):
+    """Template npz -> its packed-map npz: <maps_root>/<root index>/<path relative to that root>."""
+    for i, r in enumerate(roots):
+        if npz_path.startswith(r.rstrip("/") + "/"):
+            return os.path.join(maps_root, str(i), os.path.relpath(npz_path, r))
+    raise ValueError(f"{npz_path} is under none of the template roots")
+
+
+def confind_native_contacts(g, L):
+    cm = getattr(g, "contact_map_confind", None)
+    if cm is None or tuple(cm.shape) != (L, L):
+        return None
+    return (cm.float() >= CONFIND_THRESHOLD).float()  # same float 0/1 form as cb8_contacts
+
+
+def load_f2c_maps(path):
+    """Packed-map npz -> {rung k: bool [L, L]}."""
+    z = np.load(path)
+    L = int(z["L"])
+    return {int(k): torch.from_numpy(np.unpackbits(z["packed"][i], count=L * L).reshape(L, L).astype(np.float32))
+            for i, k in enumerate(z["rungs"])}
 
 
 # ─────────────────────────────────── per-structure pieces ────────────────────────────────────
@@ -178,7 +208,12 @@ def _chain_job(args):
     if dssp is None:
         return stem, None, [], [("native", "no_dssp_attr")], seq
     cmask = cmask.bool()
-    cm_n = cb8_contacts(coords, cmask, CB_DISK_IDX)
+    if _CONTACT_SOURCE == "confind":
+        cm_n = confind_native_contacts(g, int(coords.shape[0]))
+        if cm_n is None:
+            return stem, None, [], [("native", "no_contact_map_confind")], seq
+    else:
+        cm_n = cb8_contacts(coords, cmask, CB_DISK_IDX)
     native = topology_row(cm_n, coords, cmask, dssp, min_len)
     if native is None:
         return stem, None, [], [("native", "dssp_all_ignore")], seq
@@ -208,6 +243,13 @@ def _chain_job(args):
             return stem, native, rows, skips, seq
     tcoords, amask = npz["coords"], torch.from_numpy(npz["atom_mask"].astype(bool))
     L_t = int(amask.shape[0])
+    f2c = None
+    if _CONTACT_SOURCE == "confind":
+        mp = f2c_map_path(_MAPS_ROOT, npz_path, _ROOTS)
+        if not os.path.exists(mp):
+            skips.append(("templates", "no_f2c_maps"))
+            return stem, native, rows, skips, seq
+        f2c = load_f2c_maps(mp)
     slot_to_rung = {int(s): r for r, s in enumerate(band_slot.tolist()) if s >= 0}
     with tempfile.TemporaryDirectory() as td:
         pq = os.path.join(td, "q.pdb")
@@ -240,7 +282,13 @@ def _chain_job(args):
             if dssp_t is None:
                 skips.append((f"tpl#{k}", "tpl_dssp_none"))
                 continue
-            cm_t = cb8_contacts(full, amask, CB_ATOM37_IDX)
+            if f2c is not None:
+                cm_t = f2c.get(k)
+                if cm_t is None:
+                    skips.append((f"tpl#{k}", "no_f2c_map_for_rung"))
+                    continue
+            else:
+                cm_t = cb8_contacts(full, amask, CB_ATOM37_IDX)
             row = topology_row(cm_t, full, amask, dssp_t[0], min_len)
             if row is None:
                 skips.append((f"tpl#{k}", "tpl_dssp_all_ignore"))
@@ -292,9 +340,8 @@ def find_template(stem, roots):
     return None, None, None, None
 
 
-def cmd_build(args):
-    global _USALIGN
-    _USALIGN = args.usalign
+def _enumerate_jobs(args):
+    """Chain list of this part -> builder job tuples (the alias join and template lookup live here only)."""
     base = torch.load(args.base_index, map_location="cpu", weights_only=False, mmap=True)
     ids = [str(s) for s in base["ids"]]
     del base
@@ -340,6 +387,17 @@ def cmd_build(args):
     if args.chain_alias:
         print(f"  {n_alias_miss} chains have no alias entry -> no template (recorded, not guessed)",
               flush=True)
+    return mine, jobs, roots
+
+
+def cmd_build(args):
+    global _USALIGN, _CONTACT_SOURCE, _MAPS_ROOT, _ROOTS
+    _USALIGN = args.usalign
+    _CONTACT_SOURCE, _MAPS_ROOT = args.contact_source, args.f2c_maps
+    if _CONTACT_SOURCE == "confind" and not _MAPS_ROOT:
+        raise SystemExit("--contact-source confind needs --f2c-maps")
+    mine, jobs, roots = _enumerate_jobs(args)
+    _ROOTS = [r[0] for r in roots]
 
     out_rows = []          # per chain: dict
     skip_lines = []
@@ -355,12 +413,106 @@ def cmd_build(args):
     os.makedirs(args.out_dir, exist_ok=True)
     part_path = os.path.join(args.out_dir, f"part_{args.part:04d}.pt")
     torch.save({"chains": out_rows, "n_parts": args.n_parts, "part": args.part, "min_len": args.min_len,
-                "tm_build_range": (args.tm_min, args.tm_max), "contact_def": CONTACT_DEF}, part_path)
+                "tm_build_range": (args.tm_min, args.tm_max),
+                "contact_def": CONTACT_DEF_CONFIND if _CONTACT_SOURCE == "confind" else CONTACT_DEF}, part_path)
     with open(os.path.join(args.out_dir, f"skips_{args.part:04d}.tsv"), "w") as fh:
         fh.write("\n".join(skip_lines) + ("\n" if skip_lines else ""))
     by_reason = Counter(l.split("\t")[2].split(":")[0] for l in skip_lines)
     print(f"wrote {part_path}: {len(out_rows)} chains, {n_tpl} template rows; skips by reason: {dict(by_reason)}", flush=True)
     print("SYNTH_INDEX_PART_DONE", flush=True)
+
+
+# ──────────────────────────────────────────── f2c ────────────────────────────────────────────
+F2C_MAX_LEN = 384                    # Frame2ConFind was trained to length 384
+
+
+def _f2c_inputs(full, amask):
+    """atom37 [n, L, 37, 3] + mask [L, 37] -> Frame2ConFind x [n, L, 5, 3] (N, CA, C, CB, O) and residue mask."""
+    from proteinfoundation.utils.frame2confind_utils import _place_cb
+    x = full[:, :, :5, :].clone()                       # atom37 order N, CA, C, CB, O == the model's order
+    mask = amask[:, 0] & amask[:, 1] & amask[:, 2]
+    miss = ~amask[:, 3] & mask
+    if miss.any():
+        for j in range(x.shape[0]):
+            x[j, miss, 3] = _place_cb(full[j, miss, 0], full[j, miss, 1], full[j, miss, 2])
+    return x, mask
+
+
+def cmd_f2c(args):
+    """Frame2ConFind maps (thresholded, bit-packed) for every template rung the build would keep."""
+    sys.path.insert(0, os.path.expanduser(args.f2c_parent))
+    from Frame2ConFind.inference.api import Frame2ConFindPredictor
+    predictor = Frame2ConFindPredictor(checkpoint=os.path.expanduser(args.checkpoint), amp_dtype=args.amp_dtype,
+                                       compile_model=False)
+    print(f"f2c model {args.checkpoint} on {predictor.device}", flush=True)
+    mine, jobs, roots = _enumerate_jobs(args)
+    root_dirs = [r[0] for r in roots]
+    skip_lines, n_done, n_maps = [], 0, 0
+
+    if args.native_check > 0:
+        from proteinfoundation.utils.precompute_frame2confind_maps import _graph_to_f2s_item
+        agree, worst, n_chk = [], 0.0, 0
+        for stem, pt, *_ in jobs:
+            if n_chk >= args.native_check:
+                break
+            if not os.path.exists(pt):
+                continue
+            g = torch.load(pt, map_location="cpu", weights_only=False)
+            ref = getattr(g, "contact_map_confind", None)
+            it = _graph_to_f2s_item(g)
+            if ref is None or it is None or it["length"] > F2C_MAX_LEN:
+                continue
+            pr = predictor.predict_batch(it["x_f2s"][None], it["mask"][None])[0].float().cpu()
+            ref = ref.float()
+            worst = max(worst, (pr - ref).abs().max().item())
+            agree.append(((pr >= CONFIND_THRESHOLD) == (ref >= CONFIND_THRESHOLD)).float().mean().item())
+            n_chk += 1
+        print(f"NATIVE_CHECK n={n_chk} threshold-agreement min={min(agree):.6f} mean={sum(agree)/len(agree):.6f} "
+              f"max|prob diff|={worst:.4g}", flush=True)
+
+    for stem, pt, npz_path, band_tm, _rw, band_slot, _ml, tm_min, tm_max, _st in jobs:
+        if npz_path is None or band_tm is None:
+            continue
+        out = f2c_map_path(args.maps_out, npz_path, root_dirs)
+        if os.path.exists(out):
+            n_done += 1
+            continue
+        z = np.load(npz_path)
+        tcoords, amask = z["coords"], torch.from_numpy(z["atom_mask"].astype(bool))
+        L = int(amask.shape[0])
+        if L > F2C_MAX_LEN:
+            skip_lines.append(f"{stem}\ttemplates\tlen_gt_{F2C_MAX_LEN}:{L}")
+            continue
+        slot_to_rung = {int(sl): r for r, sl in enumerate(band_slot.tolist()) if sl >= 0}
+        rungs = [k for k in range(int(tcoords.shape[0]))
+                 if k in slot_to_rung and tm_min <= float(band_tm[slot_to_rung[k]]) <= tm_max]
+        if not rungs:
+            skip_lines.append(f"{stem}\ttemplates\tno_rung_in_tm_range")
+            continue
+        packed = []
+        for i in range(0, len(rungs), args.batch_size):
+            ks = rungs[i:i + args.batch_size]
+            full = torch.zeros(len(ks), L, 37, 3)
+            for j, k in enumerate(ks):
+                full[j][amask] = torch.from_numpy(tcoords[k]).float()
+            x, mask = _f2c_inputs(full, amask)
+            probs = predictor.predict_batch(x, mask[None].expand(len(ks), -1))[:, :L, :L].float().cpu()
+            bits = (probs >= CONFIND_THRESHOLD).numpy().reshape(len(ks), -1)
+            packed.append(np.packbits(bits, axis=1))
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        tmp = out + ".tmp.npz"
+        np.savez(tmp, rungs=np.asarray(rungs, dtype=np.int16), L=np.int32(L), packed=np.concatenate(packed),
+                 threshold=np.float32(CONFIND_THRESHOLD), checkpoint=str(args.checkpoint))
+        os.replace(tmp, out)
+        n_done += 1
+        n_maps += len(rungs)
+        if n_done % 200 == 0:
+            print(f"  {n_done} chains, {n_maps} maps this run", flush=True)
+    os.makedirs(args.maps_out, exist_ok=True)
+    with open(os.path.join(args.maps_out, f"f2c_skips_{args.part:04d}.tsv"), "w") as fh:
+        fh.write("\n".join(skip_lines) + ("\n" if skip_lines else ""))
+    print(f"part {args.part}: {n_done} chains with maps, {n_maps} new maps, {len(skip_lines)} skips", flush=True)
+    print("F2C_PART_DONE", flush=True)
 
 
 # ──────────────────────────────────────────── merge ──────────────────────────────────────────
@@ -485,26 +637,37 @@ def cmd_merge(args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    b = sub.add_parser("build")
-    b.add_argument("--base-index", required=True, help="existing topology_index.pt; its ids define the chain list")
-    b.add_argument("--processed-dir", required=True)
-    b.add_argument("--manifest", default="", help="shard_manifest.json of the processed dir")
-    b.add_argument("--templates", action="append", required=True, help="ROOT:index_band.npz, repeatable")
-    b.add_argument("--chain-alias", default="",
-                   help="TSV with label_id and auth_id columns. The template pool is keyed by "
-                        "auth_asym_id and the dataset by label_asym_id; without this they join by "
-                        "string and silently select a different polymer. Fails closed: a stem with "
-                        "no alias entry gets no template.")
-    b.add_argument("--part", type=int, required=True)
-    b.add_argument("--n-parts", type=int, required=True)
+    # chain-selection args shared by build and f2c, so both select exactly the same template rungs
+    sel = argparse.ArgumentParser(add_help=False)
+    sel.add_argument("--base-index", required=True, help="existing topology_index.pt; its ids define the chain list")
+    sel.add_argument("--processed-dir", required=True)
+    sel.add_argument("--manifest", default="", help="shard_manifest.json of the processed dir")
+    sel.add_argument("--templates", action="append", required=True, help="ROOT:index_band.npz, repeatable")
+    sel.add_argument("--chain-alias", default="",
+                     help="TSV with label_id and auth_id columns. The template pool is keyed by "
+                          "auth_asym_id and the dataset by label_asym_id; without this they join by "
+                          "string and silently select a different polymer. Fails closed: a stem with "
+                          "no alias entry gets no template.")
+    sel.add_argument("--part", type=int, required=True)
+    sel.add_argument("--n-parts", type=int, required=True)
+    sel.add_argument("--min-len", type=int, default=1)
+    sel.add_argument("--tm-min", type=float, default=0.0, help="build-time filter on template rows (default: keep the whole band)")
+    sel.add_argument("--tm-max", type=float, default=1.0)
+    sel.add_argument("--limit", type=int, default=0, help="debug: only the first N chains of the part")
+    sel.add_argument("--selftest", action="store_true", help="also USalign every native to itself and record mismatches (debug)")
+    b = sub.add_parser("build", parents=[sel])
     b.add_argument("--out-dir", required=True)
-    b.add_argument("--min-len", type=int, default=1)
-    b.add_argument("--tm-min", type=float, default=0.0, help="build-time filter on template rows (default: keep the whole band)")
-    b.add_argument("--tm-max", type=float, default=1.0)
     b.add_argument("--workers", type=int, default=32)
     b.add_argument("--usalign", default=_USALIGN)
-    b.add_argument("--limit", type=int, default=0, help="debug: only the first N chains of the part")
-    b.add_argument("--selftest", action="store_true", help="also USalign every native to itself and record mismatches (debug)")
+    b.add_argument("--contact-source", choices=("cb8", "confind"), default="cb8")
+    b.add_argument("--f2c-maps", default="", help="maps root written by `f2c` (required for --contact-source confind)")
+    f = sub.add_parser("f2c", parents=[sel])
+    f.add_argument("--maps-out", required=True)
+    f.add_argument("--checkpoint", default="~/Frame2ConFind/runs/f2s_ft_max384_pair_ebs16_no-sin-pos-emb/best.pt")
+    f.add_argument("--f2c-parent", default="~", help="directory containing the Frame2ConFind package")
+    f.add_argument("--amp-dtype", default="bf16")
+    f.add_argument("--batch-size", type=int, default=4, help="rungs per forward (the backfill used 4)")
+    f.add_argument("--native-check", type=int, default=0, help="compare F2C on N natives vs their stored maps first")
     m = sub.add_parser("merge")
     m.add_argument("--parts-dir", required=True)
     m.add_argument("--n-parts", type=int, required=True)
@@ -512,10 +675,7 @@ def main():
     m.add_argument("--eligible-out", default="")
     m.add_argument("--tm-range", type=float, nargs=2, default=(0.5, 0.9))
     args = ap.parse_args()
-    if args.cmd == "build":
-        cmd_build(args)
-    else:
-        cmd_merge(args)
+    {"build": cmd_build, "f2c": cmd_f2c, "merge": cmd_merge}[args.cmd](args)
 
 
 if __name__ == "__main__":
