@@ -31,13 +31,17 @@ PY="python -m proteinfoundation.utils.precompute_synthetic_topology_index"
 case "$MODE" in
   f2c_smoke|f2c)
     # sm120 venv: every GPU arch; f2c needs no pydssp
-    CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | tr -d ' ' | sort -u)
-    [ -n "$CC" ] && [ "$(echo "$CC" | wc -l)" -eq 1 ] || { echo "FATAL: need exactly one GPU arch, got: '$CC'"; exit 79; }
+    if [ "${CPU:-0}" = 1 ]; then
+      CC=9.0   # CPU run: activate.sh requires a value, it steers nothing here
+    else
+      CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | tr -d ' ' | sort -u)
+      [ -n "$CC" ] && [ "$(echo "$CC" | wc -l)" -eq 1 ] || { echo "FATAL: need exactly one GPU arch, got: '$CC'"; exit 79; }
+    fi
     export CUE_HOST=engaging TORCH_CUDA_ARCH_LIST="$CC"
     source /home/chenxiou/cue-openfold-env-sm120/.venv/bin/activate
     source /home/chenxiou/cue-openfold-env-sm120/activate.sh
     export DATA_PATH=/orcd/pool/006/chenxiou/proteina/data SKIP_CONFIND_PRECOMPUTE=1 PYTHONPATH=$REPO
-    nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+    [ "${CPU:-0}" = 1 ] || nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
     if [ "$MODE" = f2c_smoke ]; then
       $PY f2c "${SEL[@]}" --part 0 --limit "${LIMIT:-20}" --native-check "${NATIVE_CHECK:-100}" --amp-dtype "${AMP:-bf16}" --maps-out "$OUT/smoke_maps${SMOKE_TAG:-}"
     else
