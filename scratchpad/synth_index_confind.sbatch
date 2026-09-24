@@ -49,7 +49,7 @@ case "$MODE" in
     fi
     RC=$?
     ;;
-  smoke|build|merge)
+  smoke|smoke_merge|build|merge)
     module load miniforge
     set +u; source "$(conda info --base)/etc/profile.d/conda.sh"; conda deactivate 2>/dev/null; conda activate cue_openfold; set -u
     export CUE_HOST=engaging DATA_PATH=/orcd/pool/006/chenxiou/proteina/data SKIP_CONFIND_PRECOMPUTE=1
@@ -63,6 +63,12 @@ case "$MODE" in
           --usalign /home/chenxiou/.local/bin/USalign --part 0 --limit "${LIMIT:-20}" --out-dir "$OUT/smoke_parts_cb8"
       RC=$?
       [ $RC -eq 0 ] && python "$REPO/scratchpad/compare_index_parts.py" "$OUT/smoke_parts_confind/part_0000.pt" "$OUT/smoke_parts_cb8/part_0000.pt"
+      RC=$?
+    elif [ "$MODE" = smoke_merge ]; then
+      # toy index from the confind smoke part, for the fine-tune shakedown
+      mkdir -p "$OUT/toy"
+      $PY merge --parts-dir "$OUT/smoke_parts_confind" --n-parts 1 --out "$OUT/toy/topology_index_confind_synth.pt" \
+          --eligible-out "$OUT/toy/eligible_ids_tm0.5-0.9.txt" --tm-range 0.5 0.9
       RC=$?
     elif [ "$MODE" = build ]; then
       $PY build "${SEL[@]}" "${B[@]}" --f2c-maps "$MAPS" --part "${SLURM_ARRAY_TASK_ID:?array task id}" --out-dir "$OUT/parts"
