@@ -10,14 +10,15 @@ import math
 import re
 
 PAGE = "/Users/Chenxi/SOLab/proteina/.claude/worktrees/distogram-head/figures/training_status_report.html"
-ORIG = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report/report_7fc1e47.html"
-DATA = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report"
+ORIG = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report/r20260925/report_7fc1e47.html"
+DATA = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report/r20260925"
 SEC_OPEN = '<section class="sec" id="convergence-2026-09-21">'
 PX_TOL = 0.5
 X0, X1, Y0, Y1 = 52.0, 548.0, 14.0, 176.0
 
-SRC = {f: json.load(open(f"{DATA}/{f}")) for f in ("tri_epochs.json", "c2c_steps.json", "tri_val_pal.json")}
-XKEY = {"tri_epochs.json": "epoch", "c2c_steps.json": "step"}
+SRC = {f: json.load(open(f"{DATA}/{f}")) for f in ("tri_epochs.json", "c2c_steps.json", "tri_val_pal.json",
+                                                    "c2c_steps_confind.json")}
+XKEY = {"tri_epochs.json": "epoch", "c2c_steps.json": "step", "c2c_steps_confind.json": "step"}
 
 
 def attrs(tag):
@@ -66,7 +67,7 @@ oa, ob = section(orig)
 sec = page[pa:pb]
 charts = re.findall(r'<div class="chart-t">(.*?)</div>(<svg.*?</svg>)', sec, re.S)
 print(f"charts parsed in section: {len(charts)}")
-assert len(charts) == 10, len(charts)
+assert len(charts) == 13, len(charts)  # 10 CB-8 panels + 3 CB-8-vs-ConFind c2c panels (25 Sep)
 
 n_poly = n_pts = n_raw = n_dots = n_grid = 0
 max_err = 0.0
@@ -150,7 +151,7 @@ for title, svg in charts:
         cap_chart = (title, svg, sx, sy, top, x0, x1, polys)
     if "helix_pos_frac" in title:
         helix_chart = (title, svg, sy)
-    if title.startswith("c2c — validation loss"):
+    if title.startswith("c2c — validation loss (step"):  # not the CB-8-vs-ConFind panel, which has no excursion band
         val_chart = (title, svg, sx)
     print(f"  {title[:62]:62s} ticks 0..{labs[-1][1]:g} step {step:g}  x {x0:g}..{x1:g}")
 

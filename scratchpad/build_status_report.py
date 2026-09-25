@@ -17,12 +17,15 @@ import math
 import re
 
 PAGE = "/Users/Chenxi/SOLab/proteina/.claude/worktrees/distogram-head/figures/training_status_report.html"
-DATA = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report"
-SNAPSHOT = "22 Sep 2026"  # date of the JSON snapshots in DATA; update after a re-fetch
+DATA = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report/r20260925"
+SNAPSHOT = "25 Sep 2026"  # date of the JSON snapshots in DATA; update after a re-fetch
 
 TRI = json.load(open(f"{DATA}/tri_epochs.json"))
 C2C = json.load(open(f"{DATA}/c2c_steps.json"))
 PAL = json.load(open(f"{DATA}/tri_val_pal.json"))
+C2C_CF = json.load(open(f"{DATA}/c2c_steps_confind.json"))          # ConFind c2c twin (same recipe, ConFind maps)
+TRI_FT = json.load(open(f"{DATA}/tri_epochs_tri_confindsynth_ft.json"))  # ConFind tri fine-tune (launched 25 Sep)
+C2C_SEGMENTS, C2C_CF_SEGMENTS = 11, 6   # wandb segments per run, from the fetch_report_data.py log of 25 Sep
 
 SEC_OPEN = '<section class="sec" id="convergence-2026-09-21">'
 CAV_OPEN = '<section class="sec" id="archive-caveat-2026-09-22">'
@@ -364,6 +367,19 @@ hel_last = c_hel[-1][1]
 hel_peak_step, hel_peak = max(c_hel, key=lambda p: p[1])
 mir_nonzero = [x for x, y in c_mir if y > 0]
 mir_last_nonzero = mir_nonzero[-1]
+mir_at_last = mir_last_nonzero == c_mir[-1][0]
+mir_txt = (f"It reads <b>non-zero at the latest round</b> (step {mir_last_nonzero:,}: {c_mir[-1][1]:.3f})"
+           if mir_at_last else
+           f"It last read non-zero at step {mir_last_nonzero:,} and has been 0 at every validation round since")
+# discrete jumps in the sampled structure metrics between consecutive rounds (tbeta 25 Sep: 22,871 -> 23,515)
+c_rms_all = _pts(C2C, "step", "val/rmsd_proper")
+jumps = [(a[0], b[0], a[1], b[1]) for a, b in zip(c_rms_all, c_rms_all[1:]) if b[0] > CUT and b[1] > 1.8 * a[1]]
+jump_txt = ("" if not jumps else
+            " ⛔ <b>Structure quality jumped worse between rounds</b>: " + "; ".join(
+                f"proper RMSD {r0:.2f} &rarr; {r1:.2f} &Aring; from step {s0:,} to {s1:,}" for s0, s1, r0, r1 in jumps)
+            + ", and has not recovered since; the job ran continuously (no resume) across it, so the cause is open."
+              " A 195-chain benchmark of the saved checkpoints on either side would separate a real regression from"
+              " 16-structure validation noise.")
 
 p99 = nearest_rank([y for _, y in c_tr_z], P99)
 tr_top = y_axis(p99)[0]
@@ -381,7 +397,7 @@ cap_caption = caption_p(
        f"{'their' if len(above) != 1 else 'its'} value: {above_txt}." if above else "No value exceeds the cap.")
     + (" " + tr_zero_txt if tr_zero else ""))
 
-C = "c2c_steps.json"
+C = C2C_FILE = "c2c_steps.json"
 charts_c2c = (
     chart(f"c2c — train loss (step {CUT}+)", [S(C, "train/loss", "train", ORANGE, c_tr_z)],
           xlab="global step", cap=p99, caption=cap_caption)
@@ -394,6 +410,64 @@ charts_c2c = (
     + chart("c2c — helix_pos_frac (handedness; LOW = native)", [S(C, "val/helix_pos_frac", "val", BLUE, c_hel)],
             xlab="global step", band=HELIX_BAND, band_label=f"native ≈{HELIX_BAND[1]}")
 )
+
+# ---------------------------------------------------------------- CB-8 vs ConFind c2c at matched steps
+GREEN = "var(--ok)"
+CF = "c2c_steps_confind.json"
+cf_max = max(r["step"] for r in C2C_CF)
+cf_val_steps = [r["step"] for r in C2C_CF if "val/loss" in r]
+tb_by = {r["step"]: r for r in C2C if "val/loss" in r}
+cf_by = {r["step"]: r for r in C2C_CF if "val/loss" in r}
+matched = [st for st in cf_val_steps if st in tb_by]
+xdom_cf = (0, cf_max)
+MKEYS = (("val/loss", "validation loss"), ("val/rmsd_proper", "proper-superposition RMSD (Å, lower better)"),
+         ("val/dist_mae_sampled", "sampled distance MAE (Å, lower better)"))
+charts_cmp = "".join(
+    chart(f"c2c — {lab}, CB-8 vs ConFind (steps 0–{cf_max:,})",
+          [S(C2C_FILE, k, "CB-8 (tbeta)", BLUE, [p for p in _pts(C2C, "step", k) if p[0] <= cf_max], opacity=1.0),
+           S(CF, k, "ConFind (twin)", GREEN, _pts(C2C_CF, "step", k), opacity=1.0)],
+          xlab="global step", xdom=xdom_cf)
+    for k, lab in MKEYS)
+cmp_rows = "".join(
+    f'<tr><td class="num">{st:,}</td>'
+    + "".join(f'<td class="num">{tb_by[st].get(k, float("nan")):.3f}</td><td class="num">{cf_by[st].get(k, float("nan")):.3f}</td>'
+              for k, _l in MKEYS) + "</tr>" for st in matched)
+ft = TRI_FT[-1]
+CMP_BLOCK = f"""
+  <h3 id="c2c-cb8-vs-confind">c2c &mdash; CB-8 vs ConFind at matched steps (the Stage B pair)</h3>
+  <p class="note" style="margin:.2rem 0 .6rem">
+    The ConFind twin trains with tbeta&rsquo;s exact recipe (48 diffusion samples, lr 3e-4, warmup 2,000, t_beta
+    (1.3, 2.0), effective batch 8); only the input contact map differs. Both validate on the same steps, so the
+    table compares identical steps. ⛔ <b>Too early to read a winner:</b> the twin is at step {cf_max:,} of the
+    ~9,500 needed for the first matched comparison, and this window (before step {CUT:,}) is where tbeta itself
+    was unstable &mdash; its step-2,143 RMSD spike was a transient the report&rsquo;s convergence view starts after.
+    tbeta also crossed a mid-run target change (pseudo-CB, step 7,076) that the twin never sees.
+  </p>
+  <div class="grid2">{charts_cmp}</div>
+  <div class="scroll"><table>
+    <thead><tr><th class="num">step</th><th class="num">val loss CB-8</th><th class="num">ConFind</th>
+      <th class="num">RMSD CB-8</th><th class="num">ConFind</th><th class="num">dist MAE CB-8</th><th class="num">ConFind</th></tr></thead>
+    <tbody>{cmp_rows}</tbody></table></div>
+"""
+CF_CARDS = f"""
+  <div class="cards" style="margin:1.1rem 0">
+    <div class="card la">
+      <h3 style="margin-top:0">c2c_confind_tbeta (ConFind twin) &mdash; early</h3>
+      <p class="note">Step {cf_max:,} across {C2C_CF_SEGMENTS} chained segments, {len(cf_val_steps)} validation rounds.
+      Training resumed cleanly after the 24 Sep scratch-quota incident. Needs step 9,500 (retention-ladder
+      anchor) for the first matched structure-level comparison.</p>
+    </div>
+    <div class="card tri">
+      <h3 style="margin-top:0">tri_confindsynth_ft (ConFind tri fine-tune) &mdash; just started</h3>
+      <p class="note">Launched 25 Sep 13:57 on 2&times; RTX PRO 6000: the old ConFind tri (71,950 EMA) surgered into the
+      current recipe (synthetic references, vocab 44, no CA features, align + MLM heads) on a pure-ConFind
+      synthetic-reference index. Gates passed: total_training_steps 403,593 (= the CB-8 tri), only the 6 new head
+      parameters cold-started. One validation point so far (step {int(ft["step"])}, epoch {ft["epoch"]}, during warmup,
+      lr {ft["lr"]:.1e}): validation contact loss {ft["val_contact"]:.4f}. ⛔ Its numbers are on the ConFind
+      definition and not comparable to the CB-8 tri&rsquo;s. ~200 steps/h &rArr; 10,000 steps ≈ 27 Sep.</p>
+    </div>
+  </div>
+"""
 
 # ---------------------------------------------------------------- prose that depends on the data
 if tri_val_falling:
@@ -433,7 +507,7 @@ hel_txt = ("inside the native band" if hel_last <= HELIX_BAND[1]
 
 html = f"""{SEC_OPEN}
   <div class="eyebrow" style="margin-bottom:.35rem">Current training status &middot; generated {SNAPSHOT} from wandb history</div>
-  <h2 style="margin-top:0">Have the two live models converged?</h2>
+  <h2 style="margin-top:0">Have the live models converged? CB-8 pair + the new ConFind pair</h2>
   <p class="lede" style="font-size:1.02rem">
     {tri_lede}
     {c2c_lede}
@@ -459,11 +533,12 @@ html = f"""{SEC_OPEN}
         {last3[2][1]:.3f} across the last three rounds{trend_txt}. {mae_txt}
         <strong>{'But' if at_best else 'Earlier,'}</strong> the run posted an excursion to {exc_max:.3f} at step {exc_step:,} and a
         distance-MAE excursion to {mae_exc:.2f} &Aring; at step {mae_exc_step:,} before recovering.
-        <strong>Read:</strong> {read_txt} Judge convergence only over a window longer than that excursion.
+        <strong>Read:</strong> {read_txt} Judge convergence only over a window longer than that excursion.{jump_txt}
       </p>
     </div>
   </div>
 
+{CF_CARDS}
   <h3>tri &mdash; the loss curves</h3>
   <div class="grid2">{charts_tri}</div>
   <p class="note">The full-run panel is dominated by the first five epochs (loss falls from
@@ -471,7 +546,7 @@ html = f"""{SEC_OPEN}
 {BLOCK}
   <h3>c2c &mdash; loss, structure quality, and handedness</h3>
   <div class="grid2">{charts_c2c}</div>
-
+{CMP_BLOCK}
   <div class="callout">
     <p><strong>How to read <code>helix_pos_frac</code> &mdash; low is correct.</strong>
     It is the fraction of helical-range CA pseudo-dihedrals that are positive, and it is a
@@ -494,8 +569,7 @@ html = f"""{SEC_OPEN}
     <code>proper &gt; 2&times;reflected</code> and the gap exceeds 1 &Aring;, so it is
     fit-quality-biased: before ~step 3,000 the generated structures sit
     <strong>11.6&ndash;145 &Aring;</strong> from native, where the test cannot meaningfully fire and a
-    reading of 0 means <em>no verdict</em>, not &ldquo;correct hand&rdquo;. It last read non-zero at
-    step {mir_last_nonzero:,} and has been 0 at every validation round since.
+    reading of 0 means <em>no verdict</em>, not &ldquo;correct hand&rdquo;. {mir_txt}.
     ⛔ Per-round values are a liveness monitor over ~16 structures, <strong>not</strong> a rate:
     0 of 16 is entirely consistent with the ~1.6% rate measured by the 512-draw paired assay
     (P = 0.98<sup>16</sup> &asymp; 0.77).</p>
@@ -507,7 +581,7 @@ html = f"""{SEC_OPEN}
   </div>
 
   <p class="note">Sources: <code>tri_cb8synth_v5</code> {len(TRI)} epochs from one wandb run;
-  <code>c2c_cb8_tbeta</code> {len({r['step'] for r in C2C})} distinct global steps concatenated across <strong>8</strong> chained
+  <code>c2c_cb8_tbeta</code> {len({r['step'] for r in C2C})} distinct global steps concatenated across <strong>{C2C_SEGMENTS}</strong> chained
   segments (each segment gets a new run id) and de-duplicated on step. {len(c_mae)} validation rounds carry the
   sampled metrics. Every plotted point is measured; nothing is interpolated or estimated.</p>
 {SEC_CLOSE}"""
