@@ -12,7 +12,8 @@
 set -uo pipefail
 S=/orcd/scratch/orcd/011/chenxiou
 export REPO="${REPO:?pinned checkout}"
-export CONFIG=training_contact_tri_full384_confindsynth_ft_v1 RUN=tri_cf_shakedown NGPU=2 CHAIN=0
+# one RUN per GPU-type variant: the rm -rf below must never hit another variant's store
+export CONFIG=training_contact_tri_full384_confindsynth_ft_v1 RUN=tri_cf_shakedown_${SHAKE_TAG:-h200} NGPU=2 CHAIN=0
 export SYNTH_INDEX_DIR=$S/synth_index_confind_v1/toy INDEX_FILE=topology_index_confind_synth.pt
 head -4 $S/valset_analysis/val_fixed32_max256.txt > $S/.tmp/toy_val4.txt
 TOY="opt.accumulate_grad_batches=2 opt.val_check_interval_optim_steps=2 opt.limit_val_batches=2 opt.warmup_steps=2
