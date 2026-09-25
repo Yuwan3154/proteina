@@ -14,9 +14,11 @@ set -uo pipefail
 D=/home/gridsan/cou/c2cbench
 REPO=$D/proteina
 # /etc/profile first (as run_full_pipeline_afdb_slurm.sh does), else `module`/`source activate` silently no-op
+set +u   # /etc/profile.d/Z97-byobu.sh reads an unset LC_BYOBU and kills a `set -u` shell at 0 s
 source /etc/profile
 module load conda/Python-ML-2025b-pytorch cuda/12.6
 source activate cathfold
+set -u
 PY=/home/gridsan/cou/.conda/envs/cathfold/bin/python   # absolute: a failed activation must not fall back to /usr/bin/python
 export DATA_PATH=$D/data SKIP_CONFIND_PRECOMPUTE=1 SIGMA_DATA=16.0 PYTHONPATH=$REPO TMPDIR=$D/tmp
 mkdir -p $D/logs $D/out $D/tmp
