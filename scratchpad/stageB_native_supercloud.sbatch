@@ -13,8 +13,11 @@
 set -uo pipefail
 D=/home/gridsan/cou/c2cbench
 REPO=$D/proteina
+# /etc/profile first (as run_full_pipeline_afdb_slurm.sh does), else `module`/`source activate` silently no-op
+source /etc/profile
 module load conda/Python-ML-2025b-pytorch cuda/12.6
 source activate cathfold
+PY=/home/gridsan/cou/.conda/envs/cathfold/bin/python   # absolute: a failed activation must not fall back to /usr/bin/python
 export DATA_PATH=$D/data SKIP_CONFIND_PRECOMPUTE=1 SIGMA_DATA=16.0 PYTHONPATH=$REPO TMPDIR=$D/tmp
 mkdir -p $D/logs $D/out $D/tmp
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
@@ -22,7 +25,7 @@ git -C $REPO log -1 --format="[repo] %h"
 CH=$REPO/scratchpad/stageA/stageA_run_union.txt
 DS=pdb_train_contact-CB8_S25_max384_purge-test_cutoff-190828
 run() {  # $1 gpu, $2 ckpt, $3 label
-  CUDA_VISIBLE_DEVICES=$1 python $REPO/scratchpad/stageB_c2c_from_maps.py --ckpt "$2" --weights ema --dataset $DS \
+  CUDA_VISIBLE_DEVICES=$1 $PY $REPO/scratchpad/stageB_c2c_from_maps.py --ckpt "$2" --weights ema --dataset $DS \
       --chains $CH --n_seeds 1 --native --out $D/out/$3.jsonl --label $3 --usalign /home/gridsan/cou/.local/bin/USalign \
       > $D/logs/$3.log 2>&1
 }
