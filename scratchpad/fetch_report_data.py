@@ -107,13 +107,19 @@ for rid in TRI_RUNS:
     pal = {"run": run.name, "state": run.state, "epoch": float(df["epoch"].dropna().iloc[-1]) if len(df) else None,
            "onestep_by_epoch": {}, "sampling": {}, "strata_counts": {}}
     for key in ONESTEP + FLOOR:
-        sub = df[[key, "epoch"]].dropna(subset=[key]) if key in df.columns else df.iloc[0:0]
+        if key not in df.columns:  # not logged yet (e.g. a young run): an empty series, reported below
+            pal["strata_counts"][key], pal["onestep_by_epoch"][key] = 0, []
+            continue
+        sub = df[[key, "epoch"]].dropna(subset=[key])
         pal["strata_counts"][key] = int(len(sub))
         g = sub.groupby("epoch").agg(mean=(key, "mean"), n=(key, "size")) if len(sub) else None
         pal["onestep_by_epoch"][key] = [] if g is None else [[int(e), round(float(r["mean"]), 6), int(r["n"])]
                                                             for e, r in g.iterrows()]
     for key in SAMPLING:
-        sub = df[[key, "epoch"]].dropna(subset=[key]) if key in df.columns else df.iloc[0:0]
+        if key not in df.columns:
+            pal["sampling"][key] = []
+            continue
+        sub = df[[key, "epoch"]].dropna(subset=[key])
         pal["sampling"][key] = [[int(e), round(float(v), 6)] for v, e in zip(sub[key], sub["epoch"])]
     empty = [k for k, v in list(pal["onestep_by_epoch"].items()) + list(pal["sampling"].items()) if not v]
     print(f"[tri {rid}] pal: {len(empty)} empty series")
