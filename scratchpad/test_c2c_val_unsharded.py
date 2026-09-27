@@ -27,7 +27,6 @@ def val_ids(dataset, unsharded):
         cfg = hydra.compose(config_name=dataset)
     OmegaConf.set_struct(cfg, False)
     cfg.datamodule.batch_size = 1
-    cfg.datamodule.num_workers = 0
     if unsharded:
         cfg.datamodule.val_shard_across_ranks = False
     dm = hydra.utils.instantiate(cfg.datamodule)
