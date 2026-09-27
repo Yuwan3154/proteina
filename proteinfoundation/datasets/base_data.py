@@ -66,6 +66,7 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         cath_balanced_member_tracking: bool = False,
         cath_balanced_emit_topology: bool = False,
         eligible_ids_file: Optional[str] = None,
+        val_shard_across_ranks: bool = True,
     ):
         """Initialising the base data module class.
 
@@ -134,6 +135,9 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         # Restrict cluster draws to these chain ids (one per line), e.g. chains that have a
         # synthetic topology reference; clusters left with no eligible member are dropped.
         self.eligible_ids_file = eligible_ids_file
+        # False: every DDP rank validates on the full single-device val sequence, so a 2-GPU run
+        # scores the same structures as a 1-GPU run at the same global step (c2c, 2026-09-27).
+        self.val_shard_across_ranks = val_shard_across_ranks
         self._chain_to_cat = None  # lazy cache for cath-balanced sampling
         # Last-built samplers kept on the datamodule so on_{train,validation}_epoch_start
         # can call set_epoch even on Lightning versions that don't auto-propagate.
@@ -276,6 +280,7 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         nocat_sample_counts_init: Optional[Dict[str, int]] = None,
         cat_cluster_sample_counts_init: Optional[Dict[str, int]] = None,
         member_sample_counts_init: Optional[Dict[str, int]] = None,
+        shard: bool = True,
     ) -> DataLoader:
         """Returns the dataloader for the corresponding dataset.
 
@@ -291,6 +296,8 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             raise ValueError(
                 "Sampling mode not set, should be one of 'random', 'cluster-random' or 'cluster-reps'"
             )
+        assert shard or self.sampling_mode in ("cluster-random", "cluster-reps"), \
+            f"shard=False is implemented for ClusterSampler only, not sampling_mode={self.sampling_mode}"
         if clusterid_to_seqid_mapping and self.sampling_mode == "cath-balanced":
             sampler = CATBalancedSampler(
                 dataset=dataset,
@@ -324,6 +331,7 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
                 sampling_mode=self.sampling_mode,
                 seed=self.cluster_sampler_seed,
                 v2=self.cluster_sampler_v2,
+                shard=shard,
             )
             shuffle = False
         elif self.sampling_mode == "random":
@@ -451,6 +459,7 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             nocat_sample_counts_init=self._val_nocat_sample_counts_restore,
             cat_cluster_sample_counts_init=self._val_cat_cluster_sample_counts_restore,
             member_sample_counts_init=self._val_member_sample_counts_restore,
+            shard=self.val_shard_across_ranks,
         )
         if isinstance(getattr(val_dl, "sampler", None), (ClusterSampler, CATBalancedSampler)):
             self._val_cluster_sampler = val_dl.sampler

@@ -135,6 +135,8 @@ def main():
     # real measurement for THAT model (71.8 GB at L=384). It says nothing about this one.
     # Effective batch = batch_size * accum * devices; keep it fixed when raising batch_size.
     cfg_data.datamodule.batch_size = args.batch_size
+    # Unsharded validation: a 2-GPU run scores the same val structures as a 1-GPU run (2026-09-27).
+    cfg_data.datamodule.val_shard_across_ranks = False
     print(f"[batch] per-rank {args.batch_size} x accum {args.accum} x {args.devices} ranks "
           f"= effective {args.batch_size * args.accum * args.devices}", flush=True)
 
@@ -240,6 +242,7 @@ def main():
     trainer = L.Trainer(
         accelerator="gpu", devices=args.devices, num_nodes=1,
         strategy="ddp" if args.devices > 1 else "auto",
+        use_distributed_sampler=False,   # ClusterSampler shards across ranks itself (as train.py:862)
         precision=args.precision,        # ⛔ the LOSS is fp32 internally regardless; see af3_diffusion
         max_epochs=-1,
         accumulate_grad_batches=args.accum,

@@ -41,6 +41,7 @@ class ClusterSampler(Sampler):
         drop_last: bool = False,
         seed: int = 0,
         v2: bool = True,
+        shard: bool = True,
     ):
         """
         Initializes the ClusterSampler for selecting sequences during training.
@@ -62,6 +63,8 @@ class ClusterSampler(Sampler):
                 cluster-order shuffle (synchronized across DDP ranks → correct partitioning)
                 and per-cluster member draw (rank-distinct → no global RNG contamination).
                 Set False to fall back to the legacy global-RNG behaviour for comparison.
+            shard (bool): When True (default), partition clusters across DDP ranks. When False, every
+                rank iterates the full single-device sequence (same order and members as 1 GPU).
         """
         self.dataset = dataset
         self.clusterid_to_seqid_mapping = clusterid_to_seqid_mapping
@@ -81,6 +84,7 @@ class ClusterSampler(Sampler):
         self.num_replicas = None
         self.seed = int(seed)
         self.v2 = bool(v2)
+        self.shard = bool(shard)
         self.epoch = 0
 
     def set_epoch(self, epoch: int) -> None:
@@ -107,14 +111,15 @@ class ClusterSampler(Sampler):
         # set logging to true so that first sample in epoche gets logged
         self.log_clusters = True
         # setup distributed/non-distributed backend
-        if torch.distributed.is_initialized():
+        if torch.distributed.is_initialized() and self.shard:
             self.num_replicas = torch.distributed.get_world_size()
             self.rank = torch.distributed.get_rank()
         else:
             self.num_replicas = None
             self.rank = 0
             logger.info(
-                f"Distributed sampler is not initialized, assuming single-device setup."
+                f"ClusterSampler not sharding (distributed={torch.distributed.is_initialized()}, "
+                f"shard={self.shard}): single-device sequence on this rank."
             )
 
         # Build a rank-synchronized generator for cluster-order shuffling.
