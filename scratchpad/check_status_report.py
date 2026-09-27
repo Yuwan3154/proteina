@@ -11,14 +11,16 @@ import re
 
 PAGE = "/Users/Chenxi/SOLab/proteina/.claude/worktrees/distogram-head/figures/training_status_report.html"
 ORIG = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report/r20260925/report_7fc1e47.html"
-DATA = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report/r20260925"
+DATA = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report/r20260926"
 SEC_OPEN = '<section class="sec" id="convergence-2026-09-21">'
 PX_TOL = 0.5
 X0, X1, Y0, Y1 = 52.0, 548.0, 14.0, 176.0
 
 SRC = {f: json.load(open(f"{DATA}/{f}")) for f in ("tri_epochs.json", "c2c_steps.json", "tri_val_pal.json",
-                                                    "c2c_steps_confind.json")}
-XKEY = {"tri_epochs.json": "epoch", "c2c_steps.json": "step", "c2c_steps_confind.json": "step"}
+                                                    "c2c_steps_confind.json", "tri_epochs_tri_confindsynth_ft.json",
+                                                    "tri_val_pal_tri_confindsynth_ft.json")}
+XKEY = {"tri_epochs.json": "epoch", "c2c_steps.json": "step", "c2c_steps_confind.json": "step",
+        "tri_epochs_tri_confindsynth_ft.json": "epoch"}
 
 
 def attrs(tag):
@@ -35,7 +37,7 @@ def median9(pts, w):
 
 
 def source(src, key, smooth=None):
-    if src == "tri_val_pal.json":
+    if src.startswith("tri_val_pal"):
         d = SRC[src]
         rows = d["onestep_by_epoch"].get(key) or d["sampling"][key]
         pts = [(r[0], r[1]) for r in rows]
@@ -67,7 +69,7 @@ oa, ob = section(orig)
 sec = page[pa:pb]
 charts = re.findall(r'<div class="chart-t">(.*?)</div>(<svg.*?</svg>)', sec, re.S)
 print(f"charts parsed in section: {len(charts)}")
-assert len(charts) == 13, len(charts)  # 10 CB-8 panels + 3 CB-8-vs-ConFind c2c panels (25 Sep)
+assert len(charts) == 15, len(charts)  # 10 CB-8 + 3 CB-8-vs-ConFind c2c (25 Sep) + 2 ConFind tri FT (26 Sep)
 
 n_poly = n_pts = n_raw = n_dots = n_grid = 0
 max_err = 0.0

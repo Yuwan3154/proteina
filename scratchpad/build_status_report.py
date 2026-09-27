@@ -17,15 +17,16 @@ import math
 import re
 
 PAGE = "/Users/Chenxi/SOLab/proteina/.claude/worktrees/distogram-head/figures/training_status_report.html"
-DATA = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report/r20260925"
-SNAPSHOT = "25 Sep 2026"  # date of the JSON snapshots in DATA; update after a re-fetch
+DATA = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report/r20260926"
+SNAPSHOT = "26 Sep 2026"  # date of the JSON snapshots in DATA; update after a re-fetch
 
 TRI = json.load(open(f"{DATA}/tri_epochs.json"))
 C2C = json.load(open(f"{DATA}/c2c_steps.json"))
 PAL = json.load(open(f"{DATA}/tri_val_pal.json"))
 C2C_CF = json.load(open(f"{DATA}/c2c_steps_confind.json"))          # ConFind c2c twin (same recipe, ConFind maps)
 TRI_FT = json.load(open(f"{DATA}/tri_epochs_tri_confindsynth_ft.json"))  # ConFind tri fine-tune (launched 25 Sep)
-C2C_SEGMENTS, C2C_CF_SEGMENTS = 11, 6   # wandb segments per run, from the fetch_report_data.py log of 25 Sep
+PAL_FT = json.load(open(f"{DATA}/tri_val_pal_tri_confindsynth_ft.json"))
+C2C_SEGMENTS, C2C_CF_SEGMENTS = 13, 11   # wandb segments per run, from the fetch_report_data.py log of 26 Sep
 
 SEC_OPEN = '<section class="sec" id="convergence-2026-09-21">'
 CAV_OPEN = '<section class="sec" id="archive-caveat-2026-09-22">'
@@ -377,9 +378,13 @@ jumps = [(a[0], b[0], a[1], b[1]) for a, b in zip(c_rms_all, c_rms_all[1:]) if b
 jump_txt = ("" if not jumps else
             " ⛔ <b>Structure quality jumped worse between rounds</b>: " + "; ".join(
                 f"proper RMSD {r0:.2f} &rarr; {r1:.2f} &Aring; from step {s0:,} to {s1:,}" for s0, s1, r0, r1 in jumps)
-            + ", and has not recovered since; the job ran continuously (no resume) across it, so the cause is open."
-              " A 195-chain benchmark of the saved checkpoints on either side would separate a real regression from"
-              " 16-structure validation noise.")
+            + f" (lowest since: {min((p for p in c_rms_all if p[0] > jumps[-1][1]), key=lambda p: p[1])[1]:.2f} &Aring; at"
+              f" step {min((p for p in c_rms_all if p[0] > jumps[-1][1]), key=lambda p: p[1])[0]:,}; latest round:"
+              f" {c_rms_all[-1][1]:.2f} &Aring; at step {c_rms_all[-1][0]:,}). The 195-chain"
+              " native-map benchmark of the checkpoints either side (25 Sep, SuperCloud, EMA weights: step 21,228 vs"
+              " last.ckpt at 24,710) found <b>no regression</b>: TM-score median 0.926 &rarr; 0.932 (paired +0.004,"
+              " 129 better / 61 worse, Wilcoxon p = 1.8e-5), RMSD 1.41 &rarr; 1.33 &Aring;, 0 mirrors in both. The"
+              " jump is in the 16-structure validation monitor, not the model.")
 
 p99 = nearest_rank([y for _, y in c_tr_z], P99)
 tr_top = y_axis(p99)[0]
@@ -433,6 +438,19 @@ cmp_rows = "".join(
     + "".join(f'<td class="num">{tb_by[st].get(k, float("nan")):.3f}</td><td class="num">{cf_by[st].get(k, float("nan")):.3f}</td>'
               for k, _l in MKEYS) + "</tr>" for st in matched)
 ft = TRI_FT[-1]
+FTF, FTP = "tri_epochs_tri_confindsynth_ft.json", "tri_val_pal_tri_confindsynth_ft.json"
+ft_tc, ft_vc = _pts(TRI_FT, "epoch", "train_contact"), _pts(TRI_FT, "epoch", "val_contact")
+ft_va = _pts(TRI_FT, "epoch", "val_align")
+SPAL = "validation_sampling/contact_precision_at_L_mean"
+ft_sp = [(r[0], r[1]) for r in PAL_FT["sampling"][SPAL]]
+FT_XLAB = "fine-tune epoch (own axis; warm start)"
+charts_ft = (
+    chart("ConFind tri FT — contact-map loss",
+          [S(FTF, "train_contact", "train", ORANGE, ft_tc), S(FTF, "val_contact", "validation", BLUE, ft_vc)],
+          xlab=FT_XLAB, xdom=(0, int(ft["epoch"])))
+    + chart("ConFind tri FT — sampled contact precision at L (mean)",
+            [S(FTP, SPAL, "validation sampling", BLUE, ft_sp)], xlab=FT_XLAB, xdom=(0, int(ft["epoch"])))
+)
 CMP_BLOCK = f"""
   <h3 id="c2c-cb8-vs-confind">c2c &mdash; CB-8 vs ConFind at matched steps (the Stage B pair)</h3>
   <p class="note" style="margin:.2rem 0 .6rem">
@@ -458,13 +476,17 @@ CF_CARDS = f"""
       anchor) for the first matched structure-level comparison.</p>
     </div>
     <div class="card tri">
-      <h3 style="margin-top:0">tri_confindsynth_ft (ConFind tri fine-tune) &mdash; just started</h3>
+      <h3 style="margin-top:0">tri_confindsynth_ft (ConFind tri fine-tune) &mdash; epoch {int(ft["epoch"])}</h3>
       <p class="note">Launched 25 Sep 13:57 on 2&times; RTX PRO 6000: the old ConFind tri (71,950 EMA) surgered into the
       current recipe (synthetic references, vocab 44, no CA features, align + MLM heads) on a pure-ConFind
       synthetic-reference index. Gates passed: total_training_steps 403,593 (= the CB-8 tri), only the 6 new head
-      parameters cold-started. One validation point so far (step {int(ft["step"])}, epoch {ft["epoch"]}, during warmup,
-      lr {ft["lr"]:.1e}): validation contact loss {ft["val_contact"]:.4f}. ⛔ Its numbers are on the ConFind
-      definition and not comparable to the CB-8 tri&rsquo;s. ~200 steps/h &rArr; 10,000 steps ≈ 27 Sep.</p>
+      parameters cold-started. Now step {int(ft["step"]):,} (epoch {int(ft["epoch"])}, {len(ft_vc)} validation rounds).
+      Validation contact loss is flat at {min(y for _, y in ft_vc):.4f}&ndash;{max(y for _, y in ft_vc):.4f}
+      (the warm-started trunk already knew ConFind maps); the cold-started alignment head fell from
+      {ft_va[0][1]:.2f} to {ft_va[-1][1]:.2f} (validation). Sampled precision at L: {ft_sp[0][1]:.3f} (epoch
+      {ft_sp[0][0]}) &rarr; {ft_sp[-1][1]:.3f} (epoch {ft_sp[-1][0]}), {len(ft_sp)} rounds. ⛔ Its numbers are on the
+      ConFind definition and not comparable to the CB-8 tri&rsquo;s; the x-axis is its own epoch count, not the
+      lineage&rsquo;s. ~200 steps/h &rArr; 10,000 steps ≈ 27 Sep afternoon.</p>
     </div>
   </div>
 """
@@ -539,6 +561,7 @@ html = f"""{SEC_OPEN}
   </div>
 
 {CF_CARDS}
+  <div class="grid2">{charts_ft}</div>
   <h3>tri &mdash; the loss curves</h3>
   <div class="grid2">{charts_tri}</div>
   <p class="note">The full-run panel is dominated by the first five epochs (loss falls from
