@@ -11,6 +11,9 @@
 #SBATCH --open-mode=append
 #SBATCH --output=/orcd/scratch/orcd/011/chenxiou/c2c_store/logs/%x-%j.out
 #SBATCH --error=/orcd/scratch/orcd/011/chenxiou/c2c_store/logs/%x-%j.err
+# node5101: every DDP job there dies in the first NCCL broadcast (illegal memory access; 60 tri FT + 3 c2c
+# segments on 2026-09-27, any model, P2P on or off). Header, so chain successors inherit it.
+#SBATCH --exclude=node5101
 #
 # ⛔ mit_normal_gpu ONLY, and h200:2 is exactly that partition's per-user GPU cap
 # (QOS mit_normal_gpu: gres/gpu=2). The generation array is pinned to mit_preemptable for the same

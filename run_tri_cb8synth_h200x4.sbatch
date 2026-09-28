@@ -12,6 +12,9 @@
 #SBATCH --requeue
 #SBATCH --open-mode=append
 #SBATCH --signal=B:USR1@60
+# node5101: every DDP job there dies in the first NCCL broadcast (illegal memory access; 60 tri FT + 3 c2c
+# segments on 2026-09-27, any model, P2P on or off). Header, so chain successors inherit it.
+#SBATCH --exclude=node5101
 #
 # tri retrain: CB-8 contacts + synthetic references + vocab 44 + aux heads, 4x H200 on mit_preemptable
 # (user directive 2026-09-09; h200:4 is the whole per-user preemptable GPU cap). Clone of
