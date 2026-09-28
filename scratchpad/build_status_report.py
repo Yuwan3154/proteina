@@ -17,8 +17,8 @@ import math
 import re
 
 PAGE = "/Users/Chenxi/SOLab/proteina/.claude/worktrees/distogram-head/figures/training_status_report.html"
-DATA = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report/r20260927"
-SNAPSHOT = "27 Sep 2026"  # date of the JSON snapshots in DATA; update after a re-fetch
+DATA = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report/r20260928"
+SNAPSHOT = "28 Sep 2026"  # date of the JSON snapshots in DATA; update after a re-fetch
 
 TRI = json.load(open(f"{DATA}/tri_epochs.json"))
 C2C = json.load(open(f"{DATA}/c2c_steps.json"))
@@ -26,7 +26,7 @@ PAL = json.load(open(f"{DATA}/tri_val_pal.json"))
 C2C_CF = json.load(open(f"{DATA}/c2c_steps_confind.json"))          # ConFind c2c twin (same recipe, ConFind maps)
 TRI_FT = json.load(open(f"{DATA}/tri_epochs_tri_confindsynth_ft.json"))  # ConFind tri fine-tune (launched 25 Sep)
 PAL_FT = json.load(open(f"{DATA}/tri_val_pal_tri_confindsynth_ft.json"))
-C2C_SEGMENTS, C2C_CF_SEGMENTS = 18, 14   # wandb segments per run, from the fetch_report_data.py log of 27 Sep
+C2C_SEGMENTS, C2C_CF_SEGMENTS = 18, 15   # wandb segments per run, from the fetch_report_data.py log of 28 Sep
 
 SEC_OPEN = '<section class="sec" id="convergence-2026-09-21">'
 CAV_OPEN = '<section class="sec" id="archive-caveat-2026-09-22">'
@@ -460,9 +460,10 @@ CMP_BLOCK = f"""
   <p class="note" style="margin:.2rem 0 .6rem">
     The ConFind twin trains with tbeta&rsquo;s exact recipe (48 diffusion samples, lr 3e-4, warmup 2,000, t_beta
     (1.3, 2.0), effective batch 8); only the input contact map differs. Both validate on the same steps, so the
-    table compares identical steps. ⛔ <b>Too early to read a winner:</b> the twin is at step {cf_max:,} of the
-    ~9,500 needed for the first matched comparison, and this window (before step {CUT:,}) is where tbeta itself
-    was unstable &mdash; its step-2,143 RMSD spike was a transient the report&rsquo;s convergence view starts after.
+    table compares identical steps. ⛔ <b>Not yet a matched result:</b> the twin is at step {cf_max:,} of its 29,620
+    target, and these 16-structure monitor rounds move with which chains they draw; the structure-level comparison is
+    the 195-chain native benchmark at matched steps. Early steps (before {CUT:,}) are where tbeta itself was unstable
+    &mdash; its step-2,143 RMSD spike was a transient the report&rsquo;s convergence view starts after.
     tbeta also crossed a mid-run target change (pseudo-CB, step 7,076) that the twin never sees. Both runs moved to
     2 GPUs on 27 Sep at the same effective batch (twin from ~step 5,400, tbeta from 29,290); a 2-GPU validation round
     scored the same 16 chains, in the same order, as tbeta&rsquo;s 1-GPU rounds, so the curves stay comparable.
@@ -479,8 +480,9 @@ CF_CARDS = f"""
       <h3 style="margin-top:0">c2c_confind_tbeta (ConFind twin) &mdash; step {cf_max:,}</h3>
       <p class="note">Step {cf_max:,} across {C2C_CF_SEGMENTS} chained segments, {len(cf_val_steps)} validation rounds.
       On 2 GPUs since ~step 5,400 (27 Sep 04:50): 1 per GPU &times; accumulation 4 &times; 2 = effective batch 8,
-      unchanged, and validation unsplit so it scores the same chains a 1-GPU run would. Needs step 9,500 (retention-ladder
-      anchor) for the first matched structure-level comparison.</p>
+      unchanged, and validation unsplit so it scores the same chains a 1-GPU run would. Trains to step 29,620 (tbeta&rsquo;s
+      final step) for a matched comparison; a 195-chain native-map benchmark runs every 1,000 steps on SuperCloud (first
+      at step 11,190) and may show a plateau earlier.</p>
     </div>
     <div class="card tri">
       <h3 style="margin-top:0">tri_confindsynth_ft (ConFind tri fine-tune) &mdash; epoch {int(ft["epoch"])}</h3>
@@ -515,23 +517,19 @@ else:
     tri_title = "approaching convergence"
     tri_read = ("validation has plateaued; training has not yet. Not overfitting "
                 "(validation tracks training), but there is little left to gain on this metric.")
-if at_best:
-    c2c_lede = (f"""<strong>c2c: no &mdash; still improving.</strong> Its validation loss is at the lowest value of the
-    whole run right now ({c2c_best:.3f} at step {c2c_best_step:,}), and the curve has already shown one
-    large non-monotone excursion, so a flat-looking tail here would not be evidence of convergence.""")
-else:
-    c2c_lede = (f"""<strong>c2c: no.</strong> Its lowest validation loss is {c2c_best:.3f} at step {c2c_best_step:,},
-    but the latest round reads {c2c_last:.3f} at step {c2c_last_step:,}, and the curve had already shown one
-    large non-monotone excursion before that, so convergence can only be judged over a window longer than it.""")
+# tbeta was stopped 28 Sep at step 29,620 on the user's decision; numbers from the 28 Sep convergence read
+# (report data r20260927, windows after the step-20,227 EMA-validation switch) and the 25/27 Sep native benchmarks.
+c2c_lede = ("""<strong>c2c (CB-8, tbeta): converged on the structure objective &mdash; stopped 28 Sep at step 29,620,
+    final checkpoint frozen.</strong> Training diffusion loss has been flat since ~step 12,000 (2,500-step bin medians
+    0.045&ndash;0.053; no trend after step 20,227, t = +0.29); validation loss is flat once the one hard chain draw
+    (steps 26,803&ndash;27,803) is excluded (t = +1.28); and the 195-chain native-map benchmark is flat from step 24,710
+    to 29,360 (96 chains better / 95 worse, Wilcoxon p = 0.97). Only the auxiliary distogram head was still improving.
+    The learning rate had barely decayed (~97% of peak), so this is a plateau at a near-constant rate.""")
 two_recent_lowest = sorted(y for _, y in c_val)[:2] == sorted(y for _, y in c_val[-2:])
 trend_txt = (" &mdash; the two lowest values of the run are the\n        two most recent" if two_recent_lowest
              else f"; the run&rsquo;s lowest is {c2c_best:.3f} at step {c2c_best_step:,}")
 mae_txt = (f"Sampled distance MAE is likewise at its best, {mae_last:.3f} &Aring;." if mae_last == mae_min
            else f"Sampled distance MAE reads {mae_last:.3f} &Aring; against its best, {mae_min:.3f} &Aring; at step {mae_min_step:,}.")
-read_txt = ("still descending, and demonstrably capable of moving the wrong way for\n        thousands of steps."
-            if at_best else
-            f"not at its best (the latest round is {c2c_last / c2c_best:.1f}&times; the run&rsquo;s lowest), and\n"
-            f"        demonstrably capable of moving the wrong way for thousands of steps.")
 hel_txt = ("inside the native band" if hel_last <= HELIX_BAND[1]
            else f"above the {HELIX_BAND[0]:g}&ndash;{HELIX_BAND[1]} native band drawn on the chart")
 
@@ -557,13 +555,13 @@ html = f"""{SEC_OPEN}
       </p>
     </div>
     <div class="card la">
-      <h3 style="margin-top:0">c2c_cb8_tbeta &mdash; NOT converged</h3>
+      <h3 style="margin-top:0">c2c_cb8_tbeta &mdash; converged, stopped at step 29,620</h3>
       <p class="note">
-        Step {int(c2c_last_step):,}. Validation loss {last3[0][1]:.3f} &rarr; {last3[1][1]:.3f} &rarr;
+        Final checkpoint final_tbeta_s29620.ckpt (read-only). Last validation round at step {int(c2c_last_step):,}. Validation loss {last3[0][1]:.3f} &rarr; {last3[1][1]:.3f} &rarr;
         {last3[2][1]:.3f} across the last three rounds{trend_txt}. {mae_txt}
         <strong>{'But' if at_best else 'Earlier,'}</strong> the run posted an excursion to {exc_max:.3f} at step {exc_step:,} and a
         distance-MAE excursion to {mae_exc:.2f} &Aring; at step {mae_exc_step:,} before recovering.
-        <strong>Read:</strong> {read_txt} Judge convergence only over a window longer than that excursion.{jump_txt}
+        {jump_txt}
       </p>
     </div>
   </div>
