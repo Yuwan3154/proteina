@@ -17,8 +17,8 @@ import math
 import re
 
 PAGE = "/Users/Chenxi/SOLab/proteina/.claude/worktrees/distogram-head/figures/training_status_report.html"
-DATA = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report/r20260926"
-SNAPSHOT = "26 Sep 2026"  # date of the JSON snapshots in DATA; update after a re-fetch
+DATA = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report/r20260927"
+SNAPSHOT = "27 Sep 2026"  # date of the JSON snapshots in DATA; update after a re-fetch
 
 TRI = json.load(open(f"{DATA}/tri_epochs.json"))
 C2C = json.load(open(f"{DATA}/c2c_steps.json"))
@@ -26,7 +26,7 @@ PAL = json.load(open(f"{DATA}/tri_val_pal.json"))
 C2C_CF = json.load(open(f"{DATA}/c2c_steps_confind.json"))          # ConFind c2c twin (same recipe, ConFind maps)
 TRI_FT = json.load(open(f"{DATA}/tri_epochs_tri_confindsynth_ft.json"))  # ConFind tri fine-tune (launched 25 Sep)
 PAL_FT = json.load(open(f"{DATA}/tri_val_pal_tri_confindsynth_ft.json"))
-C2C_SEGMENTS, C2C_CF_SEGMENTS = 13, 11   # wandb segments per run, from the fetch_report_data.py log of 26 Sep
+C2C_SEGMENTS, C2C_CF_SEGMENTS = 18, 14   # wandb segments per run, from the fetch_report_data.py log of 27 Sep
 
 SEC_OPEN = '<section class="sec" id="convergence-2026-09-21">'
 CAV_OPEN = '<section class="sec" id="archive-caveat-2026-09-22">'
@@ -384,7 +384,11 @@ jump_txt = ("" if not jumps else
               " native-map benchmark of the checkpoints either side (25 Sep, SuperCloud, EMA weights: step 21,228 vs"
               " last.ckpt at 24,710) found <b>no regression</b>: TM-score median 0.926 &rarr; 0.932 (paired +0.004,"
               " 129 better / 61 worse, Wilcoxon p = 1.8e-5), RMSD 1.41 &rarr; 1.33 &Aring;, 0 mirrors in both. The"
-              " jump is in the 16-structure validation monitor, not the model.")
+              " jump is in the 16-structure validation monitor, not the model."
+              + (f" The later high-RMSD rounds (steps 26,804, 27,304, 27,804) all scored the <b>identical 16 chains</b>"
+                 f" (same CA sequences, same order; checked 27 Sep), and proper RMSD fell to"
+                 f" {dict(c_rms_all)[28447]:.2f} &Aring; at step 28,447, the first round on a new draw of chains: the"
+                 f" monitor moves with which 16 chains it draws." if 28447 in dict(c_rms_all) else ""))
 
 p99 = nearest_rank([y for _, y in c_tr_z], P99)
 tr_top = y_axis(p99)[0]
@@ -459,7 +463,9 @@ CMP_BLOCK = f"""
     table compares identical steps. ⛔ <b>Too early to read a winner:</b> the twin is at step {cf_max:,} of the
     ~9,500 needed for the first matched comparison, and this window (before step {CUT:,}) is where tbeta itself
     was unstable &mdash; its step-2,143 RMSD spike was a transient the report&rsquo;s convergence view starts after.
-    tbeta also crossed a mid-run target change (pseudo-CB, step 7,076) that the twin never sees.
+    tbeta also crossed a mid-run target change (pseudo-CB, step 7,076) that the twin never sees. Both runs moved to
+    2 GPUs on 27 Sep at the same effective batch (twin from ~step 5,400, tbeta from 29,290); a 2-GPU validation round
+    scored the same 16 chains, in the same order, as tbeta&rsquo;s 1-GPU rounds, so the curves stay comparable.
   </p>
   <div class="grid2">{charts_cmp}</div>
   <div class="scroll"><table>
@@ -470,9 +476,10 @@ CMP_BLOCK = f"""
 CF_CARDS = f"""
   <div class="cards" style="margin:1.1rem 0">
     <div class="card la">
-      <h3 style="margin-top:0">c2c_confind_tbeta (ConFind twin) &mdash; early</h3>
+      <h3 style="margin-top:0">c2c_confind_tbeta (ConFind twin) &mdash; step {cf_max:,}</h3>
       <p class="note">Step {cf_max:,} across {C2C_CF_SEGMENTS} chained segments, {len(cf_val_steps)} validation rounds.
-      Training resumed cleanly after the 24 Sep scratch-quota incident. Needs step 9,500 (retention-ladder
+      On 2 GPUs since ~step 5,400 (27 Sep 04:50): 1 per GPU &times; accumulation 4 &times; 2 = effective batch 8,
+      unchanged, and validation unsplit so it scores the same chains a 1-GPU run would. Needs step 9,500 (retention-ladder
       anchor) for the first matched structure-level comparison.</p>
     </div>
     <div class="card tri">
@@ -486,7 +493,8 @@ CF_CARDS = f"""
       {ft_va[0][1]:.2f} to {ft_va[-1][1]:.2f} (validation). Sampled precision at L: {ft_sp[0][1]:.3f} (epoch
       {ft_sp[0][0]}) &rarr; {ft_sp[-1][1]:.3f} (epoch {ft_sp[-1][0]}), {len(ft_sp)} rounds. ⛔ Its numbers are on the
       ConFind definition and not comparable to the CB-8 tri&rsquo;s; the x-axis is its own epoch count, not the
-      lineage&rsquo;s. ~200 steps/h &rArr; 10,000 steps ≈ 27 Sep afternoon.</p>
+      lineage&rsquo;s. It lost ~7.5 h on 27 Sep (13:54&ndash;21:27): all 60 chained restarts landed on node5101, where
+      every multi-GPU job dies at start-up in the first NCCL broadcast (now excluded in both launchers).</p>
     </div>
   </div>
 """
