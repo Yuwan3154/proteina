@@ -17,8 +17,8 @@ import math
 import re
 
 PAGE = "/Users/Chenxi/SOLab/proteina/.claude/worktrees/distogram-head/figures/training_status_report.html"
-DATA = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report/r20260928"
-SNAPSHOT = "28 Sep 2026"  # date of the JSON snapshots in DATA; update after a re-fetch
+DATA = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report/r20260929"
+SNAPSHOT = "29 Sep 2026"  # date of the JSON snapshots in DATA; update after a re-fetch
 
 TRI = json.load(open(f"{DATA}/tri_epochs.json"))
 C2C = json.load(open(f"{DATA}/c2c_steps.json"))
@@ -26,7 +26,8 @@ PAL = json.load(open(f"{DATA}/tri_val_pal.json"))
 C2C_CF = json.load(open(f"{DATA}/c2c_steps_confind.json"))          # ConFind c2c twin (same recipe, ConFind maps)
 TRI_FT = json.load(open(f"{DATA}/tri_epochs_tri_confindsynth_ft.json"))  # ConFind tri fine-tune (launched 25 Sep)
 PAL_FT = json.load(open(f"{DATA}/tri_val_pal_tri_confindsynth_ft.json"))
-C2C_SEGMENTS, C2C_CF_SEGMENTS = 18, 15   # wandb segments per run, from the fetch_report_data.py log of 28 Sep
+BENCH = json.load(open(f"{DATA}/bench_c2c.json"))  # scratchpad/bench_summary.py over the 195-chain native benchmark arms
+C2C_SEGMENTS, C2C_CF_SEGMENTS = 18, 15   # wandb segments per run, from the fetch_report_data.py log of 29 Sep
 
 SEC_OPEN = '<section class="sec" id="convergence-2026-09-21">'
 CAV_OPEN = '<section class="sec" id="archive-caveat-2026-09-22">'
@@ -474,6 +475,37 @@ CMP_BLOCK = f"""
       <th class="num">RMSD CB-8</th><th class="num">ConFind</th><th class="num">dist MAE CB-8</th><th class="num">ConFind</th></tr></thead>
     <tbody>{cmp_rows}</tbody></table></div>
 """
+def _bench_row(label, e, prev=True):
+    vp = e.get("vs_prev") if prev else None
+    vr = e.get("vs_ref")
+    cell = lambda v: (f'{v["better"]} / {v["worse"]} (p {v["p"]:.1e})' if v else "&mdash;")
+    return (f'<tr><td>{label}</td><td class="num">{e["step"]:,}</td>'
+            f'<td class="num">{e["tm_median"]:.3f} ({e["tm_q25"]:.3f}&ndash;{e["tm_q75"]:.3f})</td>'
+            f'<td class="num">{e["n_tm05"]}</td><td class="num">{e["rmsd_median"]:.2f}</td>'
+            f'<td class="num">{e["mirror"]:.3f}</td><td class="num">{cell(vp)}</td><td class="num">{cell(vr)}</td></tr>')
+
+
+bench_rows = "".join(_bench_row("ConFind twin", e) for e in BENCH["arms"])
+bench_rows += _bench_row("CB-8 tbeta (reference)", BENCH["ref"], prev=False)
+BL = BENCH["arms"][-1]
+BENCH_BLOCK = f"""
+  <h3 id="c2c-native-benchmark">c2c &mdash; 195-chain native-map benchmark (the plateau check)</h3>
+  <p class="note" style="margin:.2rem 0 .6rem">
+    Each checkpoint rebuilds all 195 benchmark chains from their true contact maps (its own definition: ConFind for
+    the twin, CB-8 for tbeta), EMA weights, 1 seed, SuperCloud V100, identical harness; scored on the pre-registered
+    {BENCH["n_chains"]}-chain primary set. The twin is checked every 1,000 steps. Paired columns count chains better /
+    worse (Wilcoxon on TM). The CB-8 row is tbeta at step {BENCH["ref"]["step"]:,}, inside its flat stretch (it stopped at
+    29,620). Latest twin (step {BL["step"]:,}): TM &ge; 0.5 on {BL["n_tm05"]} of {BENCH["n_chains"]} chains vs
+    {BENCH["ref"]["n_tm05"]} for CB-8, but per chain CB-8 is still better on {BL["vs_ref"]["worse"]} of {BENCH["n_chains"]}
+    (median TM {BL["tm_median"]:.3f} vs {BENCH["ref"]["tm_median"]:.3f}), and the twin is still improving at every check
+    ({BL["vs_prev"]["better"]} / {BL["vs_prev"]["worse"]} vs the previous one) &mdash; no plateau yet.
+  </p>
+  <div class="scroll"><table>
+    <thead><tr><th>model</th><th class="num">step</th><th class="num">TM median (q25&ndash;q75)</th>
+      <th class="num">TM &ge; 0.5</th><th class="num">RMSD med (&Aring;)</th><th class="num">mirror</th>
+      <th class="num">vs previous check</th><th class="num">vs CB-8</th></tr></thead>
+    <tbody>{bench_rows}</tbody></table></div>
+"""
 CF_CARDS = f"""
   <div class="cards" style="margin:1.1rem 0">
     <div class="card la">
@@ -576,6 +608,7 @@ html = f"""{SEC_OPEN}
   <h3>c2c &mdash; loss, structure quality, and handedness</h3>
   <div class="grid2">{charts_c2c}</div>
 {CMP_BLOCK}
+{BENCH_BLOCK}
   <div class="callout">
     <p><strong>How to read <code>helix_pos_frac</code> &mdash; low is correct.</strong>
     It is the fraction of helical-range CA pseudo-dihedrals that are positive, and it is a

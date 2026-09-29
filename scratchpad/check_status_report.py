@@ -11,7 +11,7 @@ import re
 
 PAGE = "/Users/Chenxi/SOLab/proteina/.claude/worktrees/distogram-head/figures/training_status_report.html"
 ORIG = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report/r20260925/report_7fc1e47.html"
-DATA = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report/r20260928"
+DATA = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report/r20260929"
 SEC_OPEN = '<section class="sec" id="convergence-2026-09-21">'
 PX_TOL = 0.5
 X0, X1, Y0, Y1 = 52.0, 548.0, 14.0, 176.0
