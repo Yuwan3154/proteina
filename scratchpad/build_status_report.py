@@ -17,7 +17,7 @@ import math
 import re
 
 PAGE = "/Users/Chenxi/SOLab/proteina/.claude/worktrees/distogram-head/figures/training_status_report.html"
-DATA = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report/r20260929"
+DATA = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report/r20260929b"
 SNAPSHOT = "29 Sep 2026"  # date of the JSON snapshots in DATA; update after a re-fetch
 
 TRI = json.load(open(f"{DATA}/tri_epochs.json"))
@@ -498,7 +498,16 @@ BENCH_BLOCK = f"""
     29,620). Latest twin (step {BL["step"]:,}): TM &ge; 0.5 on {BL["n_tm05"]} of {BENCH["n_chains"]} chains vs
     {BENCH["ref"]["n_tm05"]} for CB-8, but per chain CB-8 is still better on {BL["vs_ref"]["worse"]} of {BENCH["n_chains"]}
     (median TM {BL["tm_median"]:.3f} vs {BENCH["ref"]["tm_median"]:.3f}), and the twin is still improving at every check
-    ({BL["vs_prev"]["better"]} / {BL["vs_prev"]["worse"]} vs the previous one) &mdash; no plateau yet.
+    ({BL["vs_prev"]["better"]} / {BL["vs_prev"]["worse"]} vs the previous one, p {BL["vs_prev"]["p"]:.1e}).
+  </p>
+  <p class="note" style="margin:.2rem 0 .6rem">
+    <b>Training trend, twin vs tbeta at matched steps (29 Sep):</b> training diffusion loss follows the same course
+    (~0.10 until ~7k steps, then falling; the twin lagged 1.2&ndash;1.35&times; over 8&ndash;12k) and flattens at the same point
+    &mdash; neither has a significant trend over steps 12,000&ndash;16,200 (tbeta t = &minus;0.74, twin t = &minus;0.37), and tbeta
+    then stayed flat to its end. Training distogram loss (the same true-distance target for both) sits a steady 5&ndash;15%
+    higher for the twin at every stage, declining at the same slow rate (&minus;0.0128 vs &minus;0.0125 log per 1k steps): a
+    constant offset, consistent with the sparser ConFind map (~2.5% vs ~7.6% contacts) carrying less distance
+    information. Validation rounds before step 20,227 are not comparable (tbeta validated raw weights then).
   </p>
   <div class="scroll"><table>
     <thead><tr><th>model</th><th class="num">step</th><th class="num">TM median (q25&ndash;q75)</th>
