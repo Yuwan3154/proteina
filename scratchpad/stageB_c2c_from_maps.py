@@ -280,6 +280,7 @@ def main():
                         label=args.label, stem=stem, chain_index=ci, seq_fp=seq_fp, L=L,
                         sample_index=None if r is None else r["sample_index"],
                         tri_file=None if r is None else r["file"],
+                        ref_id=None if r is None else r.get("ref_id"),   # template the tri sample saw
                         seed=si, torch_seed=seed, weights=args.weights, ckpt=args.ckpt,
                         global_step=gstep, dataset=args.dataset, contact_def=contact_def,
                         map_source="native" if r is None else "tri", maps_dir=args.maps_dir,

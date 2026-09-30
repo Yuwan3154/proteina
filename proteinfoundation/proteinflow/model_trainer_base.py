@@ -3765,11 +3765,16 @@ class ModelTrainerBase(L.LightningModule):
         os.makedirs(dump_dir, exist_ok=True)
         prob = torch.sigmoid(logits.detach().float())[:L, :L].cpu().numpy()
         gt_c = gt.detach().float()[:L, :L].cpu().numpy()
+        # The template this sample was conditioned on (built for this same batch by
+        # _build_self_reference_topology), so two tris can be checked to have seen the SAME pairs.
+        ref_ids = getattr(self, "_last_sampling_ref_ids", None) or []
+        ref_id = str(ref_ids[s]) if s < len(ref_ids) else None
         path = os.path.join(dump_dir, f"{stem}_s{k:02d}.npz")
         np.savez_compressed(path, contact_prob=prob, contact_gt=gt_c,
-                            L=np.int32(L), stem=stem, sample_index=np.int32(k))
+                            L=np.int32(L), stem=stem, sample_index=np.int32(k),
+                            ref_id=("" if ref_id is None else ref_id))
         with open(os.path.join(dump_dir, "samples.jsonl"), "a") as fh:
-            fh.write(json.dumps({"stem": stem, "sample_index": k, "L": L,
+            fh.write(json.dumps({"stem": stem, "sample_index": k, "L": L, "ref_id": ref_id,
                                  "file": os.path.basename(path),
                                  "metrics": metrics or {}}) + "\n")
 
