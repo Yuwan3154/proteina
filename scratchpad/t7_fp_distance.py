@@ -18,6 +18,8 @@ import numpy as np
 import torch
 
 from proteinfoundation.datasets.pdb_data import _processed_path_sharded
+from proteinfoundation.datasets.transforms import ContactMapTransform
+from proteinfoundation.utils.constants import PDB_TO_OPENFOLD_INDEX_TENSOR
 
 DATA = pathlib.Path("/orcd/pool/006/chenxiou/proteina/data/pdb_train")
 SEP_MIN = 6
@@ -25,12 +27,13 @@ QS = (10, 25, 50, 75, 90)
 
 
 def native_cb(stem, man):
+    """CB exactly as the dataset's ContactMapTransform places it: the raw .pt is in PDB atom order (index 3 = O), so
+    reorder to OpenFold (index 3 = CB) as pdb_data.py does, then fill missing CB with the pseudo-CB."""
     g = torch.load(_processed_path_sharded(DATA / "processed", stem, man), weights_only=False)
-    x = g.coords.numpy()                      # [L, 37, 3], atom37: N CA C CB ...
-    m = g.coord_mask.numpy().astype(bool)
-    cb = np.where(m[:, 3:4], x[:, 3], x[:, 1])   # CB, or CA where CB is missing (glycine / unresolved)
-    ok = m[:, 1]
-    return cb, ok
+    x = g.coords[:, PDB_TO_OPENFOLD_INDEX_TENSOR, :].float()
+    m = g.coord_mask[:, PDB_TO_OPENFOLD_INDEX_TENSOR].float()
+    cb = ContactMapTransform._fill_missing_cb_pseudo(x[:, 3, :].clone(), x, m, m[:, 3] < 0.5)
+    return cb.numpy(), (m[:, 1] >= 0.5).numpy()
 
 
 def qd(d):
@@ -59,6 +62,8 @@ def main():
             pred = z["contact_prob"][i, j] > 0.5
             gt = z["contact_gt"][i, j] > 0.5
             d = D[i, j]
+            if label == "CB8":  # correctness gate: the CB-8 native map must be exactly CB <= 8 A on these coordinates
+                assert np.array_equal(d <= 8.0, gt), f"{stem}: rebuilt CB<=8 map != dumped CB-8 native map"
             fp, tp, fn = pred & ~gt, pred & gt, ~pred & gt
             rows.append(dict(label=label, stem=stem, sample_index=k, L=L, n_pairs=int(len(d)), n_tp=int(tp.sum()),
                              n_fp=int(fp.sum()), n_fn=int(fn.sum()), fp_dist=qd(d[fp]), tp_dist=qd(d[tp]),
