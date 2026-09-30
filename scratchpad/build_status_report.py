@@ -17,7 +17,7 @@ import math
 import re
 
 PAGE = "/Users/Chenxi/SOLab/proteina/.claude/worktrees/distogram-head/figures/training_status_report.html"
-DATA = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report/r20260929b"
+DATA = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report/r20260929c"
 SNAPSHOT = "29 Sep 2026"  # date of the JSON snapshots in DATA; update after a re-fetch
 
 TRI = json.load(open(f"{DATA}/tri_epochs.json"))
