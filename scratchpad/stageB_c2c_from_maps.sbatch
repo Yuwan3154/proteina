@@ -60,7 +60,7 @@ if [ -n "${STEPS:-}" ]; then ARGS+=(--steps "$STEPS"); fi
 if [ -n "${PDB_DIR:-}" ]; then ARGS+=(--pdb_dir "$PDB_DIR"); fi
 if [ -n "${USALIGN:-}" ]; then ARGS+=(--usalign "$USALIGN"); fi
 # T7 (a): optional corruption of the native map (only with NATIVE=1); CORRUPT_RATE unset = off
-if [ -n "${CORRUPT_RATE:-}" ]; then ARGS+=(--corrupt_rate "$CORRUPT_RATE" --corrupt_mode "${CORRUPT_MODE:-balanced}" --corrupt_seed "${CORRUPT_SEED:-0}"); fi
+if [ -n "${CORRUPT_RATE:-}" ]; then ARGS+=(--corrupt_rate "$CORRUPT_RATE" --corrupt_mode "${CORRUPT_MODE:-balanced}" --corrupt_seed "${CORRUPT_SEED:-0}" --n_corrupt "${N_CORRUPT:-1}"); fi
 
 if [ "$NATIVE" = 1 ]; then SRC=native; else SRC="$MAPS_DIR"; fi
 echo "[stageB] label=$LABEL dataset=$DATASET weights=${WEIGHTS:-ema} n_seeds=$N_SEEDS steps=${STEPS:-default} maps=$SRC"
@@ -72,15 +72,16 @@ rc=$?
 echo "STAGEB_RC[$LABEL]=$rc"
 
 # ⛔ Verify the ARTEFACT, not the exit code: exactly one row per (chain, tri sample, seed).
-python - "$OUT" "$CHAINS" "$N_SEEDS" "$NATIVE" "$MAPS_DIR" <<'PY'
+python - "$OUT" "$CHAINS" "$N_SEEDS" "$NATIVE" "$MAPS_DIR" "${CORRUPT_RATE:+${N_CORRUPT:-1}}" <<'PY'
 import collections, json, os, sys
 out, chains, n_seeds, native, maps_dir = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4] == "1", sys.argv[5]
+n_corrupt = int(sys.argv[6]) if sys.argv[6] else 0
 stems = sorted({l.split()[0] for l in open(chains) if l.strip()})
 want_stems = set(stems)
 per = collections.defaultdict(list)
 if native:
     for st in stems:
-        per[st].append(None)
+        per[st].extend(range(n_corrupt) if n_corrupt else [None])
 else:
     for l in open(os.path.join(maps_dir, "samples.jsonl")):
         if l.strip():

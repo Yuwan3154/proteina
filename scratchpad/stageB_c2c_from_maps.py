@@ -82,6 +82,8 @@ def main():
     ap.add_argument("--corrupt_rate", type=float, default=0.0)
     ap.add_argument("--corrupt_mode", choices=("balanced", "uniform"), default="balanced")
     ap.add_argument("--corrupt_seed", type=int, default=0)
+    # independent corruption draws per chain, each fed like one tri sample (c2c seed stays chain-only, as in the tri arm)
+    ap.add_argument("--n_corrupt", type=int, default=1)
     args = ap.parse_args()
     assert args.corrupt_rate == 0.0 or args.native, "--corrupt_rate applies to the --native arm only"
 
@@ -239,7 +241,10 @@ def main():
             dens_nat = offdiag_density(b["contacts"][0, :L, :L].cpu().numpy())
             # Sequence fingerprint: rotation- and definition-invariant, so rows join across arms.
             seq_fp = hashlib.sha1(aa_c[:L].numpy().astype(np.int8).tobytes()).hexdigest()[:12]
-            maps = [None] if args.native else tri[stem]
+            if args.native:
+                maps = [("corrupt", k) for k in range(args.n_corrupt)] if args.corrupt_rate > 0 else [None]
+            else:
+                maps = tri[stem]
             n_expected += len(maps) * args.n_seeds
             if args.pdb_dir:
                 odir = os.path.join(args.pdb_dir, args.label, f"{ci // 1000:03d}", stem)
@@ -252,12 +257,12 @@ def main():
             write_atom14_pdb(tp, gt14, aa_c, m_c)
 
             for r in maps:
-                if r is None and args.corrupt_rate > 0:
-                    g = torch.Generator().manual_seed(args.corrupt_seed * 1_000_003 + ci)
+                if isinstance(r, tuple):
+                    g = torch.Generator().manual_seed((args.corrupt_seed * 1000 + r[1]) * 1_000_003 + ci)
                     cc = augment_contacts(b["contacts"].float().cpu(), b["mask"].float().cpu(), args.corrupt_rate,
                                           args.corrupt_mode, generator=g)
                     contacts = cc.to(dev).to(b["contacts"].dtype)
-                    dens_tri, tag = offdiag_density(cc[0, :L, :L].numpy()), f"corrupt{args.corrupt_rate:g}"
+                    dens_tri, tag = offdiag_density(cc[0, :L, :L].numpy()), f"corrupt{args.corrupt_rate:g}_d{r[1]:02d}"
                 elif r is None:
                     contacts, dens_tri, tag = b["contacts"], None, "nativemap"
                 else:
@@ -291,12 +296,12 @@ def main():
                     tm = usalign_tm(gp, tp, args.usalign)
                     rec = dict(
                         label=args.label, stem=stem, chain_index=ci, seq_fp=seq_fp, L=L,
-                        sample_index=None if r is None else r["sample_index"],
-                        tri_file=None if r is None else r["file"],
-                        ref_id=None if r is None else r.get("ref_id"),   # template the tri sample saw
+                        sample_index=None if r is None else (r[1] if isinstance(r, tuple) else r["sample_index"]),
+                        tri_file=None if r is None or isinstance(r, tuple) else r["file"],
+                        ref_id=None if r is None or isinstance(r, tuple) else r.get("ref_id"),   # template the tri sample saw
                         seed=si, torch_seed=seed, weights=args.weights, ckpt=args.ckpt,
                         global_step=gstep, dataset=args.dataset, contact_def=contact_def,
-                        map_source="native" if r is None else "tri", maps_dir=args.maps_dir,
+                        map_source="tri" if isinstance(r, dict) else "native", maps_dir=args.maps_dir,
                         corrupt_rate=args.corrupt_rate, corrupt_mode=args.corrupt_mode if args.corrupt_rate else None,
                         corrupt_seed=args.corrupt_seed if args.corrupt_rate else None,
                         steps=args.steps, sigma_data=SIGMA_DATA,
