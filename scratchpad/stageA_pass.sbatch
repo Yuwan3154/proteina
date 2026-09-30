@@ -34,8 +34,14 @@ case "${MODEL:?}" in
   cfft) REPO=$S/proteina_cfft;   CFG=training_contact_tri_full384_confindsynth_ft_v1; IDX=$S/synth_index_confind_v1 ;;
   *) echo "FATAL: MODEL=$MODEL"; exit 77 ;;
 esac
+# REPO_OVERRIDE: run the harness from a dedicated checkout (T7) instead of a live training checkout.
+# Only for the new-alphabet models (new, cfft share the vocab-44 code); never for old.
+if [ -n "${REPO_OVERRIDE:-}" ]; then
+  [ "$MODEL" != old ] || { echo "FATAL: REPO_OVERRIDE is for new|cfft only"; exit 77; }
+  REPO=$REPO_OVERRIDE
+fi
 export SYNTH_INDEX_DIR=$IDX
-echo "[pass] SYNTH_INDEX_DIR=$SYNTH_INDEX_DIR"
+echo "[pass] SYNTH_INDEX_DIR=$SYNTH_INDEX_DIR REPO=$REPO"
 [ -f "${CHAINS:?}" ] || { echo "FATAL: no chain list $CHAINS"; exit 77; }
 [ -f "${CKPT:?}" ] || { echo "FATAL: no checkpoint $CKPT"; exit 77; }
 DUMP=$S/stageA/${LABEL:?}
