@@ -28,8 +28,9 @@ from scipy.stats import spearmanr, wilcoxon
 SETS = (("primary 191 (max384 val, 1/cluster)", "stageA_val_1percluster.txt"),
         ("sequence-clean 144", "stageA_primary_seqclean.txt"),
         ("novel-fold", "stageA_novel.txt"))
+# thresholded (> 0.5) precision / recall / F1 are what the c2c actually sees; P@L ranks by probability
 XS = ("tri_contact_precision_at_L", "tri_contact_precision_at_L5", "tri_contact_long_range_precision_at_L5",
-      "tri_precision", "tri_f1", "density_ratio")
+      "tri_contact_precision", "tri_contact_recall", "tri_contact_f1", "density_ratio")
 DEFS = ("CB8", "CONFIND")
 
 
