@@ -45,6 +45,7 @@ import hydra
 from omegaconf import OmegaConf
 
 from gen_c2c_structures import MODEL_CFG, usalign_tm  # scratchpad/, next to this file
+from proteinfoundation.datasets.contact_augment import augment_contacts
 from proteinfoundation.datasets.pdb_data import PDBDataset
 from proteinfoundation.nn.af3_diffusion import C2C_INFERENCE_STEPS, SIGMA_DATA
 from proteinfoundation.proteinflow.contact2coord_trainer import ContactToCoordTrainer
@@ -76,7 +77,13 @@ def main():
     ap.add_argument("--pdb_dir", default=None, help="also keep atom14 PDBs here (sharded)")
     ap.add_argument("--usalign", default="/home/chenxiou/.local/bin/USalign")
     ap.add_argument("--label", required=True)
+    # T7 (a): corrupt the NATIVE map with the c2c training augmentation (contact_augment) before the rollout, seeded per
+    # chain, to measure each c2c's degradation curve under matched corruption. 0 = off (the plain ceiling arm).
+    ap.add_argument("--corrupt_rate", type=float, default=0.0)
+    ap.add_argument("--corrupt_mode", choices=("balanced", "uniform"), default="balanced")
+    ap.add_argument("--corrupt_seed", type=int, default=0)
     args = ap.parse_args()
+    assert args.corrupt_rate == 0.0 or args.native, "--corrupt_rate applies to the --native arm only"
 
     assert os.access(args.usalign, os.X_OK), f"USalign not executable: {args.usalign}"
     assert os.path.isfile(args.ckpt), f"missing checkpoint: {args.ckpt}"
@@ -245,7 +252,13 @@ def main():
             write_atom14_pdb(tp, gt14, aa_c, m_c)
 
             for r in maps:
-                if r is None:
+                if r is None and args.corrupt_rate > 0:
+                    g = torch.Generator().manual_seed(args.corrupt_seed * 1_000_003 + ci)
+                    cc = augment_contacts(b["contacts"].float().cpu(), b["mask"].float().cpu(), args.corrupt_rate,
+                                          args.corrupt_mode, generator=g)
+                    contacts = cc.to(dev).to(b["contacts"].dtype)
+                    dens_tri, tag = offdiag_density(cc[0, :L, :L].numpy()), f"corrupt{args.corrupt_rate:g}"
+                elif r is None:
                     contacts, dens_tri, tag = b["contacts"], None, "nativemap"
                 else:
                     prob = np.load(os.path.join(args.maps_dir, r["file"]))["contact_prob"]
@@ -284,6 +297,8 @@ def main():
                         seed=si, torch_seed=seed, weights=args.weights, ckpt=args.ckpt,
                         global_step=gstep, dataset=args.dataset, contact_def=contact_def,
                         map_source="native" if r is None else "tri", maps_dir=args.maps_dir,
+                        corrupt_rate=args.corrupt_rate, corrupt_mode=args.corrupt_mode if args.corrupt_rate else None,
+                        corrupt_seed=args.corrupt_seed if args.corrupt_rate else None,
                         steps=args.steps, sigma_data=SIGMA_DATA,
                         density_tri=dens_tri, density_native=dens_nat,
                         tm=tm, rmsd_proper=float(h["rmsd_proper"]),

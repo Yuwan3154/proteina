@@ -12,7 +12,7 @@
 #   CKPT=<c2c ckpt>  DATASET=<the c2c's OWN dataset yaml>  CHAINS=<chain list>  OUT=<fresh .jsonl>
 #   LABEL=<arm name>  and EXACTLY ONE of  MAPS_DIR=<tri dump dir>  |  NATIVE=1 (ceiling arm)
 #   optional: WEIGHTS=ema|raw (ema)  N_SEEDS (1)  STEPS (script default C2C_INFERENCE_STEPS)
-#             PDB_DIR  USALIGN  REPO
+#             PDB_DIR  USALIGN  REPO  CORRUPT_RATE CORRUPT_MODE CORRUPT_SEED (native only)
 # Env block copied from train_c2c.sbatch.
 set -uo pipefail
 REPO="${REPO:-/orcd/scratch/orcd/011/chenxiou/proteina_tri}"
@@ -59,6 +59,8 @@ if [ "$NATIVE" = 1 ]; then ARGS+=(--native); else ARGS+=(--maps_dir "$MAPS_DIR")
 if [ -n "${STEPS:-}" ]; then ARGS+=(--steps "$STEPS"); fi
 if [ -n "${PDB_DIR:-}" ]; then ARGS+=(--pdb_dir "$PDB_DIR"); fi
 if [ -n "${USALIGN:-}" ]; then ARGS+=(--usalign "$USALIGN"); fi
+# T7 (a): optional corruption of the native map (only with NATIVE=1); CORRUPT_RATE unset = off
+if [ -n "${CORRUPT_RATE:-}" ]; then ARGS+=(--corrupt_rate "$CORRUPT_RATE" --corrupt_mode "${CORRUPT_MODE:-balanced}" --corrupt_seed "${CORRUPT_SEED:-0}"); fi
 
 if [ "$NATIVE" = 1 ]; then SRC=native; else SRC="$MAPS_DIR"; fi
 echo "[stageB] label=$LABEL dataset=$DATASET weights=${WEIGHTS:-ema} n_seeds=$N_SEEDS steps=${STEPS:-default} maps=$SRC"
