@@ -14,7 +14,8 @@ Reported per pre-registered set (primary 191, sequence-clean 144, novel-fold):
      the answer, so the within-query distribution is the one that says whether a better map gives a better structure.
 
 Usage: python scratchpad/stageB_pairs_analyze.py <lists_dir> CB8_TRI=a.jsonl CONFIND_TRI=b.jsonl
-          [CB8_NATIVE=c.jsonl] [CONFIND_NATIVE=d.jsonl] [--k 8] [--out merged.tsv]
+          [CB8_NATIVE=c.jsonl] [CONFIND_NATIVE=d.jsonl] [SUBSET=list.txt] [--k 8] [--out merged.tsv]
+SUBSET adds that chain list as the first reported set (e.g. the T7-quick L<=256 fold-clustered subset).
 """
 
 import json
@@ -85,10 +86,15 @@ def main():
                         fh.write("\t".join(str(r.get(c) if c != "def" else d) for c in cols) + "\n")
         print(f"[out] per-sample table -> {out}")
 
-    for name, f in SETS:
-        chains = [ln.strip() for ln in open(os.path.join(lists, f)) if ln.strip()]
+    sets = list(SETS)
+    if "SUBSET" in kv:
+        sets.insert(0, (f"subset {os.path.basename(kv['SUBSET'])}", os.path.abspath(kv["SUBSET"])))
+    for name, f in sets:
+        chains = [ln.split()[0] for ln in open(os.path.join(lists, f)) if ln.strip()]
         chains = [s for s in chains if s in common]
         print(f"\n==== {name}: {len(chains)} queries x {k} samples ====")
+        if not chains:
+            continue
         print(f"{'arm':22s} {'TM q25':>7s} {'median':>7s} {'q75':>7s} {'TM>=0.5':>9s} {'RMSDp med':>9s} {'mirror':>7s}"
               f" {'query-mean TM med':>18s}")
         qmean = {}
