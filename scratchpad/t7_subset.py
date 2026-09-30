@@ -1,9 +1,10 @@
 """T7-QUICK subset (user 2026-09-30): held-out union, L <= 256, clustered WITHIN the set by fold.
 
 Native CA traces come from the processed .pt files (repo's own sharded-path logic); all-vs-all USalign (default
-sequence-independent TM-align mode) in parallel; single-linkage clusters at TM >= 0.5 (same fold) normalised by the
-SHORTER chain; one representative per cluster = its medoid (highest mean TM to the other members; singletons are their
-own representative). Writes the subset list, a cluster table, and chunk lists (each query repeated K times, whole
+sequence-independent TM-align mode) in parallel; GREEDY CENTROID clusters at TM >= 0.5 (same fold) normalised by the
+SHORTER chain: longest chain first, each unassigned chain becomes a centroid and absorbs every unassigned chain within
+TM >= 0.5 of IT (no transitive chaining -- single linkage chained 72 of 144 chains into one cluster, 2026-09-30);
+the centroid is the representative. Writes the subset list, a cluster table, and chunk lists (each query repeated K times, whole
 queries per chunk).
 
 Usage: python scratchpad/t7_subset.py UNION_LIST SAMPLES_JSONL OUT_DIR [--lmax 256] [--k 8] [--chunk 25] [--procs 8]
@@ -70,30 +71,23 @@ def main():
     for (i, j), (t1, t2) in zip(pairs, tms):
         M[i, j] = M[j, i] = max(t1, t2)  # shorter-chain normalisation = the larger of the two
     np.save(out / "tm_matrix.npy", M)
-    parent = list(range(n))
-
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-    for i in range(n):
-        for j in range(i + 1, n):
-            if M[i, j] >= TM_FOLD:
-                parent[find(i)] = find(j)
-    groups = {}
-    for i in range(n):
-        groups.setdefault(find(i), []).append(i)
-    reps = []
+    order = sorted(range(n), key=lambda i: (-L[sel[i]], sel[i]))
+    assigned, clusters = set(), []
+    for i in order:
+        if i in assigned:
+            continue
+        mem = [i] + [j for j in order if j not in assigned and j != i and M[i, j] >= TM_FOLD]
+        assigned.update(mem)
+        clusters.append(mem)
+    reps = [sel[m[0]] for m in clusters]
     with open(out / "clusters.tsv", "w") as fh:
         fh.write("cluster\trepresentative\tsize\tmembers\n")
-        for c, mem in enumerate(sorted(groups.values(), key=lambda m: (-len(m), sel[m[0]]))):
-            rep = mem[0] if len(mem) == 1 else max(mem, key=lambda i: np.mean([M[i, j] for j in mem if j != i]))
-            reps.append(sel[rep])
-            fh.write(f"{c}\t{sel[rep]}\t{len(mem)}\t{','.join(sel[i] for i in mem)}\n")
+        for c, mem in enumerate(clusters):
+            fh.write(f"{c}\t{sel[mem[0]]}\t{len(mem)}\t{','.join(sel[i] for i in mem)}\n")
+    groups = {c: m for c, m in enumerate(clusters)}
     reps = sorted(reps)
     sizes = sorted((len(m) for m in groups.values()), reverse=True)
-    print(f"[cluster] TM>={TM_FOLD} (shorter-chain norm), single linkage: {len(groups)} clusters from {n} chains; "
+    print(f"[cluster] TM>={TM_FOLD} (shorter-chain norm), greedy centroid: {len(groups)} clusters from {n} chains; "
           f"largest sizes {sizes[:8]}; singletons {sum(1 for x in sizes if x == 1)}", flush=True)
     (out / "subset.txt").write_text("\n".join(reps) + "\n")
     # chunks balanced by total residues x K (sampling cost grows with L), whole queries per chunk
