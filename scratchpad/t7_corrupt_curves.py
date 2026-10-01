@@ -49,7 +49,7 @@ def main():
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         fig, ax = plt.subplots(1, 2, figsize=(10, 4))
-        for m, c, lab in (("CB8", "#3a6ea5", "CB-8 c2c (tbeta final)"), ("CF", "#c46b2d", "ConFind c2c (twin)")):
+        for m, c, lab in (("CB8", "#3a6ea5", "CB-8 c2c (tbeta final)"), ("CF", "#c46b2d", "ConFind c2c (twin step 18,800)")):
             r, med, frac = zip(*curves[m])
             ax[0].plot(r, med, "-o", color=c, lw=2, ms=8, label=lab)
             ax[1].plot(r, frac, "-o", color=c, lw=2, ms=8, label=lab)
