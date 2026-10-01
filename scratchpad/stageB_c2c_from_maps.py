@@ -315,7 +315,7 @@ def main():
                         rmsd_refl_gap_frac=float(h["rmsd_refl_gap_frac"]),
                         dist_mae=mae, rg_ratio=rg,
                     )
-                    if r is not None:
+                    if isinstance(r, dict):
                         rec.update({f"tri_{k}": v for k, v in (r.get("metrics") or {}).items()})
                     fh.write(json.dumps(rec) + "\n")
                     fh.flush()
