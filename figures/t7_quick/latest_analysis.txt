@@ -1,0 +1,84 @@
+[arm] CB8: 792 tri rows over 99 queries, 8 samples each; contact_def method=distance atom=CB cutoff=8.0 cb_fill=pseudo_cb confind_thr=0.0; c2c step 29620; native ceiling 99 rows
+[arm] CONFIND: 792 tri rows over 99 queries, 8 samples each; contact_def method=confind atom=CB cutoff=8.0 cb_fill=ca confind_thr=0.01; c2c step 18800; native ceiling 99 rows
+[pairs] 99 queries present in both, SAME template in both (asserted)
+[out] per-sample table -> /Users/Chenxi/.claude/jobs/2c2943b0/tmp/t7ql_out/latest_merged.tsv
+
+==== subset subset.txt: 99 queries x 8 samples ====
+arm                     TM q25  median     q75   TM>=0.5 RMSDp med  mirror  query-mean TM med
+CB8 tri                  0.403   0.488   0.568   371/792      8.31   0.145              0.483
+CB8 native (ceiling)     0.892   0.934   0.956    95/99  
+CONFIND tri              0.508   0.594   0.665   602/792      6.51   0.066              0.598
+CONFIND native (ceiling)   0.860   0.912   0.935    95/99  
+  CB8 -> CONFIND (per-query mean TM): median d +0.092  ConFind better 93 / worse 6  Wilcoxon p=2.04e-16
+  -- CB8: structure vs sampled-map quality (Spearman rho) --
+     x                                         pooled TM  between-q TM     within-q TM median [IQR] (n, frac>0)  pooled RMSD
+     tri_contact_precision_at_L                   +0.615        +0.642         +0.42 [+0.05,+0.66] (n=99, 0.77)       -0.507
+     tri_contact_precision_at_L5                  +0.487        +0.534         +0.22 [-0.07,+0.49] (n=97, 0.72)       -0.381
+     tri_contact_long_range_precision_at_L5       +0.594        +0.656         +0.33 [-0.07,+0.56] (n=92, 0.73)       -0.409
+     tri_contact_precision                        +0.532        +0.569         +0.39 [+0.11,+0.61] (n=98, 0.86)       -0.432
+     tri_contact_recall                           +0.564        +0.568         +0.56 [+0.34,+0.79] (n=98, 0.91)       -0.520
+     tri_contact_f1                               +0.592        +0.612         +0.55 [+0.30,+0.74] (n=98, 0.87)       -0.520
+     density_ratio                                +0.311        +0.320         +0.21 [-0.03,+0.53] (n=99, 0.71)       -0.367
+  -- CONFIND: structure vs sampled-map quality (Spearman rho) --
+     x                                         pooled TM  between-q TM     within-q TM median [IQR] (n, frac>0)  pooled RMSD
+     tri_contact_precision_at_L                   +0.590        +0.582         +0.45 [+0.09,+0.73] (n=98, 0.81)       -0.507
+     tri_contact_precision_at_L5                  +0.471        +0.512         +0.25 [-0.06,+0.54] (n=97, 0.71)       -0.417
+     tri_contact_long_range_precision_at_L5       +0.517        +0.531         +0.18 [-0.11,+0.55] (n=94, 0.65)       -0.456
+     tri_contact_precision                        +0.546        +0.535         +0.52 [+0.03,+0.74] (n=99, 0.79)       -0.466
+     tri_contact_recall                           +0.554        +0.538         +0.55 [+0.23,+0.79] (n=97, 0.91)       -0.489
+     tri_contact_f1                               +0.582        +0.566         +0.55 [+0.14,+0.77] (n=99, 0.87)       -0.511
+     density_ratio                                +0.177        +0.198         +0.11 [-0.13,+0.38] (n=99, 0.60)       -0.198
+
+==== primary 191 (max384 val, 1/cluster): 99 queries x 8 samples ====
+arm                     TM q25  median     q75   TM>=0.5 RMSDp med  mirror  query-mean TM med
+CB8 tri                  0.403   0.488   0.568   371/792      8.31   0.145              0.483
+CB8 native (ceiling)     0.892   0.934   0.956    95/99  
+CONFIND tri              0.508   0.594   0.665   602/792      6.51   0.066              0.598
+CONFIND native (ceiling)   0.860   0.912   0.935    95/99  
+  CB8 -> CONFIND (per-query mean TM): median d +0.092  ConFind better 93 / worse 6  Wilcoxon p=2.04e-16
+  -- CB8: structure vs sampled-map quality (Spearman rho) --
+     x                                         pooled TM  between-q TM     within-q TM median [IQR] (n, frac>0)  pooled RMSD
+     tri_contact_precision_at_L                   +0.615        +0.642         +0.42 [+0.05,+0.66] (n=99, 0.77)       -0.507
+     tri_contact_precision_at_L5                  +0.487        +0.534         +0.22 [-0.07,+0.49] (n=97, 0.72)       -0.381
+     tri_contact_long_range_precision_at_L5       +0.594        +0.656         +0.33 [-0.07,+0.56] (n=92, 0.73)       -0.409
+     tri_contact_precision                        +0.532        +0.569         +0.39 [+0.11,+0.61] (n=98, 0.86)       -0.432
+     tri_contact_recall                           +0.564        +0.568         +0.56 [+0.34,+0.79] (n=98, 0.91)       -0.520
+     tri_contact_f1                               +0.592        +0.612         +0.55 [+0.30,+0.74] (n=98, 0.87)       -0.520
+     density_ratio                                +0.311        +0.320         +0.21 [-0.03,+0.53] (n=99, 0.71)       -0.367
+  -- CONFIND: structure vs sampled-map quality (Spearman rho) --
+     x                                         pooled TM  between-q TM     within-q TM median [IQR] (n, frac>0)  pooled RMSD
+     tri_contact_precision_at_L                   +0.590        +0.582         +0.45 [+0.09,+0.73] (n=98, 0.81)       -0.507
+     tri_contact_precision_at_L5                  +0.471        +0.512         +0.25 [-0.06,+0.54] (n=97, 0.71)       -0.417
+     tri_contact_long_range_precision_at_L5       +0.517        +0.531         +0.18 [-0.11,+0.55] (n=94, 0.65)       -0.456
+     tri_contact_precision                        +0.546        +0.535         +0.52 [+0.03,+0.74] (n=99, 0.79)       -0.466
+     tri_contact_recall                           +0.554        +0.538         +0.55 [+0.23,+0.79] (n=97, 0.91)       -0.489
+     tri_contact_f1                               +0.582        +0.566         +0.55 [+0.14,+0.77] (n=99, 0.87)       -0.511
+     density_ratio                                +0.177        +0.198         +0.11 [-0.13,+0.38] (n=99, 0.60)       -0.198
+
+==== sequence-clean 144: 74 queries x 8 samples ====
+arm                     TM q25  median     q75   TM>=0.5 RMSDp med  mirror  query-mean TM med
+CB8 tri                  0.390   0.479   0.562   259/592      8.42   0.155              0.479
+CB8 native (ceiling)     0.886   0.924   0.951    70/74  
+CONFIND tri              0.485   0.581   0.658   428/592      6.71   0.076              0.578
+CONFIND native (ceiling)   0.857   0.903   0.931    70/74  
+  CB8 -> CONFIND (per-query mean TM): median d +0.091  ConFind better 68 / worse 6  Wilcoxon p=4.35e-12
+  -- CB8: structure vs sampled-map quality (Spearman rho) --
+     x                                         pooled TM  between-q TM     within-q TM median [IQR] (n, frac>0)  pooled RMSD
+     tri_contact_precision_at_L                   +0.600        +0.613         +0.40 [+0.05,+0.64] (n=74, 0.76)       -0.492
+     tri_contact_precision_at_L5                  +0.469        +0.496         +0.22 [-0.05,+0.40] (n=72, 0.72)       -0.351
+     tri_contact_long_range_precision_at_L5       +0.557        +0.596         +0.32 [+0.01,+0.56] (n=68, 0.75)       -0.360
+     tri_contact_precision                        +0.518        +0.537         +0.40 [+0.12,+0.60] (n=73, 0.84)       -0.414
+     tri_contact_recall                           +0.553        +0.543         +0.55 [+0.33,+0.79] (n=73, 0.92)       -0.516
+     tri_contact_f1                               +0.589        +0.600         +0.55 [+0.29,+0.74] (n=73, 0.86)       -0.517
+     density_ratio                                +0.343        +0.359         +0.21 [+0.00,+0.46] (n=74, 0.72)       -0.405
+  -- CONFIND: structure vs sampled-map quality (Spearman rho) --
+     x                                         pooled TM  between-q TM     within-q TM median [IQR] (n, frac>0)  pooled RMSD
+     tri_contact_precision_at_L                   +0.605        +0.604         +0.48 [+0.09,+0.75] (n=74, 0.81)       -0.467
+     tri_contact_precision_at_L5                  +0.473        +0.538         +0.25 [-0.05,+0.54] (n=73, 0.71)       -0.364
+     tri_contact_long_range_precision_at_L5       +0.530        +0.550         +0.26 [-0.05,+0.56] (n=70, 0.67)       -0.427
+     tri_contact_precision                        +0.535        +0.524         +0.52 [+0.06,+0.71] (n=74, 0.81)       -0.414
+     tri_contact_recall                           +0.539        +0.520         +0.56 [+0.29,+0.76] (n=73, 0.92)       -0.444
+     tri_contact_f1                               +0.573        +0.557         +0.56 [+0.17,+0.76] (n=74, 0.92)       -0.467
+     density_ratio                                +0.176        +0.191         +0.14 [-0.10,+0.45] (n=74, 0.65)       -0.222
+
+==== novel-fold: 0 queries x 8 samples ====
