@@ -361,7 +361,8 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         # timeout (seconds): if a DataLoader worker hangs (e.g. on a
         # corrupted file or NFS stall), raise instead of blocking forever.
         # 300 s is generous enough for even very slow I/O.
-        dl_timeout = 300 if self.num_workers > 0 else 0
+        # DATALOADER_TIMEOUT_S overrides it: both tris died together on a shared-storage stall (2026-10-02/04).
+        dl_timeout = int(os.environ.get("DATALOADER_TIMEOUT_S", "300")) if self.num_workers > 0 else 0
 
         # For DATA_LOADING_DEBUG: set rank and debug on dataset so workers log per rank/worker.
         # When running distributed, enable verbose logging by default so we can see which
