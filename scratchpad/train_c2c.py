@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from c2c_ckpt_callbacks import build_ckpt_callbacks  # scratchpad/, next to this file
 from proteinfoundation.nn.af3_diffusion import SIGMA_DATA
 from proteinfoundation.proteinflow.contact2coord_trainer import GRAD_CLIP, ContactToCoordTrainer
+from proteinfoundation.utils.atomic_checkpoint_io import SameDirAtomicCheckpointIO
 
 # AF3 widths and depth throughout (SI Alg. 23); user directive 2026-09-04 fixed depth at 24.
 MODEL_CFG = dict(
@@ -240,6 +241,7 @@ def main():
     print(f"[wandb] entity={WANDB_ENTITY} project=contact2coord name={args.name}", flush=True)
 
     trainer = L.Trainer(
+        plugins=[SameDirAtomicCheckpointIO()],  # atomic without $TMPDIR on scratch (see the module)
         accelerator="gpu", devices=args.devices, num_nodes=1,
         strategy="ddp" if args.devices > 1 else "auto",
         use_distributed_sampler=False,   # ClusterSampler shards across ranks itself (as train.py:862)

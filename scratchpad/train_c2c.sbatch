@@ -33,9 +33,11 @@ source "$ENV_DIR/.venv/bin/activate"
 source "$ENV_DIR/activate.sh"
 export DATA_PATH=/orcd/pool/006/chenxiou/proteina/data
 export SKIP_CONFIND_PRECOMPUTE=1 PYTHONPATH=$REPO${PYTHONPATH:+:$PYTHONPATH}
-# ⛔ Short TMPDIR on the checkpoints' own device: 82 chars once cost this project a whole training
-# chain via the 108-byte AF_UNIX sun_path limit, and it HANGS rather than crashing.
-export TMPDIR=/orcd/scratch/orcd/011/chenxiou/.tmp
+# ⛔ TMPDIR is NODE-LOCAL (tmpfs): DataLoader workers hand every batch over through AF_UNIX sockets under it, and on
+# scratch each fstor018 NFS stall froze all handoffs until the 300 s loader timeout killed the run (09-28, 10-02, 10-04).
+# Checkpoint atomicity no longer needs it on scratch: SameDirAtomicCheckpointIO renames within the ckpt dir.
+# Keep it short: the 108-byte AF_UNIX sun_path limit HANGS rather than crashes.
+export TMPDIR=/tmp/chenxiou_${SLURM_JOB_ID:-nojob}
 mkdir -p "$TMPDIR" /orcd/scratch/orcd/011/chenxiou/c2c_store/logs
 [ ${#TMPDIR} -le 70 ] || { echo "FATAL: TMPDIR ${#TMPDIR} chars > 70: $TMPDIR"; exit 78; }
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True

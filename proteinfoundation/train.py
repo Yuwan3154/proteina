@@ -40,6 +40,7 @@ from omegaconf import OmegaConf
 from einops._torch_specific import allow_ops_in_compiled_graph
 allow_ops_in_compiled_graph()
 
+from proteinfoundation.utils.atomic_checkpoint_io import SameDirAtomicCheckpointIO
 from proteinfoundation.utils.precompute_confind_maps import run_precompute
 from proteinfoundation.utils.ema_utils.ema_callback import (
     EMA,
@@ -818,7 +819,7 @@ if __name__ == "__main__":
             log_info(f"Froze {n_frozen:,} pretrained IPA structure module parameters")
 
     # Train
-    plugins = []
+    plugins = [SameDirAtomicCheckpointIO()]  # atomic without $TMPDIR on scratch (see the module)
     show_prog_bar = args.show_prog_bar
     # Resolve val cadence: prefer the gradient-step-based knob (val_check_interval_optim_steps);
     # convert to Lightning's minibatch counter by multiplying by accumulate_grad_batches.

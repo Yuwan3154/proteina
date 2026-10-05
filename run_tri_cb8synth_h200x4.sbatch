@@ -66,7 +66,11 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_TH
 export TORCHINDUCTOR_CACHE_DIR=/orcd/scratch/orcd/011/chenxiou/torchinductor_cache_sm${CC/./}
 export TRITON_CACHE_DIR=/orcd/scratch/orcd/011/chenxiou/triton_cache_sm${CC/./}
 mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$REPO/logs"
-export TMPDIR=/orcd/scratch/orcd/011/chenxiou/.tmp
+# ⛔ TMPDIR is NODE-LOCAL (tmpfs): DataLoader workers hand every batch over through AF_UNIX sockets under it, and on
+# scratch each fstor018 NFS stall froze all handoffs until the 300 s loader timeout killed the run (09-28, 10-02, 10-04).
+# Checkpoint atomicity no longer needs it on scratch: SameDirAtomicCheckpointIO renames within the ckpt dir.
+# Keep it short: the 108-byte AF_UNIX sun_path limit HANGS rather than crashes.
+export TMPDIR=/tmp/chenxiou_${SLURM_JOB_ID:-nojob}
 mkdir -p "$TMPDIR"
 [ ${#TMPDIR} -le 70 ] || { echo "FATAL: TMPDIR ${#TMPDIR} chars > 70: $TMPDIR"; exit 78; }
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
