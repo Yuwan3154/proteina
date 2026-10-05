@@ -59,6 +59,8 @@ source "$ENV_DIR/.venv/bin/activate"
 source "$ENV_DIR/activate.sh"
 
 export SKIP_CONFIND_PRECOMPUTE=1
+# Ride through shared-storage stalls longer than the old 300 s (user 2026-10-05); stays below the 3600 s NCCL timeout.
+export DATALOADER_TIMEOUT_S=1800
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 # compiled kernels are arch-specific, so each arch gets its own cache
 export TORCHINDUCTOR_CACHE_DIR=/orcd/scratch/orcd/011/chenxiou/torchinductor_cache_sm${CC/./}
