@@ -17,8 +17,8 @@ import math
 import re
 
 PAGE = "/Users/Chenxi/SOLab/proteina/.claude/worktrees/distogram-head/figures/training_status_report.html"
-DATA = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report/r20261002"
-SNAPSHOT = "2 Oct 2026"  # date of the JSON snapshots in DATA; update after a re-fetch
+DATA = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report/r20261005"
+SNAPSHOT = "5 Oct 2026"  # date of the JSON snapshots in DATA; update after a re-fetch
 
 TRI = json.load(open(f"{DATA}/tri_epochs.json"))
 C2C = json.load(open(f"{DATA}/c2c_steps.json"))
@@ -27,7 +27,7 @@ C2C_CF = json.load(open(f"{DATA}/c2c_steps_confind.json"))          # ConFind c2
 TRI_FT = json.load(open(f"{DATA}/tri_epochs_tri_confindsynth_ft.json"))  # ConFind tri fine-tune (launched 25 Sep)
 PAL_FT = json.load(open(f"{DATA}/tri_val_pal_tri_confindsynth_ft.json"))
 BENCH = json.load(open(f"{DATA}/bench_c2c.json"))  # scratchpad/bench_summary.py over the 195-chain native benchmark arms
-C2C_SEGMENTS, C2C_CF_SEGMENTS = 18, 23   # wandb segments per run, from the fetch_report_data.py log of 2 Oct
+C2C_SEGMENTS, C2C_CF_SEGMENTS = 18, 33   # wandb segments per run, from the fetch_report_data.py log of 5 Oct
 
 SEC_OPEN = '<section class="sec" id="convergence-2026-09-21">'
 CAV_OPEN = '<section class="sec" id="archive-caveat-2026-09-22">'
@@ -521,8 +521,9 @@ CF_CARDS = f"""
       <h3 style="margin-top:0">c2c_confind_tbeta (ConFind twin) &mdash; step {cf_max:,}</h3>
       <p class="note">Step {cf_max:,} across {C2C_CF_SEGMENTS} chained segments, {len(cf_val_steps)} validation rounds.
       On 2 GPUs since ~step 5,400 (27 Sep 04:50): 1 per GPU &times; accumulation 4 &times; 2 = effective batch 8,
-      unchanged, and validation unsplit so it scores the same chains a 1-GPU run would. Trains to step 29,620 (tbeta&rsquo;s
-      final step) for a matched comparison; a 195-chain native-map benchmark runs every 1,000 steps on SuperCloud (first
+      unchanged, and validation unsplit so it scores the same chains a 1-GPU run would. Target was step 29,620 (tbeta&rsquo;s
+      final step) for a matched comparison; it overran to ~32,000 (the watcher stopped at 29,630 but the job chain did not)
+      and was stopped on 5 Oct 00:38; a 195-chain native-map benchmark runs every 1,000 steps on SuperCloud (first
       at step 11,190) and may show a plateau earlier.</p>
     </div>
     <div class="card tri">
