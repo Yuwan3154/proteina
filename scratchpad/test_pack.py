@@ -2,6 +2,7 @@
 Usage: python scratchpad/test_pack.py WORKDIR"""
 
 import os
+import subprocess
 import sys
 
 import torch
@@ -22,11 +23,9 @@ for i in range(len(stems)):
     a, b = disk[i], packed[i]
     assert a.id == b.id and torch.equal(a.coords, b.coords) and torch.equal(a.coord_mask, b.coord_mask), stems[i]
 print(f"[1] PASS {len(stems)} packed graphs identical to disk (id, coords, coord_mask)")
-raised = False
-try:
-    PDBDataset(pdb_codes=codes + ["9zzz"], chains=chains + ["A"], data_dir=D, file_names=stems + ["9zzz_A"],
-               num_workers=0, pack_path=pack)
-except ValueError as e:
-    raised = "lacks 1 of 6 stems" in str(e)
-assert raised, "missing stem did not raise"
+code = ("from proteinfoundation.datasets.pdb_data import PDBDataset; "
+        f"PDBDataset(pdb_codes={codes + ['9zzz']!r}, chains={chains + ['A']!r}, data_dir={D!r}, "
+        f"file_names={stems + ['9zzz_A']!r}, num_workers=0, pack_path={pack!r})")
+r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+assert r.returncode != 0 and "ValueError" in r.stderr and "lacks 1 of 6 stems" in r.stderr, r.stderr[-500:]
 print("[2] PASS a stem absent from the pack raises at init")
