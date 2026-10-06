@@ -8,6 +8,8 @@ datamodule:
   _target_: "proteinfoundation.datasets.pdb_data.PDBLightningDataModule"
   data_dir: ${oc.env:DATA_PATH}/pdb_train/ # Directory where the dataset is stored
   in_memory: False
+  # Packed-mmap mode (2026-10-06): env-gated, null when PACK_PATH is unset (per-file disk reads as before).
+  pack_path: ${oc.env:PACK_PATH,null}
   format: "cif" # format for file download
   overwrite: False # Whether to overwrite existing dataset files and reprocess the raw data
   regenerate_missing: True # When True, regenerate only missing .pt files (e.g. after purge_invalid_pt_files)

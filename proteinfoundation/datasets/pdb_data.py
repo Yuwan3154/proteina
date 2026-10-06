@@ -777,6 +777,11 @@ class PDBDataset(Dataset):
             rank_zero_info(
                 f"Packed-mmap index: {len(self._pack_index)} entries; pack={pack_path}"
             )
+            # A stem absent from the pack would be skipped silently in __getitem__ and change the data: fail here.
+            if file_names is not None:
+                missing = [f for f in file_names if f not in self._pack_index]
+                if missing:
+                    raise ValueError(f"pack {pack_path} lacks {len(missing)} of {len(file_names)} stems, e.g. {missing[:10]}")
 
         if self.in_memory and not self.packed:
             rank_zero_info("Reading data into memory")
