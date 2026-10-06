@@ -61,6 +61,10 @@ source "$ENV_DIR/activate.sh"
 export SKIP_CONFIND_PRECOMPUTE=1
 # Ride through shared-storage stalls longer than the old 300 s (user 2026-10-05); stays below the 3600 s NCCL timeout.
 export DATALOADER_TIMEOUT_S=1800
+# Training samples from ONE packed blob on so3/002 SSD (user 2026-10-06), not the HDD store (hstor012 stalled 44 min on
+# 10-06 and killed both tris). PDBDataset fails at startup if any train/val stem is missing from the pack.
+export PACK_PATH="${PACK_PATH:-/orcd/compute/so3/002/chenxi/proteina_pack/tri_v1.pack}"
+[ -f "$PACK_PATH" ] && [ -f "$PACK_PATH.idx.npz" ] || { echo "FATAL: no pack at $PACK_PATH"; exit 77; }
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 # compiled kernels are arch-specific, so each arch gets its own cache
 export TORCHINDUCTOR_CACHE_DIR=/orcd/scratch/orcd/011/chenxiou/torchinductor_cache_sm${CC/./}
