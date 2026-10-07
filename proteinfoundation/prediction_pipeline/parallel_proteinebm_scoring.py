@@ -66,7 +66,7 @@ signal.signal(signal.SIGTERM, signal_handler)
 def get_proteina_base_dir():
     """Auto-detect proteina base directory."""
     possible_dirs = [
-        os.path.expanduser("~/proteina"),
+        os.environ.get('PROTEINA_BASE_DIR') or os.path.expanduser("~/proteina"),  # D36aq C8: worktree isolation
         os.path.join(os.getcwd(), ".."),  # Assume we're in prediction_pipeline
     ]
     for dir_path in possible_dirs:
