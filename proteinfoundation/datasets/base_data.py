@@ -21,6 +21,7 @@ from torch_geometric import transforms as T
 from torch_geometric.data import Dataset
 from torch_geometric.loader import DataLoader
 
+from proteinfoundation.utils import io_audit
 from proteinfoundation.utils.cluster_utils import ClusterSampler, CATBalancedSampler
 from proteinfoundation.utils.dense_padding_data_loader import DensePaddingDataLoader
 
@@ -32,6 +33,7 @@ def _gc_freeze_worker_init(worker_id: int) -> None:
     # dicts (TEDLabel 656k, DomainCrop spans, file_names, sampler state) into each worker
     # and grow host RAM unboundedly across iterations.
     gc.freeze()
+    io_audit.install(f"dlworker{worker_id}")
 
 
 class BaseLightningDataModule(L.LightningDataModule, ABC):

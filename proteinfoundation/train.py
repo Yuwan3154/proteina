@@ -41,6 +41,7 @@ from einops._torch_specific import allow_ops_in_compiled_graph
 allow_ops_in_compiled_graph()
 
 from proteinfoundation.utils.atomic_checkpoint_io import SameDirAtomicCheckpointIO
+from proteinfoundation.utils import io_audit
 from proteinfoundation.utils.precompute_confind_maps import run_precompute
 from proteinfoundation.utils.ema_utils.ema_callback import (
     EMA,
@@ -222,6 +223,7 @@ if __name__ == "__main__":
         format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {file}:{line} | {message}",
     )  # Send to stdout
     log_info(f"Avoid wandb and checkpointing: {args.nolog}")
+    io_audit.install(f"main_rank{os.environ.get('LOCAL_RANK', '0')}")  # no-op unless IO_AUDIT_DIR is set
     callbacks = [SeedCallback()]  # Different devices will be assigend different seeds
 
     # Load experiment config
