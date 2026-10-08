@@ -8,8 +8,9 @@ datamodule:
   _target_: "proteinfoundation.datasets.pdb_data.PDBLightningDataModule"
   data_dir: ${oc.env:DATA_PATH}/pdb_train/ # Directory where the dataset is stored
   in_memory: False
-  # Packed-mmap mode (2026-10-06): env-gated, null when PACK_PATH is unset (per-file disk reads as before).
-  pack_path: ${oc.env:PACK_PATH,null}
+  # Packed-mmap mode: training samples from ONE blob on so3/002 SSD (user 2026-10-06/07), not the HDD store that stalled
+  # 44 min on 10-06. PACK_PATH overrides; PDBDataset fails at startup if any declared stem is missing from the pack.
+  pack_path: ${oc.env:PACK_PATH,/orcd/compute/so3/002/chenxi/proteina_pack/tri_v2.pack}
   format: "cif" # format for file download
   overwrite: False # Whether to overwrite existing dataset files and reprocess the raw data
   regenerate_missing: True # When True, regenerate only missing .pt files (e.g. after purge_invalid_pt_files)
