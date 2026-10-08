@@ -88,6 +88,55 @@ def _segments_by_protein(csv_file, csv_col, segments_col, min_len):
     return out
 
 
+_STANDARD_AA = set("ACDEFGHIKLMNPQRSTVWY")
+
+
+def _query_from_dataset_enabled() -> bool:
+    """PROTEINA_AF2RANK_QUERY_FROM_DATASET: unset = off (default); exactly "1" = on; anything else raises."""
+    v = os.environ.get("PROTEINA_AF2RANK_QUERY_FROM_DATASET")
+    if v is not None and v != "1":
+        raise ValueError(f"PROTEINA_AF2RANK_QUERY_FROM_DATASET must be unset or exactly '1', got {v!r}")
+    return v == "1"
+
+
+def _query_sequence_by_protein(csv_file, csv_col, sequence_col="sequence"):
+    """protein -> the sequence proteina sampled (dataset CSV), for PROTEINA_AF2RANK_QUERY_FROM_DATASET=1."""
+    df = pd.read_csv(csv_file, keep_default_na=False)
+    df.columns = df.columns.str.strip()
+    out = {}
+    for _, r in df.iterrows():
+        pid, seq = str(r[csv_col]).strip(), r[sequence_col]
+        if not isinstance(seq, str) or not seq.strip() or not set(seq.strip()) <= _STANDARD_AA:
+            raise ValueError(f"{pid}: dataset sequence must be a non-empty string of the 20 standard amino acids, got {seq!r}")
+        if pid in out:
+            raise ValueError(f"duplicate protein id {pid!r} in {csv_file}")
+        out[pid] = seq.strip()
+    return out
+
+
+def _n_ca(pdb_path: str) -> int:
+    with open(pdb_path) as f:
+        return sum(1 for line in f if line.startswith("ATOM") and line[12:16].strip() == "CA")
+
+
+def _validate_query(protein_id, query, native_sequence, segments, template_paths) -> None:
+    """Fail loudly if the dataset query cannot stand in for the native's resolved sequence."""
+    j = 0
+    for aa in query:
+        if j < len(native_sequence) and aa == native_sequence[j]:
+            j += 1
+    if j != len(native_sequence):
+        raise ValueError(f"{protein_id}: native resolved sequence ({len(native_sequence)}) is not an in-order "
+                         f"subsequence of the dataset query ({len(query)}); matched {j}")
+    if segments:
+        if max(e for _, e in segments) > len(query):
+            raise ValueError(f"{protein_id}: segment end {max(e for _, e in segments)} > query length {len(query)}")
+    else:
+        for p in template_paths:
+            if _n_ca(p) != len(query):
+                raise ValueError(f"{protein_id}: decoy {p} has {_n_ca(p)} residues != query length {len(query)}")
+
+
 def _load_protein_ids(csv_file: str, id_col: str) -> List[str]:
     df = pd.read_csv(csv_file)
     if id_col not in df.columns:
@@ -465,6 +514,11 @@ def main() -> None:
     if args.segment_mode == 'joint':
         seg_by_protein = _segments_by_protein(args.csv_file, args.csv_col, args.segments_col, args.segment_min_len)
         logger.info(f"segment_mode=joint: {len(seg_by_protein)} proteins with >=1 segment >={args.segment_min_len}; mask_inter_segment={args.mask_inter_segment}")
+    # OFF by default (D36aq C8): AF2 query = the dataset sequence instead of the native's resolved residues.
+    query_by_protein = {}
+    if _query_from_dataset_enabled():
+        query_by_protein = _query_sequence_by_protein(args.csv_file, args.csv_col)
+        logger.info(f"PROTEINA_AF2RANK_QUERY_FROM_DATASET=1: AF2 query from {args.csv_file} for {len(query_by_protein)} proteins")
 
     shard_index, num_shards = resolve_shard_args(args.shard_index, args.num_shards)
     lengths = lengths_from_csv(args.csv_file, args.csv_col, args.len_col)
@@ -618,6 +672,7 @@ def main() -> None:
             model_name="model_1_ptm",
             out_dir_key="out_dir_m1",
             seg_by_protein=seg_by_protein,
+            query_by_protein=query_by_protein,
             mask_inter_segment=args.mask_inter_segment,
             mask_sidechains=args.mask_sidechains,
             recycles=args.recycles,
@@ -640,6 +695,7 @@ def main() -> None:
             model_name="model_2_ptm",
             out_dir_key="out_dir_m2",
             seg_by_protein=seg_by_protein,
+            query_by_protein=query_by_protein,
             mask_inter_segment=args.mask_inter_segment,
             mask_sidechains=args.mask_sidechains,
             recycles=args.recycles,
@@ -794,6 +850,7 @@ def _run_model_pass(
     compile_strategy: str = "per_block",
     use_cueq_triangle_mul: bool = False,
     seg_by_protein: Dict = None,
+    query_by_protein: Dict = None,
     mask_inter_segment: bool = True,
     mask_sidechains: bool = True,
 ) -> None:
@@ -845,6 +902,12 @@ def _run_model_pass(
                 logger.error(f"  {protein_id}: reset_reference failed: {e}; skipping")
                 continue
 
+        if query_by_protein:
+            # outside the scoring try/except on purpose: an invalid query must fail the job, not skip a protein
+            _validate_query(protein_id, query_by_protein[protein_id], scorer._native_sequence,
+                            seg_by_protein.get(protein_id) if seg_by_protein else None,
+                            [str(p) for p in topk_df["structure_path"]])
+            scorer.set_query_sequence(query_by_protein[protein_id])
         scorer.set_segments(seg_by_protein.get(protein_id) if seg_by_protein else None)
         scorer._mask_inter_segment = mask_inter_segment
         try:

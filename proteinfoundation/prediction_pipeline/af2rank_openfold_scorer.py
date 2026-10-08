@@ -60,8 +60,12 @@ USALIGN_TIMEOUT_S = 120
 # Utility functions (self-contained, no ColabDesign/JAX dependency)
 # ---------------------------------------------------------------------------
 
-def tmscore(x, y, tmscore_exe=None, env=None):
+def tmscore(x, y, tmscore_exe=None, env=None, x_seq=None, y_seq=None):
     """Calculate TMscore between two coordinate arrays (CA atoms).
+
+    x_seq / y_seq: optional one-letter sequences written as the residue names (default None = all
+    ALA, unchanged). With USalign -TMscore 5 the residues are then paired by SEQUENCE alignment,
+    which is required when the two arrays have different lengths.
 
     tmscore_exe: explicit USalign/TMscore path. When None it is resolved from
     $USALIGN_PATH / PATH via resolve_usalign_exe (fails loudly if unresolvable).
@@ -71,11 +75,14 @@ def tmscore(x, y, tmscore_exe=None, env=None):
 
     with tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False) as f1, \
          tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False) as f2:
-        for f, z in zip([f1, f2], [x, y]):
+        for f, z, zs in zip([f1, f2], [x, y], [x_seq, y_seq]):
             coords = z if isinstance(z, np.ndarray) else z.detach().cpu().numpy()
+            if zs is not None:
+                assert len(zs) == len(coords), f"sequence length {len(zs)} != {len(coords)} CA coords"
             for k, c in enumerate(coords):
+                resn = "ALA" if zs is None else rc.restype_1to3.get(zs[k], "UNK")
                 f.write("ATOM  %5d  %-2s  %3s %s%4d    %8.3f%8.3f%8.3f  %4.2f  %4.2f\n"
-                        % (k + 1, "CA", "ALA", "A", k + 1, c[0], c[1], c[2], 1, 0))
+                        % (k + 1, "CA", resn, "A", k + 1, c[0], c[1], c[2], 1, 0))
             f.flush()
 
     cmd = [used_exe, f1.name, f2.name]
@@ -865,6 +872,8 @@ class OpenFoldAF2Rank:
         self.reference_sequence = get_sequence_from_structure(reference_pdb, detected_chain)
         self.reference_coords = get_ca_coords_from_structure(reference_pdb, detected_chain)
         self.reference_pdb = reference_pdb  # file path, for all-atom USalign ref-vs-template
+        self._native_sequence = self.reference_sequence
+        self._query_from_dataset = False
 
         logger.info(f"Reference sequence length: {len(self.reference_sequence)}")
         logger.info(f"Reference coords shape: {self.reference_coords.shape}")
@@ -943,6 +952,8 @@ class OpenFoldAF2Rank:
         self.reference_sequence = get_sequence_from_structure(reference_pdb, detected_chain)
         self.reference_coords = get_ca_coords_from_structure(reference_pdb, detected_chain)
         self.reference_pdb = reference_pdb
+        self._native_sequence = self.reference_sequence
+        self._query_from_dataset = False
         self._residue_type = torch.tensor(
             [[rc.restype_order.get(aa, rc.restype_num) for aa in self.reference_sequence]],
             dtype=torch.long,
@@ -951,6 +962,25 @@ class OpenFoldAF2Rank:
         self._compile_pad_length = _round_up_to_multiple(len(self.reference_sequence), 32)
         logger.info(f"reset_reference: new sequence length {len(self.reference_sequence)}")
         self._segments = None
+
+    def set_query_sequence(self, query_sequence: str) -> None:
+        """OFF by default (D36aq C8). Make the AF2 query the sequence proteina SAMPLED (the dataset
+        CSV `sequence`) instead of the native's resolved residues. The native stays the reference:
+        tm_ref_pred is then computed with residue names, so USalign -TMscore 5 pairs by sequence even
+        though the query (full SEQRES span) is longer than the native's resolved chain. Call after
+        reset_reference (which turns this off again) and before set_segments-based scoring;
+        segments are 0-based over THIS query."""
+        assert len(self._native_sequence) == len(self.reference_coords), "native sequence/CA length mismatch"
+        self.reference_sequence = query_sequence
+        self._residue_type = torch.tensor(
+            [[rc.restype_order.get(aa, rc.restype_num) for aa in self.reference_sequence]],
+            dtype=torch.long,
+        )
+        self._mask = torch.ones((1, len(self.reference_sequence)), dtype=torch.float32)
+        self._compile_pad_length = _round_up_to_multiple(len(self.reference_sequence), 32)
+        self._query_from_dataset = True
+        logger.info(f"set_query_sequence: query length {len(query_sequence)} "
+                    f"(native resolved length {len(self._native_sequence)})")
 
     def set_segments(self, segments) -> None:
         """Enable joint-discontinuous composite-template scoring for the current
@@ -1110,7 +1140,11 @@ class OpenFoldAF2Rank:
         if "final_atom_positions" in out:
             pred_ca = out["final_atom_positions"][:, 1, :].detach().cpu().numpy()
             if not self.skip_ref_metrics:
-                _rp = tmscore(self.reference_coords, pred_ca, tmscore_exe=self.usalign_exe, env=_USALIGN_PARALLEL_ENV)
+                if self._query_from_dataset:
+                    _rp = tmscore(self.reference_coords, pred_ca, tmscore_exe=self.usalign_exe, env=_USALIGN_PARALLEL_ENV,
+                                  x_seq=self._native_sequence, y_seq=self.reference_sequence)
+                else:
+                    _rp = tmscore(self.reference_coords, pred_ca, tmscore_exe=self.usalign_exe, env=_USALIGN_PARALLEL_ENV)
                 scores["tm_ref_pred"] = _rp.get("tms", 0.0)
                 scores["rmsd_ref_pred"] = _rp.get("rms", float("nan"))
             _tp = tmscore(template_coords, pred_ca, tmscore_exe=self.usalign_exe, env=_USALIGN_PARALLEL_ENV)
