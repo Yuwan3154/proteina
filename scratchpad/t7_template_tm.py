@@ -5,7 +5,8 @@ does: label stem -> auth id via the alias -> <pool>/shard{crc32(auth)%1000}/<aut
 PDB; the native from its processed .pt (PDB atom order -> atom37) as a PDB; the residue sequences must match (the
 template is a partial-diffusion variant of the native); TM = USalign -TMscore 5 normalised by the native, the same
 call that scored the c2c outputs. Writes OUT.tsv (stem, ref_id, L, tm_template) and the PDBs under PDB_DIR.
-Usage: python t7_template_tm.py ROWS.jsonl OUT.tsv PDB_DIR
+Usage: [TEMPLATE_ROOT=...] python t7_template_tm.py ROWS.jsonl OUT.tsv PDB_DIR
+Every template's rewind_steps[slot] must equal the ref_id's rw (same template version the index was built from).
 """
 
 import json
@@ -24,7 +25,7 @@ from proteinfoundation.openfold_stub.np.residue_constants import atom_types, res
 from proteinfoundation.utils.constants import PDB_TO_OPENFOLD_INDEX_TENSOR
 
 S = "/orcd/scratch/orcd/011/chenxiou"
-POOL = f"{S}/t2_pool_auth"
+POOL = os.environ.get("TEMPLATE_ROOT", f"{S}/t2_pool_auth")  # shard{crc32}/<auth>.npz; T2 band tree copy (SuperCloud ~/pp1c_work/templates_band)
 ALIAS = f"{S}/synth_alias/auth_key.tsv"
 DATA = "/orcd/pool/006/chenxiou/proteina/data/pdb_train"
 USALIGN = "/home/chenxiou/.local/bin/USalign"
@@ -67,7 +68,11 @@ for stem, ref in sorted(refs.items()):
     slot = int(ref.split("#")[1])
     auth = alias[stem]
     npz = np.load(f"{POOL}/shard{zlib.crc32(auth.encode()) % 1000:04d}/{auth}.npz")
-    t_xyz, t_mask, t_aa = npz["coords"][slot], npz["atom_mask"].astype(float), npz["aatype"]
+    rw = int(ref.split("@rw")[1].split("#")[0])
+    assert int(npz["rewind_steps"][slot]) == rw, f"{stem}: slot {slot} rewind {int(npz['rewind_steps'][slot])} != ref_id rw{rw} (wrong template version)"
+    t_mask, t_aa = npz["atom_mask"].astype(float), npz["aatype"]
+    t_xyz = np.zeros(t_mask.shape + (3,), np.float32)
+    t_xyz[t_mask.astype(bool)] = npz["coords"][slot]  # coords hold the PRESENT atoms only, as the index builder scatters them
     g = torch.load(_processed_path_sharded(__import__("pathlib").Path(f"{DATA}/processed"), stem, man), weights_only=False)
     n_xyz = g.coords[:, PDB_TO_OPENFOLD_INDEX_TENSOR, :].numpy()
     n_mask = g.coord_mask[:, PDB_TO_OPENFOLD_INDEX_TENSOR].numpy().astype(float)
