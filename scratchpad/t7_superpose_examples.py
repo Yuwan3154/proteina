@@ -58,7 +58,9 @@ for cat, ents in P.items():
             # the shared frame (exported native) must be the SAME residues, in order, as the run's own native
             ca = lambda f: np.array([[float(l[30:38]), float(l[38:46]), float(l[46:54])] for l in open(f) if l.startswith("ATOM") and l[12:16].strip() == "CA"])
             a1, a2 = ca(nat), ca(os.path.join(os.path.dirname(g), f"{st}_native.pdb"))
-            assert a1.shape == a2.shape and np.abs(a1 - a2).max() < 1e-2, f"{st}: exported native differs from the run's native {a1.shape} vs {a2.shape}"
+            # stageB writes its native after the data pipeline centres it, so compare frame-free: CA-CA distance matrices
+            dm = lambda x: np.linalg.norm(x[:, None] - x[None], axis=-1)
+            assert a1.shape == a2.shape and np.abs(dm(a1) - dm(a2)).max() < 1e-2, f"{st}: exported native differs from the run's native {a1.shape} vs {a2.shape}"
             superpose(g, nat, os.path.join(out, f"{st}_{d}_sup.pdb"))
             print(f"{cat} {st} {d} sample {e[d]['sample_index']}: recorded TM {e[d]['tm']:.3f} regenerated {tm_regen:.3f} {'OK' if ok else 'MISMATCH'}")
 print("[done]", out)
