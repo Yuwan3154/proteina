@@ -10,6 +10,7 @@
 
 """CATH code string-to-index conversion utilities for data pipeline."""
 
+import functools
 import os
 from typing import Dict, List, Literal, Optional, Tuple
 
@@ -18,6 +19,9 @@ import torch
 from proteinfoundation.utils.ff_utils.pdb_utils import extract_cath_code_by_level
 
 
+# Cached per process: the batch collate called this every batch, re-reading the file from NFS in every DataLoader
+# worker (657 opens in a 40-step shakedown, 2026-10-07). Callers only read the returned dicts.
+@functools.lru_cache(maxsize=None)
 def load_cath_mapping(cath_code_dir: str) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, int], int, int, int]:
     """Load CATH label mapping and return class mappings and num_classes.
 
