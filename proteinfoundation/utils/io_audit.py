@@ -1,14 +1,14 @@
 """Env-gated record of every file a process opens (user 2026-10-07: prove nothing per-step still reads NFS).
 
-With IO_AUDIT_DIR set, install() adds a sys audit hook that appends each distinct (event, path) to
-IO_AUDIT_DIR/<tag>_<pid>.tsv with seconds since install. Off (a no-op) when the variable is unset.
+With IO_AUDIT_DIR set, install() adds a sys audit hook that appends EVERY open/listdir/scandir/mmap/glob (event, path)
+to IO_AUDIT_DIR/<tag>_<pid>.tsv with seconds since install, so repeated per-step reads are countable. A /dev/null open
+right after install is the positive control: an empty file then means a dead hook, never "nothing was read".
+Off (a no-op) when the variable is unset.
 """
 
 import os
 import sys
 import time
-
-_seen = set()
 
 
 def install(tag):
@@ -26,9 +26,7 @@ def install(tag):
                 return
             p = os.fspath(p) if not isinstance(p, (str, bytes)) else p
             p = p.decode(errors="replace") if isinstance(p, bytes) else p
-            key = (event, p)
-            if key not in _seen:
-                _seen.add(key)
-                fh.write(f"{time.time() - t0:.1f}\t{event}\t{p}\n")
+            fh.write(f"{time.time() - t0:.1f}\t{event}\t{p}\n")
 
     sys.addaudithook(hook)
+    open(os.devnull).close()  # positive control: must appear as the first row of every audited process
