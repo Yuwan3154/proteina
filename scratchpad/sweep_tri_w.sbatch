@@ -21,7 +21,7 @@ set -uo pipefail
 REPO=/orcd/scratch/orcd/011/chenxiou/proteina_tri
 ENV_DIR=/home/chenxiou/cue-openfold-env-sm120
 export DATA_PATH=/orcd/pool/006/chenxiou/proteina/data
-export SYNTH_INDEX_DIR="${SYNTH_INDEX_DIR:-/orcd/scratch/orcd/011/chenxiou/synth_index}"
+export SYNTH_INDEX_DIR="${SYNTH_INDEX_DIR:-/orcd/scratch/orcd/011/chenxiou/synth_index_v4}"
 export ALIGN_W="${ALIGN_W:?}" MLM_W="${MLM_W:?}"
 ARM="${ARM:?ARM names the run (tri_cb8sw_<ARM>)}"
 MAX_STEPS="${MAX_STEPS:?}"
