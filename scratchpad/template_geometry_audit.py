@@ -80,7 +80,8 @@ def cmd_refs(a):
     eligible = set(l.strip() for l in open(a.eligible) if l.strip())
     train = set(l.strip() for l in open(a.train_ids) if l.strip())
     alias = read_alias(a.alias)
-    band = np.load(a.band, allow_pickle=True)
+    _b = np.load(a.band, allow_pickle=True)
+    band = {k: _b[k] for k in _b.files}  # materialise once: an NpzFile re-reads + decompresses an array on EVERY access
     brow = {str(c): i for i, c in enumerate(band["chains"])}
     lo, hi = np.float32(a.tm_lo), np.float32(a.tm_hi)  # the transform compares float32(row_tm) with float32 bounds
     rows, n_empty = [], 0
@@ -137,7 +138,8 @@ def cmd_refs(a):
     srcs = []
     for spec in a.band_sources.split(","):
         pre, bf = spec.split("=")
-        z = np.load(bf, allow_pickle=True)
+        _z = np.load(bf, allow_pickle=True)
+        z = {k: _z[k] for k in _z.files}
         rowof = {str(c): i for i, c in enumerate(z["chains"])}
         uniq = defaultdict(list)
         for c, v in zip(z["chains"], z["tm"]):
@@ -223,7 +225,8 @@ def accept(path, n_aa, slots, rewinds):
 
 def cmd_audit(a):
     z = np.load(a.native, allow_pickle=True)
-    nat = {str(s): (int(z["offsets"][i]), int(z["offsets"][i + 1])) for i, s in enumerate(z["stems"])}
+    offs = z["offsets"]
+    nat = {str(s): (int(offs[i]), int(offs[i + 1])) for i, s in enumerate(z["stems"])}
     present_all, cont_all, aa_all = z["present"], z["cont"], z["aatype"]
     orig, new = a.map.split("=") if a.map else ("", "")
     by_auth = defaultdict(list)
@@ -252,6 +255,7 @@ def cmd_audit(a):
                     n[status] += 1
                 continue
             amask = npz["atom_mask"].astype(bool)
+            coords = npz["coords"]  # read once per file, not once per ref
             ncont, npres = cont_all[o0:o1 - 1], present_all[o0:o1]
             n_native_break = int((npres[1:] & npres[:-1] & ~ncont).sum())
             dup_same = ""
@@ -268,7 +272,7 @@ def cmd_audit(a):
                 dup_same = "absent" if None in same else str(all(same))
             for r in refs:
                 full = np.zeros(amask.shape + (3,), np.float32)
-                full[amask] = npz["coords"][int(r["slot"])]  # coords hold the PRESENT atoms only (builder scatter)
+                full[amask] = coords[int(r["slot"])]  # coords hold the PRESENT atoms only (builder scatter)
                 d, both = steps(full[:, CA], amask[:, CA])
                 ds = d[both & ncont]
                 st = lambda f: f"{f(ds):.3f}" if len(ds) else "nan"
