@@ -37,7 +37,8 @@ def main():
     with hydra.initialize("../configs/experiment_config", version_base=hydra.__version__):
         base = hydra.compose(config_name="training_ca_template_compress_v1",
                              overrides=TEST_SIZES + ["model.nn.decompress=basis_pool", "model.nn.true_seg_until_step=1"])
-        cfg_data = hydra.compose(config_name=base["dataset"])
+    with hydra.initialize(f"../configs/datasets_config/{base['dataset_config_subdir']}", version_base=hydra.__version__):
+        cfg_data = hydra.compose(config_name=base["dataset"])  # same path train.py uses
     cfg_data.datamodule.num_workers = 0
     cfg_data.datamodule.batch_size = 1
     datamodule = hydra.utils.instantiate(cfg_data.datamodule)

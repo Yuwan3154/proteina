@@ -21,6 +21,6 @@ export TMPDIR=/tmp/chenxiou_${SLURM_JOB_ID:-nojob}; mkdir -p "$TMPDIR"
 source "$ENV_DIR/.venv/bin/activate"; source "$ENV_DIR/activate.sh"
 cd "$REPO"; export PYTHONPATH=$REPO
 echo "commit $(git rev-parse --short HEAD) host $(hostname)"
-python -m pytest -q -p no:cacheprovider tests/test_ca_template_compress.py 2>&1 | tail -2
+# unit tests run in the A6000 proteina env (this env has no pytest)
 python scripts/sse1d_integration_check.py --n_batches 2 --out /orcd/scratch/orcd/011/chenxiou/sse1d_integration_${SLURM_JOB_ID}.json
 rc=$?; echo "rc=$rc"; exit $rc
