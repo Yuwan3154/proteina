@@ -15,6 +15,7 @@ export DATA_PATH=/orcd/pool/006/chenxiou/proteina/data
 export SYNTH_INDEX_DIR=/orcd/scratch/orcd/011/chenxiou/synth_index_v4
 export PACK_PATH=/orcd/compute/so3/002/chenxi/proteina_pack/tri_v2.pack
 export CUE_HOST=engaging SKIP_CONFIND_PRECOMPUTE=1 CUDA_VISIBLE_DEVICES=
+export TORCH_CUDA_ARCH_LIST=9.0  # activate.sh requires it; only steers JIT builds, none happen on CPU
 export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8
 export TMPDIR=/tmp/chenxiou_${SLURM_JOB_ID:-nojob}; mkdir -p "$TMPDIR"
 source "$ENV_DIR/.venv/bin/activate"; source "$ENV_DIR/activate.sh"
