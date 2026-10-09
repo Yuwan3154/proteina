@@ -16,6 +16,7 @@ def compute_dssp_target(
     mask: torch.Tensor,
     coord_mask: Optional[torch.Tensor] = None,
     coord_layout: Literal["atom37", "pdb"] = "atom37",
+    donor_mask: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
     """
     Compute DSSP 3-state secondary structure targets from coordinates.
@@ -36,6 +37,8 @@ def compute_dssp_target(
         coord_mask: Optional [b, n, atoms] per-atom mask. If provided, residues
                     with missing N/CA/C/O are excluded from DSSP.
         coord_layout: "atom37" (default) or "pdb". See above.
+        donor_mask: Optional [1, n]; 0 marks residues that cannot donate a backbone H-bond (proline).
+                    None keeps the pydssp call exactly as before.
 
     Returns:
         dssp_target: [b, n] long tensor with values 0=loop, 1=helix, 2=strand.
@@ -74,7 +77,11 @@ def compute_dssp_target(
         valid_mask = mask
 
     # PyDSSP expects [batch, L, 4, 3]; coords in Angstrom
-    dssp_out = pydssp.assign(ncao, out_type="index")  # [b, n]
+    if donor_mask is None:
+        dssp_out = pydssp.assign(ncao, out_type="index")  # [b, n]
+    else:  # pydssp takes one [n] donor mask for the whole batch
+        assert donor_mask.shape == (1, ncao.shape[1]), donor_mask.shape
+        dssp_out = pydssp.assign(ncao, donor_mask=donor_mask[0].float(), out_type="index")
 
     # Set invalid positions to -1 for cross_entropy ignore_index
     dssp_target = dssp_out.long().clone()

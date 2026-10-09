@@ -76,6 +76,11 @@ _USALIGN = "/home/chenxiou/.local/bin/USalign"
 # contact definition of the index: "cb8" (default, the v4 build) or "confind" (Frame2ConFind maps >= threshold:
 # the native's stored contact_map_confind, the templates' maps from the `f2c` subcommand)
 _CONTACT_SOURCE = "cb8"
+# --proline-donor-mask (user 2026-10-09): recompute every DSSP (native too) with proline unable to donate a backbone H-bond
+_PRO_DONOR_MASK = False
+PRO_IDX = 14                         # openfold restype order
+DSSP_DEF = "native: stored dssp_target; templates: pydssp; no donor mask"
+DSSP_DEF_PRO = "native + templates: pydssp with donor_mask = (aatype != PRO); native validity = N/CA/C/O coord_mask > 0.5"
 _MAPS_ROOT = ""
 _ROOTS = []
 CONFIND_THRESHOLD = 0.01             # the `contact_method: confind` transform's threshold
@@ -207,6 +212,16 @@ def _chain_job(args):
         return stem, None, [], [("native", "no_coords")], seq
     if dssp is None:
         return stem, None, [], [("native", "no_dssp_attr")], seq
+    if _PRO_DONOR_MASK:
+        if seq_ref is None or len(seq_ref) != int(coords.shape[0]):
+            return stem, None, [], [("native", "no_residue_type_for_donor_mask")], seq
+        # same atoms and validity as precompute_dssp_targets._compute_dssp (disk order, O = 3), plus the donor mask
+        dssp = compute_dssp_target(coords[None].float(), torch.ones(1, int(coords.shape[0]), dtype=torch.bool),
+                                   coord_mask=(cmask.float() > 0.5)[None], coord_layout="pdb",
+                                   donor_mask=(torch.as_tensor(seq_ref) != PRO_IDX)[None])
+        if dssp is None:
+            return stem, None, [], [("native", "native_dssp_none")], seq
+        dssp = dssp[0]
     cmask = cmask.bool()
     if _CONTACT_SOURCE == "confind":
         cm_n = confind_native_contacts(g, int(coords.shape[0]))
@@ -278,7 +293,14 @@ def _chain_job(args):
                 continue
             full = torch.zeros(L_t, 37, 3)
             full[amask] = torch.from_numpy(tcoords[k]).float()
-            dssp_t = compute_dssp_target(full[None], amask[:, CA_IDX][None], coord_mask=amask[None], coord_layout="atom37")
+            donor = None
+            if _PRO_DONOR_MASK:
+                if t_aatype is None or len(t_aatype) != L_t:
+                    skips.append((f"tpl#{k}", "no_aatype_for_donor_mask"))
+                    continue
+                donor = torch.from_numpy(np.asarray(t_aatype) != PRO_IDX)[None]
+            dssp_t = compute_dssp_target(full[None], amask[:, CA_IDX][None], coord_mask=amask[None], coord_layout="atom37",
+                                         donor_mask=donor)
             if dssp_t is None:
                 skips.append((f"tpl#{k}", "tpl_dssp_none"))
                 continue
@@ -391,8 +413,9 @@ def _enumerate_jobs(args):
 
 
 def cmd_build(args):
-    global _USALIGN, _CONTACT_SOURCE, _MAPS_ROOT, _ROOTS
+    global _USALIGN, _CONTACT_SOURCE, _MAPS_ROOT, _ROOTS, _PRO_DONOR_MASK
     _USALIGN = args.usalign
+    _PRO_DONOR_MASK = args.proline_donor_mask
     _CONTACT_SOURCE, _MAPS_ROOT = args.contact_source, args.f2c_maps
     if _CONTACT_SOURCE == "confind" and not _MAPS_ROOT:
         raise SystemExit("--contact-source confind needs --f2c-maps")
@@ -414,7 +437,8 @@ def cmd_build(args):
     part_path = os.path.join(args.out_dir, f"part_{args.part:04d}.pt")
     torch.save({"chains": out_rows, "n_parts": args.n_parts, "part": args.part, "min_len": args.min_len,
                 "tm_build_range": (args.tm_min, args.tm_max),
-                "contact_def": CONTACT_DEF_CONFIND if _CONTACT_SOURCE == "confind" else CONTACT_DEF}, part_path)
+                "contact_def": CONTACT_DEF_CONFIND if _CONTACT_SOURCE == "confind" else CONTACT_DEF,
+                "dssp_def": DSSP_DEF_PRO if _PRO_DONOR_MASK else DSSP_DEF}, part_path)
     with open(os.path.join(args.out_dir, f"skips_{args.part:04d}.tsv"), "w") as fh:
         fh.write("\n".join(skip_lines) + ("\n" if skip_lines else ""))
     by_reason = Counter(l.split("\t")[2].split(":")[0] for l in skip_lines)
@@ -569,13 +593,14 @@ def cmd_merge(args):
             feat_sumsq.add_(torch.tensor(sums[1], dtype=torch.float64))
             feat_count += cnt
 
-    min_len, contact_def = None, None
+    min_len, contact_def, dssp_defs = None, None, set()
     for part in range(args.n_parts):
         p = os.path.join(args.parts_dir, f"part_{part:04d}.pt")
         if not os.path.exists(p):
             raise FileNotFoundError(f"missing {p} -- rebuild that part before merging")
         d = torch.load(p, map_location="cpu", weights_only=False)
         min_len, contact_def = d["min_len"], d["contact_def"]
+        dssp_defs.add(d.get("dssp_def", DSSP_DEF))  # parts written before the key existed used DSSP_DEF
         for ch in d["chains"]:
             if ch["native"] is None:
                 continue                                # skipped chains are in the skip logs
@@ -616,6 +641,8 @@ def cmd_merge(args):
     std = (feat_sumsq / max(feat_count, 1) - mean ** 2).clamp(min=0.0).sqrt().clamp(min=1e-6)
     for name, m, s in zip(PAIR_FEATURE_NAMES, mean.tolist(), std.tolist()):
         print(f"  {name:<24} mean={m:10.4f} std={s:10.4f}", flush=True)
+    if len(dssp_defs) != 1:  # parts built with and without the donor mask must never be merged
+        raise ValueError(f"parts disagree on the DSSP definition: {sorted(dssp_defs)}")
     out = {
         "ids": ids,
         "cluster_of": torch.tensor(cluster_of, dtype=torch.int32),
@@ -642,6 +669,7 @@ def cmd_merge(args):
         "min_len": min_len,
         "contact_threshold": 0.5,       # the map is already binary; kept for consumers that read the key
         "contact_def": contact_def,
+        "dssp_def": dssp_defs.pop(),
         "reference_source": "synthetic",
     }
     torch.save(out, args.out)
@@ -681,6 +709,8 @@ def main():
     b.add_argument("--workers", type=int, default=32)
     b.add_argument("--usalign", default=_USALIGN)
     b.add_argument("--contact-source", choices=("cb8", "confind"), default="cb8")
+    b.add_argument("--proline-donor-mask", action="store_true",
+                   help="recompute native + template DSSP with proline as a non-donor (default: v4 behaviour)")
     b.add_argument("--f2c-maps", default="", help="maps root written by `f2c` (required for --contact-source confind)")
     f = sub.add_parser("f2c", parents=[sel])
     f.add_argument("--maps-out", required=True)
