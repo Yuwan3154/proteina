@@ -1,7 +1,7 @@
 """D36tc post-check of ONE tri pass (run AFTER sampling; non-zero exit fails the job).
 
-  1. the job log has no unconditioned-sample warning ("absent from the topology index", "has no entry for",
-     "samples unconditioned");
+  1. the job log (stdout + stderr merged) has no unconditioned-sample warning (BAD) and DOES contain the loguru
+     positive-control lines (NEED, + NEED_MAP with --map);
   2. the checkpoint load printed `missing=0 unexpected=0` (tri_gen_eval's [EMA load] line);
   3. samples.jsonl holds exactly --n per listed stem, each L == the processed .pt residue count (coords.shape[0],
      not the mask: a crop shrinks both) and ref_id == map[stem] (template arm) or == stem (self arm).
@@ -14,7 +14,11 @@ import re
 
 import torch
 
-BAD = ("absent from the topology index", "has no entry for", "samples unconditioned")
+BAD = ("absent from the topology index", "has no entry for", "samples unconditioned", "sampling UNCONDITIONED")
+# Positive controls: loguru lines that MUST be present, so a log missing the loguru stream (stderr) cannot pass
+# the BAD scan vacuously (model_trainer_base.py:3368 and :2840).
+NEED = ("validation_sampling: fixed chain set loaded from",)
+NEED_MAP = ("validation_sampling: topology_reference_map loaded from",)
 
 
 def main():
@@ -29,6 +33,9 @@ def main():
 
     log = open(args.log).read()
     fails = [f"log: {ln.strip()[:200]}" for ln in log.splitlines() if any(b in ln for b in BAD)]
+    for need in NEED + (NEED_MAP if args.map else ()):
+        if need not in log:
+            fails.append(f"log lacks positive control {need!r} (loguru stream missing?)")
     loads = re.findall(r"\[EMA load\] missing=(\d+) unexpected=(\d+)", log)
     if loads != [("0", "0")]:
         fails.append(f"checkpoint load lines {loads} (want exactly one missing=0 unexpected=0)")
