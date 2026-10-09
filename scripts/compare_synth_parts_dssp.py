@@ -4,7 +4,10 @@
   --expect dssp      : the --proline-donor-mask build; same chains and template rungs, USalign TMs unchanged, and every
                        difference must come with a changed DSSP run list (reported: how many natives / templates moved)
 
-  python scripts/compare_synth_parts_dssp.py NEW_PART.pt V4_PART.pt --expect identical|dssp
+  python scripts/compare_synth_parts_dssp.py NEW_PART.pt V4_PART.pt --expect identical|dssp [--new-skips skips_0000.tsv]
+
+--new-skips: chains the NEW build skipped as `native not_in_pack` (A6000 build reads natives from the training pack) are
+excluded from the comparison and counted; any other missing native still fails.
 """
 
 import argparse
@@ -18,14 +21,25 @@ def main():
     ap.add_argument("new")
     ap.add_argument("v4")
     ap.add_argument("--expect", choices=("identical", "dssp"), required=True)
+    ap.add_argument("--new-skips", default="")
     a = ap.parse_args()
+    not_in_pack = set()
+    if a.new_skips:
+        for line in open(a.new_skips):
+            f = line.rstrip("\n").split("\t")
+            if len(f) == 3 and f[1] == "native" and f[2] == "not_in_pack":
+                not_in_pack.add(f[0])
     x = torch.load(a.new, map_location="cpu", weights_only=False)
     y = torch.load(a.v4, map_location="cpu", weights_only=False)
     cx, cy = {c["stem"]: c for c in x["chains"]}, {c["stem"]: c for c in y["chains"]}
     assert sorted(cx) == sorted(cy), "chain sets differ"
     bad, n_nat, n_nat_runs, n_tpl, n_tpl_runs, n_tpl_align, n_rows_missing = [], 0, 0, 0, 0, 0, 0
+    n_excluded = 0
     for s in cy:
         u, v = cx[s], cy[s]
+        if s in not_in_pack and u["native"] is None:
+            n_excluded += 1
+            continue
         if (u["native"] is None) != (v["native"] is None):
             bad.append(f"{s}: native presence differs")
             continue
@@ -53,7 +67,8 @@ def main():
                 bad.append(f"{s} rung {r[3]}: row differs with identical runs")
         if len(u["rows"]) != len(v["rows"]):
             bad.append(f"{s}: {len(u['rows'])} vs {len(v['rows'])} template rows")
-    rec = {"expect": a.expect, "new_dssp_def": x.get("dssp_def"), "chains": len(cy), "natives": n_nat,
+    rec = {"expect": a.expect, "new_dssp_def": x.get("dssp_def"), "chains": len(cy), "excluded_not_in_pack": n_excluded,
+           "natives": n_nat,
            "natives_runs_changed": n_nat_runs, "template_rows": n_tpl, "template_rows_missing": n_rows_missing,
            "template_runs_changed": n_tpl_runs, "template_align_changed": n_tpl_align, "n_bad": len(bad), "bad": bad[:20]}
     print(json.dumps(rec, indent=1))

@@ -35,7 +35,9 @@ Usage:
 
 import argparse
 import hashlib
+import io
 import json
+import mmap
 import os
 import subprocess
 import sys
@@ -83,6 +85,9 @@ DSSP_DEF = "native: stored dssp_target; templates: pydssp; no donor mask"
 DSSP_DEF_PRO = "native + templates: pydssp with donor_mask = (aatype != PRO); native validity = N/CA/C/O coord_mask > 0.5"
 _MAPS_ROOT = ""
 _ROOTS = []
+# --native-pack (A6000 build, user 2026-10-09): natives read from the training pack (the processed .pt bytes) instead of
+# --processed-dir; stem -> (offset, length), opened once in the parent so the forked workers share it
+_PACK_IDX, _PACK_MM = None, None
 CONFIND_THRESHOLD = 0.01             # the `contact_method: confind` transform's threshold
 CONTACT_DEF_CONFIND = "ConFind via Frame2ConFind, prob >= 0.01 (native: stored contact_map_confind)"
 
@@ -197,10 +202,17 @@ def _chain_job(args):
     """One chain -> (native row | None, [template rows], [(what, reason)] skips)."""
     stem, pt_path, npz_path, band_tm, band_rewind, band_slot, min_len, tm_min, tm_max, selftest = args
     skips = []
-    if not os.path.exists(pt_path):
+    if _PACK_IDX is not None:
+        ent = _PACK_IDX.get(stem)
+        if ent is None:
+            return stem, None, [], [("native", "not_in_pack")], None
+        src = io.BytesIO(_PACK_MM[ent[0]:ent[0] + ent[1]])
+    elif not os.path.exists(pt_path):
         return stem, None, [], [("native", "missing_file")], None
+    else:
+        src = pt_path
     try:
-        g = torch.load(pt_path, map_location="cpu", weights_only=False)
+        g = torch.load(src, map_location="cpu", weights_only=False)
     except Exception as e:  # recorded per chain and audited afterwards, never silent
         return stem, None, [], [("native", f"load_failed:{type(e).__name__}")], None
     seq = getattr(g, "sequence", None)
@@ -413,9 +425,15 @@ def _enumerate_jobs(args):
 
 
 def cmd_build(args):
-    global _USALIGN, _CONTACT_SOURCE, _MAPS_ROOT, _ROOTS, _PRO_DONOR_MASK
+    global _USALIGN, _CONTACT_SOURCE, _MAPS_ROOT, _ROOTS, _PRO_DONOR_MASK, _PACK_IDX, _PACK_MM
     _USALIGN = args.usalign
     _PRO_DONOR_MASK = args.proline_donor_mask
+    if args.native_pack:
+        z = np.load(args.native_pack + ".idx.npz", allow_pickle=True)
+        _PACK_IDX = {str(s): (int(o), int(l)) for s, o, l in zip(z["stems"], z["offsets"], z["lengths"])}
+        fh = open(args.native_pack, "rb")  # kept open for the mmap's lifetime (module global below)
+        _PACK_MM = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+        print(f"natives from pack {args.native_pack}: {len(_PACK_IDX)} stems", flush=True)
     _CONTACT_SOURCE, _MAPS_ROOT = args.contact_source, args.f2c_maps
     if _CONTACT_SOURCE == "confind" and not _MAPS_ROOT:
         raise SystemExit("--contact-source confind needs --f2c-maps")
@@ -709,6 +727,7 @@ def main():
     b.add_argument("--workers", type=int, default=32)
     b.add_argument("--usalign", default=_USALIGN)
     b.add_argument("--contact-source", choices=("cb8", "confind"), default="cb8")
+    b.add_argument("--native-pack", default="", help="read natives from this pack (+ .idx.npz) instead of --processed-dir")
     b.add_argument("--proline-donor-mask", action="store_true",
                    help="recompute native + template DSSP with proline as a non-donor (default: v4 behaviour)")
     b.add_argument("--f2c-maps", default="", help="maps root written by `f2c` (required for --contact-source confind)")
