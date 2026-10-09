@@ -7,7 +7,7 @@ set -uo pipefail
 DEC=$1; GPU=$2; RUN=$3; shift 3
 ROOT=$HOME/sse1d_data
 export DATA_PATH=$ROOT/orcd/pool/006/chenxiou/proteina/data
-export SYNTH_INDEX_DIR=$ROOT/orcd/scratch/orcd/011/chenxiou/synth_index_v4
+export SYNTH_INDEX_DIR=${SYNTH_INDEX_DIR:-$ROOT/orcd/scratch/orcd/011/chenxiou/synth_index_v4}  # v5_pro: proline-mask rebuild
 export PACK_PATH=$ROOT/orcd/compute/so3/002/chenxi/proteina_pack/tri_v2.pack
 export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=$GPU  # same numbering as nvidia-smi -i
 busy=$(nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader | grep -c "$(nvidia-smi -i "$GPU" --query-gpu=uuid --format=csv,noheader)")
