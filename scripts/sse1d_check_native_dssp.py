@@ -39,7 +39,8 @@ def main():
         return
     z = np.load(a.pack + ".idx.npz", allow_pickle=True)
     order = np.argsort(z["stems"].astype(str))[: a.n]  # same stems on every host
-    mm = mmap.mmap(open(a.pack, "rb").fileno(), 0, access=mmap.ACCESS_READ)
+    fh = open(a.pack, "rb")  # keep the file object alive: mmap needs its descriptor
+    mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
     out, n_res, n_ctrl_diff, n_mask_diff, n_near, n_pro = {}, 0, 0, 0, 0, 0
     for i in order:
         o, l = int(z["offsets"][i]), int(z["lengths"][i])
