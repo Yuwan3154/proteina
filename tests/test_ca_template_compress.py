@@ -86,7 +86,7 @@ def test_segmentation_is_dssp_runs_with_minus_one_breaks():
     assert torch.equal(torch.where(b["dssp_target"] >= 0, b["dssp_target"], y), y)
     # row 0: 0 0 | 1 1 1 1 | 0 | -1 | 0 | 2 2 2 | 0 0 | 1 1 1 | 0 0 0  -> 9 runs (the -1 residue is its own run)
     assert int(out["sse_K"][0]) == 9, out["sse_K"]
-    assert int(out["sse_K"][1]) == 8, out["sse_K"]  # 1 1 1|0 0|2 2|0 0 0|1 1 1 1|0|2 2|0 (17 valid residues)
+    assert int(out["sse_K"][1]) == 7, out["sse_K"]  # 17 valid residues: 1 1 1|0 0|2 2|0 0 0|1 1 1 1|0|2 2
 
 
 def test_runs_block_mean_pooling():
