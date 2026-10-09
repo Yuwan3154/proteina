@@ -41,7 +41,8 @@ from scipy.stats import spearmanr
 
 
 KALIGN_BINARY_PATH = shutil.which("kalign") or "/usr/bin/kalign"
-DEFAULT_PARAMS_DIR = os.path.expanduser("~/openfold/openfold/resources/params")
+# AF2RANK_PARAMS_DIR (unset = unchanged default): hosts whose AF2 params are not under ~/openfold (Engaging: $S/params)
+DEFAULT_PARAMS_DIR = os.environ.get("AF2RANK_PARAMS_DIR") or os.path.expanduser("~/openfold/openfold/resources/params")
 
 _USALIGN_PARALLEL_ENV = {
     "OMP_NUM_THREADS": "1",

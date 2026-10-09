@@ -1,0 +1,65 @@
+# D36tc max493 (user D2 option A, 2026-10-09): ONLY PaddingTransform max_size 384 -> 493 (= the longest target,
+# 8AUC_B; used for 8AUC_B and 8X4J_A only) vs d36tc_c2c_max384.yaml. Base: the ConFind c2c (twin) dataset over the D36tc eval dir. Clone of
+# pdb_train_contact-confind_S25_max384_purge-test_cutoff-190828.yaml. Changed keys: data_dir (datamodule,
+# dataselector, datasplitter) -> the D36tc dir; dataselector min_length 40 / max_length 700 (identical
+# dataselector to d36tc_tri_max384.yaml, so both resolve the same dataset CSV); datasplitter train_val_test
+# [0.8, 0.2, 0.0], exclude_ids_from_file null, drop_ids_from_file null. Everything else identical.
+datamodule:
+  _target_: "proteinfoundation.datasets.pdb_data.PDBLightningDataModule"
+  data_dir: /orcd/pool/006/chenxiou/d36tc/data/
+  in_memory: False
+  format: "cif"
+  overwrite: False
+  regenerate_missing: True
+  batch_padding: True
+  sampling_mode: "cluster-random"
+  cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/
+  multilabel_mode: "sample"
+  transforms:
+    - _target_: "proteinfoundation.datasets.transforms.GlobalRotationTransform"
+    - _target_: "proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform"
+    - _target_: "proteinfoundation.datasets.transforms.CATHLabelTransform"
+      root_dir: ${oc.env:DATA_PATH}/cathdata/
+    - _target_: "proteinfoundation.datasets.transforms.CATHToIndicesTransform"
+      cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/
+    - _target_: "proteinfoundation.datasets.transforms.DSSPTargetTransform"
+    - _target_: "proteinfoundation.datasets.transforms.ContactMapTransform"
+      contact_method: confind
+      confind_rotamer_lib: ${oc.env:DATA_PATH}/rotlibs
+      confind_contact_threshold: 0.01
+    - _target_: "proteinfoundation.datasets.transforms.PaddingTransform"
+      max_size: 493
+  batch_size: 1
+  num_workers: 8
+  pin_memory: True
+  prefetch_factor: 2
+
+  dataselector:
+    _target_: "proteinfoundation.datasets.pdb_data.PDBDataSelector"
+    data_dir: /orcd/pool/006/chenxiou/d36tc/data/
+    fraction: 1
+    molecule_type: "protein"
+    experiment_types: ["diffraction", "EM"]
+    min_length: 40
+    max_length: 700
+    oligomeric_min: null
+    oligomeric_max: null
+    best_resolution: 0.0
+    worst_resolution: 5.0
+    has_ligands: []
+    remove_ligands: []
+    remove_non_standard_residues: True
+    remove_pdb_unavailable: True
+    max_deposition_date: "2019-08-28"
+    exclude_ids: []
+
+  datasplitter:
+    _target_: "proteinfoundation.datasets.pdb_data.PDBDataSplitter"
+    data_dir: /orcd/pool/006/chenxiou/d36tc/data/
+    train_val_test: [0.8, 0.2, 0.0]
+    split_type: "sequence_similarity"
+    split_sequence_similarity: 0.25
+    overwrite_sequence_clusters: False
+    exclude_ids: []
+    exclude_ids_from_file: null
+    drop_ids_from_file: null
