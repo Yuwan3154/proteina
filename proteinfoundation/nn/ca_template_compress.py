@@ -264,16 +264,16 @@ class CATemplateCompress1D(nn.Module):
         return y.long(), *runs_from_labels(y.long(), valid, breaks)
 
     def forward(self, batch: Dict, force_compile: bool = False) -> Dict:
-        mask = batch["mask"].float()
-        valid = mask > 0.5
+        valid = batch["mask"].bool()  # proteina's attention layers take the BOOLEAN mask
+        mask = valid.float()
         B, L = mask.shape
         dev = mask.device
         c_seq = self.cond_factory(batch)
-        c_seq = self.transition_c_2(self.transition_c_1(c_seq, mask), mask)
+        c_seq = self.transition_c_2(self.transition_c_1(c_seq, valid), valid)
         s = (self.linear_3d_embed(batch["x_t"] * mask[..., None]) + self.init_repr_factory(batch)) * mask[..., None]
         pair = self.pair_repr_builder(batch)
         for lyr in self.pre_layers:
-            s = lyr(s, pair, c_seq, mask)
+            s = lyr(s, pair, c_seq, valid)
         s_pre = s
         dssp_logits = self.dssp_head(s_pre)
 
@@ -347,7 +347,7 @@ class CATemplateCompress1D(nn.Module):
             h = s_pre + self.decomp(zn, seg_id, K_per, K)
         h = h * mask[..., None]
         for lyr in self.post_layers:
-            h = lyr(h, pair_post, c_seq, mask)
+            h = lyr(h, pair_post, c_seq, valid)
 
         out["coords_pred"] = self.coors_3d_decoder(h) * mask[..., None]
         hn = self.opm_ln(h)
