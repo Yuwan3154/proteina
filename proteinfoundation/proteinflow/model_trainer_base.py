@@ -1584,6 +1584,8 @@ class ModelTrainerBase(L.LightningModule):
             )  # [*]
             fm_loss = _sanitize_and_log_loss_vec(fm_loss, "fm_loss")
             train_loss = torch.mean(fm_loss)
+            # template align / MLM heads (CATemplateCompress1D); weights default 0 => no change for other coordinate models
+            train_loss = train_loss + self._topology_aux_losses(nn_out, batch, mask, log_prefix)
         
         if self.cfg_exp.loss.use_aux_loss:
             auxiliary_loss = self.compute_auxiliary_loss(
