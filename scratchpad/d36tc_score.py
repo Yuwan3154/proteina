@@ -23,14 +23,37 @@ import pandas as pd
 GROUPS = {"A": ("self", "tmpl", "native"), "B": ("self", "native"), "C": ("self", "tmpl", "native")}
 
 
+def native_for(natives, pid):
+    """score_arm.py's native resolution and chain: <natives>/<entry>.cif, chain = the pid suffix (none of the 42 D36
+    natives has label_asym_id != auth_asym_id on its ATOM records, checked 2026-10-09)."""
+    entry, chain = pid.rsplit("_", 1)
+    native = os.path.join(natives, entry + ".cif")
+    assert os.path.exists(native), f"{pid}: no native cif {native}"
+    return native, chain
+
+
 def tm_vs_native(usalign, native, chain, pred):
+    """score_arm.py's tm_vs_native, verbatim logic: TM1 (normalised by the native = chain1)."""
     r = subprocess.run([usalign, native, "-chain1", chain, pred, "-TMscore", "5", "-outfmt", "2"],
-                       capture_output=True, text=True, check=True)
+                       capture_output=True, text=True)
     for ln in r.stdout.splitlines():
         p = ln.split()
         if len(p) >= 7 and not ln.startswith("#"):
             return float(p[2])
     raise RuntimeError(f"no USalign row for {pred}")
+
+
+def selftest(args):
+    """Reproduce a PUBLISHED oracle with this scorer: C5 AF3 r2 seed 0 pools (score_arm.py's af3_pool glob), whose
+    stored oracle_tm = max TM over the pool, on 8AUC_B (chain B of a 2-chain native) and 6QBL_A (modified residues)."""
+    ref = {r["protein_id"]: float(r["oracle_tm"]) for r in csv.DictReader(open(args.selftest_csv))}
+    for pid in ("8AUC_B", "6QBL_A"):
+        native, chain = native_for(args.natives, pid)
+        pool = glob.glob(os.path.join(args.selftest_pool, pid, "**", "*seed-*sample-*_model.cif"), recursive=True)
+        assert len(pool) == 5, f"{pid}: {len(pool)} AF3 samples"
+        got = round(max(tm_vs_native(args.usalign, native, chain, p) for p in pool), 4)
+        print(f"[selftest] {pid}: oracle {got} vs published {ref[pid]}")
+        assert got == ref[pid], f"{pid}: scorer does not reproduce the published oracle"
 
 
 def med(v):
@@ -50,7 +73,12 @@ def main():
     ap.add_argument("--natives", default="/orcd/scratch/orcd/011/chenxiou/d36u/natives")
     ap.add_argument("--usalign", default="/home/chenxiou/.local/bin/USalign")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--selftest-csv", default="/orcd/scratch/orcd/011/chenxiou/d36aq/c5/scores/af3_af3r2_seed0.csv")
+    ap.add_argument("--selftest-pool", default="/orcd/scratch/orcd/011/chenxiou/d36aq/c5/af3/af3r2/seed0")
     args = ap.parse_args()
+    selftest(args)
+    sizes = {g: len([l for l in open(os.path.join(args.groups_dir, f"group{g}.txt")) if l.strip()]) for g in GROUPS}
+    assert sizes == {"A": 30, "B": 2, "C": 2}, f"group sizes {sizes} (want A 30, B 2, C 2 = 34)"
 
     expected, found, problems, out = 0, 0, [], []
     for g, arms in GROUPS.items():
@@ -58,8 +86,7 @@ def main():
         for arm in arms:
             label = f"{args.prefix}_{g}_{arm}"
             for st in stems:
-                entry, ch = st.rsplit("_", 1)
-                native = os.path.join(args.natives, f"{entry}.cif")
+                native, ch = native_for(args.natives, st)
                 pdbs = sorted(glob.glob(os.path.join(args.c2c_pdb, label, "*", st, "*_gen.pdb")))
                 expected += 8
                 found += len(pdbs)

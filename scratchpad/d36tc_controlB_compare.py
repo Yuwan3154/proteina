@@ -1,8 +1,9 @@
-"""D36tc CONTROL B compare: my rerun vs the T7-NEWEST records, per stem and tri sample.
+"""D36tc CONTROL B compare (CPU): my reruns vs the T7-NEWEST records. No tolerance was pre-registered: the verdict is
+EXACT or DELTAS, and DELTAS is NOT a pass (it goes back to the orchestrator with the evidence).
 
-tri : contact_prob (max |dp|, bit-exact?), contact_gt (exact), ref_id (exact) of <stem>_sKK.npz vs the record dump.
-c2c : tm, rmsd_proper, torch_seed of each (stem, sample_index) row vs the record jsonl.
-No tolerance is set (none was pre-registered): the verdict is EXACT or the deltas, reported in full.
+--tri  STEM:MINE_DIR:RECORD_DIR   tri maps of STEM (all its samples): contact_prob bit-exact or max|dp|; contact_gt and
+                                  ref_id must be equal (else structural FAIL).
+--c2c  MINE_JSONL:RECORD_JSONL    every (stem, sample_index) row of the chunk: tm, rmsd_proper deltas; torch_seed equal.
 """
 import argparse
 import json
@@ -12,50 +13,53 @@ import sys
 import numpy as np
 
 
-def rows(path, stem):
-    return {r["sample_index"]: r for r in (json.loads(l) for l in open(path) if l.strip()) if r["stem"] == stem}
+def load(path, stem=None):
+    rs = [json.loads(l) for l in open(path) if l.strip()]
+    return {(r["stem"], r["sample_index"]): r for r in rs if stem is None or r["stem"] == stem}
 
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--mine", required=True)
-ap.add_argument("--pair", action="append", required=True, help="stem:record_tri_dir:record_c2c_jsonl")
+ap.add_argument("--tri", action="append", default=[])
+ap.add_argument("--c2c", action="append", default=[])
 args = ap.parse_args()
 
-problems, all_exact = [], True
-for spec in args.pair:
-    stem, rtri, rc2c = spec.split(":")
-    mdir = os.path.join(args.mine, f"tri_{stem}")
-    mt = rows(os.path.join(mdir, "samples.jsonl"), stem)
-    rt = rows(os.path.join(rtri, "samples.jsonl"), stem)
-    if sorted(mt) != list(range(8)) or sorted(rt) != list(range(8)):
-        problems.append(f"{stem}: tri samples mine {sorted(mt)} record {sorted(rt)}")
+structural, exact_all, n_tri, n_c2c = [], True, 0, 0
+for spec in args.tri:
+    stem, mdir, rdir = spec.split(":")
+    mt, rt = load(os.path.join(mdir, "samples.jsonl"), stem), load(os.path.join(rdir, "samples.jsonl"), stem)
+    if sorted(mt) != sorted(rt) or not mt:
+        structural.append(f"tri {stem}: samples mine {sorted(k[1] for k in mt)} record {sorted(k[1] for k in rt)}")
         continue
-    for k in range(8):
-        a = np.load(os.path.join(mdir, mt[k]["file"]))
-        b = np.load(os.path.join(rtri, rt[k]["file"]))
-        dp = float(np.abs(a["contact_prob"] - b["contact_prob"]).max()) if a["contact_prob"].shape == b["contact_prob"].shape else float("inf")
-        exact = bool(np.array_equal(a["contact_prob"], b["contact_prob"]))
+    for key in sorted(mt):
+        a = np.load(os.path.join(mdir, mt[key]["file"]))
+        b = np.load(os.path.join(rdir, rt[key]["file"]))
+        same_shape = a["contact_prob"].shape == b["contact_prob"].shape
+        exact = same_shape and bool(np.array_equal(a["contact_prob"], b["contact_prob"]))
+        dp = float(np.abs(a["contact_prob"] - b["contact_prob"]).max()) if same_shape else float("inf")
         gt = bool(np.array_equal(a["contact_gt"], b["contact_gt"]))
-        ref = mt[k]["ref_id"] == rt[k]["ref_id"]
-        all_exact &= exact
-        print(f"  tri {stem} s{k:02d}: contact_prob {'EXACT' if exact else f'max|dp| {dp:.3g}'}  gt {'=' if gt else 'DIFF'}  "
-              f"ref_id {mt[k]['ref_id']} {'=' if ref else '!= ' + str(rt[k]['ref_id'])}")
+        ref = mt[key]["ref_id"] == rt[key]["ref_id"]
+        exact_all &= exact
+        n_tri += 1
+        print(f"  tri {stem} s{key[1]:02d}: contact_prob {'EXACT' if exact else f'max|dp| {dp:.3g}'}  "
+              f"gt {'=' if gt else 'DIFF'}  ref_id {mt[key]['ref_id']}{'' if ref else ' != ' + str(rt[key]['ref_id'])}")
         if not (gt and ref):
-            problems.append(f"{stem} s{k:02d}: gt {gt} ref_id {ref}")
-    mc = rows(os.path.join(args.mine, f"B_{stem}.jsonl"), stem)
-    rc = rows(rc2c, stem)
-    if sorted(mc) != list(range(8)) or sorted(rc) != list(range(8)):
-        problems.append(f"{stem}: c2c rows mine {sorted(mc)} record {sorted(rc)}")
+            structural.append(f"tri {stem} s{key[1]:02d}: gt {gt} ref_id {ref}")
+for spec in args.c2c:
+    mpath, rpath = spec.split(":")
+    mc, rc = load(mpath), load(rpath)
+    if sorted(mc) != sorted(rc) or not mc:
+        structural.append(f"c2c {mpath}: {len(mc)} rows vs record {len(rc)} (keys differ)")
         continue
-    for k in range(8):
-        dtm = mc[k]["tm"] - rc[k]["tm"]
-        drm = mc[k]["rmsd_proper"] - rc[k]["rmsd_proper"]
-        seed = mc[k]["torch_seed"] == rc[k]["torch_seed"]
-        all_exact &= dtm == 0 and drm == 0
-        print(f"  c2c {stem} s{k:02d}: tm {mc[k]['tm']:.4f} vs {rc[k]['tm']:.4f} (d {dtm:+.4f})  "
-              f"rmsd d {drm:+.3f}  seed {'=' if seed else 'DIFF'}")
-        if not seed:
-            problems.append(f"{stem} s{k:02d}: torch_seed {mc[k]['torch_seed']} vs {rc[k]['torch_seed']}")
-print(f"[controlB] structural problems {len(problems)}: {problems}")
-print("CONTROL_B " + ("EXACT" if all_exact and not problems else ("DELTAS (see rows)" if not problems else "FAIL")))
-sys.exit(1 if problems else 0)
+    dtm = np.array([mc[k]["tm"] - rc[k]["tm"] for k in sorted(mc)])
+    drm = np.array([mc[k]["rmsd_proper"] - rc[k]["rmsd_proper"] for k in sorted(mc)])
+    seeds = sum(mc[k]["torch_seed"] != rc[k]["torch_seed"] for k in mc)
+    n_c2c += len(mc)
+    exact_all &= bool((dtm == 0).all() and (drm == 0).all())
+    print(f"  c2c {os.path.basename(mpath)}: {len(mc)} rows; tm exact {int((dtm == 0).sum())}, max|dtm| {np.abs(dtm).max():.4g}; "
+          f"rmsd exact {int((drm == 0).sum())}, max|drmsd| {np.abs(drm).max():.4g}; torch_seed mismatches {seeds}")
+    if seeds:
+        structural.append(f"c2c {mpath}: {seeds} torch_seed mismatches")
+print(f"[controlB] tri samples compared {n_tri}, c2c rows compared {n_c2c}; structural problems {len(structural)}: {structural}")
+verdict = "FAIL" if structural or not (n_tri or n_c2c) else ("EXACT" if exact_all else "DELTAS (not a pass)")
+print(f"CONTROL_B {verdict}")
+sys.exit(0 if verdict == "EXACT" else 1)

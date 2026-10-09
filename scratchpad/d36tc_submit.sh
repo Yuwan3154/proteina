@@ -13,10 +13,16 @@ C2C=$S/c2c_store/c2c_confind_tbeta/final_twin_s29000.ckpt; C2C_MD5=1f5693e773b05
 GPU="--job-name=d36tc_gpu --partition=mit_normal_gpu --gres=gpu:l40s:1 --time=06:00:00 --exclude=node5101"
 STAGE="${STAGE:?controlB|controlC|prod|af2rank|score}"
 cd "$P/logs"
-for f in d36tc_tri d36tc_c2c d36tc_controlB d36tc_controlC d36tc_af2rank d36tc_score; do bash -n "$R/$f.sbatch"; done
+for f in d36tc_tri d36tc_c2c d36tc_controlB d36tc_controlB_compare d36tc_controlC d36tc_af2rank d36tc_score; do bash -n "$R/$f.sbatch"; done
 
 case "$STAGE" in
-  controlB) echo "controlB $(sbatch --parsable $GPU --dependency=singleton $R/d36tc_controlB.sbatch)" ;;
+  controlB)
+    J=""
+    for M in tri c2c; do for K in 00 01; do
+      j=$(env MODE=$M CHUNK=$K sbatch --parsable --export=ALL $GPU --dependency=singleton $R/d36tc_controlB.sbatch)
+      echo "controlB $M c$K $j"; J="$J:$j"
+    done; done
+    echo "controlB compare $(sbatch --parsable --dependency=afterok$J $R/d36tc_controlB_compare.sbatch)" ;;
   controlC) echo "controlC $(sbatch --parsable $GPU --dependency=singleton $R/d36tc_controlC.sbatch)" ;;
   prod)
     for G in A B C; do
@@ -38,7 +44,7 @@ case "$STAGE" in
     done ;;
   af2rank)
     for M in model_1_ptm model_2_ptm; do
-      echo "$M $(env MODEL=$M LABELS=d36tc_A_self,d36tc_A_tmpl,d36tc_B_self,d36tc_C_self,d36tc_C_tmpl \
+      echo "$M $(env MODEL=$M EXPECT_POOLS=66 LABELS=d36tc_A_self,d36tc_A_tmpl,d36tc_B_self,d36tc_C_self,d36tc_C_tmpl \
           sbatch --parsable --export=ALL $GPU --dependency=singleton $R/d36tc_af2rank.sbatch)"
     done ;;
   score) echo "score $(sbatch --parsable $R/d36tc_score.sbatch)" ;;

@@ -30,6 +30,7 @@ def main():
     ap.add_argument("--out", default="/orcd/pool/006/chenxiou/d36tc/af2rank")
     ap.add_argument("--natives", default="/orcd/scratch/orcd/011/chenxiou/d36u/natives")
     ap.add_argument("--n", type=int, default=8)
+    ap.add_argument("--expect-pools", type=int, required=True, help="number of (label, stem) pools over --labels")
     args = ap.parse_args()
     usalign = shutil.which("USalign")
     assert usalign, "USalign not on PATH"
@@ -46,6 +47,7 @@ def main():
             native = os.path.join(args.natives, f"{entry}.cif")
             assert os.path.exists(native), native
             jobs.append((label, stem, chain, native, pdbs))
+    assert len(jobs) == args.expect_pools, f"{len(jobs)} pools, want {args.expect_pools}"
     print(f"[af2rank] {args.model}: {len(jobs)} (label, stem) pools, {sum(len(j[4]) for j in jobs)} decoys", flush=True)
 
     scorer = None
