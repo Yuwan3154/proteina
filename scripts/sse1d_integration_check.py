@@ -14,6 +14,7 @@ import os
 import tempfile
 
 import hydra
+import lightning as L
 import torch
 from omegaconf import OmegaConf
 
@@ -58,6 +59,9 @@ def main():
                 cfg = hydra.compose(config_name="training_ca_template_compress_v1",
                                     overrides=TEST_SIZES + [f"model.nn.decompress={dec}", f"model.nn.true_seg_until_step={until}"])
             model = Proteina(cfg, store_dir=tempfile.mkdtemp())
+            # training_step reads trainer.world_size / global_step: attach a bare CPU trainer (no fit, no logger)
+            model.trainer = L.Trainer(accelerator="cpu", devices=1, logger=False, enable_checkpointing=False,
+                                      enable_progress_bar=False)
             logged = {}
             model.log = lambda name, value, *args, **kw: logged.__setitem__(name, float(value))
             for i, b in enumerate(batches):
