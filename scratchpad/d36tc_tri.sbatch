@@ -8,7 +8,7 @@
 #
 # D36tc tri pass: the ConFind tri (cfft) on the D36tc eval dataset, self arm, optionally conditioned on another
 # chain's index row (MAP = topology_reference_map JSON). Env block = stageA_pass.sbatch (cfft).
-#   CKPT=<tri EMA>  CHAINS=<fixed list, stem x N>  N=<samples per stem>  LABEL=<pass name>
+#   CKPT=<tri EMA>  EXPECT_MD5=<full md5 of CKPT, required>  CHAINS=<fixed list, stem x N>  N=<samples per stem>  LABEL=<pass name>
 #   optional: MAP  DATASET (default d36tc_tri_max384)  SEED (0)  REPO ($S/proteina_d36tc)
 # Partition, --gres, --time and the job name go on the sbatch command line.
 set -uo pipefail
@@ -27,11 +27,13 @@ source "$ENV_DIR/.venv/bin/activate"
 source "$ENV_DIR/activate.sh"
 export DATA_PATH=/orcd/pool/006/chenxiou/proteina/data SKIP_CONFIND_PRECOMPUTE=1
 export ALIGN_W=0.3 MLM_W=0.3
+export PYTHONUNBUFFERED=1
 export TMPDIR=/tmp/chenxiou_${SLURM_JOB_ID}
 mkdir -p "$TMPDIR" "$P/logs" "$P/tri"
+trap 'rm -rf "$TMPDIR"' EXIT
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
-: "${CKPT:?}" "${CHAINS:?}" "${N:?}" "${LABEL:?}"
+: "${CKPT:?}" "${EXPECT_MD5:?}" "${CHAINS:?}" "${N:?}" "${LABEL:?}"
 MAP="${MAP:-}"
 [ -f "$CHAINS" ] || { echo "FATAL: no chain list $CHAINS"; exit 77; }
 [ -f "$CKPT" ] || { echo "FATAL: no checkpoint $CKPT"; exit 77; }
@@ -42,7 +44,11 @@ RUNLOG=$P/logs/run_${LABEL}_${SLURM_JOB_ID}.log
 MAPARGS=(); [ -n "$MAP" ] && MAPARGS=(--map "$MAP")
 TRIMAP=(); [ -n "$MAP" ] && TRIMAP=(--topology_reference_map "$MAP")
 echo "[d36tc] $LABEL dataset=$DATASET map=${MAP:-none} chains=$CHAINS ($(grep -c . "$CHAINS")) N=$N seed=${SEED:-0}"
-echo "[d36tc] ckpt=$CKPT md5=$(md5sum < "$CKPT" | cut -c1-12)"
+MD5=$(md5sum < "$CKPT" | cut -d" " -f1)
+echo "[d36tc] ckpt=$CKPT md5=$MD5 expect=$EXPECT_MD5"
+[ "$MD5" = "$EXPECT_MD5" ] || { echo "FATAL: checkpoint md5 $MD5 != EXPECT_MD5 $EXPECT_MD5"; exit 75; }
+# The frozen tri files are full Lightning checkpoints (optimizer_states present) whose state_dict holds the EMA
+# weights written by EmaModelCheckpoint (-EMA name); there is no separate EMA dict to compare, so the md5 pin is the gate.
 cd "$REPO" || exit 76
 git log -1 --format="[repo] $REPO HEAD %h"
 
@@ -63,6 +69,5 @@ PYTHONPATH="$REPO" python scratchpad/d36tc_postcheck.py --log "$RUNLOG" --dump "
     --processed-dir "$PROC" --n "$N" "${MAPARGS[@]}"
 vrc=$?
 echo "POSTCHECK_RC=$vrc"
-rm -rf "$TMPDIR"
 [ "$rc" -ne 0 ] && exit "$rc"
 exit "$vrc"
