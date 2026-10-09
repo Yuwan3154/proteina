@@ -17,7 +17,11 @@ export PYTHONPATH=$REPO
 export TMPDIR=/tmp/chenxiou_${SLURM_JOB_ID}; mkdir -p "$TMPDIR"; trap 'rm -rf "$TMPDIR"' EXIT
 cd "$REPO"; git log -1 --format="[repo] $REPO HEAD %h"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
-md5sum "$AF2RANK_PARAMS_DIR/params_model_1_ptm.npz"
+# AF2 params must be the SuperCloud production files (md5 from SuperCloud ~/openfold/openfold/resources/params)
+for pm in "params_model_1_ptm.npz dfca7cd972028fc6adcc0c8995857a2a" "params_model_2_ptm.npz edb0729d11e83734b820c348c5ffe42a"; do
+  set -- $pm; h=$(md5sum < "$AF2RANK_PARAMS_DIR/$1" | cut -d' ' -f1); echo "[params] $1 $h (SC $2)"
+  [ "$h" = "$2" ] || { echo "FATAL: $1 differs from the SuperCloud production params"; exit 72; }
+done
 python scratchpad/d36tc_controlC.py --mode score --manifest "$C/manifest.csv" --root "$C/sc" --out "$C/o6w_engaging.csv"
 rc=$?
 echo "SCORE_RC=$rc"
