@@ -49,8 +49,9 @@ def main():
         batches.append(b)
         if len(batches) == a.n_batches:
             break
-    print(json.dumps({"event": "data", "n_batches": len(batches), "keys": sorted(batches[0].keys()),
-                      "L": [int(b["mask"].shape[1]) for b in batches]}), flush=True)
+    keys = sorted(batches[0].keys())  # a PyG Batch; the trainer builds `mask` inside training_step
+    shapes = {k: list(batches[0][k].shape) for k in keys if torch.is_tensor(batches[0][k])}
+    print(json.dumps({"event": "data", "n_batches": len(batches), "keys": keys, "shapes": shapes}), flush=True)
     for dec in ("pair_row_xattn", "pair_bias", "basis_pool", "spectral"):
         for until, phase in ((1, "true_seg"), (0, "pred_seg")):
             with hydra.initialize("../configs/experiment_config", version_base=hydra.__version__):
@@ -60,7 +61,7 @@ def main():
             logged = {}
             model.log = lambda name, value, *args, **kw: logged.__setitem__(name, float(value))
             for i, b in enumerate(batches):
-                b = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in b.items()}
+                b = b.clone()
                 loss = model.training_step(b, i)
                 loss = loss["loss"] if isinstance(loss, dict) else loss
                 model.zero_grad()
