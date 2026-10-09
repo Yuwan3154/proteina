@@ -1,0 +1,57 @@
+name: ca_template_compress
+nn_class: CATemplateCompress1D   # proteinfoundation/nn/ca_template_compress.py (user directive 2026-10-08)
+
+# 1D attention (pre) -> hard SSE runs -> tri-mul on the (K+T)^2 grid (compressed query + topology reference)
+# -> 2D->1D decompressor -> 1D attention (post) -> CA head + outer-product distogram head.
+# ??? = a value the user has not chosen yet; hydra refuses to run until it is set (no invented sizes).
+decompress: ???         # pair_row_xattn | pair_bias | basis_pool | spectral
+token_dim: ???          # 1D width
+pair_repr_dim: ???      # residue-level pair-bias width
+dim_cond: ???
+nheads: ???
+n_pre: ???              # 1D layers before compression
+n_mid: ???              # tri-mul blocks at the compressed level
+n_post: ???             # 1D layers after decompression
+mid_dim: ???            # compressed-grid pair width (tri used pair_dim 320)
+mid_tri_hidden: ${.mid_dim}
+mid_transition_n: 4     # AF2 Evoformer expansion (tri)
+mid_dim_cond: 128       # tri dim_cond
+true_seg_until_step: ??? # optimiser steps that segment by the TRUE DSSP before switching to the SSE head
+opm_dim: 32             # AF2 outer-product-mean hidden width
+xattn_heads: ${.nheads} # pair_row_xattn
+spectral_heads: ???     # spectral only
+spectral_r: ???         # spectral only
+spectral_hidden: ???    # spectral only
+
+# template side = contact_map_tri_30M_cb8
+max_rel_pos: 64
+topology_cond: True
+max_topology_he_len: 64
+topology_vocab_size: 44
+pair_ref_features: both
+n_residue_types: 22
+
+# 1D featurisation = ca_af3_60M_no_tri (proteina's CA model), plus the query sequence
+feats_init_seq: ["res_seq_pdb_idx", "chain_break_per_res", "x_sc"]
+residue_type_emb_init_seq: True
+seq_emb_dim: 128
+feats_cond_seq: ["time_emb", "fold_emb"]
+t_emb_dim: 256
+idx_emb_dim: 128
+fold_emb_dim: 256
+cath_code_dir: ${oc.env:DATA_PATH}/pdb_raw/
+multilabel_mode: "sample"
+feats_pair_repr: ["rel_seq_sep", "x_sc_pair_dists", "xt_pair_dists"]
+feats_pair_cond: ["time_emb"]
+xt_pair_dist_dim: 64
+xt_pair_dist_min: 0.1
+xt_pair_dist_max: 3
+x_sc_pair_dist_dim: 128
+x_sc_pair_dist_min: 0.1
+x_sc_pair_dist_max: 3
+seq_sep_dim: 127
+strict_feats: False
+use_qkln: True
+num_buckets_predict_pair: 39   # = loss.num_dist_buckets (tri)
+predict_dssp: True
+contact_map_mode: False

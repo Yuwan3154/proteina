@@ -1,0 +1,106 @@
+# 1D template model with SSE-run compression (user directive 2026-10-08): mimics the tri topology-reference model's
+# DATA, template inputs and template aux heads (training_contact_tri_full384_cb8synth_v1), but reasons in 1D attention
+# before compression and after decompression, with tri-mul ONLY on the compressed (K+T)^2 grid, and is trained as
+# proteina CA FLOW MATCHING (noised query CA in, clean CA out; user). ??? = not yet chosen by the user.
+run_name_: ca_template_compress
+
+hardware:
+  ncpus_per_task_train_: 4
+  ncpus_per_task_prepro_: 8
+  accelerator: gpu
+  ngpus_per_node_: 4
+  nnodes_: 1
+
+loss:
+  t_distribution:            # tri
+    name: logit-normal
+    p1: 0.0
+    p2: 1.0
+  loss_t_clamp: 0.9
+  use_aux_loss: True
+  aux_loss_t_lim: 0.3
+  thres_aux_2d_loss: 0.6
+  aux_loss_weight: 1.0
+  num_dist_buckets: 39
+  distogram_min_bin: 0.325
+  distogram_max_bin: 5.075
+  dssp_aux_loss_weight: 1.0  # proteina's CA+DSSP config (training_ca_motif_80M_no-tri_individual-emb_dssp_*)
+  align_loss: softmax        # tri
+  align_loss_weight: 0.3     # tri D9 (user 2026-10-08: keep)
+  mlm_loss_weight: 0.3
+
+defaults:
+  - model: caflow
+  - override model/nn: ca_template_compress
+  - _self_
+
+model:
+  target_pred: x_1           # predict the clean CA (user 2026-10-08); caflow's default is v
+
+dataset: pdb_train_contact-CB8-synthtopo_S25_max384_purge-test_cutoff-190828   # the tri's data, unchanged
+dataset_config_subdir: pdb
+
+force_precision_f32: False
+
+training:                    # tri
+  self_cond: True
+  seq_cond: True
+  fold_cond: True
+  mask_T_prob: 0.5
+  mask_A_prob: 0.5
+  mask_C_prob: 0.5
+  fold_label_sample_ratio: [0.5, 0.1, 0.15, 0.25]
+  mask_seq_proportion: 0.1
+  finetune_seq_cond_lora_only: False
+
+lora:
+  use: False
+  lora_alpha: 32.0
+  lora_dropout: 0.0
+  r: 0
+  train_bias: "none"
+
+opt:                         # tri
+  lr: 0.0001
+  max_epochs: 1000
+  max_steps: -1
+  accumulate_grad_batches: 8  # 4 GPUs x bs 1 x 8 = effective 32
+  val_check_interval_optim_steps: 50
+  limit_val_batches: 64
+  skip_nan_grad: False
+  grad_and_weight_analysis: False
+  dist_strategy: ddp
+  dist_timeout_s: 3600
+  dist_backend: nccl
+  use_lr_warmup: True
+  warmup_steps: 1000
+  warmup_start_lr_ratio: 0.0
+  lr_scheduler_type: "cosine"
+
+log:
+  wandb_project: protein_transformer_big_runs
+  log_wandb: True
+  log_every_n_steps: 100
+  log_structure_every_n_steps: 100
+  checkpoint: True
+  checkpoint_every_n_steps: 50
+  last_ckpt_every_n_steps: 50
+
+validation_sampling:         # CA-model sampling (training_ca_motif_80M_no-tri_*); template handling from the tri
+  topology_nonself: True
+  topology_nonself_seed: 0
+  dt: 0.005
+  sampling_mode: sc
+  sc_scale_noise: 0.45
+  tmscore_n_samples: 4
+  tmscore_every_n_val_epochs: 20
+  tmscore_mode: 5
+  fixed_chain_list: /orcd/scratch/orcd/011/chenxiou/valset_analysis/val_fixed32_max256.txt
+
+seed: 42
+
+ema:
+  decay: 0.999
+  validate_original_weights: False
+  every_n_steps: 1
+  cpu_offload: False
