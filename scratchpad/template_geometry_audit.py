@@ -15,7 +15,10 @@ targets recorded before the deletion (--control_targets) and refs stops unless e
 band row of EVERY ref's auth (64 TMs + rewinds + slots) must equal, exactly, the row of the resolved file's own name in that
 source tree's band index (--band_sources PREFIX=BAND, ...), and that TM vector must be unique in the source band -- the
 pool band was copied from those rows, and 64 independent partial-diffusion TMs are a fingerprint a swapped same-sequence
-partner cannot share. (The identity guard below cannot do this: a seq_partner has the same aatype by definition, and
+partner cannot share; an exact match whose vector occurs more than once in the source band is kept but tagged
+fp=dup<n>:<partner names> in REFS.tsv; audit then loads each partner file (same tree layout) and records dup_same
+(coords, atom_mask, aatype, rewind_steps all equal), and summary leaves dup refs whose identity is not settled out of
+the headline. (The identity guard below cannot do this: a seq_partner has the same aatype by definition, and
 rewind ladders repeat across chains.) audit opens exactly
 that path (after one --map ORIG=NEW prefix translation, e.g. to the SuperCloud copy of the T2 tree) and only CHECKS it:
 aatype == native residue_type (the builder's identity gate) and rewind_steps[slot] == band rewind for EVERY used rung;
@@ -47,7 +50,8 @@ import torch
 
 BREAK_A = 4.0  # ChainBreakPerResidueTransform(chain_break_cutoff=4.0)
 CA = 1  # atom37 and PDB atom order both put CA at index 1
-COLS = ["set", "stem", "ref_id", "tm", "status", "path", "L", "n_scored", "n_excess_break", "n_native_break", "max_ca", "min_ca", "median_ca"]
+COLS = ["set", "stem", "ref_id", "tm", "status", "path", "L", "n_scored", "n_excess_break", "n_native_break", "max_ca", "min_ca", "median_ca",
+        "dup_same"]
 
 
 def steps(ca, present):
@@ -135,11 +139,11 @@ def cmd_refs(a):
         pre, bf = spec.split("=")
         z = np.load(bf, allow_pickle=True)
         rowof = {str(c): i for i, c in enumerate(z["chains"])}
-        uniq = defaultdict(int)
-        for v in z["tm"]:
-            uniq[v.tobytes()] += 1
+        uniq = defaultdict(list)
+        for c, v in zip(z["chains"], z["tm"]):
+            uniq[v.tobytes()].append(str(c))
         srcs.append((pre, z, rowof, uniq))
-    fp_bad, n_fp = [], defaultdict(int)
+    fp_bad, n_fp, fptag = [], defaultdict(int), {}
     for auth, tg in target.items():
         src = [s for s in srcs if tg.startswith(s[0].rstrip("/") + "/")]
         assert len(src) == 1, f"{auth}: target {tg} matches {len(src)} band sources"
@@ -152,8 +156,14 @@ def cmd_refs(a):
             continue
         i = rowof[key]
         same = all(np.array_equal(band[f][b], z[f][i]) for f in ("tm", "rewind", "slot"))
-        if not same or uniq[z["tm"][i].tobytes()] != 1:
-            fp_bad.append((auth, key, f"equal={same} copies={uniq[z['tm'][i].tobytes()]}"))
+        names = uniq[z["tm"][i].tobytes()]
+        copies = len(names)
+        if not same:
+            fp_bad.append((auth, key, f"equal=False copies={copies}"))
+            continue
+        fptag[auth] = "unique" if copies == 1 else f"dup{copies}:" + ",".join(n for n in names if n != key)
+        if copies != 1:
+            n_fp["exact but duplicated in source band"] += 1
             continue
         n_fp[pre + (" (file name != auth id)" if key != auth else "")] += 1
     assert not fp_bad, f"band fingerprint failed for {len(fp_bad)} of {len(target)} auths, e.g. {fp_bad[:5]}"
@@ -170,10 +180,10 @@ def cmd_refs(a):
             continue
         used = [j for j in range(len(sl)) if sl[j] >= 0]
         lines.append(f"{st}\t{stem}\t{auth}\t{rid}\t{k}\t{rw}\t{float(t):.4f}\t{','.join(str(int(sl[j])) for j in used)}\t"
-                     f"{','.join(str(int(rws[j])) for j in used)}\t{target[auth]}\n")
+                     f"{','.join(str(int(rws[j])) for j in used)}\t{target[auth]}\t{fptag[auth]}\n")
     assert not bad, f"{len(bad)} refs disagree with the band index (rung, rewind, tm), e.g. {bad[:5]}"
     with open(a.out_refs, "w") as fh:  # written only after every ref passed the band check
-        fh.write("set\tstem\tauth\tref_id\tslot\trewind\ttm\trung_slots\trung_rewinds\ttarget\n")
+        fh.write("set\tstem\tauth\tref_id\tslot\trewind\ttm\trung_slots\trung_rewinds\ttarget\tfp\n")
         fh.writelines(lines)
     z = np.load(a.pack + ".idx.npz", allow_pickle=True)
     ent = {str(s): (int(o), int(l)) for s, o, l in zip(z["stems"], z["offsets"], z["lengths"])}
@@ -244,6 +254,18 @@ def cmd_audit(a):
             amask = npz["atom_mask"].astype(bool)
             ncont, npres = cont_all[o0:o1 - 1], present_all[o0:o1]
             n_native_break = int((npres[1:] & npres[:-1] & ~ncont).sum())
+            dup_same = ""
+            if refs[0]["fp"] != "unique":
+                tree = os.path.dirname(os.path.dirname(path))
+                same = []
+                for pn in refs[0]["fp"].split(":", 1)[1].split(","):
+                    pp = f"{tree}/shard{zlib.crc32(pn.encode()) % 1000:04d}/{pn}.npz"
+                    if not os.path.exists(pp):
+                        same.append(None)
+                        continue
+                    other = np.load(pp)
+                    same.append(all(np.array_equal(npz[k], other[k]) for k in ("coords", "atom_mask", "aatype", "rewind_steps")))
+                dup_same = "absent" if None in same else str(all(same))
             for r in refs:
                 full = np.zeros(amask.shape + (3,), np.float32)
                 full[amask] = npz["coords"][int(r["slot"])]  # coords hold the PRESENT atoms only (builder scatter)
@@ -251,7 +273,7 @@ def cmd_audit(a):
                 ds = d[both & ncont]
                 st = lambda f: f"{f(ds):.3f}" if len(ds) else "nan"
                 out.write("\t".join([r["set"], stem, r["ref_id"], r["tm"], "ok", path, str(amask.shape[0]), str(len(ds)),
-                                     str(int((ds > BREAK_A).sum())), str(n_native_break), st(np.max), st(np.min), st(np.median)]) + "\n")
+                                     str(int((ds > BREAK_A).sum())), str(n_native_break), st(np.max), st(np.min), st(np.median), dup_same]) + "\n")
                 n["ok"] += 1
     print(f"part {a.part}/{a.n_parts}: " + ", ".join(f"{k} {v}" for k, v in sorted(n.items())))
 
@@ -268,7 +290,9 @@ def cmd_summary(a):
                 if key not in best or rank[r["status"]] < rank[best[key]["status"]]:
                     best[key] = r
     with open(a.refs) as fh:
-        want = {(r["set"], r["ref_id"]) for r in csv.DictReader(fh, delimiter="\t")}
+        refrows = list(csv.DictReader(fh, delimiter="\t"))
+    want = {(r["set"], r["ref_id"]) for r in refrows}
+    dup = {(r["set"], r["ref_id"]) for r in refrows if r["fp"] != "unique"}
     lost, extra = want - set(best), set(best) - want
     assert not lost and not extra, f"audit rows vs REFS: {len(lost)} refs without a row (e.g. {sorted(lost)[:5]}), {len(extra)} rows not in REFS"
     print(f"{len(best)} refs resolved from {len(a.tsvs)} files (complete against {a.refs})")
@@ -280,8 +304,15 @@ def cmd_summary(a):
         for r in R:
             status[r["status"]] += 1
         print(f"\n== {st.upper()}: {len(R)} refs; status " + ", ".join(f"{k} {v}" for k, v in sorted(status.items())))
-        ok = [r for r in R if r["status"] == "ok" and int(r["n_scored"]) > 0]
-        print(f"  scored: {len(ok)} (ok with 0 scored steps: {status['ok'] - len(ok)})")
+        ok_all = [r for r in R if r["status"] == "ok" and int(r["n_scored"]) > 0]
+        dk = [r for r in ok_all if (st, r["ref_id"]) in dup]
+        unres = [r for r in dk if r["dup_same"] != "True"]
+        print(f"  fp=dup (band fingerprint exact but not unique in its source): {len(dk)} refs; partner arrays identical "
+              f"for {len(dk) - len(unres)}; identity unresolved for {len(unres)} (left out of the numbers below; "
+              f"{sum(int(r['n_excess_break']) > 0 for r in unres)} of them broken)")
+        ures = {r["ref_id"] for r in unres}
+        ok = [r for r in ok_all if r["ref_id"] not in ures]
+        print(f"  scored: {len(ok_all)}; headline (unresolved dups removed): {len(ok)}; ok with 0 scored steps: {status['ok'] - len(ok_all)}")
         if not ok:
             continue
         nb = np.array([int(r["n_excess_break"]) for r in ok])

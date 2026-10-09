@@ -127,6 +127,28 @@ with tempfile.TemporaryDirectory() as td:
     # a recorded target the rule does not reproduce must stop refs
     open(f"{td}/ctrl_bad.tsv", "w").write(open(f"{td}/ctrl.tsv").read().replace("AUTHremap_B.npz", "AUTHremap_A.npz"))
     assert fails(*[x if x != f"{td}/ctrl.tsv" else f"{td}/ctrl_bad.tsv" for x in REFS]), "refs accepted a control target mismatch"
+    # a source band holding the same fingerprint twice (same-sequence chains sharing templates) -> tagged dup2, not fatal
+    z = dict(np.load(f"{td}/t2_band.npz"))
+    z2 = {k: (np.concatenate([v, v[:1]]) if k in ("chains", "tm", "rewind", "slot") else v) for k, v in z.items()}
+    z2["chains"] = z2["chains"].copy(); z2["chains"][-1] = "AUTHtwin_Z"
+    np.savez(f"{td}/t2_band_dup.npz", **z2)
+    print(run(*[x.replace(f"{td}/t2_band.npz", f"{td}/t2_band_dup.npz") for x in REFS]))
+    tags = {r["stem"]: r["fp"] for r in csv.DictReader(open(f"{td}/refs.tsv"), delimiter="\t")}
+    first = str(z["chains"][0]).replace("AUTH", "")
+    assert tags[first] == "dup2:AUTHtwin_Z" and sum(v.startswith("dup2") for v in tags.values()) == 1, tags
+    # partner file present with identical arrays -> dup_same True; absent partner -> 'absent'
+    fst = "AUTH" + first
+    src = f"{t2_new}/shard{zlib.crc32(fst.encode()) % 1000:04d}/{fst}.npz"
+    dst_dir = f"{t2_new}/shard{zlib.crc32(b'AUTHtwin_Z') % 1000:04d}"
+    os.makedirs(dst_dir, exist_ok=True)
+    np.savez(f"{dst_dir}/AUTHtwin_Z.npz", **dict(np.load(src)))
+    run("audit", "--refs", f"{td}/refs.tsv", "--native", f"{td}/nat.npz", "--map", f"{t2_orig}={t2_new}", "--out", f"{td}/dup.tsv")
+    ds = {r["stem"]: r["dup_same"] for r in csv.DictReader(open(f"{td}/dup.tsv"), delimiter="\t")}
+    assert ds[first] == "True" and all(v == "" for k, v in ds.items() if k != first), ds
+    os.remove(f"{dst_dir}/AUTHtwin_Z.npz")
+    run("audit", "--refs", f"{td}/refs.tsv", "--native", f"{td}/nat.npz", "--map", f"{t2_orig}={t2_new}", "--out", f"{td}/dup2.tsv")
+    assert {r["stem"]: r["dup_same"] for r in csv.DictReader(open(f"{td}/dup2.tsv"), delimiter="\t")}[first] == "absent"
+    print(run(*REFS))  # restore the clean refs.tsv
     # the T2 band row under the partner name holding ANOTHER chain's fingerprint (a swapped homomer) must stop refs
     z = dict(np.load(f"{td}/t2_band.npz")); z["tm"] = z["tm"].copy()
     j = list(z["chains"]).index("AUTHremap_B"); z["tm"][j, 50] += 0.5
