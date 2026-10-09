@@ -27,6 +27,7 @@ from torch.nn.modules.module import _IncompatibleKeys
 from proteinfoundation.flow_matching.r3n_fm import FlowMatcher
 from proteinfoundation.nn.contact_map_dit import ContactMapSiT
 from proteinfoundation.nn.contact_map_tri import ContactMapTriSiT
+from proteinfoundation.nn.ca_template_compress import CATemplateCompress1D
 from proteinfoundation.nn.contact_map_hier import ContactMapHierSiT
 from proteinfoundation.nn.protein_transformer import ProteinTransformerAF3
 from proteinfoundation.proteinflow.model_trainer_base import ModelTrainerBase
@@ -121,6 +122,7 @@ NN_REGISTRY = {
     "ContactMapSiT": ContactMapSiT,
     "ContactMapHierSiT": ContactMapHierSiT,
     "ContactMapTriSiT": ContactMapTriSiT,
+    "CATemplateCompress1D": CATemplateCompress1D,
 }
 
 
