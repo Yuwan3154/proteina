@@ -31,7 +31,11 @@ C2C_TRAIN = ["train/loss", "train/diffusion", "train/distogram", "train/rmsd"]
 TRI_KEYS = {"train_contact": "train/contact_map_loss_epoch", "val_contact": "validation_loss/contact_map_loss_epoch",
             "train_align": "train/align_loss_epoch", "val_align": "validation_loss/align_loss_epoch",
             "train_p": "train/contact_precision_at_L_single_step_epoch",
-            "val_p": "validation_loss/contact_precision_at_L_single_step", "lr": "lr-Adam", "step": "global_step"}
+            "val_p": "validation_loss/contact_precision_at_L_single_step", "lr": "lr-Adam", "step": "global_step",
+            # QxT alignment head (user 2026-10-08): precision@Q and the SAME metric on a position-only (diagonal) score
+            "train_align_p": "train/align_precision_at_q_epoch", "val_align_p": "validation_loss/align_precision_at_q_epoch",
+            "train_align_pos": "train/align_precision_at_q_pos_baseline_epoch",
+            "val_align_pos": "validation_loss/align_precision_at_q_pos_baseline_epoch"}
 STRATA = ["", "_tlow", "_tmid", "_thigh"]
 ONESTEP = [f"validation_loss/contact_precision_at_L_single_step{s}" for s in STRATA]
 FLOOR = [f"validation_loss/contact_precision_at_L_noisy_floor{s}" for s in STRATA]
