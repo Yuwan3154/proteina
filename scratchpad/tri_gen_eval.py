@@ -119,8 +119,13 @@ def main():
     ap.add_argument("--zero_ca_features", action="store_true",
                     help="zero cell_in's min_ca_dist/mean_ca_dist columns (old checkout only)")
     ap.add_argument("--mask_regime", choices=["single", "variable"], default="single")
+    # D36tc: condition each query on ANOTHER chain's index row ({query stem: reference stem} JSON),
+    # resolved by validation_sampling.topology_reference_map inside self_reference(); self arm only.
+    ap.add_argument("--topology_reference_map", default=None)
+    ap.add_argument("--dataset", default=None, help="override the experiment config's dataset yaml")
     args = ap.parse_args()
     assert args.mask_regime == "single" or args.arm == "mask", "--mask_regime applies to --arm mask"
+    assert args.topology_reference_map is None or args.arm == "self", "--topology_reference_map needs --arm self"
     if args.dump_dir is not None:
         # samples.jsonl APPENDS and the per-stem counter restarts per process: a reused dir would
         # silently mix passes.
@@ -143,6 +148,11 @@ def main():
         cfg_exp.validation_sampling.fixed_chain_list = args.fixed_chain_list
     if args.dump_dir is not None:
         cfg_exp.validation_sampling.contact_dump_dir = args.dump_dir
+    if args.dataset is not None:
+        cfg_exp.dataset = args.dataset
+    if args.topology_reference_map is not None:
+        cfg_exp.validation_sampling.topology_reference_map = args.topology_reference_map
+        print(f"[arm] self via topology_reference_map={args.topology_reference_map}")
     if args.arm == "mask" and args.mask_regime == "variable":
         from proteinfoundation.datasets.topology_reference import TopologyReferenceTransform
         # ⛔ The OLD checkout lacks this path and would silently run the SELF arm instead.
