@@ -7,7 +7,9 @@
   python scripts/compare_synth_parts_dssp.py NEW_PART.pt V4_PART.pt --expect identical|dssp [--new-skips skips_0000.tsv]
 
 --new-skips: chains the NEW build skipped as `native not_in_pack` (A6000 build reads natives from the training pack) are
-excluded from the comparison and counted; any other missing native still fails.
+excluded from the comparison and counted; any other missing native still fails. In --expect dssp a native the new build
+skipped as `dssp_all_ignore` is also counted, not failed: no residue has a complete N/CA/C/O backbone (CA-only chains),
+so v4's row came from stored labels computed on fill coordinates (validity does not depend on the donor mask).
 """
 
 import argparse
@@ -23,22 +25,27 @@ def main():
     ap.add_argument("--expect", choices=("identical", "dssp"), required=True)
     ap.add_argument("--new-skips", default="")
     a = ap.parse_args()
-    not_in_pack = set()
+    not_in_pack, all_ignore = set(), set()
     if a.new_skips:
         for line in open(a.new_skips):
             f = line.rstrip("\n").split("\t")
             if len(f) == 3 and f[1] == "native" and f[2] == "not_in_pack":
                 not_in_pack.add(f[0])
+            if len(f) == 3 and f[1] == "native" and f[2] == "dssp_all_ignore":
+                all_ignore.add(f[0])
     x = torch.load(a.new, map_location="cpu", weights_only=False)
     y = torch.load(a.v4, map_location="cpu", weights_only=False)
     cx, cy = {c["stem"]: c for c in x["chains"]}, {c["stem"]: c for c in y["chains"]}
     assert sorted(cx) == sorted(cy), "chain sets differ"
     bad, n_nat, n_nat_runs, n_tpl, n_tpl_runs, n_tpl_align, n_rows_missing = [], 0, 0, 0, 0, 0, 0
-    n_excluded = 0
+    n_excluded, n_all_ignore = 0, 0
     for s in cy:
         u, v = cx[s], cy[s]
         if s in not_in_pack and u["native"] is None:
             n_excluded += 1
+            continue
+        if a.expect == "dssp" and s in all_ignore and u["native"] is None and v["native"] is not None:
+            n_all_ignore += 1
             continue
         if (u["native"] is None) != (v["native"] is None):
             bad.append(f"{s}: native presence differs")
@@ -68,6 +75,7 @@ def main():
         if len(u["rows"]) != len(v["rows"]):
             bad.append(f"{s}: {len(u['rows'])} vs {len(v['rows'])} template rows")
     rec = {"expect": a.expect, "new_dssp_def": x.get("dssp_def"), "chains": len(cy), "excluded_not_in_pack": n_excluded,
+           "dropped_no_complete_backbone": n_all_ignore,
            "natives": n_nat,
            "natives_runs_changed": n_nat_runs, "template_rows": n_tpl, "template_rows_missing": n_rows_missing,
            "template_runs_changed": n_tpl_runs, "template_align_changed": n_tpl_align, "n_bad": len(bad), "bad": bad[:20]}
