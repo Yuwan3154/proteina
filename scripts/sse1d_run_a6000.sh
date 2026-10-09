@@ -13,7 +13,11 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=$GPU  # same numbering 
 busy=$(nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader | grep -c "$(nvidia-smi -i "$GPU" --query-gpu=uuid --format=csv,noheader)")
 if [ "$busy" -ne 0 ]; then echo "GPU $GPU busy ($busy processes)"; exit 3; fi
 cd "$HOME/proteina_sse1d" || exit 2
-echo "commit $(git rev-parse --short HEAD) dec=$DEC gpu=$GPU run=$RUN start $(date)"
+# the env has ~/proteina's proteinfoundation installed; without this, train.py's imports come from that checkout
+export PYTHONPATH=$HOME/proteina_sse1d
+PF=$("$HOME/miniconda3/envs/proteina_sse1d/bin/python" -c "import proteinfoundation; print(proteinfoundation.__file__)")
+[ "$PF" = "$HOME/proteina_sse1d/proteinfoundation/__init__.py" ] || { echo "wrong proteinfoundation: $PF"; exit 4; }
+echo "commit $(git rev-parse --short HEAD) dec=$DEC gpu=$GPU run=$RUN start $(date) pkg=$PF"
 exec "$HOME/miniconda3/bin/conda" run --no-capture-output -p "$HOME/miniconda3/envs/proteina_sse1d" \
   python proteinfoundation/train.py --config_name training_ca_template_compress_v1 \
   --ngpus_per_node 1 --nnodes 1 --accumulate_grad_batches 32 \
