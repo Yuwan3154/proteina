@@ -14,6 +14,8 @@ source "$REPO/scratchpad/d36tc_af2.env.sh"
 export PYTHONPATH=$REPO
 export TMPDIR=/tmp/chenxiou_${SLURM_JOB_ID}; mkdir -p "$TMPDIR"; trap 'rm -rf "$TMPDIR"' EXIT
 : "${MODEL:?}" "${LABELS:?}" "${EXPECT_POOLS:?}"
+# `python -m` from $REPO: running scratchpad/<x>.py puts scratchpad/ first on sys.path, and the tracked stub
+# scratchpad/openfold/ (utils/tm_score.py only) then shadows the real openfold (Control C 25383711: no openfold.utils.loss)
 cd "$REPO"; git log -1 --format="[repo] $REPO HEAD %h"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 # AF2 params must be the SuperCloud production files (md5 from SuperCloud ~/openfold/openfold/resources/params)
@@ -21,7 +23,7 @@ for pm in "params_model_1_ptm.npz dfca7cd972028fc6adcc0c8995857a2a" "params_mode
   set -- $pm; h=$(md5sum < "$AF2RANK_PARAMS_DIR/$1" | cut -d' ' -f1); echo "[params] $1 $h (SC $2)"
   [ "$h" = "$2" ] || { echo "FATAL: $1 differs from the SuperCloud production params"; exit 72; }
 done
-python scratchpad/d36tc_af2rank.py --model "$MODEL" --labels "$LABELS" --expect-pools "$EXPECT_POOLS"
+python -m scratchpad.d36tc_af2rank --model "$MODEL" --labels "$LABELS" --expect-pools "$EXPECT_POOLS"
 rc=$?
 echo "AF2RANK_RC=$rc"
 exit $rc
