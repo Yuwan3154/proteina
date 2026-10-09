@@ -1,8 +1,9 @@
 name: ca_template_compress
-nn_class: CATemplateCompress1D   # proteinfoundation/nn/ca_template_compress.py (user directive 2026-10-08)
+nn_class: CATemplateCompress1D   # proteinfoundation/nn/ca_template_compress.py (user directives 2026-10-08, 2026-10-09)
 
-# 1D attention (pre) -> hard SSE runs -> tri-mul on the (K+T)^2 grid (compressed query + topology reference)
-# -> 2D->1D decompressor -> 1D attention (post) -> CA head + outer-product distogram head.
+# 1D attention (pre) -> local-attention compression over windows of 9 residues, stride 5, right-padded (user 2026-10-09)
+# -> tri-mul on the (K+T)^2 grid (window tokens + topology reference) -> 2D->1D decompressor -> 1D attention (post)
+# -> CA head + outer-product distogram head.
 # ??? = a value the user has not chosen yet; hydra refuses to run until it is set (no invented sizes).
 decompress: ???         # pair_row_xattn | pair_bias | basis_pool | spectral
 token_dim: ???          # 1D width
@@ -16,7 +17,6 @@ mid_dim: ???            # compressed-grid pair width (tri used pair_dim 320)
 mid_tri_hidden: ${.mid_dim}
 mid_transition_n: 4     # AF2 Evoformer expansion (tri)
 mid_dim_cond: 128       # tri dim_cond
-true_seg_until_step: ??? # optimiser steps that segment by the TRUE DSSP before switching to the SSE head
 opm_dim: 32             # AF2 outer-product-mean hidden width
 xattn_heads: ${.nheads} # pair_row_xattn
 spectral_heads: ???     # spectral only

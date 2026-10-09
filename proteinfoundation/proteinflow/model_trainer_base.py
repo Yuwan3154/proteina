@@ -1311,10 +1311,6 @@ class ModelTrainerBase(L.LightningModule):
         batch["t"] = t
         batch["mask"] = mask
         batch["x_t"] = x_t
-        # CATemplateCompress1D segments by the TRUE DSSP before this optimiser step, by its own SSE head after it
-        _seg_until = getattr(self.nn, "true_seg_until_step", None)
-        if _seg_until is not None:
-            batch["sse_use_true"] = self.global_step < int(_seg_until)
 
         # Fold conditional training: apply progressive masking to cath_code_indices
         if self.cfg_exp.training.fold_cond:

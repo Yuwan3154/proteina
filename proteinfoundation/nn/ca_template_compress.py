@@ -1,16 +1,16 @@
-"""1D template model with SSE-run compression (user directive 2026-10-08).
+"""1D template model with fixed-window compression (user directives 2026-10-08, 2026-10-09).
 
 Regime: proteina CA flow matching (predict clean CA). Layout:
-  1D pair-biased attention over residues (ProteinTransformerAF3 blocks)
-  -> SSE head + HARD segmentation into consecutive runs (DSSP while `sse_use_true`, else argmax; no gradient through it)
-  -> compress to a K x K pair rep, concatenated with the T template topology elements on one (K+T)^2 grid (as in
-     ContactMapTriSiT) and updated ONLY by the tri's TriBlocks
-  -> decompress 2D -> 1D (one of four designs, `decompress`)
+  1D pair-biased attention over residues (ProteinTransformerAF3 blocks) -> SSE head (DSSP CE, aux only)
+  -> compress by LOCAL ATTENTION over windows of 9 residues, each overlapping the next by 4 (stride 5), right-padded
+     (user 2026-10-09; replaces the SSE-run segmentation): one token per window, a K x K window pair rep, concatenated
+     with the T template topology elements on one (K+T)^2 grid (as in ContactMapTriSiT), updated ONLY by the tri's TriBlocks
+  -> decompress 2D -> 1D (one of four designs, `decompress`); a residue in two windows averages the two windows' outputs
   -> 1D pair-biased attention -> CA head, outer-product distogram head.
 The four decompressors (research/k_pair2single.md §5) all write h = s_pre + o with zero-initialised outputs:
-  pair_row_xattn  residue query (skip single + position-in-run) attends over its run's row/column of the grid
+  pair_row_xattn  residue query (skip single + position-in-window) attends over its window's row/column of the grid
   pair_bias       no vector readout; the compressed pair, expanded to residue pairs, biases the post-expansion attention
-  basis_pool      diag / row / column / template means of the run's grid row -> MLP -> FiLM by position-in-run
+  basis_pool      diag / row / column / template means of the window's grid row -> MLP -> FiLM by position-in-window
   spectral        eigenvectors of symmetrised projections of Z_KK, made sign-invariant with SignNet
 """
 
@@ -28,34 +28,26 @@ from proteinfoundation.nn.protein_transformer import MultiheadAttnAndTransition,
 from proteinfoundation.nn.feature_factory import FeatureFactory
 
 DECOMPRESSORS = ("pair_row_xattn", "pair_bias", "basis_pool", "spectral")
-# Coarse query tokens (ContactEBM sse convention): one loop token + helix/strand x the tri SSEAlphabet length slots
-# (exact 1-10, bins of 2 to 30, catch-all): 21 slots each.
-EXACT_MAX, CATCH_ALL = 10, 30
-BIN_EDGES = list(range(12, CATCH_ALL + 1, 2))
-SLOTS = EXACT_MAX + len(BIN_EDGES) + 1
-N_SEG_TOKENS = 1 + 2 * SLOTS
-POS_SIN_DIM = 32  # sinusoid width for the offset-in-run features (Non-Attentive Tacotron uses 32)
+WIN, STRIDE = 9, 5  # user 2026-10-09: windows of 9 residues, each overlapping the next by 4
+POS_SIN_DIM = 32  # sinusoid width for the offset-in-window features (Non-Attentive Tacotron uses 32)
 
 
-# ── hard segmentation helpers ─────────────────────────────────────────────────────────────────────
-def runs_from_labels(y, valid, breaks):
-    """y [B,L] long, valid [B,L] bool, breaks [B,L] bool -> start [B,L], seg_id [B,L] (-1 invalid), K [B]."""
-    prev, prev_v = torch.roll(y, 1, 1), torch.roll(valid, 1, 1)
-    start = valid & ((y != prev) | ~prev_v | breaks)
-    start[:, 0] = valid[:, 0]
-    seg_id = torch.where(valid, torch.cumsum(start.long(), 1) - 1, torch.full_like(y, -1))
-    return start, seg_id, start.sum(1)
+# ── window helpers ────────────────────────────────────────────────────────────────────────────────
+def n_windows(n_res):
+    """Windows needed to cover n_res residues; the last one is right-padded."""
+    return torch.div((n_res - WIN).clamp(min=0) + STRIDE - 1, STRIDE, rounding_mode="floor") + 1
 
 
-def length_slot(n):
-    edges = torch.tensor(BIN_EDGES, device=n.device)
-    binned = EXACT_MAX + torch.searchsorted(edges, n.clamp(min=EXACT_MAX + 1))
-    return torch.where(n <= EXACT_MAX, n - 1, binned.clamp(max=SLOTS - 1))
-
-
-def segment_token(seg_type, seg_len):
-    tok = 1 + (seg_type - 1).clamp(min=0) * SLOTS + length_slot(seg_len.clamp(min=1))
-    return torch.where(seg_type == 0, torch.zeros_like(tok), tok)
+def window_slots(valid, K_per):
+    """The (at most two) windows holding each residue: hi = min(i // STRIDE, K_b - 1), lo = hi - 1 if it reaches i.
+    Returns w [2, B, L] (lo, hi), ok [2, B, L] bool, offset-in-window p [2, B, L]."""
+    B, L = valid.shape
+    i = torch.arange(L, device=valid.device)[None].expand(B, -1)
+    hi = torch.minimum(i // STRIDE, (K_per - 1)[:, None])
+    lo = hi - 1
+    lo_ok = valid & (lo >= 0) & (lo * STRIDE + WIN > i)
+    w = torch.stack([lo.clamp(min=0), hi])
+    return w, torch.stack([lo_ok, valid]), i[None] - w * STRIDE
 
 
 def sinusoid(x, dim):
@@ -65,9 +57,34 @@ def sinusoid(x, dim):
     return torch.cat([torch.sin(ang), torch.cos(ang)], -1)
 
 
+class WindowAttentionPool(nn.Module):
+    """Compression: one token per window by multi-head attention over the window's residues, with the window MEAN as
+    the query and as the residual (Funnel Transformer's pooled-query attention, Dai et al. 2020)."""
+
+    def __init__(self, d, heads):
+        super().__init__()
+        self.h, self.ch = heads, d // heads
+        self.ln = nn.LayerNorm(d)
+        self.q, self.k, self.v = (nn.Linear(d, d, bias=False) for _ in range(3))
+        self.o = nn.Linear(d, d, bias=False)
+
+    def forward(self, s, win_idx, win_mask):
+        B, K, W = win_mask.shape
+        sw = s[torch.arange(B, device=s.device)[:, None, None], win_idx]   # [B, K, W, d]
+        m = win_mask.to(s.dtype)
+        mean = (sw * m[..., None]).sum(2) / m.sum(2).clamp(min=1)[..., None]
+        x = self.ln(sw)
+        q = self.q(self.ln(mean)).view(B, K, self.h, self.ch)
+        k, v = self.k(x).view(B, K, W, self.h, self.ch), self.v(x).view(B, K, W, self.h, self.ch)
+        logit = torch.einsum("bkhc,bkwhc->bkhw", q, k) / math.sqrt(self.ch)
+        logit = logit.masked_fill(~win_mask[:, :, None, :], torch.finfo(logit.dtype).min)  # empty windows: uniform, zeroed below
+        out = torch.einsum("bkhw,bkwhc->bkhc", torch.softmax(logit, -1), v).reshape(B, K, -1)
+        return (mean + self.o(out)) * (m.sum(2) > 0)[..., None].to(s.dtype)
+
+
 # ── decompressors ─────────────────────────────────────────────────────────────────────────────────
 class PairRowCrossAttention(nn.Module):
-    """Design B: o_i = W_o concat_h[ g_i^h * sum_m softmax_m(q_i.k_{r,m} + w_b.Z_{r,m}) v_{r,m} ], r = run of i."""
+    """Design B: o_i = W_o concat_h[ g_i^h * sum_m softmax_m(q_i.k_{r,m} + w_b.Z_{r,m}) v_{r,m} ], r = a window of i."""
 
     def __init__(self, d, c, heads, pos_dim):
         super().__init__()
@@ -82,9 +99,8 @@ class PairRowCrossAttention(nn.Module):
         self.o = nn.Linear(heads * self.ch, d, bias=False)
         nn.init.zeros_(self.o.weight)
 
-    def forward(self, s_pre, zn, seg_id, pos_feat, grid_valid, n_q):
+    def forward(self, s_pre, zn, sid, pos_feat, grid_valid, n_q):
         B, L, _ = s_pre.shape
-        sid = seg_id.clamp(min=0)
         bidx = torch.arange(B, device=s_pre.device)[:, None]
         zg = self.ln_z(zn)
         row, col = zg[bidx, sid], zg.transpose(1, 2)[bidx, sid]           # [B, L, N, c]: Z_{r,m}, Z_{m,r}
@@ -99,19 +115,17 @@ class PairRowCrossAttention(nn.Module):
 
 
 class ExpandedPairBias(nn.Module):
-    """Design C: no vector readout; Linear(LN(Z_KK)) gathered to residue pairs and ADDED to the post pair bias."""
+    """Design C: no vector readout; Linear(LN(Z_KK)) expanded to residue pairs (R E R^T, R = row-normalised window
+    membership) and ADDED to the post pair bias."""
 
     def __init__(self, c, pair_dim):
         super().__init__()
         self.ln, self.proj = nn.LayerNorm(c), nn.Linear(c, pair_dim, bias=False)
         nn.init.zeros_(self.proj.weight)
 
-    def forward(self, zn, seg_id, n_q):
-        B = zn.shape[0]
+    def forward(self, zn, R, n_q):
         e = self.proj(self.ln(zn[:, :n_q, :n_q]))                         # [B, K, K, pair_dim]
-        sid = seg_id.clamp(min=0)
-        bidx = torch.arange(B, device=zn.device)[:, None, None]
-        return e[bidx, sid[:, :, None], sid[:, None, :]] * (seg_id >= 0)[:, :, None, None] * (seg_id >= 0)[:, None, :, None]
+        return torch.einsum("bik,bklc,bjl->bijc", R, e, R)
 
 
 class BasisPoolFiLM(nn.Module):
@@ -126,7 +140,7 @@ class BasisPoolFiLM(nn.Module):
         self.o = nn.Linear(d, d, bias=False)
         nn.init.zeros_(self.o.weight)
 
-    def forward(self, zn, seg_id, pos_feat, q_valid, t_valid, n_q):
+    def forward(self, zn, sid, pos_feat, q_valid, t_valid, n_q):
         zg = self.ln_z(zn)
         zq, zqt, ztq = zg[:, :n_q, :n_q], zg[:, :n_q, n_q:], zg[:, n_q:, :n_q]
         qv, tv = q_valid.to(zg.dtype), t_valid.to(zg.dtype)
@@ -139,7 +153,6 @@ class BasisPoolFiLM(nn.Module):
         tcol = (ztq * tv[:, :, None, None]).sum(1) / nt
         has_t = (tv.sum(1) > 0).to(zg.dtype)[:, None, None].expand(-1, n_q, 1)
         x = self.ln_x(self.mlp(torch.cat([diag, row, col, trow, tcol, has_t], -1)))  # [B, K, d]
-        sid = seg_id.clamp(min=0)
         xi = torch.gather(x, 1, sid[..., None].expand(-1, -1, x.shape[-1]))
         gamma, beta = self.film(pos_feat).chunk(2, -1)
         return self.o(xi * (1 + gamma) + beta)
@@ -159,7 +172,7 @@ class SpectralSignNet(nn.Module):
         self.o = nn.Linear(d, d, bias=False)
         nn.init.zeros_(self.o.weight)
 
-    def forward(self, zn, seg_id, K_per, n_q):
+    def forward(self, zn, sid, K_per, n_q):
         B = zn.shape[0]
         m = self.proj(self.ln(zn[:, :n_q, :n_q])).permute(0, 3, 1, 2)    # [B, H, K, K]
         m = 0.5 * (m + m.transpose(-1, -2))
@@ -176,7 +189,6 @@ class SpectralSignNet(nn.Module):
             f = f.sum(2).permute(1, 0, 2).reshape(k, -1)                    # [k, H*hidden]
             feats.append(F.pad(f, (0, 0, 0, n_q - k)))
         x = self.rho(torch.stack(feats))                                    # [B, K, d]
-        sid = seg_id.clamp(min=0)
         return self.o(torch.gather(x, 1, sid[..., None].expand(-1, -1, x.shape[-1])))
 
 
@@ -195,7 +207,6 @@ class CATemplateCompress1D(nn.Module):
         c = int(kwargs["mid_dim"])
         self.max_rel_pos = int(kwargs.get("max_rel_pos", 64))
         self.pair_feat_idx = [list(PAIR_FEATURE_NAMES).index(n) for n in PAIR_FEATURE_MODES[kwargs.get("pair_ref_features", "both")]]
-        self.true_seg_until_step = kwargs.get("true_seg_until_step", None)
 
         _fk = {k: v for k, v in kwargs.items() if k not in ("feature_embedding_mode", "individual_feat_ln")}
         self.linear_3d_embed = nn.Linear(3, d, bias=False)
@@ -220,8 +231,8 @@ class CATemplateCompress1D(nn.Module):
         self.dssp_head = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, 3))
 
         # compression -> (K+T)^2 grid (template side identical to ContactMapTriSiT)
+        self.win_pool = WindowAttentionPool(d, int(kwargs["nheads"]))
         self.seg_a, self.seg_b = nn.Linear(d, c, bias=False), nn.Linear(d, c, bias=False)
-        self.seg_tok_a, self.seg_tok_b = nn.Embedding(N_SEG_TOKENS, c), nn.Embedding(N_SEG_TOKENS, c)
         self.pair_pool = nn.Linear(pdim, c, bias=False)
         self.topo_emb = nn.Embedding(int(kwargs.get("topology_vocab_size", 44)), c, padding_idx=0)
         self.block_type_emb = nn.Embedding(N_BLOCK_TYPES, c)
@@ -251,18 +262,6 @@ class CATemplateCompress1D(nn.Module):
         self.opm_out = nn.Linear(co * co, pdim)
         self.pair_head = nn.Sequential(nn.LayerNorm(pdim), nn.Linear(pdim, nb))
 
-    def _segmentation(self, batch, logits, valid):
-        dssp = batch.get("dssp_target")
-        pred = logits.detach().argmax(-1)
-        use_true = bool(batch.get("sse_use_true", False)) and dssp is not None
-        y = torch.where(dssp >= 0, dssp, pred) if use_true else pred
-        breaks = torch.zeros_like(valid)
-        if dssp is not None:  # residues with an incomplete backbone (DSSP -1) are their own runs
-            bad = (dssp == -1) & valid
-            breaks = bad | torch.roll(bad, 1, 1)
-            breaks[:, 0] = False
-        return y.long(), *runs_from_labels(y.long(), valid, breaks)
-
     def forward(self, batch: Dict, force_compile: bool = False) -> Dict:
         valid = batch["mask"].bool()  # proteina's attention layers take the BOOLEAN mask
         mask = valid.float()
@@ -277,21 +276,26 @@ class CATemplateCompress1D(nn.Module):
         s_pre = s
         dssp_logits = self.dssp_head(s_pre)
 
-        # hard segmentation and compression
-        y, start, seg_id, K_per = self._segmentation(batch, dssp_logits, valid)
-        K = max(int(K_per.max()), 1)
-        A = F.one_hot(seg_id.clamp(min=0), K).to(s.dtype) * valid[..., None].to(s.dtype)   # [B, L, K]
+        # windows and compression
+        n_res = valid.sum(1)
+        assert bool((valid == (torch.arange(L, device=dev)[None] < n_res[:, None])).all()), "windows assume right padding"
+        K_per = n_windows(n_res)
+        K = int(K_per.max())
+        w, ok, p = window_slots(valid, K_per)                                # [2, B, L] each
+        A = (F.one_hot(w, K).to(s.dtype) * ok[..., None].to(s.dtype)).sum(0)   # [B, L, K] membership
+        R = A / A.sum(-1, keepdim=True).clamp(min=1)                         # row-normalised: residue -> its windows
+        r = ok.to(s.dtype) / ok.to(s.dtype).sum(0, keepdim=True).clamp(min=1)  # [2, B, L] slot weights (rows of R)
         n_k = A.sum(1)
         q_valid = n_k > 0
         nn_ = n_k.clamp(min=1)
-        seg_type = (torch.einsum("blk,bl->bk", A, y.to(A.dtype)) / nn_).round().long()
         idx = torch.arange(L, device=dev, dtype=A.dtype)
         mid = torch.einsum("blk,l->bk", A, idx) / nn_
-        tok = torch.where(q_valid, segment_token(seg_type, n_k.round().long()), torch.zeros_like(seg_type))
-        sk = torch.einsum("blk,bld->bkd", A, s_pre) / nn_[..., None]
+        win_idx = torch.arange(K, device=dev)[:, None] * STRIDE + torch.arange(WIN, device=dev)[None]   # [K, WIN]
+        win_mask = (win_idx < L)[None] & valid[:, win_idx.clamp(max=L - 1)] & (torch.arange(K, device=dev)[None, :, None] < K_per[:, None, None])
+        sk = self.win_pool(s_pre, win_idx.clamp(max=L - 1)[None].expand(B, -1, -1), win_mask)
         pz = self.pair_pool(pair)
         zqq = torch.einsum("bik,bijc,bjl->bklc", A, pz, A) / (nn_[:, :, None, None] * nn_[:, None, :, None])
-        zqq = zqq + self.seg_a(sk)[:, :, None] + self.seg_b(sk)[:, None] + self.seg_tok_a(tok)[:, :, None] + self.seg_tok_b(tok)[:, None]
+        zqq = zqq + self.seg_a(sk)[:, :, None] + self.seg_b(sk)[:, None]
 
         he_tok = batch.get("topology_he_tokens")
         if he_tok is None:
@@ -318,34 +322,28 @@ class CATemplateCompress1D(nn.Module):
             z = blk(z, g_pair, cond)
         zn = self.mid_norm(z)
 
-        out = {"dssp_logits": dssp_logits, "sse_labels_used": y, "sse_K": K_per}
-        sid = seg_id.clamp(min=0)
-        bidx = torch.arange(B, device=dev)[:, None]
-        row_t = zn[:, :K, K:][bidx, sid]                                     # [B, L, T]: residue i -> its run's template row
+        out = {"dssp_logits": dssp_logits}
+        row_t = torch.einsum("blk,bkec->blec", R, zn[:, :K, K:])              # [B, L, T, c]: mean of i's windows' template rows
         qt_valid = valid[:, :, None] & t_valid[:, None, :]
         out["align_logits"] = self.align_head(row_t)[..., 0] * qt_valid.to(zn.dtype)
         diag = torch.diagonal(zn[:, :K, :K], dim1=1, dim2=2).transpose(1, 2)  # [B, K, c]
-        out["align_none_logits"] = self.align_none(diag[bidx, sid])[..., 0] * valid.to(zn.dtype)
+        out["align_none_logits"] = self.align_none(torch.einsum("blk,bkc->blc", R, diag))[..., 0] * valid.to(zn.dtype)
         out["mlm_logits"] = self.mlm_head(torch.diagonal(zn[:, K:, K:], dim1=1, dim2=2).transpose(1, 2))
 
-        # 2D -> 1D
-        first = torch.zeros(B, K, dtype=torch.long, device=dev).scatter_reduce(1, sid, idx.long()[None].expand(B, -1), "amin", include_self=False)
-        last = torch.zeros(B, K, dtype=torch.long, device=dev).scatter_reduce(1, sid, idx.long()[None].expand(B, -1), "amax", include_self=False)
-        S_i = idx[None] - torch.gather(first, 1, sid).to(idx.dtype)
-        E_i = torch.gather(last, 1, sid).to(idx.dtype) - idx[None]
-        u_i = S_i / (S_i + E_i).clamp(min=1)
-        pos_feat = torch.cat([sinusoid(S_i, POS_SIN_DIM), sinusoid(E_i, POS_SIN_DIM), u_i[..., None]], -1).to(s.dtype)
+        # 2D -> 1D: each window decompresses to its residues; a residue in two windows averages them (weights r)
+        pos_feat = [torch.cat([sinusoid(p[j], POS_SIN_DIM), sinusoid(WIN - 1 - p[j], POS_SIN_DIM), (p[j] / (WIN - 1))[..., None]], -1).to(s.dtype)
+                    for j in range(2)]
         pair_post = pair
         if self.decompress == "pair_row_xattn":
-            h = s_pre + self.decomp(s_pre, zn, seg_id, pos_feat, g_valid, K)
+            o = sum(r[j][..., None] * self.decomp(s_pre, zn, w[j], pos_feat[j], g_valid, K) for j in range(2))
         elif self.decompress == "pair_bias":
-            h = s_pre
-            pair_post = pair + self.decomp(zn, seg_id, K)
+            o = 0
+            pair_post = pair + self.decomp(zn, R, K)
         elif self.decompress == "basis_pool":
-            h = s_pre + self.decomp(zn, seg_id, pos_feat, q_valid, t_valid, K)
+            o = sum(r[j][..., None] * self.decomp(zn, w[j], pos_feat[j], q_valid, t_valid, K) for j in range(2))
         else:
-            h = s_pre + self.decomp(zn, seg_id, K_per, K)
-        h = h * mask[..., None]
+            o = sum(r[j][..., None] * self.decomp(zn, w[j], K_per, K) for j in range(2))
+        h = (s_pre + o) * mask[..., None]
         for lyr in self.post_layers:
             h = lyr(h, pair_post, c_seq, valid)
 

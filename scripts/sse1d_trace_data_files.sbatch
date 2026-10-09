@@ -22,5 +22,5 @@ source "$ENV_DIR/.venv/bin/activate"; source "$ENV_DIR/activate.sh"
 cd "$REPO"; export PYTHONPATH=$REPO
 echo "commit $(git rev-parse --short HEAD) host $(hostname)"
 
-python scripts/sse1d_trace_data_files.py --n_batches 4 --out /orcd/scratch/orcd/011/chenxiou/sse1d_trace_${SLURM_JOB_ID}.json --sizes model.nn.decompress=basis_pool model.nn.true_seg_until_step=1 model.nn.token_dim=64 model.nn.pair_repr_dim=32 model.nn.dim_cond=64 model.nn.nheads=4 model.nn.n_pre=1 model.nn.n_mid=1 model.nn.n_post=1 model.nn.mid_dim=32 model.nn.spectral_heads=2 model.nn.spectral_r=4 model.nn.spectral_hidden=16
+python scripts/sse1d_trace_data_files.py --n_batches 4 --out /orcd/scratch/orcd/011/chenxiou/sse1d_trace_${SLURM_JOB_ID}.json --sizes model.nn.decompress=basis_pool model.nn.token_dim=64 model.nn.pair_repr_dim=32 model.nn.dim_cond=64 model.nn.nheads=4 model.nn.n_pre=1 model.nn.n_mid=1 model.nn.n_post=1 model.nn.mid_dim=32 model.nn.spectral_heads=2 model.nn.spectral_r=4 model.nn.spectral_hidden=16
 rc=$?; echo "rc=$rc"; exit $rc

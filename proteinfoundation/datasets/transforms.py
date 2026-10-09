@@ -86,7 +86,15 @@ class DSSPTargetTransform(T.BaseTransform):
     Adds graph.dssp_target [L] with values 0=loop, 1=helix, 2=strand. Invalid residues
     (missing N/CA/C/O or masked) are set to -1 (ignore_index for CE loss).
     Skips if coords have fewer than 4 atoms (e.g. CA-only data).
+
+    proline_donor_mask: recompute even when a pre-computed target exists, with proline excluded as a backbone H-bond
+        donor (its N carries no H; pydssp donor_mask). User 2026-10-09 for the CA template model; default off.
     """
+
+    PRO_IDX = 14  # openfold restype order
+
+    def __init__(self, proline_donor_mask: bool = False):
+        self.proline_donor_mask = proline_donor_mask
 
     def forward(self, graph: Data) -> Data:
         """Computes DSSP targets and adds to graph.
@@ -107,7 +115,7 @@ class DSSPTargetTransform(T.BaseTransform):
         """
         # Fast path: use pre-computed target from precompute_dssp_targets.py.
         # Falls through to on-the-fly computation for files not yet processed.
-        if getattr(graph, "dssp_target", None) is not None:
+        if getattr(graph, "dssp_target", None) is not None and not self.proline_donor_mask:
             return graph
 
         coords = getattr(graph, "coords", None)
@@ -121,7 +129,9 @@ class DSSPTargetTransform(T.BaseTransform):
         ncao = coords[:, [0, 1, 2, 4], :]  # [L, 4, 3]
         ncao_batch = ncao.unsqueeze(0)  # [1, L, 4, 3] for PyDSSP
 
-        dssp_out = pydssp.assign(ncao_batch, out_type="index")  # [1, L]
+        # default path calls pydssp exactly as before (older pydssp has no donor_mask)
+        kw = {"donor_mask": (graph.residue_type != self.PRO_IDX).float()} if self.proline_donor_mask else {}
+        dssp_out = pydssp.assign(ncao_batch, out_type="index", **kw)  # [1, L]
         dssp_target = dssp_out[0].long().clone()  # [L]
 
         # Mask invalid residues (missing backbone atoms)

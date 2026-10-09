@@ -1,7 +1,7 @@
-# 1D template model with SSE-run compression (user directive 2026-10-08): mimics the tri topology-reference model's
-# DATA, template inputs and template aux heads (training_contact_tri_full384_cb8synth_v1), but reasons in 1D attention
-# before compression and after decompression, with tri-mul ONLY on the compressed (K+T)^2 grid, and is trained as
-# proteina CA FLOW MATCHING (noised query CA in, clean CA out; user). ??? = not yet chosen by the user.
+# 1D template model with window compression (user directives 2026-10-08, 2026-10-09): mimics the tri topology-reference
+# model's DATA, template inputs and template aux heads (training_contact_tri_full384_cb8synth_v1), but reasons in 1D
+# attention before compression and after decompression, with tri-mul ONLY on the compressed (K+T)^2 grid (K = windows of
+# 9 residues, stride 5), and is trained as proteina CA FLOW MATCHING (noised query CA in, clean CA out; user).
 run_name_: ca_template_compress
 
 hardware:
@@ -37,7 +37,7 @@ defaults:
 model:
   target_pred: x_1           # predict the clean CA (user 2026-10-08); caflow's default is v
 
-dataset: pdb_train_contact-CB8-synthtopo_S25_max384_purge-test_cutoff-190828   # the tri's data, unchanged
+dataset: pdb_train_contact-CB8-synthtopo_S25_max384_purge-test_cutoff-190828_dssp-pro   # the tri's data + proline-mask DSSP
 dataset_config_subdir: pdb
 
 force_precision_f32: False

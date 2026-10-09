@@ -4,13 +4,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from proteinfoundation.nn.ca_template_compress import DECOMPRESSORS, CATemplateCompress1D, runs_from_labels
+from proteinfoundation.nn.ca_template_compress import DECOMPRESSORS, STRIDE, WIN, CATemplateCompress1D, n_windows, window_slots
 
 NB = 39
 CFG = dict(
     token_dim=32, pair_repr_dim=16, dim_cond=32, nheads=4, n_pre=1, n_mid=1, n_post=1, mid_dim=16, mid_tri_hidden=16,
     mid_dim_cond=16, num_buckets_predict_pair=NB, opm_dim=4, spectral_heads=2, spectral_r=3, spectral_hidden=8,
-    xattn_heads=4, topology_vocab_size=44, true_seg_until_step=10,
+    xattn_heads=4, topology_vocab_size=44,
     feats_init_seq=["res_seq_pdb_idx", "chain_break_per_res", "x_sc"], feats_cond_seq=["time_emb"],
     feats_pair_repr=["rel_seq_sep", "x_sc_pair_dists", "xt_pair_dists"], feats_pair_cond=["time_emb"],
     residue_type_emb_init_seq=True, seq_emb_dim=16, t_emb_dim=16, idx_emb_dim=16, seq_sep_dim=15, xt_pair_dist_dim=8,
@@ -31,7 +31,6 @@ def _batch(L=20, T=4, seed=0):
         x_t=torch.randn(B, L, 3), x_sc=torch.randn(B, L, 3), t=torch.rand(B), mask=mask,
         residue_type=torch.randint(0, 20, (B, L)), dssp_target=dssp,
         topology_he_tokens=tok, topology_he_pos_raw=torch.rand(B, T) * L, topology_he_feat=torch.rand(B, T, T, 8),
-        sse_use_true=True,
     )
 
 
@@ -78,31 +77,56 @@ def test_coords_loss_reaches_mid_and_pre_through_decompressor(dec):
     assert mid > 0 and pre > 0, (mid, pre)
 
 
-def test_segmentation_is_dssp_runs_with_minus_one_breaks():
-    b = _batch()
-    m = _model("basis_pool")
-    out = m(b)
-    y = out["sse_labels_used"]
-    assert torch.equal(torch.where(b["dssp_target"] >= 0, b["dssp_target"], y), y)
-    # row 0: 0 0 | 1 1 1 1 | 0 | -1 | 0 | 2 2 2 | 0 0 | 1 1 1 | 0 0 0  -> 9 runs (the -1 residue is its own run)
-    assert int(out["sse_K"][0]) == 9, out["sse_K"]
-    assert int(out["sse_K"][1]) == 7, out["sse_K"]  # 17 valid residues: 1 1 1|0 0|2 2|0 0 0|1 1 1 1|0|2 2
+def _membership(valid):
+    K_per = n_windows(valid.sum(1))
+    w, ok, p = window_slots(valid, K_per)
+    A = (F.one_hot(w, int(K_per.max())).float() * ok[..., None].float()).sum(0)
+    return K_per, A, p, ok
 
 
-def test_runs_block_mean_pooling():
-    y = torch.tensor([[0, 0, 1, 1, 1, 2]])
-    valid = torch.ones_like(y, dtype=torch.bool)
-    _, seg_id, K = runs_from_labels(y, valid, torch.zeros_like(valid))
-    A = F.one_hot(seg_id, int(K)).float()
-    z = torch.randn(1, 6, 6, 3)
+def test_windows_cover_residues_as_stride5_win9():
+    assert [int(n_windows(torch.tensor(n))) for n in (1, 9, 10, 14, 15, 17, 20, 384)] == [1, 1, 2, 2, 3, 3, 4, 76]
+    valid = _batch()["mask"].bool()
+    K_per, A, p, ok = _membership(valid)
+    assert K_per.tolist() == [4, 3]
+    for b in range(2):
+        n = int(valid[b].sum())
+        ref = torch.zeros(valid.shape[1], A.shape[2])
+        for k in range(int(K_per[b])):
+            ref[k * STRIDE: min(k * STRIDE + WIN, n), k] = 1  # window k = residues 5k .. 5k+8, right-padded
+        assert torch.equal(A[b], ref), b
+    assert bool(((p >= 0) & (p < WIN))[ok].all())
+
+
+def test_window_block_mean_pooling():
+    valid = torch.ones(1, 14, dtype=torch.bool)
+    _, A, _, _ = _membership(valid)                                   # windows 0..8 and 5..13
+    z = torch.randn(1, 14, 14, 3)
     n = A.sum(1)
     zk = torch.einsum("bik,bijc,bjl->bklc", A, z, A) / (n[:, :, None, None] * n[:, None, :, None])
-    assert torch.allclose(zk[0, 1, 2], z[0, 2:5, 5:6].mean((0, 1)))
-    assert torch.allclose(zk[0, 0, 1], z[0, 0:2, 2:5].mean((0, 1)))
+    assert torch.allclose(zk[0, 0, 1], z[0, 0:9, 5:14].mean((0, 1)), atol=1e-6)
+
+
+def test_window_tokens_ignore_masked_residues():
+    torch.manual_seed(0)
+    m = _model("basis_pool").eval()
+    valid = _batch()["mask"].bool()
+    K_per = n_windows(valid.sum(1))
+    K, L = int(K_per.max()), valid.shape[1]
+    win_idx = torch.arange(K)[:, None] * STRIDE + torch.arange(WIN)[None]
+    win_mask = (win_idx < L)[None] & valid[:, win_idx.clamp(max=L - 1)] & (torch.arange(K)[None, :, None] < K_per[:, None, None])
+    s = torch.randn(2, L, CFG["token_dim"])
+    s2 = s.clone()
+    s2[1, 17:] += 100.0                                                 # masked residues of sample 1
+    with torch.no_grad():
+        t1 = m.win_pool(s, win_idx.clamp(max=L - 1)[None].expand(2, -1, -1), win_mask)
+        t2 = m.win_pool(s2, win_idx.clamp(max=L - 1)[None].expand(2, -1, -1), win_mask)
+    assert int(win_mask[1].sum()) == 9 + 9 + 7 and torch.allclose(t1, t2, atol=1e-5)  # 0..8, 5..13, 10..16
+    assert bool((t1[1, 3] == 0).all())                                  # window 3 does not exist for sample 1
 
 
 @pytest.mark.parametrize("dec,varies", [("pair_row_xattn", True), ("basis_pool", True), ("spectral", False)])
-def test_within_run_variation(dec, varies):
+def test_within_window_variation(dec, varies):
     b = _batch()
     m = _model(dec, perturb=True).eval()
     captured = {}
@@ -110,7 +134,7 @@ def test_within_run_variation(dec, varies):
     with torch.no_grad():
         m(b)
     o = captured["o"][0]
-    run = o[2:6]  # residues 2..5 form one helix run in sample 0
+    run = o[0:5]  # first call = low slot; residues 0..4 read window 0 (clamped) at offsets 0..4
     differs = bool((run - run[0]).abs().max() > 1e-6)
     assert differs == varies
 
