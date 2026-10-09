@@ -39,7 +39,7 @@ def main():
                              overrides=TEST_SIZES + ["model.nn.decompress=basis_pool", "model.nn.true_seg_until_step=1"])
     with hydra.initialize(f"../configs/datasets_config/{base['dataset_config_subdir']}", version_base=hydra.__version__):
         cfg_data = hydra.compose(config_name=base["dataset"])  # same path train.py uses
-    cfg_data.datamodule.num_workers = 0
+    cfg_data.datamodule.num_workers = 2  # the dataloader sets prefetch_factor, which needs workers
     cfg_data.datamodule.batch_size = 1
     datamodule = hydra.utils.instantiate(cfg_data.datamodule)
     datamodule.prepare_data()
