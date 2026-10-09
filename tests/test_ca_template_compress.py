@@ -13,7 +13,7 @@ CFG = dict(
     xattn_heads=4, topology_vocab_size=44, true_seg_until_step=10,
     feats_init_seq=["res_seq_pdb_idx", "chain_break_per_res", "x_sc"], feats_cond_seq=["time_emb"],
     feats_pair_repr=["rel_seq_sep", "x_sc_pair_dists", "xt_pair_dists"], feats_pair_cond=["time_emb"],
-    residue_type_emb_init_seq=True, t_emb_dim=16, idx_emb_dim=16, seq_sep_dim=15, xt_pair_dist_dim=8,
+    residue_type_emb_init_seq=True, seq_emb_dim=16, t_emb_dim=16, idx_emb_dim=16, seq_sep_dim=15, xt_pair_dist_dim=8,
     xt_pair_dist_min=0.1, xt_pair_dist_max=3, x_sc_pair_dist_dim=8, x_sc_pair_dist_min=0.1, x_sc_pair_dist_max=3,
     strict_feats=False, use_qkln=True,
 )
