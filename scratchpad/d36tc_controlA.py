@@ -66,6 +66,7 @@ ap.add_argument("--write-stored-paths", default="", help="a1: write '<stem>\\t<s
 args = ap.parse_args()
 
 stems = [l.split()[0] for l in open(args.stems) if l.strip()]
+assert len(stems) == 3 == len(set(stems)), f"Control A needs exactly 3 distinct chains, got {stems}"
 manifest = json.load(open(Path(args.train_data) / "shard_manifest.json"))
 fails = []
 if args.part == "a1":

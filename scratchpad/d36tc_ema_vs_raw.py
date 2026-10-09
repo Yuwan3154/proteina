@@ -26,6 +26,7 @@ args = ap.parse_args()
 
 m_frozen, m_run = md5(args.ema), md5(args.run_last_ema)
 print(f"md5 frozen {m_frozen}  run last-EMA {m_run}  equal={m_frozen == m_run}")
+assert m_frozen == m_run, "the run's last-EMA.ckpt is not the frozen copy"
 raw = torch.load(args.raw, map_location="cpu", weights_only=False, mmap=True)
 ema = torch.load(args.ema, map_location="cpu", weights_only=False, mmap=True)
 print(f"global_step raw {raw.get('global_step')} ema {ema.get('global_step')} (want {args.step})")

@@ -25,6 +25,9 @@ ap.add_argument("--target-seqs", required=True, help="json {target: sequence}")
 ap.add_argument("--hit-manifest", required=True, help="json {target: {ref_stem, tseq}}")
 ap.add_argument("--stage", choices=("coords", "dssp", "f2c"), default="coords")
 ap.add_argument("--extra", default="", help="file of extra stems that only need the --stage attribute check")
+ap.add_argument("--n-targets", type=int, default=34)
+ap.add_argument("--n-hits", type=int, default=31, help="unique hit stems")
+ap.add_argument("--n-extra", type=int, default=3)
 args = ap.parse_args()
 
 tseqs = json.load(open(args.target_seqs))
@@ -80,6 +83,10 @@ for e in extra:
     load(e)
 
 n_ref = len({h["ref_stem"] for h in hits.values()})
+want_read = len(set(tseqs) | {h["ref_stem"] for h in hits.values()} | set(extra))
+if len(tseqs) != args.n_targets or n_ref != args.n_hits or len(extra) != args.n_extra or len(lens) != want_read:
+    bad.append(f"sizes: targets {len(tseqs)} (want {args.n_targets}), unique hits {n_ref} (want {args.n_hits}), "
+               f"extra {len(extra)} (want {args.n_extra}), .pt read {len(lens)} of {want_read}")
 print(f"[verify-{args.stage}] targets {len(tseqs)}, hits {len(hits)} ({n_ref} unique), extra {len(extra)}; "
       f"{len(lens)} .pt read; {len(bad)} failures")
 for n in notes:
