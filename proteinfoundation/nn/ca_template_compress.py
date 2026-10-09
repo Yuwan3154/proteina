@@ -174,7 +174,8 @@ class SpectralSignNet(nn.Module):
 
     def forward(self, zn, sid, K_per, n_q):
         B = zn.shape[0]
-        m = self.proj(self.ln(zn[:, :n_q, :n_q])).permute(0, 3, 1, 2)    # [B, H, K, K]
+        with torch.autocast(zn.device.type, enabled=False):  # fp32 matrix: eigh has no bf16 kernel, near-ties need precision
+            m = self.proj(self.ln(zn[:, :n_q, :n_q].float())).permute(0, 3, 1, 2)    # [B, H, K, K]
         m = 0.5 * (m + m.transpose(-1, -2))
         feats = []
         for b in range(B):

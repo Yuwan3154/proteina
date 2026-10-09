@@ -4,24 +4,27 @@ nn_class: CATemplateCompress1D   # proteinfoundation/nn/ca_template_compress.py 
 # 1D attention (pre) -> local-attention compression over windows of 9 residues, stride 5, right-padded (user 2026-10-09)
 # -> tri-mul on the (K+T)^2 grid (window tokens + topology reference) -> 2D->1D decompressor -> 1D attention (post)
 # -> CA head + outer-product distogram head.
-# ??? = a value the user has not chosen yet; hydra refuses to run until it is set (no invented sizes).
+# Sizes (user 2026-10-09: stages 1:1:1, ~20M): the parent models' own widths -- 1D = ca_af3_60M_no_tri (token 512,
+# pair 256, cond 512, 8 heads), grid = contact_map_tri_30M_cb8 (pair 320) -- at 1 layer per stage = 20.3-21.6M params.
 decompress: ???         # pair_row_xattn | pair_bias | basis_pool | spectral
-token_dim: ???          # 1D width
-pair_repr_dim: ???      # residue-level pair-bias width
-dim_cond: ???
-nheads: ???
-n_pre: ???              # 1D layers before compression
-n_mid: ???              # tri-mul blocks at the compressed level
-n_post: ???             # 1D layers after decompression
-mid_dim: ???            # compressed-grid pair width (tri used pair_dim 320)
+token_dim: 512          # 1D width
+pair_repr_dim: 256      # residue-level pair-bias width
+dim_cond: 512
+nheads: 8
+n_pre: 1                # 1D layers before compression
+n_mid: 1                # tri-mul blocks at the compressed level
+n_post: 1               # 1D layers after decompression
+mid_dim: 320            # compressed-grid pair width (tri pair_dim)
 mid_tri_hidden: ${.mid_dim}
 mid_transition_n: 4     # AF2 Evoformer expansion (tri)
 mid_dim_cond: 128       # tri dim_cond
 opm_dim: 32             # AF2 outer-product-mean hidden width
 xattn_heads: ${.nheads} # pair_row_xattn
-spectral_heads: ???     # spectral only
-spectral_r: ???         # spectral only
-spectral_hidden: ???    # spectral only
+# spectral only, from SignNet's own config (cptq/SignNet-BasisNet Transformer_ZINC_LapPE_signinv_GIN.json): one graph
+# matrix, pos_enc_dim 16 eigenvectors, hidden_dim 64
+spectral_heads: 1
+spectral_r: 16
+spectral_hidden: 64
 
 # template side = contact_map_tri_30M_cb8
 max_rel_pos: 64
