@@ -17,8 +17,8 @@ import math
 import re
 
 PAGE = "/Users/Chenxi/SOLab/proteina/.claude/worktrees/distogram-head/figures/training_status_report.html"
-DATA = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report/r20261007"
-SNAPSHOT = "7 Oct 2026"  # date of the JSON snapshots in DATA; update after a re-fetch
+DATA = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report/r20261009"
+SNAPSHOT = "9 Oct 2026"  # date of the JSON snapshots in DATA; update after a re-fetch
 
 TRI = json.load(open(f"{DATA}/tri_epochs.json"))
 C2C = json.load(open(f"{DATA}/c2c_steps.json"))
@@ -27,7 +27,7 @@ C2C_CF = json.load(open(f"{DATA}/c2c_steps_confind.json"))          # ConFind c2
 TRI_FT = json.load(open(f"{DATA}/tri_epochs_tri_confindsynth_ft.json"))  # ConFind tri fine-tune (launched 25 Sep)
 PAL_FT = json.load(open(f"{DATA}/tri_val_pal_tri_confindsynth_ft.json"))
 BENCH = json.load(open(f"{DATA}/bench_c2c.json"))  # scratchpad/bench_summary.py over the 195-chain native benchmark arms
-C2C_SEGMENTS, C2C_CF_SEGMENTS = 18, 33   # wandb segments per run, from the fetch_report_data.py log of 7 Oct
+C2C_SEGMENTS, C2C_CF_SEGMENTS = 18, 33   # wandb segments per run, from the fetch_report_data.py log of 9 Oct (job 25353190)
 
 SEC_OPEN = '<section class="sec" id="convergence-2026-09-21">'
 CAV_OPEN = '<section class="sec" id="archive-caveat-2026-09-22">'
@@ -192,6 +192,10 @@ tri_tc = _pts(TRI, "epoch", "train_contact")
 tri_vc = _pts(TRI, "epoch", "val_contact")
 tri_ta = _pts(TRI, "epoch", "train_align")
 tri_va = _pts(TRI, "epoch", "val_align")
+GREY = "var(--muted)"
+# QxT alignment head (user 2026-10-08): precision@Q and the same metric on the position-only (nearest element midpoint) score
+tri_tap, tri_vap = _pts(TRI, "epoch", "train_align_p"), _pts(TRI, "epoch", "val_align_p")
+tri_tab, tri_vab = _pts(TRI, "epoch", "train_align_pos"), _pts(TRI, "epoch", "val_align_pos")
 tri_tc_tail = [p for p in tri_tc if p[0] >= TAIL]
 tri_vc_tail = [p for p in tri_vc if p[0] >= TAIL]
 tri_first_tail, tri_last_tail = tri_tc_tail[0], tri_tc_tail[-1]
@@ -227,6 +231,10 @@ charts_tri = (
     + chart("tri — alignment loss",
             [S(T, "train_align", "train", ORANGE, tri_ta), S(T, "val_align", "validation", BLUE, tri_va)],
             xlab="epoch")
+    + chart("tri — alignment precision@Q vs position-only baseline",
+            [S(T, "train_align_p", "head, train", ORANGE, tri_tap), S(T, "val_align_p", "head, validation", BLUE, tri_vap),
+             S(T, "train_align_pos", "baseline, train", GREY, tri_tab, dash="5 3"),
+             S(T, "val_align_pos", "baseline, validation", GREY, tri_vab, dash="2 3")], xlab="epoch")
 )
 
 # ---------------------------------------------------------------- tri validation P@L
@@ -446,6 +454,8 @@ ft = TRI_FT[-1]
 FTF, FTP = "tri_epochs_tri_confindsynth_ft.json", "tri_val_pal_tri_confindsynth_ft.json"
 ft_tc, ft_vc = _pts(TRI_FT, "epoch", "train_contact"), _pts(TRI_FT, "epoch", "val_contact")
 ft_va = _pts(TRI_FT, "epoch", "val_align")
+ft_tap, ft_vap = _pts(TRI_FT, "epoch", "train_align_p"), _pts(TRI_FT, "epoch", "val_align_p")
+ft_tab, ft_vab = _pts(TRI_FT, "epoch", "train_align_pos"), _pts(TRI_FT, "epoch", "val_align_pos")
 SPAL = "validation_sampling/contact_precision_at_L_mean"
 ft_sp = [(r[0], r[1]) for r in PAL_FT["sampling"][SPAL]]
 FT_XLAB = "fine-tune epoch (own axis; warm start)"
@@ -455,14 +465,18 @@ charts_ft = (
           xlab=FT_XLAB, xdom=(0, int(ft["epoch"])))
     + chart("ConFind tri FT — sampled contact precision at L (mean)",
             [S(FTP, SPAL, "validation sampling", BLUE, ft_sp)], xlab=FT_XLAB, xdom=(0, int(ft["epoch"])))
+    + chart("ConFind tri FT — alignment precision@Q vs position-only baseline",
+            [S(FTF, "train_align_p", "head, train", ORANGE, ft_tap), S(FTF, "val_align_p", "head, validation", BLUE, ft_vap),
+             S(FTF, "train_align_pos", "baseline, train", GREY, ft_tab, dash="5 3"),
+             S(FTF, "val_align_pos", "baseline, validation", GREY, ft_vab, dash="2 3")], xlab=FT_XLAB, xdom=(0, int(ft["epoch"])))
 )
 CMP_BLOCK = f"""
   <h3 id="c2c-cb8-vs-confind">c2c &mdash; CB-8 vs ConFind at matched steps (the Stage B pair)</h3>
   <p class="note" style="margin:.2rem 0 .6rem">
     The ConFind twin trains with tbeta&rsquo;s exact recipe (48 diffusion samples, lr 3e-4, warmup 2,000, t_beta
     (1.3, 2.0), effective batch 8); only the input contact map differs. Both validate on the same steps, so the
-    table compares identical steps. ⛔ <b>Not yet a matched result:</b> the twin is at step {cf_max:,} of its 29,620
-    target, and these 16-structure monitor rounds move with which chains they draw; the structure-level comparison is
+    table compares identical steps. ⛔ <b>Not a structure-level result:</b> the twin stopped at step {cf_max:,} (target
+    29,620; it overran, and its final model is the step-29,000 EMA), and these 16-structure monitor rounds move with which chains they draw; the structure-level comparison is
     the 195-chain native benchmark at matched steps. Early steps (before {CUT:,}) are where tbeta itself was unstable
     &mdash; its step-2,143 RMSD spike was a transient the report&rsquo;s convergence view starts after.
     tbeta also crossed a mid-run target change (pseudo-CB, step 7,076) that the twin never sees. Both runs moved to
@@ -493,11 +507,11 @@ BENCH_BLOCK = f"""
   <p class="note" style="margin:.2rem 0 .6rem">
     Each checkpoint rebuilds all 195 benchmark chains from their true contact maps (its own definition: ConFind for
     the twin, CB-8 for tbeta), EMA weights, 1 seed, SuperCloud V100, identical harness; scored on the pre-registered
-    {BENCH["n_chains"]}-chain primary set. The twin is checked every 1,000 steps. Paired columns count chains better /
+    {BENCH["n_chains"]}-chain primary set. The twin was checked every 1,000 steps. Paired columns count chains better /
     worse (Wilcoxon on TM). The CB-8 row is tbeta at step {BENCH["ref"]["step"]:,}, inside its flat stretch (it stopped at
     29,620). Latest twin (step {BL["step"]:,}): TM &ge; 0.5 on {BL["n_tm05"]} of {BENCH["n_chains"]} chains vs
     {BENCH["ref"]["n_tm05"]} for CB-8, but per chain CB-8 is still better on {BL["vs_ref"]["worse"]} of {BENCH["n_chains"]}
-    (median TM {BL["tm_median"]:.3f} vs {BENCH["ref"]["tm_median"]:.3f}), and the twin is still improving at every check
+    (median TM {BL["tm_median"]:.3f} vs {BENCH["ref"]["tm_median"]:.3f}), and at its last check the twin was still improving
     ({BL["vs_prev"]["better"]} / {BL["vs_prev"]["worse"]} vs the previous one, p {BL["vs_prev"]["p"]:.1e}).
   </p>
   <p class="note" style="margin:.2rem 0 .6rem">
@@ -523,15 +537,17 @@ CF_CARDS = f"""
       On 2 GPUs since ~step 5,400 (27 Sep 04:50): 1 per GPU &times; accumulation 4 &times; 2 = effective batch 8,
       unchanged, and validation unsplit so it scores the same chains a 1-GPU run would. Target was step 29,620 (tbeta&rsquo;s
       final step) for a matched comparison; it overran to ~32,000 (the watcher stopped at 29,630 but the job chain did not)
-      and was stopped on 5 Oct 00:38; a 195-chain native-map benchmark runs every 1,000 steps on SuperCloud (first
-      at step 11,190) and may show a plateau earlier.</p>
+      and was stopped on 5 Oct 00:38; final model = the step-29,000 EMA (user, 5 Oct). A 195-chain native-map benchmark
+      ran every 1,000 steps on SuperCloud (step 11,190 to {BL["step"]:,}); the final step-29,000 EMA is not one of its arms
+      (the nearest arm, step {BL["step"]:,}, is a separate snapshot).</p>
     </div>
     <div class="card tri">
       <h3 style="margin-top:0">tri_confindsynth_ft (ConFind tri fine-tune) &mdash; epoch {int(ft["epoch"])}</h3>
       <p class="note">Launched 25 Sep 13:57 on 2&times; RTX PRO 6000: the old ConFind tri (71,950 EMA) surgered into the
       current recipe (synthetic references, vocab 44, no CA features, align + MLM heads) on a pure-ConFind
       synthetic-reference index. Gates passed: total_training_steps 403,593 (= the CB-8 tri), only the 6 new head
-      parameters cold-started. Now step {int(ft["step"]):,} (epoch {int(ft["epoch"])}, {len(ft_vc)} validation rounds).
+      parameters cold-started. Stopped 7 Oct at step {int(ft["step"]):,} (epoch {int(ft["epoch"])}, {len(ft_vc)} validation
+      rounds; user: &ldquo;Release it.&rdquo;); its final EMA is frozen as cfft_tri_last-EMA_step60505.
       Validation contact loss is flat at {min(y for _, y in ft_vc):.4f}&ndash;{max(y for _, y in ft_vc):.4f}
       (the warm-started trunk already knew ConFind maps); the cold-started alignment head fell from
       {ft_va[0][1]:.2f} to {ft_va[-1][1]:.2f} (validation). Sampled precision at L: {ft_sp[0][1]:.3f} (epoch
@@ -612,6 +628,11 @@ html = f"""{SEC_OPEN}
   <div class="grid2">{charts_ft}</div>
   <h3>tri &mdash; the loss curves</h3>
   <div class="grid2">{charts_tri}</div>
+  <p class="note">Alignment precision@Q: per sample, the Q top-scoring (query residue, template element) cells,
+  Q = residues that truly align to an element, scored as the fraction true. The grey baseline is the same metric on a
+  position-only score (each residue to the element whose own-chain midpoint is nearest its index); synthetic templates
+  keep the query's numbering, so it is a strong but beatable prior. Batches with no aligned residues log 0 for both,
+  so read the gap, not the level.</p>
   <p class="note">The full-run panel is dominated by the first five epochs (loss falls from
   {tri_tc[0][1]:.2f} to under 0.07); the epoch-{TAIL}+ panel is the one to judge convergence on.</p>
 {BLOCK}

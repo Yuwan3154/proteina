@@ -11,7 +11,7 @@ import re
 
 PAGE = "/Users/Chenxi/SOLab/proteina/.claude/worktrees/distogram-head/figures/training_status_report.html"
 ORIG = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report/r20260925/report_7fc1e47.html"
-DATA = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report/r20261007"
+DATA = "/Users/Chenxi/.claude/jobs/2c2943b0/tmp/report/r20261009"
 SEC_OPEN = '<section class="sec" id="convergence-2026-09-21">'
 PX_TOL = 0.5
 X0, X1, Y0, Y1 = 52.0, 548.0, 14.0, 176.0
@@ -69,7 +69,7 @@ oa, ob = section(orig)
 sec = page[pa:pb]
 charts = re.findall(r'<div class="chart-t">(.*?)</div>(<svg.*?</svg>)', sec, re.S)
 print(f"charts parsed in section: {len(charts)}")
-assert len(charts) == 15, len(charts)  # 10 CB-8 + 3 CB-8-vs-ConFind c2c (25 Sep) + 2 ConFind tri FT (26 Sep)
+assert len(charts) == 17, len(charts)  # 10 CB-8 + 3 CB-8-vs-ConFind c2c (25 Sep) + 2 ConFind tri FT (26 Sep) + 2 alignment precision@Q (9 Oct)
 
 n_poly = n_pts = n_raw = n_dots = n_grid = 0
 max_err = 0.0
