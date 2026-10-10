@@ -22,6 +22,7 @@ from torch_geometric.data import Dataset
 from torch_geometric.loader import DataLoader
 
 from proteinfoundation.utils import io_audit
+from proteinfoundation.datasets.epoch_batch_plan import EpochBatchPlanSampler
 from proteinfoundation.utils.cluster_utils import ClusterSampler, CATBalancedSampler
 from proteinfoundation.utils.dense_padding_data_loader import DensePaddingDataLoader
 
@@ -68,6 +69,8 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         cath_balanced_member_tracking: bool = False,
         cath_balanced_emit_topology: bool = False,
         eligible_ids_file: Optional[str] = None,
+        epoch_batch_plan: bool = False,
+        epoch_batch_plan_len_edges: Optional[List[int]] = None,
     ):
         """Initialising the base data module class.
 
@@ -136,6 +139,12 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         # Restrict cluster draws to these chain ids (one per line), e.g. chains that have a
         # synthetic topology reference; clusters left with no eligible member are dropped.
         self.eligible_ids_file = eligible_ids_file
+        # Train loader as an epoch batch plan (user 2026-10-10): one member per cluster drawn at epoch start, batches of
+        # similar length, plan + consumed batches in the checkpoint (epoch_batch_plan.py)
+        self.epoch_batch_plan = epoch_batch_plan
+        self.epoch_batch_plan_len_edges = epoch_batch_plan_len_edges
+        self._train_plan_sampler: Optional[EpochBatchPlanSampler] = None
+        self._train_plan_restore: Optional[Dict[str, Any]] = None
         self._chain_to_cat = None  # lazy cache for cath-balanced sampling
         # Last-built samplers kept on the datamodule so on_{train,validation}_epoch_start
         # can call set_epoch even on Lightning versions that don't auto-propagate.
@@ -177,6 +186,13 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             for key in ("nocat_sample_counts", "cat_cluster_sample_counts", "member_sample_counts"):
                 if key in state:
                     out[f"{prefix}_{key}"] = state[key]
+        if self._train_plan_sampler is not None:
+            # `processed` = batches whose training_step has run, incl. the one whose on_train_batch_end saves this
+            # checkpoint (measured, scratchpad/test_epoch_batch_plan_resume.py); equal on every rank by construction
+            done = self.trainer.fit_loop.epoch_loop.batch_progress.current.processed
+            plan = self._train_plan_sampler.state_dict(consumed=done)
+            assert plan["epoch"] == self.trainer.current_epoch, (plan["epoch"], self.trainer.current_epoch)
+            out["train_epoch_plan"] = plan
         return out
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
@@ -189,6 +205,7 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         self._train_cat_cluster_sample_counts_restore = state_dict.get("train_cat_cluster_sample_counts")
         self._val_cat_cluster_sample_counts_restore = state_dict.get("val_cat_cluster_sample_counts")
         self._train_member_sample_counts_restore = state_dict.get("train_member_sample_counts")
+        self._train_plan_restore = state_dict.get("train_epoch_plan")
         self._val_member_sample_counts_restore = state_dict.get("val_member_sample_counts")
 
     def _compose_transforms(self, transforms: Iterable[Callable]) -> T.Compose:
@@ -393,6 +410,9 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             # inherited objects -- the two cheap CoW-leak mitigations (pytorch#13246).
             kwargs["persistent_workers"] = True
             kwargs["worker_init_fn"] = _gc_freeze_worker_init
+        if self.epoch_batch_plan and dataset is self.train_ds:
+            kwargs.update(batch_size=1, sampler=None, shuffle=False, drop_last=False,
+                          batch_sampler=self._make_plan_sampler(dataset, clusterid_to_seqid_mapping, sampler))
         if dataloader_class is DensePaddingDataLoader:
             kwargs["rank_for_logging"] = rank_for_logging
             kwargs["debug_data_loading"] = debug_data_loading
@@ -426,6 +446,8 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         )
         if isinstance(getattr(train_dl, "sampler", None), (ClusterSampler, CATBalancedSampler)):
             self._train_cluster_sampler = train_dl.sampler
+        if isinstance(getattr(train_dl, "batch_sampler", None), EpochBatchPlanSampler):
+            self._train_plan_sampler = train_dl.batch_sampler
         return train_dl
 
     def on_train_epoch_start(self) -> None:
@@ -436,6 +458,31 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         sampler = self._train_cluster_sampler
         if sampler is not None and hasattr(self, "trainer") and self.trainer is not None:
             sampler.set_epoch(int(self.trainer.current_epoch))
+
+    def _make_plan_sampler(self, dataset, clusterid_to_seqid_mapping, cluster_sampler) -> EpochBatchPlanSampler:
+        """Epoch batch plan over the same clusters (eligible-restricted) and seq-id -> index map the ClusterSampler
+        built for this dataset; lengths from the subclass's _dataset_lengths."""
+        assert self.sampling_mode == "cluster-random" and isinstance(cluster_sampler, ClusterSampler), \
+            f"epoch_batch_plan needs sampling_mode cluster-random, got {self.sampling_mode}"
+        assert self.epoch_batch_plan_len_edges, "epoch_batch_plan needs epoch_batch_plan_len_edges"
+        assert not getattr(getattr(self, "trainer", None), "reload_dataloaders_every_n_epochs", 0), \
+            "epoch_batch_plan: a reloaded loader would re-apply the stale restore"
+        idx = cluster_sampler.sequence_id_to_idx
+        members = [[idx[s] for s in seqs] for seqs in cluster_sampler.clusterid_to_seqid_mapping.values()]
+        dist = torch.distributed.is_available() and torch.distributed.is_initialized()
+        rank, world = (torch.distributed.get_rank(), torch.distributed.get_world_size()) if dist else (0, 1)
+        if self._train_plan_restore is not None:
+            r = self._train_plan_restore
+            logger.info(f"[epoch_batch_plan] resuming epoch {r['epoch']} after {r['consumed']} of this rank's batches "
+                        f"(Lightning's 'dataloader is not resumable' warning does not apply: the plan resumes)")
+        # kept (not cleared): configure_optimizers builds one loader for len() before Lightning builds the real one
+        return EpochBatchPlanSampler(members, self._dataset_lengths(dataset), self.batch_size,
+                                     self.epoch_batch_plan_len_edges, self.cluster_sampler_seed, rank, world,
+                                     restore=self._train_plan_restore)
+
+    def _dataset_lengths(self, dataset) -> List[int]:
+        """Residue count of every dataset index (used to group batches by length)."""
+        raise NotImplementedError(f"{type(self).__name__} does not provide lengths for epoch_batch_plan")
 
     def val_dataloader(self) -> DataLoader:
         if self.val_ds is None:

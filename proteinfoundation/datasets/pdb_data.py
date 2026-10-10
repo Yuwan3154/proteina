@@ -2045,6 +2045,15 @@ class PDBLightningDataModule(BaseLightningDataModule):
                     f"No structures to download, all {len(pdb_codes)} structure files already present"
                 )
 
+    def _dataset_lengths(self, dataset) -> List[int]:
+        """processed_length (residues with coordinates) of every dataset index, from the split dataframe."""
+        df = self.dfs_splits["train"]
+        assert "processed_length" in df.columns, "epoch_batch_plan needs processed_length (set max_length/min_length)"
+        by_id = dict(zip(df["id"].astype(str), df["processed_length"]))
+        missing = [f for f in dataset.file_names if f not in by_id or pd.isna(by_id[f])]
+        assert not missing, f"{len(missing)} of {len(dataset.file_names)} train stems have no processed_length, e.g. {missing[:5]}"
+        return [int(by_id[f]) for f in dataset.file_names]
+
     def _get_dataset(self, split: Literal["train", "val", "test"]) -> PDBDataset:
         """Initialises a dataset for a given split.
 
