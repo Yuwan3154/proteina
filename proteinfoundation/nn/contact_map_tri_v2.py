@@ -32,8 +32,9 @@ AlphaFold conventions for everything the user did not specify (user 2026-10-10: 
     n=2; each sub-module's input LayerNorm is adaptive_layernorm (zero-init scale/bias linears) and its output goes
     through adaptive_zero_init (output Linear default init, gate Linear zero weights, bias -2); SwiGLU input
     projections use the 'relu' (He) init. The conditioning is a PAIR tensor s_ij (user 2026-10-10), AF3's per-token
-    single_cond carried to the pair grid: its own clean-input pair embedding (no noisy map) + the time embedding on
-    every cell, 2 transitions, fixed across the blocks. The time t in [0, 1] goes into the Fourier embedding directly (AF3 feeds
+    single_cond carried to the pair grid: its own clean-input pair embedding (no noisy map) -> LayerNorm (no offset) ->
+    LinearNoBias (AF3 pair_cond_initial_norm / _projection), + the time embedding on every cell, 2 transitions, fixed
+    across the blocks. The time t in [0, 1] goes into the Fourier embedding directly (AF3 feeds
     1/4 log(sigma / sigma_data) of its EDM noise level; this model's noise variable is t).
 """
 
@@ -275,6 +276,9 @@ class ContactMapTriV2(nn.Module):
         # AF3 time embedding added to every cell, then 2 transitions; fixed across all blocks
         self.s_embed = CleanPairEmbedding(self.dim_cond, *emb_args)
         self.s_ref_in = Linear(len(self.pair_feat_idx), self.dim_cond, init="default")
+        # AF3 pair_cond_initial_norm (no offset) + pair_cond_initial_projection (bias-free, default init), user 10-10 "Yes"
+        self.s_in_norm = nn.LayerNorm(self.dim_cond, bias=False)
+        self.s_in_proj = Linear(self.dim_cond, self.dim_cond, bias=False, init="default")
         self.fourier = FourierEmbedding()
         self.fourier_ln = nn.LayerNorm(256, bias=False)  # AF3 noise_embedding_initial_norm: create_offset=False
         self.cond_in = Linear(256, self.dim_cond, bias=False, init="default")
@@ -383,6 +387,7 @@ class ContactMapTriV2(nn.Module):
         z = (self.z_embed(*clean) + self.cell_in(cells)) * pm
 
         s = self.s_embed(*clean) + F.pad(self.s_ref_in(ref_feat), (0, 0, L, 0, L, 0))
+        s = self.s_in_proj(self.s_in_norm(s))
         s = s + self.cond_in(self.fourier_ln(self.fourier(batch["t"])))[:, None, None, :].to(s.dtype)
         for tr in self.cond_transitions:
             s = tr(s, pair_mask)

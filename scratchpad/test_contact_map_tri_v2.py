@@ -228,10 +228,12 @@ def test_pair_conditioning():
         tj = torch.nn.functional.pad((e.topo_j(tok) + e.elem_j(b["topology_he_elem_feat"])) * he_valid, (0, 0, L, 0))
         want = want + si[:, :, None] + sj[:, None] + ti[:, :, None] + tj[:, None]
         want = want + torch.nn.functional.pad(m.s_ref_in(b["topology_he_feat"]), (0, 0, L, 0, L, 0))
+        want = torch.nn.functional.layer_norm(want, (128,), weight=m.s_in_norm.weight) @ m.s_in_proj.weight.t()
+        assert m.s_in_norm.bias is None and m.s_in_proj.bias is None and m.s_in_proj.weight.abs().max() > 0
         want = want + m.cond_in(m.fourier_ln(m.fourier(b["t"])))[:, None, None]
         want = want * pm[..., None]
         assert torch.allclose(s, want, atol=1e-5) and torch.allclose(s_hat, _ln(s), atol=1e-6)
-    print("PASS s at init == clean pair embedding + reference features + time embedding on every cell (masked); s_hat == LN(s)")
+    print("PASS s at init == LinearNoBias(LN(clean pair embedding + reference features)) + time embedding on every cell (masked); s_hat == LN(s)")
 
     randomise_(m)
     b2 = dict(b, contact_map_t=1.0 - b["contact_map_t"], contact_map_sc=torch.rand_like(b["contact_map_sc"]))
