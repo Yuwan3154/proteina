@@ -135,7 +135,7 @@ class ContactMapTriV2(nn.Module):
 
         self.seq_emb = nn.Embedding(int(kwargs.get("n_residue_types", 22)), self.dim)
         self.topo_emb = nn.Embedding(self.topology_vocab_size, self.dim, padding_idx=0)
-        self.elem_in = nn.Linear(self.n_elem_features, self.dim)
+        self.elem_in = Linear(self.n_elem_features, self.dim, init="default")  # AF2 LeCun-normal init (OpenFold primitive)
         self.block_type_emb = nn.Embedding(N_BLOCK_TYPES, self.dim)
         self.rel_pos_emb = nn.Embedding(2 * self.max_rel_pos + 2, self.dim)
         self.time_emb = TimestepEmbedding(self.dim_cond)

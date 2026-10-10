@@ -28,7 +28,7 @@ from proteinfoundation.openfold_stub.model.triangular_multiplicative_update impo
 torch.manual_seed(0)
 DT = torch.float32
 CFG = dict(pair_dim=128, tri_hidden=128, n_blocks_ref=4, n_blocks_query=4, transition_hidden=512, dim_cond=128,
-           max_topology_he_len=96, max_rel_pos=64, topology_vocab_size=45, n_elem_features=1, n_residue_types=22,
+           max_topology_he_len=96, max_rel_pos=32, topology_vocab_size=45, n_elem_features=1, n_residue_types=22,
            pair_ref_features="both", align_head={"enabled": True}, mlm_head={"enabled": True})
 
 
