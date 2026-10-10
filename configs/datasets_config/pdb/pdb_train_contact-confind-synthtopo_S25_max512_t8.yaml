@@ -22,6 +22,11 @@ datamodule:
   # they are the clusters whose templates are still being generated. The transform's unconditional
   # fallback therefore should never fire; if it does, the log says so loudly.
   eligible_ids_file: ${oc.env:SYNTH_INDEX_DIR}/eligible_ids_tm0.5-0.9.txt
+  # Epoch batch plan (user 2026-10-10 "(A)"): one member per cluster drawn at epoch start, batches grouped by length,
+  # plan + consumed batches saved in checkpoints for an exact mid-epoch resume (datasets/epoch_batch_plan.py).
+  # Edges = the torch.compile L buckets (user 10-10 "(A)": step 64 up to 512).
+  epoch_batch_plan: True
+  epoch_batch_plan_len_edges: [64, 128, 192, 256, 320, 384, 448, 512]
   cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/  # For CATH index conversion when fold_cond
   multilabel_mode: "sample"  # sample | average | sum | transformer
   transforms:
