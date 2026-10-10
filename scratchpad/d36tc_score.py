@@ -80,7 +80,7 @@ def main():
     sizes = {g: len([l for l in open(os.path.join(args.groups_dir, f"group{g}.txt")) if l.strip()]) for g in GROUPS}
     assert sizes == {"A": 30, "B": 2, "C": 2}, f"group sizes {sizes} (want A 30, B 2, C 2 = 34)"
 
-    expected, found, problems, out = 0, 0, [], []
+    expected, found, problems, out, max_gap = 0, 0, [], [], 0.0
     for g, arms in GROUPS.items():
         stems = [l.strip() for l in open(os.path.join(args.groups_dir, f"group{g}.txt")) if l.strip()]
         for arm in arms:
@@ -112,8 +112,13 @@ def main():
                     df = pd.read_csv(csvp)
                     assert len(df) == 8 and sorted(df["structure_file"]) == sorted(tms), f"{csvp}: rows != c2c files"
                     comp = df["ptm"] * df["plddt"] * df["tm_template_pred"]
-                    if not (comp == df["composite"]).all():
-                        problems.append(f"{label}/{st}: stored composite != ptm*plddt*tm_template_pred")
+                    # the stored column differs from the recomputed product only at float64 round-off (~1e-16, measured
+                    # on 61 of 66 pools, job 25523477), so no tolerance is invented: the pick is made on the RECOMPUTED
+                    # composite and must be the same row as the stored column's argmax; the max |diff| is reported.
+                    comp_gap = float((comp - df["composite"]).abs().max())
+                    max_gap = max(max_gap, comp_gap)
+                    if int(comp.idxmax()) != int(df["composite"].idxmax()):
+                        problems.append(f"{label}/{st}: argmax of recomputed composite != argmax of stored composite")
                     top = comp.max()
                     n_top = len(np.unique(df.loc[comp == top, "structure_file"]))
                     if n_top > 1:
@@ -127,6 +132,7 @@ def main():
                                headline_tm_ref_pred=float(df.loc[i, "tm_ref_pred"]), sel_c2c_tm=tms[sel])
                 out.append(rec)
     pd.DataFrame(out).to_csv(args.out, index=False)
+    print(f"[score] max |recomputed - stored composite| over all pools: {max_gap!r}")
     print(f"[score] completeness from files: {found} of {expected} expected (c2c PDBs + m1/m2 AF2 predictions)")
     for p in problems:
         print(f"  PROBLEM {p}")
@@ -138,6 +144,20 @@ def main():
         for c in cols:
             if c in d:
                 print(f"  {c:<22} {counts([float(x) for x in d[c].dropna()])}")
+    for g in GROUPS:
+        for arm in GROUPS[g]:
+            d = df[(df["group"] == g) & (df["arm"] == arm)]
+            cols = ["headline_tm_ref_pred", "sel_c2c_tm", "c2c_median8", "c2c_best8"] if arm != "native" else ["c2c_median8", "c2c_best8"]
+            print(f"  group {g} {arm}: " + "; ".join(f"{c} {counts([float(x) for x in d[c].dropna()])}" for c in cols if c in d))
+    print("\n== per-target table (self | tmpl | native)")
+    print(f"{'pid':<8} {'grp':<3} | self: refold sel_c2c med8 best8 | tmpl: refold sel_c2c med8 best8 | native: med8 best8")
+    f = lambda v: "   n/a" if v is None or v != v else f"{v:6.3f}"
+    for pid in sorted(df["pid"].unique()):
+        r = {a: df[(df["pid"] == pid) & (df["arm"] == a)].iloc[0] for a in ("self", "tmpl", "native") if len(df[(df["pid"] == pid) & (df["arm"] == a)])}
+        g = r["self"]["group"]
+        cell = lambda a, cs: " ".join(f(r[a].get(c)) for c in cs) if a in r else " ".join(["   n/a"] * len(cs))
+        print(f"{pid:<8} {g:<3} | {cell('self', ['headline_tm_ref_pred', 'sel_c2c_tm', 'c2c_median8', 'c2c_best8'])} | "
+              f"{cell('tmpl', ['headline_tm_ref_pred', 'sel_c2c_tm', 'c2c_median8', 'c2c_best8'])} | {cell('native', ['c2c_median8', 'c2c_best8'])}")
     print(f"\nwrote {args.out}")
     sys.exit(1 if problems else 0)
 
