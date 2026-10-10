@@ -1,0 +1,26 @@
+name: contact_map_tri_v2_t8
+nn_class: ContactMapTriV2   # dispatches Proteina's NN_REGISTRY
+# T8 ConFind tri v2 (user 2026-10-09). Stage A: n_blocks_ref blocks on the joint (L+T)^2 query+reference grid; the
+# align and MLM heads read its END ("right before the transition", answer (b)); stage B: n_blocks_query blocks on L^2.
+pair_dim: 128            # user: "pair width 128"
+tri_hidden: 128          # user 2026-10-09 (Q5: "Yes")
+n_blocks_ref: 4          # user: "4 blocks ... with the topology reference"
+n_blocks_query: 4        # user: "4 blocks ... without the topology reference"
+transition_hidden: 512   # SwiGLU hidden width, user 2026-10-09: "Do 512"
+dim_cond: 128            # user 2026-10-09 (Q5: "Yes")
+max_rel_pos: 64          # carried over unchanged from contact_map_tri_30M_cb8 (not re-decided for T8)
+topology_cond: True      # read by the trainer (see contact_map_tri_30M_cb8.yaml)
+max_topology_he_len: 96  # user: "Raise the max template elements to 96". Informational here: the cap in force is
+                         # the dataset config's TopologyReferenceTransform max_topology_he_len (must also be 96)
+topology_vocab_size: 45  # 2 special + helix/strand x 21 length slots + 1 loop token (user: single loop token)
+n_elem_features: 1       # per-element length feature (user 2026-10-09 Q7)
+n_residue_types: 22
+align_head:
+  enabled: True
+mlm_head:
+  enabled: True
+pair_ref_features: both
+contact_map_mode: True
+contact_map_input_dim: 1
+non_contact_value: 0
+predict_coords: False
