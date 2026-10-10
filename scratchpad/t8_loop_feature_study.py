@@ -6,8 +6,8 @@ For a seeded sample of T8 train chains, builds the reference the T8 index builde
 type loop/helix/strand an ELEMENT (min_len 1), orientation under BOTH loop-axis options. Writes one npz with
   per chain:   L, element counts (all / helix / strand / loop);
   per element: type, length;
-  per pair:    type pair, |i-j| in elements, contact_max, contact_frac, cos(zero), cos(end_to_end), 4 circuit
-               channels, seq_gap.
+  per pair:    type pair, both element lengths, |i-j| in elements, contact_max, contact_frac, cos(zero),
+               cos(end_to_end), 4 circuit channels, seq_gap.
 Usage: python t8_loop_feature_study.py CHAINS.txt DATA_DIR N SEED OUT.npz
 """
 
@@ -78,12 +78,12 @@ def main(chains, data_dir, n, seed, out):
         f = feat.numpy()
         ce = st_e2e[..., 1].numpy()
         for a, b in zip(iu, ju):
-            P.append((ci, types[a], types[b], b - a, *f[a, b, :2], f[a, b, 2], ce[a, b], *f[a, b, 3:]))
+            P.append((ci, types[a], types[b], lens[a], lens[b], b - a, *f[a, b, :2], f[a, b, 2], ce[a, b], *f[a, b, 3:]))
         if len(C) % 100 == 0:
             print(f"[study] {len(C)} chains, {len(E)} elements, {len(P)} pairs", flush=True)
     np.savez_compressed(out, chains=np.array(C, dtype=np.float64), elements=np.array(E, dtype=np.float64),
                         pairs=np.array(P, dtype=np.float32),
-                        pair_cols=np.array(["chain", "type_a", "type_b", "elem_sep", "contact_max", "contact_frac",
+                        pair_cols=np.array(["chain", "type_a", "type_b", "len_a", "len_b", "elem_sep", "contact_max", "contact_frac",
                                             "cos_zero", "cos_e2e", "circ_series", "circ_contains", "circ_inside",
                                             "circ_cross", "seq_gap"]),
                         chain_cols=np.array(["chain", "L", "T", "n_helix", "n_strand", "n_loop"]),
