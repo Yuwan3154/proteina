@@ -12,7 +12,7 @@
 #   MODEL=old|new|cfft  ARM=self|nonself|mask  REGIME=single|variable  ZERO_CA=0|1  CHAINS=<list>
 #   cfft = the ConFind tri fine-tune (tri_confindsynth_ft), its pinned checkout + ConFind synthetic index (T7, 2026-09-30).
 #   A stem listed k times gets k samples; in the nonself arm all k share one template (seeded by the query's index row).
-#   CKPT=<frozen weights>  LABEL=<pass name>  SEED (default 0)
+#   CKPT=<frozen weights>  LABEL=<pass name>  SEED (default 0)  DUMP_ALIGN=1 (T8: dump align-head first/last calls)
 # ⛔ Each model runs in ITS OWN checkout (SSE alphabet 65 vs 44). ⛔ One fresh dump dir per pass.
 set -uo pipefail
 S=/orcd/scratch/orcd/011/chenxiou
@@ -54,7 +54,8 @@ PYTHONPATH="$REPO" python scratchpad/tri_gen_eval.py \
     --config_name "$CFG" --ema_ckpt "$CKPT" --arm "$ARM" --mask_regime "${REGIME:-single}" \
     --fixed_chain_list "$CHAINS" --limit_val_batches 1 --seed "${SEED:-0}" \
     --dump_dir "$DUMP" --store "$TMPDIR/stageA_store_${SLURM_JOB_ID}" \
-    $( [ "${ZERO_CA:-0}" = 1 ] && echo --zero_ca_features )
+    $( [ "${ZERO_CA:-0}" = 1 ] && echo --zero_ca_features ) \
+    $( [ "${DUMP_ALIGN:-0}" = 1 ] && echo --dump_align )
 rc=$?
 echo "PASS_RC[$LABEL]=$rc"
 # ⛔ Verify the ARTEFACT: every listed chain must have produced exactly one sample.

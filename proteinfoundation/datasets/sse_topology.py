@@ -45,6 +45,8 @@ class SSEAlphabet:
         catch_all_above: runs longer than this collapse into a single per-type bucket.
         min_len: runs shorter than this are dropped from the encoding.
         types: DSSP indices to encode, in the order their token blocks are laid out.
+        single_token_types: types that get ONE token regardless of length (T8, user 2026-10-09: "a single token
+            for loops of any length"). Empty = every type has the full length-slot block, the original layout.
     """
 
     def __init__(
@@ -54,6 +56,7 @@ class SSEAlphabet:
         catch_all_above: int = 30,
         min_len: int = 1,
         types: Sequence[int] = SSE_TYPES,
+        single_token_types: Sequence[int] = (),
     ):
         if min_len > exact_max:
             raise ValueError(f"min_len={min_len} exceeds exact_max={exact_max}")
@@ -72,10 +75,20 @@ class SSEAlphabet:
         if not self.bin_edges or self.bin_edges[-1] < catch_all_above:
             self.bin_edges.append(catch_all_above)
         self.slots_per_type = len(self.exact_lengths) + len(self.bin_edges) + 1
+        self.single_token_types = tuple(single_token_types)
+        if not set(self.single_token_types) <= set(self.types):
+            raise ValueError(f"single_token_types {self.single_token_types} not all in types {self.types}")
+        # token block of each type, laid out in `types` order (identical to the original layout when no type is single)
+        self._slots = {t: 1 if t in self.single_token_types else self.slots_per_type for t in self.types}
+        self._offset, o = {}, N_SPECIAL_TOKENS
+        for t in self.types:
+            self._offset[t] = o
+            o += self._slots[t]
+        self._vocab_size = o
 
     @property
     def vocab_size(self) -> int:
-        return N_SPECIAL_TOKENS + len(self.types) * self.slots_per_type
+        return self._vocab_size
 
     def _slot(self, length: int) -> int:
         if length <= self.exact_max:
@@ -88,19 +101,18 @@ class SSEAlphabet:
     def token(self, dssp_type: int, length: int) -> int:
         if dssp_type not in self.types:
             raise ValueError(f"type {dssp_type} not in alphabet types {self.types}")
-        return (
-            N_SPECIAL_TOKENS
-            + self.types.index(dssp_type) * self.slots_per_type
-            + self._slot(length)
-        )
+        if dssp_type in self.single_token_types:
+            return self._offset[dssp_type]
+        return self._offset[dssp_type] + self._slot(length)
 
     def decode(self, token: int) -> Tuple[int, str]:
         """Return (dssp_type, human-readable length range) for a non-special token."""
         if token < N_SPECIAL_TOKENS:
             return (-1, "special")
-        idx = token - N_SPECIAL_TOKENS
-        t = self.types[idx // self.slots_per_type]
-        slot = idx % self.slots_per_type
+        t = next(t for t in self.types if self._offset[t] <= token < self._offset[t] + self._slots[t])
+        if t in self.single_token_types:
+            return t, "any"
+        slot = token - self._offset[t]
         if slot < len(self.exact_lengths):
             return t, str(self.exact_lengths[slot])
         slot -= len(self.exact_lengths)
@@ -396,12 +408,16 @@ def sse_sequence_gap(runs: Sequence[Tuple[int, int]], keep: Sequence[int]) -> to
     return gap.clamp(min=0.0)
 
 
+LOOP_AXIS_MODES = ("zero", "end_to_end")
+
+
 def sse_structural_pair_features(
     contact_map: torch.Tensor,
     coords: torch.Tensor,
     coord_mask: torch.Tensor,
     runs: Sequence[Tuple[int, int]],
     keep: Sequence[int],
+    loop_axis: Optional[str] = None,
 ) -> torch.Tensor:
     """[T, T, 2] contact fraction and axis cosine per element pair.
 
@@ -413,6 +429,11 @@ def sse_structural_pair_features(
 
     Residues without a resolved CA are excluded from the axis fit; an element pair with no resolved
     CA on either side gets cosine 0, which the contact channels already mark as uninformative.
+
+    loop_axis: how a LOOP element's axis is defined when loops are elements (T8). A loop is not straight, so the
+    helix/strand principal axis is not meaningful for it (user 2026-10-09, options for review): "zero" = no axis
+    (cosine 0 against every element), "end_to_end" = unit vector from its first to its last resolved CA. Required
+    whenever ``keep`` holds a loop; ignored otherwise.
     """
     T = len(keep)
     out = torch.zeros((T, T, len(STRUCTURAL_PAIR_FEATURES)), dtype=torch.float32)
@@ -436,9 +457,12 @@ def sse_structural_pair_features(
     sub = contact_map[valid][:, valid].float()
     out[..., 0] = _block_reduce(sub, row, T, "sum") / pair_res.clamp(min=1.0)
 
+    loops = [a for a, ia in enumerate(keep) if runs[ia][0] == DSSP_LOOP]
+    if loops and loop_axis not in LOOP_AXIS_MODES:
+        raise ValueError(f"keep holds {len(loops)} loop elements: loop_axis must be one of {LOOP_AXIS_MODES}, got {loop_axis!r}")
     ca_ok = valid & (coord_mask[:, CA_ATOM_INDEX] > 0.5)
     if ca_ok.any():
-        axes = _element_axes(coords[:, CA_ATOM_INDEX, :].float(), elem, ca_ok, T)
+        axes = _element_axes(coords[:, CA_ATOM_INDEX, :].float(), elem, ca_ok, T, loops=loops, loop_axis=loop_axis)
         out[..., 1] = (axes @ axes.T).clamp(-1.0, 1.0)
     # Both channels are symmetric by definition, but the reductions take matmul paths that are
     # asymmetric at ~1e-5, and the float16 storage then amplifies that to a whole ulp whenever a
@@ -448,7 +472,8 @@ def sse_structural_pair_features(
 
 
 def _element_axes(
-    ca: torch.Tensor, elem: torch.Tensor, ca_ok: torch.Tensor, T: int
+    ca: torch.Tensor, elem: torch.Tensor, ca_ok: torch.Tensor, T: int,
+    loops: Sequence[int] = (), loop_axis: Optional[str] = None,
 ) -> torch.Tensor:
     """[T, 3] unit axis per element, oriented from its first residue toward its last.
 
@@ -457,13 +482,21 @@ def _element_axes(
     with it on a straight strand. Signing it N-to-C is what makes the pairwise cosine distinguish
     parallel from antiparallel rather than collapsing both onto |cos|. An element with fewer than
     two resolved CA atoms has no definable axis and is left at zero, giving cosine 0 everywhere.
+    Elements listed in ``loops`` follow ``loop_axis`` instead (see sse_structural_pair_features).
     """
     axes = torch.zeros(T, 3)
+    loops = set(loops)
     for a in range(T):
         m = (elem == a) & ca_ok
         if int(m.sum()) < 2:
             continue
         x = ca[m]
+        if a in loops:
+            if loop_axis == "end_to_end":
+                v = x[-1] - x[0]
+                if float(v.norm()) > 1e-6:
+                    axes[a] = v / v.norm()
+            continue
         v = torch.linalg.svd(x - x.mean(0, keepdim=True), full_matrices=False).Vh[0]
         if torch.dot(v, x[-1] - x[0]) < 0:
             v = -v
@@ -479,6 +512,11 @@ def _block_reduce(m: torch.Tensor, row: torch.Tensor, T: int, reduce: str) -> to
     out = torch.full((T, T), init, dtype=m.dtype)
     out.scatter_reduce_(1, row[None, :].expand(T, -1), rows, reduce=reduce)
     return torch.nan_to_num(out, posinf=0.0)
+
+
+def element_lengths(runs: Sequence[Tuple[int, int]], keep: Sequence[int]) -> torch.Tensor:
+    """[T] residue count of each kept element, from the run lengths in force (tracks length augmentation)."""
+    return torch.tensor([float(runs[i][1]) for i in keep], dtype=torch.float32)
 
 
 def assemble_pair_features(

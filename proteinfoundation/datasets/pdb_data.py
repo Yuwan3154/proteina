@@ -328,6 +328,7 @@ class PDBDataSplitter:
         drop_ids_from_file: str = None,
         cat_aware_split: bool = False,
         chain_to_cat_path: Optional[str] = None,
+        split_dir: Optional[str] = None,
     ) -> None:
         """Initialise DataSplitter object for splitting data based on arguments into train, val and test set.
 
@@ -360,6 +361,10 @@ class PDBDataSplitter:
                 splits, one per line (``#`` comments allowed). Unlike exclude_ids_from_file this is
                 per-chain, not cluster-aware, and the IDs are not redistributed to val/test -- it is
                 for structures that are unusable rather than held out. Defaults to None.
+            split_dir (str, optional): a FROZEN split -- {train,val,test}_chain_ids.txt in this directory (T8,
+                user 2026-10-09: the max512 split inherited from max384). When set, no split is drawn and the
+                exclusion/drop files are not re-applied (the lists are final); clusters come from the
+                file_identifier's cluster tsv, restricted to each split. Defaults to None (draw as before).
         """
 
         self.df_data = df_data
@@ -380,6 +385,7 @@ class PDBDataSplitter:
         self.cat_aware_split = cat_aware_split
         self.chain_to_cat_path = chain_to_cat_path
         self._chain_to_cat_split = None
+        self.split_dir = split_dir
 
     def _load_ids_from_file(self, path: str) -> set:
         """Load IDs from a text file (one per line)."""
@@ -458,6 +464,47 @@ class PDBDataSplitter:
         rep_splits["train"] = pd.concat([rep_splits["train"], *promoted_rows], ignore_index=True)
         return rep_splits, len(moved)
 
+    def _split_from_files(self, df_data: pd.DataFrame, file_identifier: str):
+        """The frozen split of ``split_dir``; every listed chain must exist in df_data and in one cluster."""
+        ids = {}
+        for s in self.splits:
+            with open(os.path.join(self.split_dir, f"{s}_chain_ids.txt")) as fh:
+                ids[s] = {l.strip() for l in fh if l.strip()}
+        assert all(ids.values()), f"{self.split_dir}: an empty split file"
+        assert not (ids["train"] & ids["val"]) and not (ids["train"] & ids["test"]) and not (ids["val"] & ids["test"]), \
+            f"{self.split_dir}: split files overlap"
+        have = set(df_data["id"])
+        for s in self.splits:
+            miss = ids[s] - have
+            assert not miss, f"{len(miss)} {s} chains of {self.split_dir} are not in the dataset csv, e.g. {sorted(miss)[:5]}"
+        # the lists are final, so the exclusion / drop files are not re-applied -- but they must already be honoured
+        if self.exclude_ids_from_file:
+            bad = ids["train"] & self._load_ids_from_file(self.exclude_ids_from_file)
+            assert not bad, f"{len(bad)} excluded ids are in the frozen train split, e.g. {sorted(bad)[:5]}"
+        if self.drop_ids_from_file:
+            with open(self.drop_ids_from_file) as fh:
+                drop = {l.strip() for l in fh if l.strip() and not l.startswith("#")}
+            bad = (ids["train"] | ids["val"] | ids["test"]) & drop
+            assert not bad, f"{len(bad)} dropped ids are in the frozen split, e.g. {sorted(bad)[:5]}"
+        _, _, tsv = setup_clustering_file_paths(self.data_dir, file_identifier, self.split_sequence_similarity)
+        assert tsv.exists(), f"cluster tsv missing: {tsv}"
+        clusters = read_cluster_tsv(tsv)
+        where = {c: s for s in self.splits for c in ids[s]}
+        span = [rep for rep, ms in clusters.items() if len({where[c] for c in ms if c in where}) > 1]
+        rank_zero_info(f"Frozen split: {len(span)} clusters of {tsv.name} hold chains of more than one split "
+                       f"({sum(1 for rep in span for c in clusters[rep] if c in where)} chains); kept as listed")
+        self.dfs_splits = {s: df_data.loc[df_data["id"].isin(ids[s])] for s in self.splits}
+        self.clusterid_to_seqid_mappings = {}
+        for s in self.splits:
+            m = {rep: [c for c in ms if c in ids[s]] for rep, ms in clusters.items()}
+            m = {rep: ms for rep, ms in m.items() if ms}
+            n_in = sum(len(v) for v in m.values())
+            assert n_in == len(ids[s]), f"{s}: {len(ids[s]) - n_in} chains are in no cluster of {tsv.name}"
+            self.clusterid_to_seqid_mappings[s] = m
+        rank_zero_info(f"Frozen split from {self.split_dir}: " + ", ".join(
+            f"{s} {len(self.dfs_splits[s])} chains / {len(self.clusterid_to_seqid_mappings[s])} clusters" for s in self.splits))
+        return self.dfs_splits, self.clusterid_to_seqid_mappings
+
     def _derive_val_test_paths(self, base_path: str) -> Tuple[Optional[str], Optional[str]]:
         """Derive _val.txt and _test.txt paths from exclude_ids_from_file path."""
         p = pathlib.Path(base_path)
@@ -478,6 +525,8 @@ class PDBDataSplitter:
         Returns:
             dfs_splits (Dict): dictionary containing the train/val/test splits of the dataframe.
         """
+        if self.split_dir:
+            return self._split_from_files(df_data, file_identifier)
         # Collect all exclude_ids from both sources (excluded from training)
         all_exclude_ids = set()
         file_exclude_ids = set()

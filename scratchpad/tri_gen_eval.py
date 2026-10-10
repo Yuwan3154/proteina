@@ -119,6 +119,8 @@ def main():
     ap.add_argument("--zero_ca_features", action="store_true",
                     help="zero cell_in's min_ca_dist/mean_ca_dist columns (old checkout only)")
     ap.add_argument("--mask_regime", choices=["single", "variable"], default="single")
+    ap.add_argument("--dump_align", action="store_true",
+                    help="also dump the alignment head's first/last-call outputs per sample (needs --dump_dir; T8 study)")
     args = ap.parse_args()
     assert args.mask_regime == "single" or args.arm == "mask", "--mask_regime applies to --arm mask"
     if args.dump_dir is not None:
@@ -143,6 +145,9 @@ def main():
         cfg_exp.validation_sampling.fixed_chain_list = args.fixed_chain_list
     if args.dump_dir is not None:
         cfg_exp.validation_sampling.contact_dump_dir = args.dump_dir
+    if args.dump_align:
+        assert args.dump_dir is not None, "--dump_align needs --dump_dir"
+        cfg_exp.validation_sampling.dump_align_calls = True
     if args.arm == "mask" and args.mask_regime == "variable":
         from proteinfoundation.datasets.topology_reference import TopologyReferenceTransform
         # ⛔ The OLD checkout lacks this path and would silently run the SELF arm instead.

@@ -105,7 +105,7 @@ def main():
                 )
             topology = {
                 k: model._stack_topology([r[k] for r in refs]).to(device)
-                for k in model.TOPOLOGY_KEYS
+                for k in model._topology_keys()
             }
             with torch.no_grad():
                 result = model.generate(

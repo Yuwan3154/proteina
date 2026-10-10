@@ -29,6 +29,7 @@ from torch_geometric.data import Data
 
 from proteinfoundation.datasets.sse_topology import (
     DSSP_HELIX,
+    DSSP_LOOP,
     DSSP_STRAND,
     MASK_TOKEN,
     N_PAIR_FEATURES,
@@ -37,6 +38,7 @@ from proteinfoundation.datasets.sse_topology import (
     STRUCTURAL_PAIR_FEATURES,
     SSEAlphabet,
     circuit_topology_features,
+    element_lengths,
     element_positions,
     perturb_runs,
     sse_sequence_gap,
@@ -80,6 +82,11 @@ class TopologyReferenceTransform(T.BaseTransform):
         token_mask_prob: augmentation -- per-element probability of replacing the helix/strand
             token by MASK; the pre-mask token is emitted as ``topology_he_tokens_target`` for a
             masked-token loss. Both rates default to 0 = mechanism skipped, bit-identical output.
+        element_types: DSSP types that are ELEMENTS of the 2D reference (the T axis). Default helix + strand, the
+            original; T8 adds loops (user 2026-10-09). Must equal the index's own ``element_types`` when it records one.
+        single_token_types: alphabet types with one token regardless of length (T8: loops).
+        elem_features: emit ``topology_he_elem_feat`` [T, 1] = element length, standardised by the index's
+            ``elem_feature_mean`` / ``elem_feature_std`` (T8, user 2026-10-09: "Add a per-element length feature").
     """
 
     def __init__(
@@ -103,6 +110,9 @@ class TopologyReferenceTransform(T.BaseTransform):
         type_mutate_prob: float = 0.0,
         token_mask_prob: float = 0.0,
         drop_ref_len_range: Sequence[int] = (5, 39),
+        element_types: Sequence[int] = (DSSP_HELIX, DSSP_STRAND),
+        single_token_types: Sequence[int] = (),
+        elem_features: bool = False,
     ):
         if reference_source not in ("cluster", "synthetic"):
             raise ValueError(f"reference_source must be 'cluster' or 'synthetic', got {reference_source!r}")
@@ -130,7 +140,13 @@ class TopologyReferenceTransform(T.BaseTransform):
         self.alphabet = SSEAlphabet(
             exact_max=exact_max, bin_step=bin_step, catch_all_above=catch_all_above, min_len=min_len,
             types=tuple(int(t) for t in sse_types),
+            single_token_types=tuple(int(t) for t in single_token_types),
         )
+        self.element_types = tuple(int(t) for t in element_types)
+        if not set(self.element_types) <= set(self.alphabet.types):
+            raise ValueError(f"element_types {self.element_types} must all be tokenised by the alphabet {self.alphabet.types}")
+        self.elem_features = bool(elem_features)
+        self._elem_mean, self._elem_std = 0.0, 1.0
         self.seed = seed
         self._index = None
         self._id_to_row = None
@@ -147,9 +163,16 @@ class TopologyReferenceTransform(T.BaseTransform):
         # mmap: the index carries a per-element-pair feature block, so a resident copy in each of
         # the dataloader workers would multiply a multi-gigabyte allocation by num_workers. Memory
         # mapping leaves it in the page cache, shared by every worker.
-        self._index = torch.load(
-            self.index_path, map_location="cpu", weights_only=False, mmap=True
-        )
+        index = torch.load(self.index_path, map_location="cpu", weights_only=False, mmap=True)
+        # validated BEFORE it is kept: a failed check must not leave a half-initialised transform behind
+        built = tuple(int(t) for t in index.get("element_types", (DSSP_HELIX, DSSP_STRAND)))
+        if sorted(built) != sorted(self.element_types):
+            raise ValueError(f"{self.index_path} was built with element_types {built}, the transform asks for "
+                             f"{self.element_types}; the stored element contacts / features / alignment targets would not line up")
+        if self.elem_features:
+            self._elem_mean = float(index["elem_feature_mean"])
+            self._elem_std = max(float(index["elem_feature_std"]), 1e-6)
+        self._index = index
         self._id_to_row = {s: i for i, s in enumerate(self._index["ids"])}
         # Mixed with torch's per-worker seed: every dataloader worker calls this with the same
         # self.seed, so a bare manual_seed would give all of them one identical stream of template
@@ -298,7 +321,10 @@ class TopologyReferenceTransform(T.BaseTransform):
         # The standardisation constants and the caps both live behind the lazy load, and an
         # external caller has no reason to know that.
         self._ensure_loaded()
-        keep = [i for i, (t, _) in enumerate(runs) if t in (DSSP_HELIX, DSSP_STRAND)]
+        keep = [i for i, (t, _) in enumerate(runs) if t in self.element_types]
+        if he_contact.shape[0] != len(keep) and DSSP_LOOP in self.element_types and he_contact.numel():
+            # T8: never the silent zero fallback below -- an element-set mismatch would hand the model an empty 2D reference
+            raise ValueError(f"element contacts are {tuple(he_contact.shape)} but the runs give {len(keep)} elements")
         if he_contact.shape[0] != len(keep):
             he_contact = torch.zeros(len(keep), len(keep))
             structural = torch.zeros(len(keep), len(keep), len(STRUCTURAL_PAIR_FEATURES))
@@ -344,6 +370,7 @@ class TopologyReferenceTransform(T.BaseTransform):
         he_pos_raw = he_pos_raw[:k]
         he_contact = he_contact[:k, :k]
         he_feat = self._pair_features(he_contact, structural[:k, :k], runs, keep[:k])
+        elem_feat = ((element_lengths(runs, keep[:k]) - self._elem_mean) / self._elem_std)[:, None]
 
         # Token masking (BERT-style, token identity only; positions and pair features stay): the
         # pre-mask token is the target for the masked-token loss, 0 (= PAD) where not masked.
@@ -353,7 +380,7 @@ class TopologyReferenceTransform(T.BaseTransform):
             he_target = torch.where(masked, he_tokens, he_target)
             he_tokens = torch.where(masked, torch.full_like(he_tokens, MASK_TOKEN), he_tokens)
 
-        return {
+        out = {
             "topology_tokens": tokens if tokens.numel() else torch.full((1,), MASK_TOKEN, dtype=torch.long),
             "topology_pos": pos if pos.numel() else torch.zeros(1, dtype=torch.float32),
             "topology_he_tokens": (
@@ -370,6 +397,9 @@ class TopologyReferenceTransform(T.BaseTransform):
                 he_target if he_target.numel() else torch.zeros(1, dtype=torch.long)
             ),
         }
+        if self.elem_features:
+            out["topology_he_elem_feat"] = elem_feat if elem_feat.numel() else torch.zeros(1, 1)
+        return out
 
     def _build_reference(self, t_row: int, length: int, augment: bool) -> Dict[str, torch.Tensor]:
         """``assemble_reference`` fed from index row ``t_row``."""
@@ -449,9 +479,11 @@ class TopologyReferenceTransform(T.BaseTransform):
             self._set_empty(g, L=int(length))
         finally:
             self._generator = saved
-        return {k: getattr(g, k) for k in (
-            "topology_tokens", "topology_pos", "topology_pos_raw", "topology_he_tokens",
-            "topology_he_pos", "topology_he_pos_raw", "topology_he_contact", "topology_he_feat")}
+        keys = ["topology_tokens", "topology_pos", "topology_pos_raw", "topology_he_tokens",
+                "topology_he_pos", "topology_he_pos_raw", "topology_he_contact", "topology_he_feat"]
+        if self.elem_features:
+            keys.append("topology_he_elem_feat")
+        return {k: getattr(g, k) for k in keys}
 
     def forward(self, graph: Data) -> Data:
         self._ensure_loaded()
@@ -568,6 +600,8 @@ class TopologyReferenceTransform(T.BaseTransform):
         graph.topology_he_pos_raw = pos.clone()
         graph.topology_he_contact = torch.zeros(n_el, n_el)
         graph.topology_he_feat = torch.zeros(n_el, n_el, N_PAIR_FEATURES)
+        if self.elem_features:
+            graph.topology_he_elem_feat = torch.zeros(n_el, 1)
         # All zero on purpose: 0 is PAD, and the trainer's `sel = m_tgt > 1` therefore selects
         # nothing, so no MLM loss is taken on a reference the model was never shown.
         graph.topology_he_tokens_target = torch.zeros(n_el, dtype=torch.long)

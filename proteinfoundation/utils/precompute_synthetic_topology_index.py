@@ -35,7 +35,9 @@ Usage:
 
 import argparse
 import hashlib
+import io
 import json
+import mmap
 import os
 import subprocess
 import sys
@@ -53,12 +55,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from proteinfoundation.datasets.pdb_data import _processed_path_sharded  # noqa: E402
 from proteinfoundation.datasets.sse_topology import (  # noqa: E402
     DSSP_HELIX,
+    DSSP_LOOP,
     DSSP_STRAND,
+    LOOP_AXIS_MODES,
     N_PAIR_FEATURES,
     PAIR_FEATURE_NAMES,
     STRUCTURAL_PAIR_FEATURES,
     assemble_pair_features,
     dssp_to_runs,
+    element_lengths,
     runs_to_spans,
     sse_contact_reference,
     sse_structural_pair_features,
@@ -69,6 +74,10 @@ CB_CUTOFF = 8.0                      # ContactEBM CB_CONTACT_CUTOFF
 CA_IDX = 1                           # CA is index 1 in BOTH atom orders
 CB_DISK_IDX, CB_ATOM37_IDX = 4, 3    # ATOM_NUMBERING (on-disk .pt) vs atom37 (templates)
 ALIGN_NONE = -1
+# T8 (user 2026-10-09): which DSSP types are reference ELEMENTS (default helix + strand = the v4 build) and how a loop
+# element's axis is defined when loops are elements (--element-types / --loop-axis; pinned in every part and the index)
+_ELEMENT_TYPES = (DSSP_HELIX, DSSP_STRAND)
+_LOOP_AXIS = None
 CONTACT_DEF = "CB<=8.0A (CA where CB unresolved), diag 1; ContactEBM convention"
 
 # Set once per worker from the CLI (a module global survives the fork; argparse objects do not).
@@ -76,8 +85,16 @@ _USALIGN = "/home/chenxiou/.local/bin/USalign"
 # contact definition of the index: "cb8" (default, the v4 build) or "confind" (Frame2ConFind maps >= threshold:
 # the native's stored contact_map_confind, the templates' maps from the `f2c` subcommand)
 _CONTACT_SOURCE = "cb8"
+# --proline-donor-mask (user 2026-10-09): recompute every DSSP (native too) with proline unable to donate a backbone H-bond
+_PRO_DONOR_MASK = False
+PRO_IDX = 14                         # openfold restype order
+DSSP_DEF = "native: stored dssp_target; templates: pydssp; no donor mask"
+DSSP_DEF_PRO = "native + templates: pydssp with donor_mask = (aatype != PRO); native validity = N/CA/C/O coord_mask > 0.5"
 _MAPS_ROOT = ""
 _ROOTS = []
+# --native-pack (A6000 build, user 2026-10-09): natives read from the training pack (the processed .pt bytes) instead of
+# --processed-dir; stem -> (offset, length), opened once in the parent so the forked workers share it
+_PACK_IDX, _PACK_MM = None, None
 CONFIND_THRESHOLD = 0.01             # the `contact_method: confind` transform's threshold
 CONTACT_DEF_CONFIND = "ConFind via Frame2ConFind, prob >= 0.01 (native: stored contact_map_confind)"
 
@@ -124,11 +141,13 @@ def topology_row(cm, coords, atom_mask, dssp, min_len):
     if dssp is None or bool((dssp < 0).all()):
         return None
     runs = dssp_to_runs(dssp, min_len=min_len)
-    ref, keep = sse_contact_reference(cm, runs, keep_types=(DSSP_HELIX, DSSP_STRAND))
-    structural = sse_structural_pair_features(cm, coords, atom_mask, runs, keep)
+    ref, keep = sse_contact_reference(cm, runs, keep_types=_ELEMENT_TYPES)
+    structural = sse_structural_pair_features(cm, coords, atom_mask, runs, keep, loop_axis=_LOOP_AXIS)
     feat = assemble_pair_features(ref, structural, runs, keep)
     flat = feat.reshape(-1, N_PAIR_FEATURES)
-    stats = (torch.stack([flat.sum(0), (flat ** 2).sum(0)]).tolist(), int(flat.shape[0]))
+    el = element_lengths(runs, keep)  # stats for the per-element length feature (standardised by the transform)
+    stats = (torch.stack([flat.sum(0), (flat ** 2).sum(0)]).tolist(), int(flat.shape[0]),
+             [float(el.sum()), float((el ** 2).sum())], int(el.numel()))
     spans = runs_to_spans(runs)
     elem = np.full((int(cm.shape[0]),), ALIGN_NONE, dtype=np.int16)
     for e, ia in enumerate(keep):
@@ -192,10 +211,17 @@ def _chain_job(args):
     """One chain -> (native row | None, [template rows], [(what, reason)] skips)."""
     stem, pt_path, npz_path, band_tm, band_rewind, band_slot, min_len, tm_min, tm_max, selftest = args
     skips = []
-    if not os.path.exists(pt_path):
+    if _PACK_IDX is not None:
+        ent = _PACK_IDX.get(stem)
+        if ent is None:
+            return stem, None, [], [("native", "not_in_pack")], None
+        src = io.BytesIO(_PACK_MM[ent[0]:ent[0] + ent[1]])
+    elif not os.path.exists(pt_path):
         return stem, None, [], [("native", "missing_file")], None
+    else:
+        src = pt_path
     try:
-        g = torch.load(pt_path, map_location="cpu", weights_only=False)
+        g = torch.load(src, map_location="cpu", weights_only=False)
     except Exception as e:  # recorded per chain and audited afterwards, never silent
         return stem, None, [], [("native", f"load_failed:{type(e).__name__}")], None
     seq = getattr(g, "sequence", None)
@@ -207,6 +233,16 @@ def _chain_job(args):
         return stem, None, [], [("native", "no_coords")], seq
     if dssp is None:
         return stem, None, [], [("native", "no_dssp_attr")], seq
+    if _PRO_DONOR_MASK:
+        if seq_ref is None or len(seq_ref) != int(coords.shape[0]):
+            return stem, None, [], [("native", "no_residue_type_for_donor_mask")], seq
+        # same atoms and validity as precompute_dssp_targets._compute_dssp (disk order, O = 3), plus the donor mask
+        dssp = compute_dssp_target(coords[None].float(), torch.ones(1, int(coords.shape[0]), dtype=torch.bool),
+                                   coord_mask=(cmask.float() > 0.5)[None], coord_layout="pdb",
+                                   donor_mask=(torch.as_tensor(seq_ref) != PRO_IDX)[None])
+        if dssp is None:
+            return stem, None, [], [("native", "native_dssp_none")], seq
+        dssp = dssp[0]
     cmask = cmask.bool()
     if _CONTACT_SOURCE == "confind":
         cm_n = confind_native_contacts(g, int(coords.shape[0]))
@@ -278,7 +314,14 @@ def _chain_job(args):
                 continue
             full = torch.zeros(L_t, 37, 3)
             full[amask] = torch.from_numpy(tcoords[k]).float()
-            dssp_t = compute_dssp_target(full[None], amask[:, CA_IDX][None], coord_mask=amask[None], coord_layout="atom37")
+            donor = None
+            if _PRO_DONOR_MASK:
+                if t_aatype is None or len(t_aatype) != L_t:
+                    skips.append((f"tpl#{k}", "no_aatype_for_donor_mask"))
+                    continue
+                donor = torch.from_numpy(np.asarray(t_aatype) != PRO_IDX)[None]
+            dssp_t = compute_dssp_target(full[None], amask[:, CA_IDX][None], coord_mask=amask[None], coord_layout="atom37",
+                                         donor_mask=donor)
             if dssp_t is None:
                 skips.append((f"tpl#{k}", "tpl_dssp_none"))
                 continue
@@ -391,8 +434,19 @@ def _enumerate_jobs(args):
 
 
 def cmd_build(args):
-    global _USALIGN, _CONTACT_SOURCE, _MAPS_ROOT, _ROOTS
+    global _USALIGN, _CONTACT_SOURCE, _MAPS_ROOT, _ROOTS, _PRO_DONOR_MASK, _PACK_IDX, _PACK_MM, _ELEMENT_TYPES, _LOOP_AXIS
     _USALIGN = args.usalign
+    _PRO_DONOR_MASK = args.proline_donor_mask
+    _ELEMENT_TYPES = tuple(int(x) for x in args.element_types.split(","))
+    _LOOP_AXIS = args.loop_axis
+    if (DSSP_LOOP in _ELEMENT_TYPES) != (_LOOP_AXIS is not None):
+        raise SystemExit("--loop-axis is required exactly when --element-types includes loops (0)")
+    if args.native_pack:
+        z = np.load(args.native_pack + ".idx.npz", allow_pickle=True)
+        _PACK_IDX = {str(s): (int(o), int(l)) for s, o, l in zip(z["stems"], z["offsets"], z["lengths"])}
+        fh = open(args.native_pack, "rb")  # kept open for the mmap's lifetime (module global below)
+        _PACK_MM = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+        print(f"natives from pack {args.native_pack}: {len(_PACK_IDX)} stems", flush=True)
     _CONTACT_SOURCE, _MAPS_ROOT = args.contact_source, args.f2c_maps
     if _CONTACT_SOURCE == "confind" and not _MAPS_ROOT:
         raise SystemExit("--contact-source confind needs --f2c-maps")
@@ -414,7 +468,9 @@ def cmd_build(args):
     part_path = os.path.join(args.out_dir, f"part_{args.part:04d}.pt")
     torch.save({"chains": out_rows, "n_parts": args.n_parts, "part": args.part, "min_len": args.min_len,
                 "tm_build_range": (args.tm_min, args.tm_max),
-                "contact_def": CONTACT_DEF_CONFIND if _CONTACT_SOURCE == "confind" else CONTACT_DEF}, part_path)
+                "contact_def": CONTACT_DEF_CONFIND if _CONTACT_SOURCE == "confind" else CONTACT_DEF,
+                "dssp_def": DSSP_DEF_PRO if _PRO_DONOR_MASK else DSSP_DEF,
+                "element_types": list(_ELEMENT_TYPES), "loop_axis": _LOOP_AXIS}, part_path)
     with open(os.path.join(args.out_dir, f"skips_{args.part:04d}.tsv"), "w") as fh:
         fh.write("\n".join(skip_lines) + ("\n" if skip_lines else ""))
     by_reason = Counter(l.split("\t")[2].split(":")[0] for l in skip_lines)
@@ -548,12 +604,15 @@ def cmd_merge(args):
     feat_sum = torch.zeros(N_PAIR_FEATURES, dtype=torch.float64)
     feat_sumsq = torch.zeros(N_PAIR_FEATURES, dtype=torch.float64)
     feat_count = 0
+    elem_sum = elem_sumsq = 0.0
+    elem_count = 0
+    n_tpl_stats = {2: 0, 4: 0}  # template rows with / without element-length stats: never a mix
     eligible = []
     n_chains_with_tpl = 0
     lo, hi = args.tm_range
 
     def push(runs, ref_bytes, t_he, feat_bytes, stats, is_tpl):
-        nonlocal feat_count
+        nonlocal feat_count, elem_sum, elem_sumsq, elem_count
         runs_flat.extend(runs)
         runs_offset.append(runs_offset[-1] + len(runs))
         he_size.append(t_he)
@@ -564,18 +623,25 @@ def cmd_merge(args):
         feat_flat.append(f)
         feat_offset.append(feat_offset[-1] + f.numel())
         if is_tpl:  # the transform standardises REFERENCES, and references are templates
-            sums, cnt = stats
+            sums, cnt = stats[0], stats[1]
             feat_sum.add_(torch.tensor(sums[0], dtype=torch.float64))
             feat_sumsq.add_(torch.tensor(sums[1], dtype=torch.float64))
             feat_count += cnt
+            n_tpl_stats[len(stats)] += 1
+            if len(stats) == 4:  # parts written before the element-length stats existed carry 2 entries
+                elem_sum += stats[2][0]
+                elem_sumsq += stats[2][1]
+                elem_count += stats[3]
 
-    min_len, contact_def = None, None
+    min_len, contact_def, dssp_defs, elem_defs = None, None, set(), set()
     for part in range(args.n_parts):
         p = os.path.join(args.parts_dir, f"part_{part:04d}.pt")
         if not os.path.exists(p):
             raise FileNotFoundError(f"missing {p} -- rebuild that part before merging")
         d = torch.load(p, map_location="cpu", weights_only=False)
         min_len, contact_def = d["min_len"], d["contact_def"]
+        dssp_defs.add(d.get("dssp_def", DSSP_DEF))  # parts written before the key existed used DSSP_DEF
+        elem_defs.add((tuple(d.get("element_types", (DSSP_HELIX, DSSP_STRAND))), d.get("loop_axis", None)))
         for ch in d["chains"]:
             if ch["native"] is None:
                 continue                                # skipped chains are in the skip logs
@@ -616,6 +682,13 @@ def cmd_merge(args):
     std = (feat_sumsq / max(feat_count, 1) - mean ** 2).clamp(min=0.0).sqrt().clamp(min=1e-6)
     for name, m, s in zip(PAIR_FEATURE_NAMES, mean.tolist(), std.tolist()):
         print(f"  {name:<24} mean={m:10.4f} std={s:10.4f}", flush=True)
+    if len(dssp_defs) != 1:  # parts built with and without the donor mask must never be merged
+        raise ValueError(f"parts disagree on the DSSP definition: {sorted(dssp_defs)}")
+    if n_tpl_stats[2] and n_tpl_stats[4]:
+        raise ValueError(f"parts mix template rows with and without element-length stats: {n_tpl_stats}")
+    if len(elem_defs) != 1:  # element sets / loop axes differ -> element tensors and alignment targets would not line up
+        raise ValueError(f"parts disagree on (element_types, loop_axis): {sorted(elem_defs, key=str)}")
+    element_types, loop_axis = elem_defs.pop()
     out = {
         "ids": ids,
         "cluster_of": torch.tensor(cluster_of, dtype=torch.int32),
@@ -642,8 +715,17 @@ def cmd_merge(args):
         "min_len": min_len,
         "contact_threshold": 0.5,       # the map is already binary; kept for consumers that read the key
         "contact_def": contact_def,
+        "dssp_def": dssp_defs.pop(),
         "reference_source": "synthetic",
+        "element_types": element_types,
+        "loop_axis": loop_axis,
     }
+    if elem_count:
+        em = elem_sum / elem_count
+        out["elem_feature_names"] = ["length"]
+        out["elem_feature_mean"] = torch.tensor(em, dtype=torch.float32)
+        out["elem_feature_std"] = torch.tensor(max(elem_sumsq / elem_count - em ** 2, 0.0) ** 0.5, dtype=torch.float32)
+        print(f"  element length            mean={em:10.4f} std={float(out['elem_feature_std']):10.4f}", flush=True)
     torch.save(out, args.out)
     n_native = int(sum(row_is_native))
     print(f"wrote {args.out}: {len(ids)} rows = {n_native} natives + {len(ids) - n_native} template rows; "
@@ -681,6 +763,13 @@ def main():
     b.add_argument("--workers", type=int, default=32)
     b.add_argument("--usalign", default=_USALIGN)
     b.add_argument("--contact-source", choices=("cb8", "confind"), default="cb8")
+    b.add_argument("--native-pack", default="", help="read natives from this pack (+ .idx.npz) instead of --processed-dir")
+    b.add_argument("--element-types", default=f"{DSSP_HELIX},{DSSP_STRAND}",
+                   help="comma list of DSSP types that are reference elements (0 loop, 1 helix, 2 strand); default = v4")
+    b.add_argument("--loop-axis", choices=LOOP_AXIS_MODES, default=None,
+                   help="loop element axis when loops are elements (required then): zero | end_to_end")
+    b.add_argument("--proline-donor-mask", action="store_true",
+                   help="recompute native + template DSSP with proline as a non-donor (default: v4 behaviour)")
     b.add_argument("--f2c-maps", default="", help="maps root written by `f2c` (required for --contact-source confind)")
     f = sub.add_parser("f2c", parents=[sel])
     f.add_argument("--maps-out", required=True)
