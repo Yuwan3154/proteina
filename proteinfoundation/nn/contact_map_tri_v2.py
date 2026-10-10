@@ -31,7 +31,9 @@ AlphaFold conventions for everything the user did not specify (user 2026-10-10: 
     constants (noise_level_embeddings.py) -> LayerNorm without offset -> LinearNoBias -> 2 x unconditioned transition
     n=2; each sub-module's input LayerNorm is adaptive_layernorm (zero-init scale/bias linears) and its output goes
     through adaptive_zero_init (output Linear default init, gate Linear zero weights, bias -2); SwiGLU input
-    projections use the 'relu' (He) init. The time t in [0, 1] goes into the Fourier embedding directly (AF3 feeds
+    projections use the 'relu' (He) init. The conditioning is a PAIR tensor s_ij (user 2026-10-10), AF3's per-token
+    single_cond carried to the pair grid: its own clean-input pair embedding (no noisy map) + the time embedding on
+    every cell, 2 transitions, fixed across the blocks. The time t in [0, 1] goes into the Fourier embedding directly (AF3 feeds
     1/4 log(sigma / sigma_data) of its EDM noise level; this model's noise variable is t).
 """
 
@@ -41,6 +43,7 @@ from typing import Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from proteinfoundation.datasets.sse_topology import MASK_TOKEN as TOPOLOGY_MASK_TOKEN
 from proteinfoundation.datasets.sse_topology import N_PAIR_FEATURES, PAIR_FEATURE_MODES
@@ -132,29 +135,38 @@ class FourierEmbedding(nn.Module):
 
 
 class CondTransition(nn.Module):
-    """AF3 unconditioned transition_block on the conditioning vector (n = 2, diffusion_head.py), residual."""
+    """AF3 unconditioned transition_block (n = 2, diffusion_head.py) on the pair conditioning, residual."""
 
     def __init__(self, c: int, n: int):
         super().__init__()
         self.t = SwiGLUTransition(c, n * c)
 
-    def forward(self, s):
-        return s + self.t(s[:, None, None, :], s.new_ones(s.shape[0], 1, 1))[:, 0, 0, :]
+    def forward(self, s, mask):
+        return s + self.t(s, mask)
 
 
 class AdaLN(nn.Module):
-    """AF3 adaptive_layernorm: a = sigmoid(Linear(LN_scale(s))) * LN(a) + LinearNoBias(LN_scale(s)), linears zero-init."""
+    """AF3 adaptive_layernorm: a = sigmoid(Linear(LN_scale(s))) * LN(a) + LinearNoBias(LN_scale(s)), linears zero-init.
+    The parameters only; TriBlockV2 applies it from the shared normalised conditioning (see _adaln)."""
 
     def __init__(self, dim: int, dim_cond: int):
         super().__init__()
-        self.ln_a = nn.LayerNorm(dim, elementwise_affine=False)
         self.ln_s = nn.LayerNorm(dim_cond, elementwise_affine=True, bias=False)
         self.linear_s = Linear(dim_cond, dim, init="final")
         self.linear_nobias_s = Linear(dim_cond, dim, bias=False, init="final")
 
-    def forward(self, a, s):
-        s = self.ln_s(s)
-        return torch.sigmoid(self.linear_s(s))[:, None, None, :] * self.ln_a(a) + self.linear_nobias_s(s)[:, None, None, :]
+
+def _adaln(z, s_hat, gamma, w_s, b_s, w_b):
+    """AdaLN from s_hat = LN(s) without affine: LN_scale's gamma is folded into both weights (exact), so one LN of the
+    conditioning serves every block, and the scale and shift come from ONE matmul."""
+    w = torch.cat([w_s, w_b]) * gamma
+    scale, shift = F.linear(s_hat, w, torch.cat([b_s, torch.zeros_like(b_s)])).chunk(2, dim=-1)
+    return torch.sigmoid(scale) * F.layer_norm(z, z.shape[-1:]) + shift
+
+
+def _gated(z, y, s, w_g, b_g, m):
+    """AF3 adaptive_zero_init residual: z + sigmoid(Linear(s)) * y."""
+    return z + torch.sigmoid(F.linear(s, w_g, b_g)) * y * m
 
 
 def _gate(dim_cond: int, dim: int) -> Linear:
@@ -165,11 +177,42 @@ def _gate(dim_cond: int, dim: int) -> Linear:
     return g
 
 
+class CleanPairEmbedding(nn.Module):
+    """Pair embedding of the clean (non-noisy) inputs, AF2 InputEmbedder style: relative position (2k + 1 bins), region,
+    and per-token residue type / template token + element features entering as a_i + b_j (separate left/right linears).
+    Two instances: one starts the pair representation z, one starts the pair conditioning s (user 2026-10-10: separate
+    weights)."""
+
+    def __init__(self, dim: int, n_residue_types: int, vocab: int, n_elem_features: int, max_rel_pos: int):
+        super().__init__()
+        self.seq_i, self.seq_j = OneHotLinear(n_residue_types, dim), OneHotLinear(n_residue_types, dim)
+        self.topo_i, self.topo_j = OneHotLinear(vocab, dim), OneHotLinear(vocab, dim)
+        self.elem_i = Linear(n_elem_features, dim, init="default")  # AF2 LeCun-normal init
+        self.elem_j = Linear(n_elem_features, dim, init="default")
+        self.block_type = OneHotLinear(N_BLOCK_TYPES, dim)
+        self.rel_pos = OneHotLinear(2 * max_rel_pos + 1, dim)  # AF2 relpos: 2k + 1 bins
+
+    def forward(self, rel, block_idx, rtype, keep, tok, elem_feat, tok_valid):
+        T = tok.shape[1]
+        L = rel.shape[1] - T
+        x = self.rel_pos(rel) + self.block_type(block_idx)[None]
+        if rtype is not None:
+            ei = F.pad(self.seq_i(rtype) * keep, (0, 0, 0, T))
+            ej = F.pad(self.seq_j(rtype) * keep, (0, 0, 0, T))
+            x = x + ei[:, :, None, :] + ej[:, None, :, :]
+        ef = elem_feat.to(x.dtype)
+        ti = F.pad((self.topo_i(tok) + self.elem_i(ef)) * tok_valid, (0, 0, L, 0))
+        tj = F.pad((self.topo_j(tok) + self.elem_j(ef)) * tok_valid, (0, 0, L, 0))
+        return x + ti[:, :, None, :] + tj[:, None, :, :]
+
+
 class TriBlockV2(nn.Module):
-    """Outgoing + incoming fused triangle multiplication + SwiGLU transition, each conditioned on time as in AF3:
-    AdaLN in place of the sub-module's input LayerNorm, adaptive_zero_init on its output (the output Linear gets the
-    default init, as AF3 gives a conditioned output projection; AF3 has no conditioned trimul, so its linear_z is
-    treated as that projection)."""
+    """Outgoing + incoming fused triangle multiplication + SwiGLU transition, each conditioned as in AF3's diffusion
+    transformer, but on a PAIR conditioning tensor s_ij (user 2026-10-10): AdaLN in place of the sub-module's input
+    LayerNorm, adaptive_zero_init on its output (the output Linear gets the default init, as AF3 gives a conditioned
+    output projection; AF3 has no conditioned trimul, so its linear_z is treated as that projection).
+    The AdaLN and gate are recomputed in backward (non-reentrant checkpoint): their [B, N, N, C] sigmoid outputs would
+    otherwise be stored per sub-module, while their inputs (z, s, s_hat) are stored anyway."""
 
     def __init__(self, dim: int, tri_hidden: int, transition_hidden: int, dim_cond: int):
         super().__init__()
@@ -187,11 +230,15 @@ class TriBlockV2(nn.Module):
         self.adaln = nn.ModuleList(AdaLN(dim, dim_cond) for _ in range(3))
         self.gate = nn.ModuleList(_gate(dim_cond, dim) for _ in range(3))
 
-    def forward(self, z, pair_mask, cond):
+    def forward(self, z, pair_mask, cond, cond_hat):
         m = pair_mask[..., None]
         for k, mod in enumerate((self.tri_out, self.tri_in, self.transition)):
-            g = torch.sigmoid(self.gate[k](cond))[:, None, None, :]
-            z = z + g * mod.core(self.adaln[k](z, cond), pair_mask) * m
+            a, g = self.adaln[k], self.gate[k]
+            x = checkpoint(_adaln, z, cond_hat, a.ln_s.weight, a.linear_s.weight, a.linear_s.bias,
+                           a.linear_nobias_s.weight, use_reentrant=False,
+                           preserve_rng_state=False)
+            z = checkpoint(_gated, z, mod.core(x, pair_mask), cond, g.weight, g.bias, m, use_reentrant=False,
+                           preserve_rng_state=False)
         return z * m
 
 
@@ -220,20 +267,18 @@ class ContactMapTriV2(nn.Module):
         self.non_contact_value = int(kwargs.get("non_contact_value", 0))
         self.predict_coords = None  # see ContactMapTriSiT: None, not False
 
-        n_rt = int(kwargs.get("n_residue_types", 22))
-        self.seq_emb_i, self.seq_emb_j = OneHotLinear(n_rt, self.dim), OneHotLinear(n_rt, self.dim)
-        # padded elements are masked in forward
-        self.topo_emb_i = OneHotLinear(self.topology_vocab_size, self.dim)
-        self.topo_emb_j = OneHotLinear(self.topology_vocab_size, self.dim)
-        self.elem_in_i = Linear(self.n_elem_features, self.dim, init="default")  # AF2 LeCun-normal init
-        self.elem_in_j = Linear(self.n_elem_features, self.dim, init="default")
-        self.block_type_emb = OneHotLinear(N_BLOCK_TYPES, self.dim)
-        self.rel_pos_emb = OneHotLinear(2 * self.max_rel_pos + 1, self.dim)  # AF2 relpos: 2k + 1 bins
+        emb_args = (int(kwargs.get("n_residue_types", 22)), self.topology_vocab_size, self.n_elem_features,
+                    self.max_rel_pos)
+        self.z_embed = CleanPairEmbedding(self.dim, *emb_args)
+        self.cell_in = Linear(2 + len(self.pair_feat_idx), self.dim, init="default")
+        # pair conditioning s (user 2026-10-10): the clean inputs only (no noisy / self-conditioning map), own weights;
+        # AF3 time embedding added to every cell, then 2 transitions; fixed across all blocks
+        self.s_embed = CleanPairEmbedding(self.dim_cond, *emb_args)
+        self.s_ref_in = Linear(len(self.pair_feat_idx), self.dim_cond, init="default")
         self.fourier = FourierEmbedding()
         self.fourier_ln = nn.LayerNorm(256, bias=False)  # AF3 noise_embedding_initial_norm: create_offset=False
         self.cond_in = Linear(256, self.dim_cond, bias=False, init="default")
         self.cond_transitions = nn.ModuleList(CondTransition(self.dim_cond, 2) for _ in range(2))
-        self.cell_in = Linear(2 + len(self.pair_feat_idx), self.dim, init="default")
 
         blk_args = (self.dim, self.tri_hidden, self.transition_hidden, self.dim_cond)
         self.blocks_ref = nn.ModuleList(TriBlockV2(*blk_args) for _ in range(self.n_blocks_ref))
@@ -313,41 +358,38 @@ class ContactMapTriV2(nn.Module):
         pos = torch.cat([q_pos, he_pos], dim=1)
         rel = (pos[:, :, None] - pos[:, None, :]).round().long()
         rel = rel.clamp(-self.max_rel_pos, self.max_rel_pos) + self.max_rel_pos
-        z = self.rel_pos_emb(rel)
-
         is_t = torch.zeros(N, dtype=torch.long, device=device)
         is_t[L:] = 1
-        z = z + self.block_type_emb(is_t[:, None] * 2 + is_t[None, :])[None]
+        block_idx = is_t[:, None] * 2 + is_t[None, :]
 
         rtype = batch.get("residue_type")
+        keep = 1.0
         if rtype is not None:
-            r = rtype.long().clamp(min=0)
-            keep = 1.0
+            rtype = rtype.long().clamp(min=0)
             seq_dropped = batch.get("seq_dropped")
             if seq_dropped is not None:
-                keep = 1.0 - seq_dropped.reshape(B, -1)[:, :1, None].to(z.dtype)
-            ei = F.pad(self.seq_emb_i(r) * keep, (0, 0, 0, T))
-            ej = F.pad(self.seq_emb_j(r) * keep, (0, 0, 0, T))
-            z = z + ei[:, :, None, :] + ej[:, None, :, :]
-        tk, ef, hv = he_tokens.clamp(min=0), elem_feat.to(z.dtype), he_valid[..., None]
-        ti = F.pad((self.topo_emb_i(tk) + self.elem_in_i(ef)) * hv, (0, 0, L, 0))
-        tj = F.pad((self.topo_emb_j(tk) + self.elem_in_j(ef)) * hv, (0, 0, L, 0))
-        z = z + ti[:, :, None, :] + tj[:, None, :, :]
+                keep = 1.0 - seq_dropped.reshape(B, -1)[:, :1, None].to(dtype)
+        clean = (rel, block_idx, rtype, keep, he_tokens.clamp(min=0), elem_feat, he_valid[..., None])
+        ref_feat = he_feat[..., self.pair_feat_idx].to(dtype)
+        pm = pair_mask[..., None]
 
         cm_sc = batch.get("contact_map_sc")
         if cm_sc is None:
             cm_sc = torch.zeros_like(cm_t)
-        cells = z.new_zeros(B, N, N, 2 + len(self.pair_feat_idx))
+        cells = cm_t.new_zeros(B, N, N, 2 + len(self.pair_feat_idx))
         cells[:, :L, :L, 0] = cm_t
         cells[:, :L, :L, 1] = cm_sc
-        cells[:, L:, L:, 2:] = he_feat[..., self.pair_feat_idx].to(z.dtype)
-        z = (z + self.cell_in(cells)) * pair_mask[..., None]
+        cells[:, L:, L:, 2:] = ref_feat
+        z = (self.z_embed(*clean) + self.cell_in(cells)) * pm
 
-        cond = self.cond_in(self.fourier_ln(self.fourier(batch["t"])))
+        s = self.s_embed(*clean) + F.pad(self.s_ref_in(ref_feat), (0, 0, L, 0, L, 0))
+        s = s + self.cond_in(self.fourier_ln(self.fourier(batch["t"])))[:, None, None, :].to(s.dtype)
         for tr in self.cond_transitions:
-            cond = tr(cond)
+            s = tr(s, pair_mask)
+        s = s * pm
+        s_hat = F.layer_norm(s, s.shape[-1:])
         for blk in self.blocks_ref:
-            z = blk(z, pair_mask, cond)
+            z = blk(z, pair_mask, s, s_hat)
 
         q_valid = mask.bool()
         out = {}
@@ -364,7 +406,7 @@ class ContactMapTriV2(nn.Module):
         qmask = q_pair.to(dtype)
         zq = z[:, :L, :L] * qmask[..., None]
         for blk in self.blocks_query:
-            zq = blk(zq, qmask, cond)
+            zq = blk(zq, qmask, s[:, :L, :L], s_hat[:, :L, :L])
 
         logits = self.out(zq)[..., 0]
         logits = logits + logits.transpose(1, 2)

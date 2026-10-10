@@ -5,7 +5,11 @@ float32 (its time embedding casts to float32, as ContactMapTriSiT's does), toler
 2. SwiGLUTransition == the AF3 Alg. 11 formula written out; 'relu' (He) input init; zero output when unconditioned.
 3. The AF pieces match the AF3 code: one-hot Linear lookup, adaptive_layernorm, Fourier constants and the conditioning
    pipeline, init values (zero AdaLN linears, zero-weight gates with bias -2, default-init conditioned outputs,
-   final-init heads, 2k+1 relpos bins); at init the time conditioning has no effect on a block (as in AF3).
+   final-init heads, 2k+1 relpos bins); at init the conditioning has no effect on a block (as in AF3).
+3b. The pair conditioning s_ij: at init it equals its clean embedding + reference features + the time embedding on
+   every cell (transitions start as identity); it ignores the noisy and self-conditioning maps; it reaches every block
+   (stage B gets its query block); the recomputed (checkpointed) AdaLN / gate give the same values and gradients as
+   the plain computation.
 4. With all weights randomised: padding invariance (an extra masked residue and an extra masked element leave every
    valid output unchanged), the pad-bucket path equals the unpadded path, logits are symmetric and zero off-mask.
 5. The align / MLM heads read the END of stage A: their loss gives gradient to stage A, none to stage B; the contact
@@ -23,6 +27,8 @@ from proteinfoundation.nn.af3_fourier_constants import AF3_FOURIER_BIAS, AF3_FOU
 from proteinfoundation.nn.contact_map_tri_v2 import (
     AdaLN,
     ContactMapTriV2,
+    _adaln,
+    _gated,
     FourierEmbedding,
     OneHotLinear,
     SwiGLUTransition,
@@ -87,25 +93,35 @@ def test_alphafold_pieces():
     assert torch.allclose(oh(idx), want) and oh.linear.bias.abs().max() == 0
     ad = AdaLN(16, 8).double()
     randomise_(ad)
-    a, s = torch.randn(2, 4, 4, 16, dtype=torch.float64), torch.randn(2, 8, dtype=torch.float64)
+    a, s = torch.randn(2, 4, 4, 16, dtype=torch.float64), torch.randn(2, 4, 4, 8, dtype=torch.float64)
     sn = torch.nn.functional.layer_norm(s, (8,), weight=ad.ln_s.weight)
     an = torch.nn.functional.layer_norm(a, (16,))
-    want = torch.sigmoid(sn @ ad.linear_s.weight.t() + ad.linear_s.bias)[:, None, None] * an + (sn @ ad.linear_nobias_s.weight.t())[:, None, None]
-    assert torch.allclose(ad(a, s), want) and ad.ln_s.bias is None and ad.ln_a.weight is None
+    want = torch.sigmoid(sn @ ad.linear_s.weight.t() + ad.linear_s.bias) * an + sn @ ad.linear_nobias_s.weight.t()
+    got = _adaln(a, torch.nn.functional.layer_norm(s, (8,)), ad.ln_s.weight, ad.linear_s.weight, ad.linear_s.bias,
+                 ad.linear_nobias_s.weight)
+    assert torch.allclose(got, want, atol=1e-12) and ad.ln_s.bias is None
+    z, y, w, bg = (torch.randn(2, 4, 4, 16, dtype=torch.float64), torch.randn(2, 4, 4, 16, dtype=torch.float64),
+                   torch.randn(16, 8, dtype=torch.float64), torch.randn(16, dtype=torch.float64))
+    mk = torch.ones(2, 4, 4, 1, dtype=torch.float64)
+    assert torch.allclose(_gated(z, y, s, w, bg, mk), z + torch.sigmoid(s @ w.t() + bg) * y * mk, atol=1e-12)
     fe = FourierEmbedding()
     t = torch.tensor([0.0, 0.3, 1.0])
     w, b = torch.tensor(AF3_FOURIER_WEIGHT), torch.tensor(AF3_FOURIER_BIAS)
     assert torch.allclose(fe(t), torch.cos(2 * math.pi * (t[:, None] * w + b))) and len(fe.state_dict()) == 0
     m = ContactMapTriV2(**CFG)
     randomise_(m)
-    c = torch.nn.functional.layer_norm(fe(t), (256,), weight=m.fourier_ln.weight) @ m.cond_in.weight.t()
+    c = torch.randn(2, 5, 5, 128)
+    pm = torch.ones(2, 5, 5)
+    pm[1, 4:, :] = 0
+    pm[1, :, 4:] = 0
+    want = c
     for tr in m.cond_transitions:
-        h = tr.t.layer_norm(c)
-        c = c + (torch.nn.functional.silu(h @ tr.t.linear_a.weight.t()) * (h @ tr.t.linear_b.weight.t())) @ tr.t.linear_out.weight.t()
-    cm = m.cond_in(m.fourier_ln(m.fourier(t)))
+        h = tr.t.layer_norm(want)
+        want = want + (torch.nn.functional.silu(h @ tr.t.linear_a.weight.t()) * (h @ tr.t.linear_b.weight.t())) @ tr.t.linear_out.weight.t() * pm[..., None]
+    got = c
     for tr in m.cond_transitions:
-        cm = tr(cm)
-    assert torch.allclose(cm, c, atol=1e-5) and m.fourier_ln.bias is None and m.cond_in.bias is None
+        got = tr(got, pm)
+    assert torch.allclose(got, want, atol=1e-5) and m.fourier_ln.bias is None and m.cond_in.bias is None
     m = ContactMapTriV2(**CFG)
     blocks = list(m.blocks_ref) + list(m.blocks_query)
     for blk in blocks:
@@ -117,7 +133,7 @@ def test_alphafold_pieces():
         assert blk.tri_out.linear_g.weight.abs().max() == 0 and bool((blk.tri_out.linear_g.bias == 1.0).all())
     for tr in m.cond_transitions:
         assert tr.t.linear_out.weight.abs().max() == 0, "unconditioned transition: final init"
-    assert m.rel_pos_emb.linear.weight.shape[1] == 2 * CFG["max_rel_pos"] + 1
+    assert m.z_embed.rel_pos.linear.weight.shape[1] == m.s_embed.rel_pos.linear.weight.shape[1] == 2 * CFG["max_rel_pos"] + 1
     for h in (m.align_head, m.align_none, m.mlm_head, m.out):
         assert h.weight.abs().max() == 0 and h.bias.abs().max() == 0
     assert not any(isinstance(x, torch.nn.LayerNorm) and n.startswith(("mid", "out")) for n, x in m.named_modules())
@@ -158,21 +174,104 @@ def pad_one(b):
     return o
 
 
+def _ln(x):
+    return torch.nn.functional.layer_norm(x, x.shape[-1:])
+
+
 def test_block_at_init():
     m = ContactMapTriV2(**CFG).eval()
     z = torch.randn(2, 9, 9, 128)
     pm = torch.ones(2, 9, 9)
-    c1, c2 = torch.randn(2, 128), torch.randn(2, 128)
+    c1, c2 = torch.randn(2, 9, 9, 128), torch.randn(2, 9, 9, 128)
     with torch.no_grad():
         for blk in list(m.blocks_ref) + list(m.blocks_query):
-            a, b = blk(z, pm, c1), blk(z, pm, c2)
+            a, b = blk(z, pm, c1, _ln(c1)), blk(z, pm, c2, _ln(c2))
             assert torch.equal(a, b) and not torch.allclose(a, z), "fresh block: active, but independent of the condition"
-            x = blk.adaln[0](z, c1)
-            assert torch.allclose(x, 0.5 * torch.nn.functional.layer_norm(z, (128,)), atol=1e-6)
+            ad = blk.adaln[0]
+            x = _adaln(z, _ln(c1), ad.ln_s.weight, ad.linear_s.weight, ad.linear_s.bias, ad.linear_nobias_s.weight)
+            assert torch.allclose(x, 0.5 * _ln(z), atol=1e-6)
     print("PASS fresh blocks: non-identity (default-init outputs, gate sigmoid(-2)), condition-independent, AdaLN = 0.5 LN(z)")
     m2 = ContactMapTriV2(**{**CFG, "align_head": {"enabled": False}, "mlm_head": {"enabled": False}})
     assert m2(batch())["contact_map_logits"].shape == (2, 11, 11)
     print("PASS no heads -> model runs")
+
+
+def _capture(m, b):
+    """Run m on b; return z after embedding is not exposed, so capture the (s, s_hat) each block receives."""
+    got = {}
+    hs = [m.blocks_ref[0].register_forward_pre_hook(lambda mod, a: got.__setitem__("ref", a)),
+          m.blocks_query[0].register_forward_pre_hook(lambda mod, a: got.__setitem__("qry", a))]
+    out = m(b)
+    for h in hs:
+        h.remove()
+    return out, got
+
+
+def test_pair_conditioning():
+    m = ContactMapTriV2(**CFG).eval()
+    b = batch()
+    L, T = b["contact_map_t"].shape[1], b["topology_he_tokens"].shape[1]
+    with torch.no_grad():
+        _, got = _capture(m, b)
+        z0, pm, s, s_hat = got["ref"]
+        he_valid = (b["topology_he_tokens"] > 0)[..., None]
+        tok = b["topology_he_tokens"]
+        rel_pos = torch.cat([torch.arange(L).float()[None].expand(2, L), b["topology_he_pos_raw"]], 1)
+        rel = (rel_pos[:, :, None] - rel_pos[:, None, :]).round().long().clamp(-32, 32) + 32
+        is_t = torch.zeros(L + T, dtype=torch.long)
+        is_t[L:] = 1
+        e = m.s_embed
+        want = e.rel_pos(rel) + e.block_type(is_t[:, None] * 2 + is_t[None, :])[None]
+        si = torch.nn.functional.pad(e.seq_i(b["residue_type"]), (0, 0, 0, T))
+        sj = torch.nn.functional.pad(e.seq_j(b["residue_type"]), (0, 0, 0, T))
+        ti = torch.nn.functional.pad((e.topo_i(tok) + e.elem_i(b["topology_he_elem_feat"])) * he_valid, (0, 0, L, 0))
+        tj = torch.nn.functional.pad((e.topo_j(tok) + e.elem_j(b["topology_he_elem_feat"])) * he_valid, (0, 0, L, 0))
+        want = want + si[:, :, None] + sj[:, None] + ti[:, :, None] + tj[:, None]
+        want = want + torch.nn.functional.pad(m.s_ref_in(b["topology_he_feat"]), (0, 0, L, 0, L, 0))
+        want = want + m.cond_in(m.fourier_ln(m.fourier(b["t"])))[:, None, None]
+        want = want * pm[..., None]
+        assert torch.allclose(s, want, atol=1e-5) and torch.allclose(s_hat, _ln(s), atol=1e-6)
+    print("PASS s at init == clean pair embedding + reference features + time embedding on every cell (masked); s_hat == LN(s)")
+
+    randomise_(m)
+    b2 = dict(b, contact_map_t=1.0 - b["contact_map_t"], contact_map_sc=torch.rand_like(b["contact_map_sc"]))
+    b3 = dict(b, t=b["t"] * 0.5)
+    b4 = dict(b, residue_type=(b["residue_type"] + 1) % 20)
+    with torch.no_grad():
+        (o1, g1), (o2, g2) = _capture(m, b), _capture(m, b2)
+        _, g3 = _capture(m, b3)
+        _, g4 = _capture(m, b4)
+    assert torch.equal(g1["ref"][2], g2["ref"][2]) and not torch.equal(g1["ref"][0], g2["ref"][0])
+    assert not torch.allclose(o1["contact_map_logits"], o2["contact_map_logits"])
+    assert (g1["ref"][2] - g3["ref"][2]).abs().max() > 1e-3 and (g1["ref"][2] - g4["ref"][2]).abs().max() > 1e-3
+    assert torch.equal(g1["qry"][2], g1["ref"][2][:, :L, :L]) and torch.equal(g1["qry"][3], g1["ref"][3][:, :L, :L])
+    print("PASS s ignores the noisy + self-cond maps (z does not), follows t and residue type; stage B gets s[:L, :L]")
+
+    blk = m.blocks_ref[0].double()
+    z = torch.randn(2, 7, 7, 128, dtype=torch.float64, requires_grad=True)
+    c = torch.randn(2, 7, 7, 128, dtype=torch.float64, requires_grad=True)
+    pm = torch.ones(2, 7, 7, dtype=torch.float64)
+    mod_ = __import__("proteinfoundation.nn.contact_map_tri_v2", fromlist=["x"])
+    res, orig, calls = [], mod_.checkpoint, []
+    for ckpt in (orig, lambda f, *a, **k: calls.append(1) or f(*a)):
+        mod_.checkpoint = ckpt
+        blk.zero_grad(set_to_none=True)
+        z.grad = c.grad = None
+        out = blk(z, pm, c, _ln(c))
+        (out ** 2).sum().backward()
+        res.append([out.detach(), z.grad.clone(), c.grad.clone()] + [p.grad.clone() for p in blk.parameters()])
+    mod_.checkpoint = orig
+    assert len(calls) == 6, "the plain pass must replace all 6 checkpoint calls of the block"
+    d = max((x - y).abs().max().item() for x, y in zip(*res))
+    assert d < 1e-10 and len(res[0]) == 3 + len(list(blk.parameters())), d
+    seen = []
+    mod_.checkpoint = lambda f, *a, **k: seen.append((f, a)) or f(*a)
+    blk(z, pm, c, _ln(c))
+    mod_.checkpoint = orig
+    assert sum(f is _gated for f, a in seen) == 3, seen
+    assert all(a[2] is c for f, a in seen if f is _gated), "the gate must read raw s (AF3 adaptive_zero_init), not LN(s)"
+    m.blocks_ref[0].float()
+    print(f"PASS recomputed AdaLN / gate == plain: output, input and all {len(res[0]) - 3} parameter gradients (max |diff| {d:.1e})")
 
 
 def test_model_invariances():
@@ -253,6 +352,7 @@ if __name__ == "__main__":
     test_swiglu()
     test_alphafold_pieces()
     test_block_at_init()
+    test_pair_conditioning()
     test_model_invariances()
     test_head_gradients()
     test_every_param_gets_grad()
