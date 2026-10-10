@@ -149,6 +149,16 @@ def test_transform_with_loops():
         assert out["topology_he_feat"].shape == (T, T, N_PAIR_FEATURES)
         print(f"PASS transform: loops are elements (tokens {toks}), midpoints, standardised lengths {want.tolist()}")
 
+        tfm = TopologyReferenceTransform(index_path=p, sse_types=(L_, H_, E_), single_token_types=(L_,),
+                                         element_types=(L_, H_, E_), elem_features=True, max_topology_he_len=96,
+                                         mutate_prob=0.0, type_mutate_prob=0.0, token_mask_prob=1.0)
+        om = tfm.assemble_reference(runs, torch.zeros(T, T), torch.zeros(T, T, 2), length=27, augment=True)
+        tm, tg, ef = om["topology_he_tokens"].tolist(), om["topology_he_tokens_target"].tolist(), om["topology_he_elem_feat"][:, 0]
+        assert tm == [2, 1, 2, 1, 2], tm                      # helix/strand masked (MASK = 1), loops never
+        assert tg[0] == tg[2] == tg[4] == 0 and tg[1] == toks[1] and tg[3] == toks[3], tg
+        assert ef[1] == 0 and ef[3] == 0 and torch.allclose(ef[[0, 2, 4]], want[[0, 2, 4]]), ef
+        print("PASS masking: loops never MLM targets; masked elements' length feature hidden (0), loops' kept")
+
         tf_old = TopologyReferenceTransform(index_path=p, sse_types=(H_, E_))
         assert raises(ValueError, tf_old._ensure_loaded)
         print("PASS index guard: a helix/strand transform refuses an index built with loop elements")

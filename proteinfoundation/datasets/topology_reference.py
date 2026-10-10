@@ -377,8 +377,13 @@ class TopologyReferenceTransform(T.BaseTransform):
         he_target = torch.zeros_like(he_tokens)
         if augment and self.token_mask_prob > 0.0 and he_tokens.numel():
             masked = torch.rand(he_tokens.shape, generator=self._generator) < self.token_mask_prob
+            if self.alphabet.single_token_types:  # T8 (user 2026-10-10): a one-token type (loop) is never an MLM target
+                single = torch.tensor([self.alphabet.token(t, 1) for t in self.alphabet.single_token_types])
+                masked = masked & ~torch.isin(he_tokens, single)
             he_target = torch.where(masked, he_tokens, he_target)
             he_tokens = torch.where(masked, torch.full_like(he_tokens, MASK_TOKEN), he_tokens)
+            if self.elem_features:  # T8 (user 2026-10-10): hide a masked element's length, else it gives the length slot away
+                elem_feat = torch.where(masked[:, None], torch.zeros_like(elem_feat), elem_feat)
 
         out = {
             "topology_tokens": tokens if tokens.numel() else torch.full((1,), MASK_TOKEN, dtype=torch.long),
