@@ -2,20 +2,29 @@
 float32 (its time embedding casts to float32, as ContactMapTriSiT's does), tolerance 1e-5.
 
 1. Fused triangle updates == OpenFold's unfused forward (same parameters), outgoing and incoming.
-2. SwiGLUTransition == the AF3 Alg. 11 formula written out; zero output at init (final init).
-3. Every block is the identity at init (zero-init FiLM + 'final' output layers), so an untrained model's logits are 0.
+2. SwiGLUTransition == the AF3 Alg. 11 formula written out; 'relu' (He) input init; zero output when unconditioned.
+3. The AF pieces match the AF3 code: one-hot Linear lookup, adaptive_layernorm, Fourier constants and the conditioning
+   pipeline, init values (zero AdaLN linears, zero-weight gates with bias -2, default-init conditioned outputs,
+   final-init heads, 2k+1 relpos bins); at init the time conditioning has no effect on a block (as in AF3).
 4. With all weights randomised: padding invariance (an extra masked residue and an extra masked element leave every
    valid output unchanged), the pad-bucket path equals the unpadded path, logits are symmetric and zero off-mask.
 5. The align / MLM heads read the END of stage A: their loss gives gradient to stage A, none to stage B; the contact
    loss reaches both.
-6. Parameter count at the user's sizes (4 + 4 blocks, width 128, tri hidden 128, SwiGLU 512, 96 elements).
+6. With all weights randomised, every parameter gets a gradient from the summed losses (nothing unused for DDP).
+7. Parameter count at the user's sizes (4 + 4 blocks, width 128, tri hidden 128, SwiGLU 512, 96 elements).
 Run: python scratchpad/test_contact_map_tri_v2.py
 """
 
+import math
+
 import torch
 
+from proteinfoundation.nn.af3_fourier_constants import AF3_FOURIER_BIAS, AF3_FOURIER_WEIGHT
 from proteinfoundation.nn.contact_map_tri_v2 import (
+    AdaLN,
     ContactMapTriV2,
+    FourierEmbedding,
+    OneHotLinear,
     SwiGLUTransition,
     TriMulIncomingFused,
     TriMulOutgoingFused,
@@ -63,7 +72,58 @@ def test_swiglu():
     want = (torch.nn.functional.silu(h @ t.linear_a.weight.T) * (h @ t.linear_b.weight.T)) @ t.linear_out.weight.T
     d = (t(z, m) - want).abs().max().item()
     assert d < 1e-12 and t.linear_a.bias is None and t.linear_out.bias is None, d
-    print(f"PASS SwiGLU == AF3 Alg. 11 formula (max |diff| {d:.1e}), bias-free, zero at init")
+    big = SwiGLUTransition(128, 512)
+    sd = big.linear_a.weight.std().item()
+    assert abs(sd / math.sqrt(2 / 128) - 1) < 0.05, sd
+    assert SwiGLUTransition(16, 32, out_init="default").linear_out.weight.abs().max() > 0
+    print(f"PASS SwiGLU == AF3 Alg. 11 formula (max |diff| {d:.1e}), bias-free, zero at init; "
+          f"input std {sd:.4f} vs He sqrt(2/128) {math.sqrt(2 / 128):.4f}")
+
+
+def test_alphafold_pieces():
+    oh = OneHotLinear(7, 5).double()
+    idx = torch.tensor([[0, 3, 6], [2, 2, 1]])
+    want = torch.nn.functional.one_hot(idx, 7).double() @ oh.linear.weight.t() + oh.linear.bias
+    assert torch.allclose(oh(idx), want) and oh.linear.bias.abs().max() == 0
+    ad = AdaLN(16, 8).double()
+    randomise_(ad)
+    a, s = torch.randn(2, 4, 4, 16, dtype=torch.float64), torch.randn(2, 8, dtype=torch.float64)
+    sn = torch.nn.functional.layer_norm(s, (8,), weight=ad.ln_s.weight)
+    an = torch.nn.functional.layer_norm(a, (16,))
+    want = torch.sigmoid(sn @ ad.linear_s.weight.t() + ad.linear_s.bias)[:, None, None] * an + (sn @ ad.linear_nobias_s.weight.t())[:, None, None]
+    assert torch.allclose(ad(a, s), want) and ad.ln_s.bias is None and ad.ln_a.weight is None
+    fe = FourierEmbedding()
+    t = torch.tensor([0.0, 0.3, 1.0])
+    w, b = torch.tensor(AF3_FOURIER_WEIGHT), torch.tensor(AF3_FOURIER_BIAS)
+    assert torch.allclose(fe(t), torch.cos(2 * math.pi * (t[:, None] * w + b))) and len(fe.state_dict()) == 0
+    m = ContactMapTriV2(**CFG)
+    randomise_(m)
+    c = torch.nn.functional.layer_norm(fe(t), (256,), weight=m.fourier_ln.weight) @ m.cond_in.weight.t()
+    for tr in m.cond_transitions:
+        h = tr.t.layer_norm(c)
+        c = c + (torch.nn.functional.silu(h @ tr.t.linear_a.weight.t()) * (h @ tr.t.linear_b.weight.t())) @ tr.t.linear_out.weight.t()
+    cm = m.cond_in(m.fourier_ln(m.fourier(t)))
+    for tr in m.cond_transitions:
+        cm = tr(cm)
+    assert torch.allclose(cm, c, atol=1e-5) and m.fourier_ln.bias is None and m.cond_in.bias is None
+    m = ContactMapTriV2(**CFG)
+    blocks = list(m.blocks_ref) + list(m.blocks_query)
+    for blk in blocks:
+        assert all(bool((g.bias == -2.0).all()) and g.weight.abs().max() == 0 for g in blk.gate)
+        assert all(x.linear_s.weight.abs().max() == 0 and x.linear_s.bias.abs().max() == 0
+                   and x.linear_nobias_s.weight.abs().max() == 0 for x in blk.adaln)
+        for lin in (blk.tri_out.linear_z, blk.tri_in.linear_z, blk.transition.linear_out):
+            assert lin.weight.abs().max() > 0, "conditioned output projections take the default init (AF3)"
+        assert blk.tri_out.linear_g.weight.abs().max() == 0 and bool((blk.tri_out.linear_g.bias == 1.0).all())
+    for tr in m.cond_transitions:
+        assert tr.t.linear_out.weight.abs().max() == 0, "unconditioned transition: final init"
+    assert m.rel_pos_emb.linear.weight.shape[1] == 2 * CFG["max_rel_pos"] + 1
+    for h in (m.align_head, m.align_none, m.mlm_head, m.out):
+        assert h.weight.abs().max() == 0 and h.bias.abs().max() == 0
+    assert not any(isinstance(x, torch.nn.LayerNorm) and n.startswith(("mid", "out")) for n, x in m.named_modules())
+    print("PASS AF pieces: one-hot lookup; adaptive_layernorm; AF3 Fourier constants (not in state_dict) + conditioning "
+          "pipeline; inits (AdaLN zeros, gates 0/-2, conditioned outputs default, trimul gating 0/1, heads final, "
+          "relpos 2k+1); no LayerNorm before the heads")
 
 
 def batch(B=2, L=11, T=6, seed=1):
@@ -98,18 +158,21 @@ def pad_one(b):
     return o
 
 
-def test_identity_at_init():
+def test_block_at_init():
     m = ContactMapTriV2(**CFG).eval()
     z = torch.randn(2, 9, 9, 128)
     pm = torch.ones(2, 9, 9)
-    cond = torch.randn(2, 128)
+    c1, c2 = torch.randn(2, 128), torch.randn(2, 128)
     with torch.no_grad():
         for blk in list(m.blocks_ref) + list(m.blocks_query):
-            assert torch.equal(blk(z, pm, cond), z), "a fresh block must be the identity"
-    print("PASS every fresh block is exactly the identity (zero-init FiLM, final-init tri-mul and SwiGLU outputs)")
+            a, b = blk(z, pm, c1), blk(z, pm, c2)
+            assert torch.equal(a, b) and not torch.allclose(a, z), "fresh block: active, but independent of the condition"
+            x = blk.adaln[0](z, c1)
+            assert torch.allclose(x, 0.5 * torch.nn.functional.layer_norm(z, (128,)), atol=1e-6)
+    print("PASS fresh blocks: non-identity (default-init outputs, gate sigmoid(-2)), condition-independent, AdaLN = 0.5 LN(z)")
     m2 = ContactMapTriV2(**{**CFG, "align_head": {"enabled": False}, "mlm_head": {"enabled": False}})
-    assert m2.mid_norm is None and m2(batch())["contact_map_logits"].shape == (2, 11, 11)
-    print("PASS no heads -> no mid_norm (nothing unconsumed for DDP)")
+    assert m2(batch())["contact_map_logits"].shape == (2, 11, 11)
+    print("PASS no heads -> model runs")
 
 
 def test_model_invariances():
@@ -163,6 +226,17 @@ def test_head_gradients():
     print(f"PASS heads at the end of stage A: align+MLM grad -> stage A {ref:.2e}, stage B {qry}; contact -> both")
 
 
+def test_every_param_gets_grad():
+    m = ContactMapTriV2(**CFG)
+    randomise_(m)
+    o = m(batch())
+    (o["contact_map_logits"].sum() + o["align_logits"].sum() + o["align_none_logits"].sum() + o["mlm_logits"].sum()).backward()
+    names = [n for n, p in m.named_parameters()]
+    dead = [n for n, p in m.named_parameters() if p.grad is None or p.grad.abs().max() == 0]
+    assert not dead, dead
+    print(f"PASS all {len(names)} parameter tensors get a non-zero gradient")
+
+
 def test_param_count():
     m = ContactMapTriV2(**CFG)
     n = sum(p.numel() for p in m.parameters())
@@ -170,15 +244,17 @@ def test_param_count():
     print(f"INFO params {n:,} total; per block {per:,} "
           f"(tri-out {sum(p.numel() for p in m.blocks_ref[0].tri_out.parameters()):,}, "
           f"SwiGLU {sum(p.numel() for p in m.blocks_ref[0].transition.parameters()):,}, "
-          f"FiLM {sum(p.numel() for p in m.blocks_ref[0].mod.parameters()):,}); 8 blocks {8 * per:,}")
+          f"AdaLN+gates {sum(p.numel() for p in list(m.blocks_ref[0].adaln.parameters()) + list(m.blocks_ref[0].gate.parameters())):,}); 8 blocks {8 * per:,}")
     assert len(m.blocks_ref) == 4 and len(m.blocks_query) == 4
 
 
 if __name__ == "__main__":
     test_fused_trimul()
     test_swiglu()
-    test_identity_at_init()
+    test_alphafold_pieces()
+    test_block_at_init()
     test_model_invariances()
     test_head_gradients()
+    test_every_param_gets_grad()
     test_param_count()
     print("ALL PASS")
