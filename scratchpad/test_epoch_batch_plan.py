@@ -86,13 +86,19 @@ def test_sampler_state():
     assert list(r) == ebp.build_epoch_plan(CLUSTERS, LENGTHS, 3, EDGES, 0, 2, 2)[1] and r.epoch == 2
     end = ebp.EpochBatchPlanSampler(CLUSTERS, LENGTHS, 3, EDGES, 0, 1, 2, restore=s.state_dict(consumed=len(e1)))
     assert end.epoch == 2 and list(end) == ebp.build_epoch_plan(CLUSTERS, LENGTHS, 3, EDGES, 0, 2, 2)[1]
+    p = ebp.EpochBatchPlanSampler(CLUSTERS, LENGTHS, 3, EDGES, 0, 1, 2, position_fn=lambda: (7, 20))
+    assert list(p) == ebp.build_epoch_plan(CLUSTERS, LENGTHS, 3, EDGES, 0, 7, 2)[1][20:] and p.epoch == 7
+    assert list(p) == ebp.build_epoch_plan(CLUSTERS, LENGTHS, 3, EDGES, 0, 8, 2)[1]
+    q = ebp.EpochBatchPlanSampler(CLUSTERS, LENGTHS, 3, EDGES, 0, 1, 2, position_fn=lambda: (7, len(s)))
+    assert list(q) == ebp.build_epoch_plan(CLUSTERS, LENGTHS, 3, EDGES, 0, 8, 2)[1] and q.epoch == 8
+    assert s.n_batches == -(-N_CLUSTERS // 3)
     try:
         ebp.EpochBatchPlanSampler(CLUSTERS, LENGTHS, 3, EDGES, 0, 0, 4, restore=st)
         raise SystemExit("FAIL: world-size mismatch restored")
     except AssertionError:
         pass
     print(f"PASS each pass advances the epoch (len {len(s)} constant); restore at k yields batches k..end, then the "
-          "next epoch; restore at the end starts the next epoch; world-size mismatch refused")
+          "next epoch; restore at the end starts the next epoch; world-size mismatch refused; without a saved plan the first iterator takes (epoch, position) from position_fn")
 
 
 if __name__ == "__main__":

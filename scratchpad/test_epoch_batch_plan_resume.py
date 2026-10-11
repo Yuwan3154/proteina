@@ -72,11 +72,14 @@ class DM(L.LightningDataModule):
         if self.kind == "baseline":
             self.sampler = SeededOrder(rank, world)
             return DataLoader(Idx(), sampler=self.sampler, batch_size=BS, num_workers=2, persistent_workers=True)
-        self.sampler = ebp.EpochBatchPlanSampler(CLUSTERS, LENGTHS, BS, EDGES, 0, rank, world, restore=self.restore)
+        tr = self.trainer
+        self.sampler = ebp.EpochBatchPlanSampler(
+            CLUSTERS, LENGTHS, BS, EDGES, 0, rank, world, restore=self.restore,
+            position_fn=lambda: (tr.current_epoch, tr.fit_loop.epoch_loop.batch_progress.current.processed))
         return DataLoader(Idx(), batch_sampler=self.sampler, num_workers=2, persistent_workers=True)
 
     def state_dict(self):
-        if self.kind != "plan" or self.sampler is None:
+        if self.kind == "baseline" or self.sampler is None:
             return {}
         bp = self.trainer.fit_loop.epoch_loop.batch_progress.current
         st = self.sampler.state_dict(consumed=bp.processed)
@@ -124,6 +127,7 @@ class Counters(Callback):
 
 
 def run(kind, d, log, kill=None, ckpt=None, devices=1):
+    kind = "plan" if kind == "legacy" else kind
     cb = [ModelCheckpoint(dirpath=d, every_n_train_steps=3, save_top_k=-1, save_last=False), Counters()]
     max_steps = -1
     if kill is not None and devices == 1:
@@ -180,6 +184,28 @@ def main():
                 if kind == "plan":
                     ok = ok and same_all
                 shutil.rmtree(d)
+        # legacy: a checkpoint written by the stateless sampler (no plan saved) resumed onto the plan, then killed
+        # and resumed again mid-epoch 1; the plan's epoch-0 remainder is batches k..end, and the second resume exact
+        d = tempfile.mkdtemp()
+        run("baseline", os.path.join(d, "a"), os.path.join(d, "a.jsonl"), kill=6, devices=devices)
+        ck_a = os.path.join(d, "a", [f for f in os.listdir(os.path.join(d, "a")) if "step=6" in f][0])
+        run("legacy", os.path.join(d, "b"), os.path.join(d, "b.jsonl"), ckpt=ck_a, devices=devices)
+        run("legacy", os.path.join(d, "b2"), os.path.join(d, "b2.jsonl"), ckpt=ck_a, kill=18, devices=devices)
+        ck_b = os.path.join(d, "b2", [f for f in os.listdir(os.path.join(d, "b2")) if "step=18" in f][0])
+        run("legacy", os.path.join(d, "c"), os.path.join(d, "c.jsonl"), ckpt=ck_b, devices=devices)
+        legacy_ok = True
+        for r in range(devices):
+            B = [(x["epoch"], tuple(x["ids"])) for x in read(os.path.join(d, f"b.jsonl.r{r}"))]
+            B2 = [(x["epoch"], tuple(x["ids"])) for x in read(os.path.join(d, f"b2.jsonl.r{r}")) if x["step"] < 18]
+            C = [(x["epoch"], tuple(x["ids"])) for x in read(os.path.join(d, f"c.jsonl.r{r}"))]
+            ep0 = [ids for e, ids in B if e == 0]
+            want0 = [tuple(b) for b in ebp.build_epoch_plan(CLUSTERS, LENGTHS, BS, EDGES, 0, 0, devices)[r][12:]]
+            r_ok = ep0 == want0 and B2 + C == B and len(B) > 0
+            print(f"legacy gpus={devices} rank {r}: epoch-0 remainder = plan batches 12..23: {ep0 == want0}; "
+                  f"kill@18 + resume reproduces the uninterrupted legacy run: {B2 + C == B}")
+            legacy_ok = legacy_ok and r_ok
+        ok = ok and legacy_ok
+        shutil.rmtree(d)
     print("PLAN RESUME EXACT" if ok else "PLAN RESUME NOT EXACT")
     sys.exit(0 if ok else 1)
 

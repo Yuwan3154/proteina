@@ -22,6 +22,12 @@ datamodule:
   # they are the clusters whose templates are still being generated. The transform's unconditional
   # fallback therefore should never fire; if it does, the log says so loudly.
   eligible_ids_file: ${oc.env:SYNTH_INDEX_DIR}/eligible_ids_tm0.5-0.9.txt
+  # Epoch batch plan (user 2026-10-10 "(b) Correct it."): same one-member-per-cluster draw, but planned at epoch start
+  # and saved in every checkpoint, so a mid-epoch resume no longer replays the epoch's first k batches and drops the
+  # rest (scratchpad/test_epoch_batch_plan_resume.py). batch_size 1 -> length grouping is a no-op here; the edges
+  # follow the T8 rule (step 64) up to this config's max_length.
+  epoch_batch_plan: True
+  epoch_batch_plan_len_edges: [64, 128, 192, 256, 320, 384]
   cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/  # For CATH index conversion when fold_cond
   multilabel_mode: "sample"  # sample | average | sum | transformer
   transforms:

@@ -14,7 +14,7 @@ Plan for epoch e (identical on every rank, from (seed, e) only):
 """
 
 import bisect
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 from torch.utils.data import Sampler
@@ -67,23 +67,33 @@ class EpochBatchPlanSampler(Sampler[List[int]]):
 
     State for checkpoints: state_dict() -> {epoch, plan, consumed}; plan is the full all-rank plan of the current
     epoch (so a resume never depends on rebuilding it), consumed is the number of THIS rank's batches already trained
-    in that epoch (from the trainer's progress at save time)."""
+    in that epoch (from the trainer's progress at save time).
+
+    Without a saved plan (a fresh run, or a checkpoint written before this sampler existed), the first started iterator
+    asks position_fn() for (epoch, batches already trained in it) -- the trainer's restored counters -- so the plan's
+    epoch and position agree with Lightning's from the first save on."""
 
     def __init__(self, cluster_members: List[List[int]], lengths: List[int], batch_size: int, len_edges: List[int],
-                 seed: int, rank: int, world: int, restore: Optional[Dict] = None):
+                 seed: int, rank: int, world: int, restore: Optional[Dict] = None,
+                 position_fn: Optional[Callable[[], Tuple[int, int]]] = None):
         self.cluster_members, self.lengths = cluster_members, lengths
         self.batch_size, self.len_edges = int(batch_size), sorted(int(x) for x in len_edges)
         self.seed, self.rank, self.world = int(seed), int(rank), int(world)
-        n_batches = -(-len(cluster_members) // self.batch_size)
-        assert n_batches >= self.world, (n_batches, self.world)
-        self.n_per_rank = -(-n_batches // self.world)  # the same every epoch: one member per cluster
+        self.n_batches = -(-len(cluster_members) // self.batch_size)  # all ranks, before world padding
+        assert self.n_batches >= self.world, (self.n_batches, self.world)
+        self.n_per_rank = -(-self.n_batches // self.world)  # the same every epoch: one member per cluster
         self.epoch, self.plan, self.skip, self._started = 0, None, 0, False
+        self.position_fn = position_fn if restore is None else None
         if restore is not None:
             assert len(restore["plan"]) == self.world, (len(restore["plan"]), self.world)
-            self.epoch, self.plan, self.skip = int(restore["epoch"]), restore["plan"], int(restore["consumed"])
-            if self.skip >= len(self.plan[self.rank]):
-                # checkpoint at an epoch's last batch: the next iterator is the next epoch's
-                self.epoch, self.plan, self.skip = self.epoch + 1, None, 0
+            self._set_position(int(restore["epoch"]), int(restore["consumed"]), restore["plan"])
+
+    def _set_position(self, epoch: int, consumed: int, plan=None):
+        self.epoch, self.plan, self.skip = epoch, plan, consumed
+        if self.skip >= self.n_per_rank:
+            # checkpoint at an epoch's last batch: Lightning re-enters that finished epoch and builds ONE iterator,
+            # before the next epoch starts, so that iterator must be the next epoch's
+            self.epoch, self.plan, self.skip = epoch + 1, None, 0
 
     def _ensure_plan(self):
         if self.plan is None:
@@ -96,6 +106,8 @@ class EpochBatchPlanSampler(Sampler[List[int]]):
         # the second, so the epoch must advance on the first next(), never in iter() itself.
         if self._started:
             self.epoch, self.plan, self.skip = self.epoch + 1, None, 0
+        elif self.position_fn is not None:
+            self._set_position(*self.position_fn())
         self._started = True
         self._ensure_plan()
         skip, self.skip = self.skip, 0
