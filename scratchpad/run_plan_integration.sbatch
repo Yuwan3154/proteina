@@ -26,7 +26,7 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_TH
 export TMPDIR=/tmp/chenxiou_${SLURM_JOB_ID:-nojob}
 mkdir -p "$TMPDIR"
 [ ${#TMPDIR} -le 70 ] || { echo "FATAL: TMPDIR ${#TMPDIR} chars > 70: $TMPDIR"; exit 78; }
-export CUE_HOST=engaging
+export CUE_HOST=engaging TORCH_CUDA_ARCH_LIST=9.0  # as run_tri_cb8synth_h200x4.sbatch; activate.sh requires it
 source "$ENV_DIR/.venv/bin/activate"
 source "$ENV_DIR/activate.sh"
 export PYTHONPATH=$REPO${PYTHONPATH:+:$PYTHONPATH}
