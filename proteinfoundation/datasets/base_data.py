@@ -484,9 +484,13 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             logger.info(f"[epoch_batch_plan] resuming epoch {r['epoch']} after {r['consumed']} of this rank's batches "
                         f"(Lightning's 'dataloader is not resumable' warning does not apply: the plan resumes)")
         # kept (not cleared): configure_optimizers builds one loader for len() before Lightning builds the real one
+        def position():
+            tr = self.trainer
+            return int(tr.current_epoch), int(tr.fit_loop.epoch_loop.batch_progress.current.processed)
+
         return EpochBatchPlanSampler(members, self._dataset_lengths(dataset), self.batch_size,
                                      self.epoch_batch_plan_len_edges, self.cluster_sampler_seed, rank, world,
-                                     restore=self._train_plan_restore)
+                                     restore=self._train_plan_restore, position_fn=position)
 
     def _dataset_lengths(self, dataset) -> List[int]:
         """Residue count of every dataset index (used to group batches by length)."""

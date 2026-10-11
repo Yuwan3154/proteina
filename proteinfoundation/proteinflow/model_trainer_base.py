@@ -233,7 +233,8 @@ class ModelTrainerBase(L.LightningModule):
                         # reported vs 411,000 optimizer steps actually taken to reach max_epochs.
                         world_size = max(1, int(getattr(self.trainer, "world_size", 1) or 1))
                         if isinstance(getattr(train_dataloader, "batch_sampler", None), EpochBatchPlanSampler):
-                            world_size = 1  # its len() is already this rank's batch count
+                            # its len() is this rank's count; use the all-rank count, as ClusterSampler's len() was
+                            steps_per_epoch = train_dataloader.batch_sampler.n_batches
                         total_steps = int(
                             (steps_per_epoch / world_size / accumulate_grad_batches) * max_epochs
                         )
