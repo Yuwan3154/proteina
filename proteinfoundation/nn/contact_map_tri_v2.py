@@ -312,6 +312,10 @@ class ContactMapTriV2(nn.Module):
         return self._forward_impl(batch)
 
     def forward(self, batch: Dict, force_compile: bool = False) -> Dict:
+        if batch.get("contact_map_sc") is not None and batch["contact_map_sc"].dtype != torch.bfloat16:
+            # one dtype for the self-conditioning map (user 2026-10-10 "bf16"): the trainer's zeros are fp32, the SC
+            # prediction bf16 under bf16-mixed (an fp32 one is rounded), and dynamic=False would compile two graphs per bucket
+            batch = {**batch, "contact_map_sc": batch["contact_map_sc"].to(torch.bfloat16)}
         L = batch["contact_map_t"].shape[1]
         tok = batch.get("topology_he_tokens")
         T = tok.shape[1] if tok is not None else 1

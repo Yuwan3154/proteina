@@ -16,8 +16,8 @@ Per-rank random (L, T) puts ranks in different compile buckets at different time
 hang an allreduce). Hang guard: faulthandler dumps all stacks if a step (or the final barrier) exceeds --stall_s.
 
 Output in --out: {tag}_run{id}_rank{r}.jsonl, one row per timed unit -- kind in {train_step (fwd+bwd of one micro-batch, incl. its
-SC), sc, val_sc, val, sample}, L, T, buckets, B, entry ("grad" / "nograd" / "inference"), variant (dtype of the
-contact_map_sc input), first_call for that (entry, Lb, Tb, B, variant),
+SC), sc, val_sc, val, sample}, L, T, buckets, B, entry ("grad" / "nograd" / "inference"), variant (dtype the model
+feeds contact_map_sc to the network: bf16 since the model casts it), first_call for that (entry, Lb, Tb, B, variant),
 seconds, peak GB of THAT unit; {tag}_run{id}_rank{r}_stats.json with Dynamo cache entries per code object, graph breaks, and the
 expected entry counts. Each rank uses its own inductor cache dir (TORCHINDUCTOR_CACHE_DIR/rank{r}) so first calls are
 cold per rank; rerun with the same --out to measure warm-cache (requeue) times.
@@ -46,6 +46,8 @@ torch._dynamo.config.recompile_limit = 32  # as train.py (configure_compile rais
 
 from proteinfoundation.nn.contact_map_tri_v2 import ContactMapTriV2  # noqa: E402
 
+# ContactMapTriV2.forward casts contact_map_sc to bf16 (user 2026-10-11), so every call is one variant per bucket
+SC_DTYPE = "torch.bfloat16"
 LEN_EDGES = [64, 128, 192, 256, 320, 384, 448, 512]
 TOPO_EDGES = [16, 32, 48, 64, 80, 96]
 CFG = dict(pair_dim=128, tri_hidden=128, n_blocks_ref=4, n_blocks_query=4, transition_hidden=512, dim_cond=128,
@@ -89,7 +91,7 @@ class Step(torch.nn.Module):
     def forward(self, b, do_sc, L, T):
         if do_sc:
             with torch.no_grad():
-                sc = self.timer("sc", "nograd", lambda: self.model(b), L, T, 1, str(b["contact_map_sc"].dtype),
+                sc = self.timer("sc", "nograd", lambda: self.model(b), L, T, 1, SC_DTYPE,
                                 sync_only=True)
             torch.clear_autocast_cache()
             b = {**b, "contact_map_sc": sc["contact_map_pred"].detach()}
@@ -137,8 +139,8 @@ def main():
     seen = set()
 
     def timer(kind, entry, fn, L, T, B, variant, sync_only=False):
-        # variant = dtype of contact_map_sc fed in (fp32 zeros, or the bf16 SC prediction): a dynamic=False guard,
-        # so each (entry, bucket) compiles once per variant
+        # variant = dtype of contact_map_sc as the network sees it (a dynamic=False guard; bf16 since the model casts
+        # it), so each (entry, bucket) compiles once
         key = (entry, bucket(L, LEN_EDGES), bucket(T, TOPO_EDGES), B, variant)
         torch.cuda.synchronize(dev)
         if not sync_only:
@@ -175,14 +177,14 @@ def main():
                 L, T = rng.randint(20, args.max_len), rng.randint(1, 96)
                 vb = make_batch(1, L, T, dev, g)
                 if rng.random() < args.p_sc:
-                    sc = timer("val_sc", "inference", lambda: model(vb), L, T, 1, str(vb["contact_map_sc"].dtype))
+                    sc = timer("val_sc", "inference", lambda: model(vb), L, T, 1, SC_DTYPE)
                     vb = {**vb, "contact_map_sc": sc["contact_map_pred"]}
                 acc = acc + loss_of(timer("val", "inference", lambda: model(vb), L, T, 1,
-                                          str(vb["contact_map_sc"].dtype)))
+                                          SC_DTYPE))
             L, T = rng.randint(20, args.max_len), rng.randint(1, 96)
             sb = make_batch(args.sample_bs, L, T, dev, g)
             for _ in range(args.sample_steps):
-                o = timer("sample", "inference", lambda: model(sb), L, T, args.sample_bs, str(sb["contact_map_sc"].dtype))
+                o = timer("sample", "inference", lambda: model(sb), L, T, args.sample_bs, SC_DTYPE)
                 sb = {**sb, "contact_map_t": o["contact_map_pred"].float(), "contact_map_sc": o["contact_map_pred"]}
             dist.all_reduce(acc)
         torch.clear_autocast_cache()
@@ -210,8 +212,7 @@ def main():
                     loss.backward()
                 return loss
 
-            # the training forward sees the bf16 SC prediction after SC, the fp32 zeros without
-            loss = timer("train_step", "grad", micro_step, L, T, 1, "torch.bfloat16" if do_sc else "torch.float32")
+            loss = timer("train_step", "grad", micro_step, L, T, 1, SC_DTYPE)
             red = loss.detach().clone()
             dist.all_reduce(red)  # the sync_dist=True logs of training_step
         opt.step()

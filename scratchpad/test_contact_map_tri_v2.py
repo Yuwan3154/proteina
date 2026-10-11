@@ -327,6 +327,24 @@ def test_head_gradients():
     print(f"PASS heads at the end of stage A: align+MLM grad -> stage A {ref:.2e}, stage B {qry}; contact -> both")
 
 
+def test_sc_dtype_unified():
+    m = ContactMapTriV2(**CFG).eval()
+    randomise_(m)
+    b = batch()
+    seen = []
+    orig = m._forward_impl
+    m._forward_impl = lambda bb: seen.append(bb["contact_map_sc"].dtype) or orig(bb)
+    with torch.no_grad():
+        o32 = m(b)
+        o16 = m({**b, "contact_map_sc": b["contact_map_sc"].to(torch.bfloat16)})
+    m._forward_impl = orig
+    assert seen == [torch.bfloat16, torch.bfloat16], seen
+    assert torch.equal(o32["contact_map_logits"], o16["contact_map_logits"])
+    assert b["contact_map_sc"].dtype == torch.float32, "the caller's batch must not be modified"
+    print("PASS contact_map_sc reaches the network as bf16 whether passed fp32 or bf16 (one compiled graph per bucket); "
+          "outputs identical; caller's batch untouched")
+
+
 def test_every_param_gets_grad():
     m = ContactMapTriV2(**CFG)
     randomise_(m)
@@ -357,6 +375,7 @@ if __name__ == "__main__":
     test_pair_conditioning()
     test_model_invariances()
     test_head_gradients()
+    test_sc_dtype_unified()
     test_every_param_gets_grad()
     test_param_count()
     print("ALL PASS")
