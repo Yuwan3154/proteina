@@ -72,8 +72,9 @@ datamodule:
                                      # cannot leak the query's own topology. [1, 1] = old behaviour.
       self_fallback: True            # irrelevant in synthetic mode (never self); kept for the cluster-mode reader
       min_len: 1                     # 1-residue elements are kept: 16.87% of all elements
-    - _target_: "proteinfoundation.datasets.transforms.PaddingTransform"
-      max_size: 512                  # T8 max length
+    # No PaddingTransform (user 2026-10-10 "Yes"): it padded every residue axis to 512; the dense collate now pads each
+    # batch to its longest chain, and the model pads to its torch.compile buckets. ext_lig (whose pad value 2 differed
+    # from the collate's -1) is not produced by these transforms.
   batch_size: 1 # T8: the 4M-param model is far smaller; 1 kept until measured (effective batch 32 via accumulation).
                 # Old note: MEASURED on a 95 GB RTX PRO 6000: the tri model fits batch 1 only, at every
                 # length tried. At L=384 (grid N=384+64=448) peak is 71.81 GB = 76% of the card;
