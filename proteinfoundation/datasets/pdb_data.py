@@ -2046,9 +2046,11 @@ class PDBLightningDataModule(BaseLightningDataModule):
                 )
 
     def _dataset_lengths(self, dataset) -> List[int]:
-        """processed_length (residues with coordinates) of every dataset index, from the split dataframe."""
-        df = self.dfs_splits["train"]
+        """processed_length (residues with coordinates) of every dataset index. Read from df_data: a sequence-similarity
+        split rebuilds dfs_splits with only cluster_id / id / pdb / chain (cluster_utils.expand_cluster_splits)."""
+        df = self.df_data
         assert "processed_length" in df.columns, "epoch_batch_plan needs processed_length (set max_length/min_length)"
+        assert df["id"].is_unique, "duplicate ids in df_data"
         by_id = dict(zip(df["id"].astype(str), df["processed_length"]))
         missing = [f for f in dataset.file_names if f not in by_id or pd.isna(by_id[f])]
         assert not missing, f"{len(missing)} of {len(dataset.file_names)} train stems have no processed_length, e.g. {missing[:5]}"
