@@ -91,7 +91,7 @@ class Step(torch.nn.Module):
     def forward(self, b, do_sc, L, T):
         if do_sc:
             with torch.no_grad():
-                sc = self.timer("sc", "nograd", lambda: self.model(b), L, T, 1, SC_DTYPE,
+                sc = self.timer("sc", "nograd", lambda: self.model(b), L, T, b["mask"].shape[0], SC_DTYPE,
                                 sync_only=True)
             torch.clear_autocast_cache()
             b = {**b, "contact_map_sc": sc["contact_map_pred"].detach()}
@@ -111,6 +111,9 @@ def main():
     ap.add_argument("--sample_bs", type=int, default=4)
     ap.add_argument("--sample_steps", type=int, default=50)
     ap.add_argument("--max_len", type=int, default=512)
+    ap.add_argument("--train_bs", type=int, default=1, help="per-GPU training batch size")
+    ap.add_argument("--fixed_shape", type=lambda s: s == "True", default=False,
+                    help="train at L = max_len, T = 96 only (memory / throughput at the largest bucket)")
     ap.add_argument("--stall_s", type=int, default=1800)
     ap.add_argument("--run_id", type=int, default=0, help="0 = first (cold-cache) run on this --out; 1+ = reruns (warm)")
     ap.add_argument("--pg_timeout_s", type=int, default=3600)
@@ -175,11 +178,11 @@ def main():
             acc = torch.zeros((), device=dev)
             for _ in range(args.n_val):
                 L, T = rng.randint(20, args.max_len), rng.randint(1, 96)
-                vb = make_batch(1, L, T, dev, g)
+                vb = make_batch(args.train_bs, L, T, dev, g)  # production validates at the datamodule batch size
                 if rng.random() < args.p_sc:
-                    sc = timer("val_sc", "inference", lambda: model(vb), L, T, 1, SC_DTYPE)
+                    sc = timer("val_sc", "inference", lambda: model(vb), L, T, args.train_bs, SC_DTYPE)
                     vb = {**vb, "contact_map_sc": sc["contact_map_pred"]}
-                acc = acc + loss_of(timer("val", "inference", lambda: model(vb), L, T, 1,
+                acc = acc + loss_of(timer("val", "inference", lambda: model(vb), L, T, args.train_bs,
                                           SC_DTYPE))
             L, T = rng.randint(20, args.max_len), rng.randint(1, 96)
             sb = make_batch(args.sample_bs, L, T, dev, g)
@@ -200,8 +203,8 @@ def main():
         faulthandler.dump_traceback_later(args.stall_s, repeat=True, file=sys.stderr)
         opt.zero_grad(set_to_none=True)
         for micro in range(args.accum):
-            L, T = rng.randint(20, args.max_len), rng.randint(1, 96)
-            b = make_batch(1, L, T, dev, g)
+            L, T = (args.max_len, 96) if args.fixed_shape else (rng.randint(20, args.max_len), rng.randint(1, 96))
+            b = make_batch(args.train_bs, L, T, dev, g)
             do_sc = rng.random() < args.p_sc
             ctx = contextlib.nullcontext() if micro == args.accum - 1 else ddp.no_sync()
 
@@ -212,7 +215,7 @@ def main():
                     loss.backward()
                 return loss
 
-            loss = timer("train_step", "grad", micro_step, L, T, 1, SC_DTYPE)
+            loss = timer("train_step", "grad", micro_step, L, T, args.train_bs, SC_DTYPE)
             red = loss.detach().clone()
             dist.all_reduce(red)  # the sync_dist=True logs of training_step
         opt.step()
