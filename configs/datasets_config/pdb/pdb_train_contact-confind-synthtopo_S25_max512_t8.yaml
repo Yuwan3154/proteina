@@ -73,8 +73,10 @@ datamodule:
       self_fallback: True            # irrelevant in synthetic mode (never self); kept for the cluster-mode reader
       min_len: 1                     # 1-residue elements are kept: 16.87% of all elements
     # No PaddingTransform (user 2026-10-10 "Yes"): it padded every residue axis to 512; the dense collate now pads each
-    # batch to its longest chain, and the model pads to its torch.compile buckets. ext_lig (whose pad value 2 differed
-    # from the collate's -1) is not produced by these transforms.
+    # batch to its longest chain, and the model pads to its torch.compile buckets. Measured on CB-8 data (50 chains,
+    # scratchpad/check_padding_keys.py on branch cb8-plan-port @f86b340): valid regions and the model's residue mask unchanged; only the PADDED fills of
+    # chains / residue_pdb_idx / residue_type / seq_pos (0 -> -1) and ext_lig (2 -> -1) change -- residue_type is read
+    # under the pair mask, ext_lig only when the nn sets ext_lig_emb_dim (T8 does not), the rest not in training.
   batch_size: 1 # T8: the 4M-param model is far smaller; 1 kept until measured (effective batch 32 via accumulation).
                 # Old note: MEASURED on a 95 GB RTX PRO 6000: the tri model fits batch 1 only, at every
                 # length tried. At L=384 (grid N=384+64=448) peak is 71.81 GB = 76% of the card;
