@@ -30,7 +30,9 @@ cd "$REPO" || exit 3
 git log --oneline -1
 git merge-base --is-ancestor cc05b73 HEAD || { echo "FATAL: $REPO predates cc05b73 (pack mode)"; exit 3; }
 SEL=(--chain-list "$CHAINS" --processed-dir "$DATA/processed" --manifest "$DATA/shard_manifest.json"
-     --template-pack "$PACK" --max-templates 64 --tm-min 0.5 --tm-max 0.9 --n-parts "$N_PARTS")
+     --template-pack "$PACK" --max-templates "${MAX_TEMPLATES:-64}" --tm-min 0.5 --tm-max 0.9 --n-parts "$N_PARTS")
+# MAX_TEMPLATES > the most in-range templates of any chain (161) = every in-range template: the f2c superset that any
+# later gate + cap-64 selection draws from (maps are keyed per chain and draw, so f2c and build may differ in the cap)
 PY="python -m proteinfoundation.utils.precompute_synthetic_topology_index"
 case "$MODE" in
   f2c_smoke|f2c)
