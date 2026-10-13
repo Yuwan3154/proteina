@@ -145,7 +145,9 @@ def main():
     nat = {str(s): (int(o), int(l)) for s, o, l in zip(z["stems"], z["offsets"], z["lengths"])}
     nat_fh = open(args.native_pack, "rb")
     rng = random.Random(args.seed)
-    sample = rng.sample([s for s in want if s in have], min(args.sample_chains, len(want) - len(missing)))
+    pool = [s for s in want if s in have and s in nat]
+    rep["coverage"]["in_pack_but_not_in_native_pack"] = sum(1 for s in want if s in have and s not in nat)
+    sample = rng.sample(pool, min(args.sample_chains, len(pool)))
     st = Counter()
     broken_hist, clash_hist, ident, ln_mismatch, steps_all = Counter(), Counter(), [], [], []
     tm_pairs = []
