@@ -92,6 +92,9 @@ DSSP_DEF = "native: stored dssp_target; templates: pydssp; no donor mask"
 DSSP_DEF_PRO = "native + templates: pydssp with donor_mask = (aatype != PRO); native validity = N/CA/C/O coord_mask > 0.5"
 _MAPS_ROOT = ""
 _ROOTS = []
+# --template-pack (T8, user 2026-10-12/13): templates from the t2 template pack (TemplatePack, keyed by the dataset's own
+# label chain id); opened in the parent, memory-mapped lazily per forked worker
+_TPACK = None
 # --native-pack (A6000 build, user 2026-10-09): natives read from the training pack (the processed .pt bytes) instead of
 # --processed-dir; stem -> (offset, length), opened once in the parent so the forked workers share it
 _PACK_IDX, _PACK_MM = None, None
@@ -120,6 +123,42 @@ def load_f2c_maps(path):
     L = int(z["L"])
     return {int(k): torch.from_numpy(np.unpackbits(z["packed"][i], count=L * L).reshape(L, L).astype(np.float32))
             for i, k in enumerate(z["rungs"])}
+
+
+def pack_map_path(maps_root, stem):
+    """Pack mode: one maps file per chain, sharded by crc32 (<= ~100 files per directory)."""
+    return os.path.join(maps_root, f"{zlib.crc32(stem.encode()) % 1000:04d}", f"{stem}.npz")
+
+
+def load_pack_maps(path):
+    """Pack-mode maps npz -> {draw: float 0/1 [L, L]} (templates differ in length: per-template L and byte offsets)."""
+    z = np.load(path)
+    out = {}
+    for i, d in enumerate(z["draws"]):
+        L = int(z["L"][i])
+        bits = z["packed"][int(z["byte_off"][i]):int(z["byte_off"][i + 1])]
+        out[int(d)] = torch.from_numpy(np.unpackbits(bits, count=L * L).reshape(L, L).astype(np.float32))
+    return out
+
+
+def select_pack_rows(tp, stem, tm_min, tm_max, cap):
+    """User 2026-10-13 "(b)": at most `cap` templates per chain, spread evenly over the TM range -- evenly in TM VALUE:
+    for each of `cap` targets linspace(tm_min, tm_max, cap), the nearest still-unused in-range row (ties: lower draw).
+    Returned in (tm_native, draw) order."""
+    if stem not in tp:
+        return None
+    tm, draw = tp.col["tm_native"], tp.col["draw"]
+    rows = [r for r in tp.rows(stem) if tm_min <= float(tm[r]) <= tm_max]
+    assert len({int(draw[r]) for r in rows}) == len(rows), f"{stem}: draw ids repeat (rows, maps and ids key on draw)"
+    if len(rows) > cap:
+        free, picked = set(rows), []
+        for t in np.linspace(tm_min, tm_max, cap):
+            r = min(free, key=lambda r: (abs(float(tm[r]) - t), int(draw[r])))
+            free.discard(r)
+            picked.append(r)
+        rows = picked
+    rows.sort(key=lambda r: (float(tm[r]), int(draw[r])))
+    return rows
 
 
 # ─────────────────────────────────── per-structure pieces ────────────────────────────────────
@@ -209,7 +248,7 @@ def usalign_pairs(pdb_q: str, pdb_r: str):
 # ───────────────────────────────────── the per-chain worker ──────────────────────────────────
 def _chain_job(args):
     """One chain -> (native row | None, [template rows], [(what, reason)] skips)."""
-    stem, pt_path, npz_path, band_tm, band_rewind, band_slot, min_len, tm_min, tm_max, selftest = args
+    stem, pt_path, npz_path, band_tm, band_rewind, band_slot, min_len, tm_min, tm_max, selftest, pack_rows = args
     skips = []
     if _PACK_IDX is not None:
         ent = _PACK_IDX.get(stem)
@@ -256,6 +295,8 @@ def _chain_job(args):
     L_n = int(coords.shape[0])
 
     rows = []
+    if _TPACK is not None:
+        return _pack_chain_rows(stem, native, coords, cmask, L_n, pack_rows, min_len, skips, seq)
     if npz_path is None:
         skips.append(("templates", "no_npz"))
         return stem, native, rows, skips, seq
@@ -314,44 +355,94 @@ def _chain_job(args):
                 continue
             full = torch.zeros(L_t, 37, 3)
             full[amask] = torch.from_numpy(tcoords[k]).float()
-            donor = None
-            if _PRO_DONOR_MASK:
-                if t_aatype is None or len(t_aatype) != L_t:
-                    skips.append((f"tpl#{k}", "no_aatype_for_donor_mask"))
-                    continue
-                donor = torch.from_numpy(np.asarray(t_aatype) != PRO_IDX)[None]
-            dssp_t = compute_dssp_target(full[None], amask[:, CA_IDX][None], coord_mask=amask[None], coord_layout="atom37",
-                                         donor_mask=donor)
-            if dssp_t is None:
-                skips.append((f"tpl#{k}", "tpl_dssp_none"))
-                continue
+            cm_t = None
             if f2c is not None:
                 cm_t = f2c.get(k)
                 if cm_t is None:
                     skips.append((f"tpl#{k}", "no_f2c_map_for_rung"))
                     continue
-            else:
-                cm_t = cb8_contacts(full, amask, CB_ATOM37_IDX)
-            row = topology_row(cm_t, full, amask, dssp_t[0], min_len)
-            if row is None:
-                skips.append((f"tpl#{k}", "tpl_dssp_all_ignore"))
+            got, why = _template_row(full, amask, t_aatype, cm_t, pq, qmap, L_n, td, k, min_len)
+            if got is None:
+                skips.append((f"tpl#{k}", why))
                 continue
-            pr = os.path.join(td, f"r{k}.pdb")
-            rmap = write_ca_pdb(full[:, CA_IDX].numpy(), amask[:, CA_IDX].numpy(), pr)
-            if not rmap:
-                skips.append((f"tpl#{k}", "tpl_has_no_ca"))
-                continue
-            try:
-                pairs, tm_us = usalign_pairs(pq, pr)
-            except Exception as e:  # recorded; the row is dropped, not silently zeroed
-                skips.append((f"tpl#{k}", f"usalign_failed:{e}"))
-                continue
-            elem_t = row[5]
-            align = np.full((L_n,), ALIGN_NONE, dtype=np.int16)
-            for qw, rw in pairs:
-                align[qmap[qw]] = elem_t[rmap[rw]]
-            rows.append((row[:5], tm, rewind, k, align.tobytes(), tm_us))
+            rows.append((got[0], tm, rewind, k, got[1], got[2]))
     return stem, native, rows, skips, seq
+
+
+def _pack_chain_rows(stem, native, coords, cmask, L_n, pack_rows, min_len, skips, seq):
+    """Pack mode: the chain's selected template rows (select_pack_rows) -> template rows. No sequence or length gate
+    (user 2026-10-13: templates may be redesigned and indels change the length); the pack is keyed by the dataset's
+    own label chain id, so there is no auth/label translation to get wrong."""
+    rows = []
+    if pack_rows is None:
+        skips.append(("templates", "not_in_template_pack"))
+        return stem, native, rows, skips, seq
+    if not pack_rows:
+        skips.append(("templates", "no_template_in_tm_range"))
+        return stem, native, rows, skips, seq
+    f2c = None
+    if _CONTACT_SOURCE == "confind":
+        mp = pack_map_path(_MAPS_ROOT, stem)
+        if not os.path.exists(mp):
+            skips.append(("templates", "no_f2c_maps"))
+            return stem, native, rows, skips, seq
+        f2c = load_pack_maps(mp)
+    with tempfile.TemporaryDirectory() as td:
+        pq = os.path.join(td, "q.pdb")
+        qmap = write_ca_pdb(coords[:, CA_IDX].numpy(), cmask[:, CA_IDX].numpy(), pq)
+        if not qmap:
+            skips.append(("templates", "native_has_no_ca"))
+            return stem, native, rows, skips, seq
+        for r in pack_rows:
+            rec = _TPACK._read(r)
+            k = rec["draw"]
+            amask = torch.from_numpy(rec["atom_mask"])
+            full = torch.zeros(int(amask.shape[0]), 37, 3)
+            full[amask] = torch.from_numpy(rec["coords"]).float()
+            cm_t = None
+            if f2c is not None:
+                cm_t = f2c.get(k)
+                if cm_t is None or tuple(cm_t.shape) != (int(amask.shape[0]),) * 2:
+                    skips.append((f"tpl#{k}", "no_f2c_map_for_draw"))
+                    continue
+            got, why = _template_row(full, amask, rec["aatype"], cm_t, pq, qmap, L_n, td, k, min_len)
+            if got is None:
+                skips.append((f"tpl#{k}", why))
+                continue
+            rows.append((got[0], rec["tm_native"], rec["rewind"], k, got[1], got[2]))
+    return stem, native, rows, skips, seq
+
+
+def _template_row(full, amask, t_aatype, cm_t, pq, qmap, L_n, td, k, min_len):
+    """One template (atom37 coords [L_t, 37, 3], mask [L_t, 37], its own aatype) -> ((topology row[:5], USalign alignment
+    bytes, USalign TM), None), or (None, skip reason). cm_t None = CB-8 contacts from the coordinates."""
+    donor = None
+    if _PRO_DONOR_MASK:
+        if t_aatype is None or len(t_aatype) != int(amask.shape[0]):
+            return None, "no_aatype_for_donor_mask"
+        donor = torch.from_numpy(np.asarray(t_aatype) != PRO_IDX)[None]
+    dssp_t = compute_dssp_target(full[None], amask[:, CA_IDX][None], coord_mask=amask[None], coord_layout="atom37",
+                                 donor_mask=donor)
+    if dssp_t is None:
+        return None, "tpl_dssp_none"
+    if cm_t is None:
+        cm_t = cb8_contacts(full, amask, CB_ATOM37_IDX)
+    row = topology_row(cm_t, full, amask, dssp_t[0], min_len)
+    if row is None:
+        return None, "tpl_dssp_all_ignore"
+    pr = os.path.join(td, f"r{k}.pdb")
+    rmap = write_ca_pdb(full[:, CA_IDX].numpy(), amask[:, CA_IDX].numpy(), pr)
+    if not rmap:
+        return None, "tpl_has_no_ca"
+    try:
+        pairs, tm_us = usalign_pairs(pq, pr)
+    except Exception as e:  # recorded; the row is dropped, not silently zeroed
+        return None, f"usalign_failed:{e}"
+    elem_t = row[5]
+    align = np.full((L_n,), ALIGN_NONE, dtype=np.int16)
+    for qw, rw in pairs:
+        align[qmap[qw]] = elem_t[rmap[rw]]
+    return (row[:5], align.tobytes(), tm_us), None
 
 
 def _hash_sequence(seq, stem):
@@ -385,11 +476,19 @@ def find_template(stem, roots):
 
 def _enumerate_jobs(args):
     """Chain list of this part -> builder job tuples (the alias join and template lookup live here only)."""
-    base = torch.load(args.base_index, map_location="cpu", weights_only=False, mmap=True)
-    ids = [str(s) for s in base["ids"]]
-    del base
+    global _TPACK
+    if not (args.chain_list or args.base_index):
+        raise SystemExit("give --chain-list or --base-index")
+    if args.chain_list:
+        ids = [l.strip() for l in open(args.chain_list) if l.strip()]
+    else:
+        base = torch.load(args.base_index, map_location="cpu", weights_only=False, mmap=True)
+        ids = [str(s) for s in base["ids"]]
+        del base
     manifest = json.load(open(args.manifest)) if args.manifest and os.path.exists(args.manifest) else None
-    roots = load_template_roots(args.templates)
+    if bool(args.templates) == bool(args.template_pack):
+        raise SystemExit("give exactly one of --templates (npz band tree) or --template-pack")
+    roots = load_template_roots(args.templates) if args.templates else []
     mine = ids[args.part::args.n_parts]
     if args.limit > 0:
         mine = mine[: args.limit]
@@ -412,6 +511,26 @@ def _enumerate_jobs(args):
                     alias[f[il]] = f[ia]
         print(f"chain alias: {len(alias)} label->auth entries from {args.chain_alias}", flush=True)
 
+    if args.template_pack:
+        from proteinfoundation.utils.t2_pack_reader import TemplatePack
+        _TPACK = TemplatePack(args.template_pack)
+        # load every index column HERE: the lazy np.load zip handle must not be shared by forked workers
+        # (a zipfile's seek+read is not safe across processes), and the columns are then shared copy-on-write
+        for k in _TPACK.col._z.files:
+            _TPACK.col[k]
+        if args.tm_min_given is None or args.tm_max_given is None:
+            raise SystemExit("pack mode: give --tm-min and --tm-max explicitly (T8: 0.5 0.9, user 2026-10-10)")
+        if args.chain_alias:
+            raise SystemExit("pack mode: --chain-alias does not apply (the pack is keyed by the dataset's label id)")
+        print(f"template pack {args.template_pack}: {len(_TPACK.stems)} chains; cap {args.max_templates} per chain, "
+              f"TM {args.tm_min}-{args.tm_max}, spread evenly over TM", flush=True)
+        jobs = []
+        for stem in mine:
+            pt = str(_processed_path_sharded(Path(args.processed_dir), stem, manifest))
+            sel = select_pack_rows(_TPACK, stem, args.tm_min, args.tm_max, args.max_templates)
+            jobs.append((stem, pt, None, None, None, None, args.min_len, args.tm_min, args.tm_max, bool(args.selftest), sel))
+        return mine, jobs, roots
+
     jobs = []
     n_alias_miss = 0
     for stem in mine:
@@ -421,12 +540,12 @@ def _enumerate_jobs(args):
             if not key:
                 n_alias_miss += 1
                 jobs.append((stem, pt, None, None, None, None, args.min_len, args.tm_min,
-                             args.tm_max, bool(args.selftest)))
+                             args.tm_max, bool(args.selftest), None))
                 continue
         else:
             key = stem
         npz, tm, rw, sl = find_template(key, roots)
-        jobs.append((stem, pt, npz, tm, rw, sl, args.min_len, args.tm_min, args.tm_max, bool(args.selftest)))
+        jobs.append((stem, pt, npz, tm, rw, sl, args.min_len, args.tm_min, args.tm_max, bool(args.selftest), None))
     if args.chain_alias:
         print(f"  {n_alias_miss} chains have no alias entry -> no template (recorded, not guessed)",
               flush=True)
@@ -544,7 +663,10 @@ def cmd_f2c(args):
               f"| contact Jaccard min={js[0]:.4f} median={js[len(js)//2]:.4f} mean={sum(js)/len(js):.4f} "
               f"| max|prob diff|={worst:.4g}", flush=True)
 
-    for stem, pt, npz_path, band_tm, _rw, band_slot, _ml, tm_min, tm_max, _st in jobs:
+    if _TPACK is not None:
+        n_done, n_maps, t_infer = _pack_f2c(args, jobs, predictor, skip_lines)
+        jobs = []  # pack mode done; the npz loop below is the band-tree path
+    for stem, pt, npz_path, band_tm, _rw, band_slot, _ml, tm_min, tm_max, _st, _pr in jobs:
         if npz_path is None or band_tm is None:
             continue
         out = f2c_map_path(args.maps_out, npz_path, root_dirs)
@@ -585,11 +707,68 @@ def cmd_f2c(args):
         if n_done % 200 == 0:
             print(f"  {n_done} chains, {n_maps} maps this run", flush=True)
     os.makedirs(args.maps_out, exist_ok=True)
-    with open(os.path.join(args.maps_out, f"f2c_skips_{args.part:04d}.tsv"), "w") as fh:
+    os.makedirs(os.path.join(args.maps_out, "_skips"), exist_ok=True)  # the root holds the 1000 crc shard dirs
+    with open(os.path.join(args.maps_out, "_skips", f"f2c_skips_{args.part:04d}.tsv"), "w") as fh:
         fh.write("\n".join(skip_lines) + ("\n" if skip_lines else ""))
     print(f"part {args.part}: {n_done} chains with maps, {n_maps} new maps, {len(skip_lines)} skips; "
           f"inference {t_infer:.1f} s = {t_infer / max(n_maps, 1):.4f} s/map", flush=True)
     print("F2C_PART_DONE", flush=True)
+
+
+def _pack_f2c(args, jobs, predictor, skip_lines):
+    """Pack mode: per chain, Frame2ConFind maps (thresholded, bit-packed) of its selected templates. Templates of one
+    chain differ in length (indels): a batch is padded to its longest template, each map is cut to its own L."""
+    import time
+    n_done = n_maps = 0
+    t_infer = 0.0
+    for stem, *_rest, sel in jobs:
+        if not sel:
+            skip_lines.append(f"{stem}\ttemplates\t{'not_in_template_pack' if sel is None else 'no_template_in_tm_range'}")
+            continue
+        out = pack_map_path(args.maps_out, stem)
+        if os.path.exists(out):
+            n_done += 1
+            continue
+        recs = [_TPACK._read(r) for r in sel]
+        keep = [rc for rc in recs if int(rc["atom_mask"].shape[0]) <= args.max_len]
+        for rc in recs:
+            if int(rc["atom_mask"].shape[0]) > args.max_len:
+                skip_lines.append(f"{stem}\ttpl#{rc['draw']}\tlen_gt_{args.max_len}:{rc['atom_mask'].shape[0]}")
+        if not keep:
+            continue
+        keep.sort(key=lambda rc: -int(rc["atom_mask"].shape[0]))  # similar lengths share a batch
+        draws, Ls, bits = [], [], []
+        for i in range(0, len(keep), args.batch_size):
+            chunk = keep[i:i + args.batch_size]
+            Lmax = max(int(rc["atom_mask"].shape[0]) for rc in chunk)
+            full = torch.zeros(len(chunk), Lmax, 37, 3)
+            amask = torch.zeros(len(chunk), Lmax, 37, dtype=torch.bool)
+            for j, rc in enumerate(chunk):
+                am = torch.from_numpy(rc["atom_mask"])
+                L = int(am.shape[0])
+                amask[j, :L] = am
+                full[j, :L][am] = torch.from_numpy(rc["coords"]).float()
+            xs, ms = zip(*(_f2c_inputs(full[j:j + 1], amask[j]) for j in range(len(chunk))))
+            x, mask = torch.cat(xs), torch.stack(ms)
+            t0 = time.perf_counter()
+            probs = predictor.predict_batch(x, mask).float().cpu()
+            t_infer += time.perf_counter() - t0
+            for j, rc in enumerate(chunk):
+                L = int(rc["atom_mask"].shape[0])
+                draws.append(int(rc["draw"]))
+                Ls.append(L)
+                bits.append(np.packbits((probs[j, :L, :L] >= CONFIND_THRESHOLD).numpy().reshape(-1)))
+        byte_off = np.concatenate([[0], np.cumsum([b.size for b in bits])]).astype(np.int64)
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        tmp = out + ".tmp.npz"
+        np.savez(tmp, draws=np.asarray(draws, dtype=np.int32), L=np.asarray(Ls, dtype=np.int32), byte_off=byte_off,
+                 packed=np.concatenate(bits), threshold=np.float32(CONFIND_THRESHOLD), checkpoint=str(args.checkpoint))
+        os.replace(tmp, out)
+        n_done += 1
+        n_maps += len(draws)
+        if n_done % 200 == 0:
+            print(f"  {n_done} chains, {n_maps} maps this run, {t_infer / max(n_maps, 1):.4f} s/map", flush=True)
+    return n_done, n_maps, t_infer
 
 
 # ──────────────────────────────────────────── merge ──────────────────────────────────────────
@@ -742,10 +921,14 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     # chain-selection args shared by build and f2c, so both select exactly the same template rungs
     sel = argparse.ArgumentParser(add_help=False)
-    sel.add_argument("--base-index", required=True, help="existing topology_index.pt; its ids define the chain list")
+    sel.add_argument("--base-index", default="", help="existing topology_index.pt; its ids define the chain list")
+    sel.add_argument("--chain-list", default="", help="chain ids, one per line (instead of --base-index)")
+    sel.add_argument("--template-pack", default="", help="t2 template pack root (TemplatePack; instead of --templates)")
+    sel.add_argument("--max-templates", type=int, default=64, help="pack mode: templates per chain, spread over TM "
+                                                                    "(user 2026-10-13: cap 64)")
     sel.add_argument("--processed-dir", required=True)
     sel.add_argument("--manifest", default="", help="shard_manifest.json of the processed dir")
-    sel.add_argument("--templates", action="append", required=True, help="ROOT:index_band.npz, repeatable")
+    sel.add_argument("--templates", action="append", default=[], help="ROOT:index_band.npz, repeatable")
     sel.add_argument("--chain-alias", default="",
                      help="TSV with label_id and auth_id columns. The template pool is keyed by "
                           "auth_asym_id and the dataset by label_asym_id; without this they join by "
@@ -754,8 +937,8 @@ def main():
     sel.add_argument("--part", type=int, required=True)
     sel.add_argument("--n-parts", type=int, required=True)
     sel.add_argument("--min-len", type=int, default=1)
-    sel.add_argument("--tm-min", type=float, default=0.0, help="build-time filter on template rows (default: keep the whole band)")
-    sel.add_argument("--tm-max", type=float, default=1.0)
+    sel.add_argument("--tm-min", type=float, default=None, help="build-time filter on template rows (default: keep the whole band)")
+    sel.add_argument("--tm-max", type=float, default=None)
     sel.add_argument("--limit", type=int, default=0, help="debug: only the first N chains of the part")
     sel.add_argument("--selftest", action="store_true", help="also USalign every native to itself and record mismatches (debug)")
     b = sub.add_parser("build", parents=[sel])
@@ -788,6 +971,10 @@ def main():
     m.add_argument("--eligible-out", default="")
     m.add_argument("--tm-range", type=float, nargs=2, default=(0.5, 0.9))
     args = ap.parse_args()
+    if hasattr(args, "tm_min"):  # pack mode requires them explicitly; the band-tree path keeps its 0.0-1.0 defaults
+        args.tm_min_given, args.tm_max_given = args.tm_min, args.tm_max
+        args.tm_min = 0.0 if args.tm_min is None else args.tm_min
+        args.tm_max = 1.0 if args.tm_max is None else args.tm_max
     {"build": cmd_build, "f2c": cmd_f2c, "merge": cmd_merge}[args.cmd](args)
 
 
