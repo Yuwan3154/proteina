@@ -57,7 +57,8 @@ case "$MODE" in
     export CUE_HOST=engaging DATA_PATH=/orcd/pool/006/chenxiou/proteina/data SKIP_CONFIND_PRECOMPUTE=1
     export PYTHONPATH=$REPO CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
     B=(--contact-source confind --element-types 0,1,2 --loop-axis zero --proline-donor-mask --native-pack "$NATIVE_PACK"
-       --workers "${SLURM_CPUS_PER_TASK:-32}" --usalign /home/chenxiou/.local/bin/USalign)
+       --workers "${SLURM_CPUS_PER_TASK:-32}" --usalign /home/chenxiou/.local/bin/USalign
+       --max-ca-clashes 4 --ca-clash-a 3.4)  # user 2026-10-13: "gate at 3.4 A" + "<=4" (before the cap)
     if [ "$MODE" = smoke ]; then
       $PY build "${SEL[@]}" "${B[@]}" --f2c-maps "${SMOKE_MAPS:-$OUT/smoke_maps}" --part 0 --limit "${LIMIT:-20}" \
           --out-dir "$OUT/smoke_parts"

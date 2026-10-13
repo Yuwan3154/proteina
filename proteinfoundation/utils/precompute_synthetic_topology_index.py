@@ -98,6 +98,9 @@ _TPACK = None
 # --native-pack (A6000 build, user 2026-10-09): natives read from the training pack (the processed .pt bytes) instead of
 # --processed-dir; stem -> (offset, length), opened once in the parent so the forked workers share it
 _PACK_IDX, _PACK_MM = None, None
+# --max-ca-clashes / --ca-clash-a (T8, user 2026-10-13 "gate at 3.4 A" + "<=4"): a template with more than k non-bonded
+# (|i - j| >= 2) CA-CA pairs closer than the cutoff is dropped BEFORE the cap; (k, cutoff, cap) or None = no gate
+_CA_CLASH_GATE = None
 CONFIND_THRESHOLD = 0.01             # the `contact_method: confind` transform's threshold
 CONTACT_DEF_CONFIND = "ConFind via Frame2ConFind, prob >= 0.01 (native: stored contact_map_confind)"
 
@@ -141,16 +144,19 @@ def load_pack_maps(path):
     return out
 
 
-def select_pack_rows(tp, stem, tm_min, tm_max, cap):
+def select_pack_rows(tp, stem, tm_min, tm_max, cap, keep=None):
     """User 2026-10-13 "(b)": at most `cap` templates per chain, spread evenly over the TM range -- evenly in TM VALUE:
     for each of `cap` targets linspace(tm_min, tm_max, cap), the nearest still-unused in-range row (ties: lower draw).
+    `keep` (row -> bool, optional) filters the in-range rows BEFORE the cap (the clash gate); cap None = no cap.
     Returned in (tm_native, draw) order."""
     if stem not in tp:
         return None
     tm, draw = tp.col["tm_native"], tp.col["draw"]
     rows = [r for r in tp.rows(stem) if tm_min <= float(tm[r]) <= tm_max]
     assert len({int(draw[r]) for r in rows}) == len(rows), f"{stem}: draw ids repeat (rows, maps and ids key on draw)"
-    if len(rows) > cap:
+    if keep is not None:
+        rows = [r for r in rows if keep(r)]
+    if cap is not None and len(rows) > cap:
         free, picked = set(rows), []
         for t in np.linspace(tm_min, tm_max, cap):
             r = min(free, key=lambda r: (abs(float(tm[r]) - t), int(draw[r])))
@@ -162,6 +168,15 @@ def select_pack_rows(tp, stem, tm_min, tm_max, cap):
 
 
 # ─────────────────────────────────── per-structure pieces ────────────────────────────────────
+def ca_clash_pairs(ca: np.ndarray, present: np.ndarray, cutoff: float) -> int:
+    """Non-bonded (residue index |i - j| >= 2) CA-CA pairs closer than `cutoff` (same metric as t8_clash_gate_stats)."""
+    rn = np.flatnonzero(present)
+    c = ca[rn]
+    d = np.linalg.norm(c[:, None] - c[None], axis=-1)
+    i, j = np.triu_indices(len(rn), k=1)
+    return int(((rn[j] - rn[i] >= 2) & (d[i, j] < cutoff)).sum())
+
+
 def cb8_contacts(coords: torch.Tensor, atom_mask: torch.Tensor, cb_idx: int) -> torch.Tensor:
     """ContactEBM's CB-8 map: CB where resolved else CA, d <= 8, symmetric, diag 1; residues with no
     CA carry no contacts (the binary-map port of ContactEBM's pair mask)."""
@@ -218,23 +233,30 @@ def write_ca_pdb(ca_xyz: np.ndarray, present: np.ndarray, path: str):
     return idx_map
 
 
-def usalign_pairs(pdb_q: str, pdb_r: str):
-    """Aligned (query_written, ref_written) pairs and the query-normalised TM, sequence-independent."""
+def usalign_pairs(pdb_q: str, pdb_r: str, n_q: int, n_r: int):
+    """Aligned (query_written, ref_written) pairs and the query-normalised TM, sequence-independent. n_q / n_r = residues
+    written to each file: USalign must have read exactly those (it reads ATOM records only), or the indices would shift."""
     out = subprocess.run([_USALIGN, pdb_q, pdb_r, "-TMscore", "0"], capture_output=True, text=True, timeout=600)
     if out.returncode != 0:
         raise RuntimeError(f"rc={out.returncode}")
     lines = out.stdout.splitlines()
     tm_q = float("nan")
     for l in lines:
-        if l.startswith("TM-score=") and "Chain_1" in l:
+        # US-align 20241108 says "Structure_1", older builds "Chain_1"
+        if l.startswith("TM-score=") and ("Structure_1" in l or "Chain_1" in l):
             tm_q = float(l.split("=")[1].split()[0])
             break
+    if tm_q != tm_q:
+        raise RuntimeError("no query-normalised TM-score line")
     anchor = next((i for i, l in enumerate(lines) if l.startswith('(":" denotes')), None)
     if anchor is None or anchor + 3 >= len(lines):
         raise RuntimeError("no alignment block")
     seq_q, seq_r = lines[anchor + 1], lines[anchor + 3]
     if len(seq_q) != len(seq_r):
         raise RuntimeError("ragged alignment block")
+    read_q, read_r = len(seq_q) - seq_q.count("-"), len(seq_r) - seq_r.count("-")
+    if (read_q, read_r) != (n_q, n_r):
+        raise RuntimeError(f"residues_read_{read_q}_{read_r}_vs_written_{n_q}_{n_r}")
     pairs, qi, ri = [], 0, 0
     for cq, cr in zip(seq_q, seq_r):
         q_res, r_res = cq != "-", cr != "-"
@@ -337,7 +359,7 @@ def _chain_job(args):
         if selftest:
             # the probe's gate: a chain aligned to ITSELF must map every element residue onto its own
             # element -- catches an index-map, parse or span off-by-one that a cross-chain number hides
-            pairs, _ = usalign_pairs(pq, pq)
+            pairs, _ = usalign_pairs(pq, pq, len(qmap), len(qmap))
             elem_n = native[5]
             self_align = np.full((L_n,), ALIGN_NONE, dtype=np.int16)
             for qw, rw in pairs:
@@ -380,6 +402,21 @@ def _pack_chain_rows(stem, native, coords, cmask, L_n, pack_rows, min_len, skips
     if not pack_rows:
         skips.append(("templates", "no_template_in_tm_range"))
         return stem, native, rows, skips, seq
+    if _CA_CLASH_GATE is not None:
+        # the parent passed every in-range row uncapped; gate here (decoding is the cost), THEN cap evenly in TM
+        max_k, cutoff, cap, tm_min, tm_max = _CA_CLASH_GATE
+        n_clash = {}
+        for r in pack_rows:
+            rec = _TPACK._read(r)
+            full = np.zeros((rec["atom_mask"].shape[0], 37, 3), dtype=np.float32)
+            full[rec["atom_mask"]] = rec["coords"]
+            n_clash[r] = ca_clash_pairs(full[:, CA_IDX], rec["atom_mask"][:, CA_IDX], cutoff)
+            if n_clash[r] > max_k:
+                skips.append((f"tpl#{rec['draw']}", f"ca_clashes_gt_{max_k}:{n_clash[r]}"))
+        pack_rows = select_pack_rows(_TPACK, stem, tm_min, tm_max, cap, keep=lambda r: n_clash[r] <= max_k)
+        if not pack_rows:
+            skips.append(("templates", "no_template_after_clash_gate"))
+            return stem, native, rows, skips, seq
     f2c = None
     if _CONTACT_SOURCE == "confind":
         mp = pack_map_path(_MAPS_ROOT, stem)
@@ -435,7 +472,7 @@ def _template_row(full, amask, t_aatype, cm_t, pq, qmap, L_n, td, k, min_len):
     if not rmap:
         return None, "tpl_has_no_ca"
     try:
-        pairs, tm_us = usalign_pairs(pq, pr)
+        pairs, tm_us = usalign_pairs(pq, pr, len(qmap), len(rmap))
     except Exception as e:  # recorded; the row is dropped, not silently zeroed
         return None, f"usalign_failed:{e}"
     elem_t = row[5]
@@ -527,7 +564,9 @@ def _enumerate_jobs(args):
         jobs = []
         for stem in mine:
             pt = str(_processed_path_sharded(Path(args.processed_dir), stem, manifest))
-            sel = select_pack_rows(_TPACK, stem, args.tm_min, args.tm_max, args.max_templates)
+            # with the clash gate the cap is applied in the worker, after the gate
+            cap = None if getattr(args, "max_ca_clashes", None) is not None else args.max_templates
+            sel = select_pack_rows(_TPACK, stem, args.tm_min, args.tm_max, cap)
             jobs.append((stem, pt, None, None, None, None, args.min_len, args.tm_min, args.tm_max, bool(args.selftest), sel))
         return mine, jobs, roots
 
@@ -552,9 +591,23 @@ def _enumerate_jobs(args):
     return mine, jobs, roots
 
 
+def _gate_def():
+    if _CA_CLASH_GATE is None:
+        return "none"
+    return (f"drop templates with > {_CA_CLASH_GATE[0]} non-bonded (|i-j|>=2) CA-CA pairs < {_CA_CLASH_GATE[1]} A, "
+            f"before the cap of {_CA_CLASH_GATE[2]} evenly in TM")
+
+
 def cmd_build(args):
     global _USALIGN, _CONTACT_SOURCE, _MAPS_ROOT, _ROOTS, _PRO_DONOR_MASK, _PACK_IDX, _PACK_MM, _ELEMENT_TYPES, _LOOP_AXIS
+    global _CA_CLASH_GATE
     _USALIGN = args.usalign
+    if (args.max_ca_clashes is None) != (args.ca_clash_a is None):
+        raise SystemExit("give --max-ca-clashes and --ca-clash-a together (T8: 4 and 3.4, user 2026-10-13)")
+    if args.max_ca_clashes is not None:
+        if not args.template_pack:
+            raise SystemExit("--max-ca-clashes applies to pack mode only")
+        _CA_CLASH_GATE = (args.max_ca_clashes, args.ca_clash_a, args.max_templates, args.tm_min, args.tm_max)
     _PRO_DONOR_MASK = args.proline_donor_mask
     _ELEMENT_TYPES = tuple(int(x) for x in args.element_types.split(","))
     _LOOP_AXIS = args.loop_axis
@@ -589,7 +642,7 @@ def cmd_build(args):
                 "tm_build_range": (args.tm_min, args.tm_max),
                 "contact_def": CONTACT_DEF_CONFIND if _CONTACT_SOURCE == "confind" else CONTACT_DEF,
                 "dssp_def": DSSP_DEF_PRO if _PRO_DONOR_MASK else DSSP_DEF,
-                "element_types": list(_ELEMENT_TYPES), "loop_axis": _LOOP_AXIS}, part_path)
+                "element_types": list(_ELEMENT_TYPES), "loop_axis": _LOOP_AXIS, "template_gate": _gate_def()}, part_path)
     with open(os.path.join(args.out_dir, f"skips_{args.part:04d}.tsv"), "w") as fh:
         fh.write("\n".join(skip_lines) + ("\n" if skip_lines else ""))
     by_reason = Counter(l.split("\t")[2].split(":")[0] for l in skip_lines)
@@ -812,7 +865,7 @@ def cmd_merge(args):
                 elem_sumsq += stats[2][1]
                 elem_count += stats[3]
 
-    min_len, contact_def, dssp_defs, elem_defs = None, None, set(), set()
+    min_len, contact_def, dssp_defs, elem_defs, gate_defs = None, None, set(), set(), set()
     for part in range(args.n_parts):
         p = os.path.join(args.parts_dir, f"part_{part:04d}.pt")
         if not os.path.exists(p):
@@ -821,6 +874,7 @@ def cmd_merge(args):
         min_len, contact_def = d["min_len"], d["contact_def"]
         dssp_defs.add(d.get("dssp_def", DSSP_DEF))  # parts written before the key existed used DSSP_DEF
         elem_defs.add((tuple(d.get("element_types", (DSSP_HELIX, DSSP_STRAND))), d.get("loop_axis", None)))
+        gate_defs.add(d.get("template_gate", "none"))  # parts written before the key existed had no gate
         for ch in d["chains"]:
             if ch["native"] is None:
                 continue                                # skipped chains are in the skip logs
@@ -868,6 +922,8 @@ def cmd_merge(args):
     if len(elem_defs) != 1:  # element sets / loop axes differ -> element tensors and alignment targets would not line up
         raise ValueError(f"parts disagree on (element_types, loop_axis): {sorted(elem_defs, key=str)}")
     element_types, loop_axis = elem_defs.pop()
+    if len(gate_defs) != 1:
+        raise ValueError(f"parts disagree on the template gate: {sorted(gate_defs)}")
     out = {
         "ids": ids,
         "cluster_of": torch.tensor(cluster_of, dtype=torch.int32),
@@ -898,6 +954,7 @@ def cmd_merge(args):
         "reference_source": "synthetic",
         "element_types": element_types,
         "loop_axis": loop_axis,
+        "template_gate": gate_defs.pop(),
     }
     if elem_count:
         em = elem_sum / elem_count
@@ -954,6 +1011,9 @@ def main():
     b.add_argument("--proline-donor-mask", action="store_true",
                    help="recompute native + template DSSP with proline as a non-donor (default: v4 behaviour)")
     b.add_argument("--f2c-maps", default="", help="maps root written by `f2c` (required for --contact-source confind)")
+    b.add_argument("--max-ca-clashes", type=int, default=None,
+                   help="pack mode: drop templates with more than this many non-bonded CA-CA clashes, before the cap")
+    b.add_argument("--ca-clash-a", type=float, default=None, help="clash cutoff in A (with --max-ca-clashes)")
     f = sub.add_parser("f2c", parents=[sel])
     f.add_argument("--maps-out", required=True)
     # the production "winner" that wrote every stored contact_map_confind (overwrite of 2026-06-03, verified 100%)
