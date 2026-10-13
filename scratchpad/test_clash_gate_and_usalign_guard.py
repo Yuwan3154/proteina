@@ -3,13 +3,22 @@
 python scratchpad/test_clash_gate_and_usalign_guard.py [USALIGN]"""
 
 import os
+import subprocess
 import sys
 import tempfile
 
 import numpy as np
-import pytest
 
 import proteinfoundation.utils.precompute_synthetic_topology_index as B
+
+
+def refused(pq, pr, n_q, n_r, expect):
+    """usalign_pairs must RAISE (child process: exit code + message), never return shifted pairs."""
+    code = (f"import proteinfoundation.utils.precompute_synthetic_topology_index as B; B._USALIGN = {B._USALIGN!r}; "
+            f"B.usalign_pairs({pq!r}, {pr!r}, {n_q}, {n_r})")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert out.returncode != 0 and expect in out.stderr, (n_q, n_r, out.returncode, out.stderr[-300:])
+
 
 # --- ca_clash_pairs: residue-index separation, not written order; adjacent steps never count
 ca = np.stack([np.arange(10) * 3.8, np.zeros(10), np.zeros(10)], 1).astype(np.float32)
@@ -67,13 +76,11 @@ with tempfile.TemporaryDirectory() as td:
     assert tm_self > 0.999 and all(a == b for a, b in self_pairs) and len(self_pairs) == len(qmap)
     print(f"PASS usalign_pairs: TM {tm:.4f} parsed (Structure_1 label), self-alignment identity on {len(qmap)} residues")
     for wrong in ((len(qmap) + 1, len(rmap)), (len(qmap), len(rmap) - 1)):
-        with pytest.raises(RuntimeError, match="residues_read"):
-            B.usalign_pairs(pq, pr, *wrong)
+        refused(pq, pr, *wrong, "RuntimeError: residues_read")
     # the ProteinEBMalign failure: a HETATM residue in the file is invisible to USalign -> must be refused, not shifted
     lines = open(pq).read().splitlines()
     lines[10] = "HETATM" + lines[10][6:]
     open(pq, "w").write("\n".join(lines) + "\n")
-    with pytest.raises(RuntimeError, match="residues_read_37_"):
-        B.usalign_pairs(pq, pr, len(qmap), len(rmap))
+    refused(pq, pr, len(qmap), len(rmap), "RuntimeError: residues_read_37_")
     print("PASS guard: wrong counts and a HETATM residue (read 37 of 38) are refused")
 print("ALL PASS")
