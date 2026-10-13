@@ -92,6 +92,7 @@ def main():
     ap.add_argument("--workers", type=int, default=30)
     ap.add_argument("--max-clashes", type=int, nargs="+", default=[0, 1], help="gate Gk = at most k clash pairs")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--per-chain-out", help="TSV: stem, in-range templates, then the cap-64 selection under each gate")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     z = np.load(args.native_pack + ".idx.npz", allow_pickle=True)
@@ -139,6 +140,12 @@ def main():
             "tm_span_per_chain_after": {q: round(float(np.quantile([span(s_) for s_ in surv if s_] or [0], float(q))), 3)
                                         for q in ("0.05", "0.5")},
         }
+    if args.per_chain_out:
+        with open(args.per_chain_out, "w") as fh:
+            fh.write("\t".join(["stem", "n_in"] + [f"sel_{k}" for k in gates]) + "\n")
+            for stem, _, _, o in res:
+                sel = [evenly_in_tm([x for x in o if f(x[2], x[3])], args.cap, args.tm_min, args.tm_max) for f in gates.values()]
+                fh.write("\t".join([stem, str(len(o))] + [str(v) for v in sel]) + "\n")
     with open(os.path.join(args.out, "clash_gate_stats.json"), "w") as fh:
         json.dump(rep, fh, indent=1)
     print(json.dumps(rep, indent=1))
