@@ -2,8 +2,8 @@
 Carbon VdW radius of 1.7 A ... We could relax the gate to at most 1 with such clashes. Calculate statistics on how gating
 on this would impact data availability after filtering.").
 
-clash = a non-bonded (|i - j| >= 2) CA-CA pair closer than --clash (3.4 A). Gates (the user's): G0 = no clash,
-G1 = at most 1 clash. Also per TM bin (0.1 wide, as the generator's t2_prod_summary bins) and the TM span each chain's
+clash = a non-bonded (|i - j| >= 2) CA-CA pair closer than --clash (3.4 A). Gates (the user's): Gk = at most k clash
+pairs, k in --max-clashes (user: 0 and 1, then 4). Also per TM bin (0.1 wide, as the generator's t2_prod_summary bins) and the TM span each chain's
 selection covers before vs after gating.
 For a seeded sample of chains (all in-range templates of each, TM [0.5, 0.9]): templates surviving each gate (template- and
 chain-weighted), chains left with none, and the templates per chain the cap-64 selection would then get (gate FIRST, then
@@ -90,6 +90,7 @@ def main():
     ap.add_argument("--tm-max", type=float, default=0.9)
     ap.add_argument("--cap", type=int, default=64)
     ap.add_argument("--workers", type=int, default=30)
+    ap.add_argument("--max-clashes", type=int, nargs="+", default=[0, 1], help="gate Gk = at most k clash pairs")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
@@ -102,7 +103,7 @@ def main():
     with Pool(args.workers, initializer=init, initargs=(args.pack, args, nat)) as p:
         res = p.map(chain_job, sample, chunksize=4)
 
-    gates = {"G0": lambda nb, st: nb == 0, "G1": lambda nb, st: nb <= 1}
+    gates = {f"G{k}": (lambda k: lambda nb, st: nb <= k)(k) for k in args.max_clashes}
     bins = [(0.5, 0.6), (0.6, 0.7), (0.7, 0.8), (0.8, 0.9)]
 
     def span(rows):
