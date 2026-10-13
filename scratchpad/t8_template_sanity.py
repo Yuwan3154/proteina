@@ -8,7 +8,8 @@ Layer 2 -- a seeded sample of chains, every SELECTED template decoded: finite co
 present; residue_index contiguous 1..L; orig_idx in [-1, L_native) and strictly increasing over its non -1 entries;
 broken CA-CA steps by the GENERATOR's own rule (of-t2deep t2_stage_b.n_broken_steps: > 4.0 A, except a step joining two
 native-adjacent residues whose native step is itself broken; more than 1 = dropped, the user's "badly broken");
-non-bonded CA-CA < 3.0 A (clashes); L_native
+non-bonded CA-CA < 3.0 A (clashes) and consecutive steps < 3.0 A (with whether each sits at an indel junction), plus the
+same CA metrics on the sampled NATIVES as a known-good control (user 2026-10-13); L_native
 vs the native in the training pack (a mismatch = a template of a different native: reported as provenance, and the
 broken-step rule is then not applied); sequence identity to the native at orig_idx positions (REPORTED only: templates may
 be redesigned); USalign TM(template, native) recomputed on a sub-sample vs the stored tm_native.
@@ -35,6 +36,24 @@ from proteinfoundation.utils.t2_pack_reader import TemplatePack, layout
 CA = 1
 BROKEN_CA_CA = 4.0   # of-t2deep prune_work/t2_indel/t2_stage_b.py n_broken_steps (the generator's gate)
 CLASH_CA_CA = 3.0    # reported only (no gate)
+SHORT_STEP = 3.0     # consecutive CA-CA below this is reported (vs ~3.8 A); same threshold on templates and natives
+
+
+def ca_metrics(ca, ok, resnum, core=None):
+    """Consecutive CA-CA steps between residues adjacent in `resnum`, and non-bonded (|i - j| >= 2 in resnum) CA-CA pairs
+    closer than CLASH_CA_CA, over residues with a resolved CA. With `core` (bool per residue), also the number of clash
+    pairs with BOTH ends in the core."""
+    c, rn = ca[ok], resnum[ok]
+    adj = np.diff(rn) == 1
+    steps = np.linalg.norm(c[1:] - c[:-1], axis=1)[adj]
+    d = np.linalg.norm(c[:, None] - c[None], axis=-1)
+    i, j = np.triu_indices(len(c), k=1)
+    hit = (np.abs(rn[j] - rn[i]) >= 2) & (d[i, j] < CLASH_CA_CA)
+    n_core = None
+    if core is not None:
+        k = core[ok]
+        n_core = int((hit & k[i] & k[j]).sum())
+    return steps, int(hit.sum()), n_core
 
 
 def n_broken_steps(ca, orig, nat_break):
@@ -150,6 +169,8 @@ def main():
     sample = rng.sample(pool, min(args.sample_chains, len(pool)))
     st = Counter()
     broken_hist, clash_hist, ident, ln_mismatch, steps_all = Counter(), Counter(), [], [], []
+    nat_steps_all, nat_clash_hist = [], Counter()
+    paired, mins = [], {}
     tm_pairs = []
     us_budget = args.usalign_templates
     with tempfile.TemporaryDirectory() as td:
@@ -161,6 +182,15 @@ def main():
             n_seq = np.asarray(g.residue_type)
             nca = placeholder_ca(g.coords[:, CA].numpy().astype(np.float32), (g.coord_mask[:, CA] > 0.5).numpy())
             nat_break = np.linalg.norm(nca[1:] - nca[:-1], axis=1) > BROKEN_CA_CA
+            # native CONTROL (user 2026-10-13): the same metrics on the resolved native CAs
+            n_ok = (g.coord_mask[:, CA] > 0.5).numpy()
+            n_steps, n_clash, _ = ca_metrics(g.coords[:, CA].numpy().astype(np.float32), n_ok, np.arange(L_nat))
+            nat_steps_all.append(n_steps)
+            nat_clash_hist[min(n_clash, 5)] += 1
+            st["natives_with_short_step"] += int((n_steps < SHORT_STEP).any())
+            st["native_short_steps"] += int((n_steps < SHORT_STEP).sum())
+            st["native_steps_lt_2.5"] += int((n_steps < 2.5).sum())
+            chain_tpl_clash = []
             pq = None
             for r in select_pack_rows(tp, stem, args.tm_min, args.tm_max, args.cap) or []:
                 rec = tp._read(r)
@@ -197,10 +227,25 @@ def main():
                     broken_hist[min(nb_, 5)] += 1
                     if nb_ > 1:
                         st["templates_badly_broken"] += 1
-                cac = ca[has_ca]
-                d = np.linalg.norm(cac[:, None] - cac[None], axis=-1)
-                iu = np.triu_indices(len(cac), k=2)
-                clash_hist[min(int((d[iu] < CLASH_CA_CA).sum()), 5)] += 1
+                # core = retained residues opposite a RESOLVED native residue; the rest were generated (inserted, or the
+                # native residue had no coordinates)
+                core = (oi >= 0) & (n_ok[np.clip(oi, 0, L_nat - 1)] if rec["L_native"] == L_nat else np.zeros(Lt, bool))
+                _, t_clash, t_core = ca_metrics(ca, has_ca, np.arange(Lt), core)
+                clash_hist[min(t_clash, 5)] += 1
+                chain_tpl_clash.append(t_clash)
+                st["template_clash_pairs"] += t_clash
+                st["template_clash_pairs_core_core"] += t_core
+                d_step = np.linalg.norm(ca[1:] - ca[:-1], axis=1)
+                short = np.flatnonzero((d_step < SHORT_STEP) & has_ca[1:] & has_ca[:-1])
+                if short.size:
+                    st["templates_with_short_step"] += 1
+                    st["short_steps"] += int(short.size)
+                    junction = (oi[short] < 0) | (oi[short + 1] < 0) | (oi[short + 1] != oi[short] + 1)
+                    st["short_steps_at_indel_junction"] += int(junction.sum())
+                    st["template_steps_lt_2.5"] += int((d_step[short] < 2.5).sum())
+                    for v, jn in zip(d_step[short], junction):
+                        key = "min_short_step_at_junction" if jn else "min_short_step_not_at_junction"
+                        mins[key] = min(mins.get(key, 9.9), float(v))
                 m = oi >= 0
                 if m.any() and len(n_seq) == L_nat:
                     ident.append(float((rec["aatype"][m] == n_seq[oi[m]]).mean()))
@@ -212,10 +257,14 @@ def main():
                     write_ca_pdb(ca, has_ca, pr)
                     tm_pairs.append((rec["tm_native"], usalign_tm(pr, pq, args.usalign)))
                     us_budget -= 1
+            if chain_tpl_clash:
+                paired.append((n_clash, chain_tpl_clash))
     steps = np.concatenate(steps_all) if steps_all else np.zeros(0)
     dtm = np.array([b - a for a, b in tm_pairs])
     rep["sample"] = {"chains": len(sample), **dict(st), "broken_steps_per_template": dict(sorted(broken_hist.items())),
                      "ca_clash_pairs_per_template": dict(sorted(clash_hist.items())),
+                     "NATIVE_CONTROL_ca_clash_pairs_per_native": dict(sorted(nat_clash_hist.items())),
+                     "NATIVE_CONTROL_ca_ca_step": quantiles(np.concatenate(nat_steps_all) if nat_steps_all else []),
                      "ca_ca_step": quantiles(steps), "L_native_vs_training_native_mismatch": len(ln_mismatch),
                      "L_native_mismatch_examples": ln_mismatch[:10], "seq_identity_at_orig_idx": quantiles(ident),
                      "usalign_n": len(tm_pairs), "usalign_tm_minus_stored": quantiles(dtm),
@@ -226,6 +275,18 @@ def main():
             fails.append(f"sample.{k}={st[k]}")
     if st["residues_missing_backbone"]:
         fails.append(f"sample.residues_missing_backbone={st['residues_missing_backbone']}")
+    # paired control (per chain): native clash count vs its templates', chain- AND template-weighted
+    nat0 = [t for n_, t in paired if n_ == 0]
+    rep["paired_control"] = {
+        "chains": len(paired),
+        "chain_weighted_frac_templates_more_clashes_than_native": round(float(np.mean([np.mean(np.array(t) > n_) for n_, t in paired])), 4) if paired else None,
+        "template_weighted_frac_templates_more_clashes_than_native": round(float(np.mean(np.concatenate([np.array(t) > n_ for n_, t in paired]))), 4) if paired else None,
+        "chains_native_0_clash": len(nat0),
+        "among_native_0_clash_chains_template_weighted_frac_with_clash": round(float(np.mean(np.concatenate([np.array(t) > 0 for t in nat0]))), 4) if nat0 else None,
+        "among_native_0_clash_chains_chain_weighted_frac_with_clash": round(float(np.mean([np.mean(np.array(t) > 0) for t in nat0])), 4) if nat0 else None,
+        "native_clash_mean": round(float(np.mean([n_ for n_, _ in paired])), 3) if paired else None,
+        "template_clash_mean_chain_weighted": round(float(np.mean([np.mean(t) for _, t in paired])), 3) if paired else None,
+        **{k: round(v, 3) for k, v in mins.items()}}
     rep["hard_fail"] = fails
     rep["verdict"] = "FAIL" if fails else "PASS (hard checks); review the reported distributions for sign-off"
     with open(os.path.join(args.out, "template_sanity.json"), "w") as f:
