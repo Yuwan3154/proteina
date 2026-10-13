@@ -109,15 +109,18 @@ def main():
     args = ap.parse_args()
     os.makedirs(os.path.join(args.dir, "out"), exist_ok=True)
     rows = [l.rstrip("\n").split("\t") for l in open(os.path.join(args.dir, "manifest.tsv"))][1:]
-    with Pool(args.workers, initializer=init, initargs=(args,)) as p:
-        res = [r for rs in p.imap_unordered(job, rows) for r in rs]
     keys = ["tag", "group", "protocol", "L", "clash_before", "clash_after", "step_before", "step_after", "rmsd_ca",
-            "tm_before", "tm_after",
-            "dssp_same", "e_before", "e_after", "sec"]
-    with open(os.path.join(args.dir, "results.tsv"), "w") as f:
+            "tm_before", "tm_after", "dssp_same", "e_before", "e_after", "sec"]
+    res = []
+    # one row per (template, protocol) as each template finishes, so a time limit keeps what was done
+    with Pool(args.workers, initializer=init, initargs=(args,)) as p, \
+            open(os.path.join(args.dir, "results.tsv"), "w") as f:
         f.write("\t".join(keys) + "\n")
-        for r in sorted(res, key=lambda r: (r["group"], r["tag"], r["protocol"])):
-            f.write("\t".join(f"{r[k]:.4f}" if isinstance(r[k], float) else str(r[k]) for k in keys) + "\n")
+        for rs in p.imap_unordered(job, rows):
+            for r in rs:
+                f.write("\t".join(f"{r[k]:.4f}" if isinstance(r[k], float) else str(r[k]) for k in keys) + "\n")
+            f.flush()
+            res.extend(rs)
     for g in ("gated", "kept_1_k", "kept_0"):
         for name in args.protocols:
             s = [r for r in res if r["group"] == g and r["protocol"] == name]
