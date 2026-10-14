@@ -49,7 +49,7 @@ datamodule:
       # reference. 0 disables the mechanism entirely.
       prob: 0.25
     - _target_: "proteinfoundation.datasets.topology_reference.TopologyReferenceTransform"
-      index_path: ${oc.env:SYNTH_INDEX_DIR}/topology_index_confind_synth.pt  # T8 index: --contact-source confind --element-types 0,1,2 --loop-axis ... --proline-donor-mask
+      index_path: ${oc.env:SYNTH_INDEX_DIR}/topology_index_confind_synth_t8.pt  # T8 index: --contact-source confind --element-types 0,1,2 --loop-axis ... --proline-donor-mask
       reference_source: synthetic
       tm_range: [0.5, 0.9]           # user decision 2026-09-10 (D1)
       sse_types: [0, 1, 2]           # T8: loops are tokenised too ...
@@ -63,8 +63,10 @@ datamodule:
       type_mutate_prob: 0.1          # per-element probability of a helix <-> strand flip (user, D5)
       token_mask_prob: 0.1           # per-element probability of MASKing the token; target kept for the MLM loss (user, D5)
       drop_prob: 0.25                # train an unconditional branch for classifier-free guidance.
-      drop_ref_len_range: ???        # T8: RE-MEASURE on the T8 index (p5-p95 of served element counts); the old
-                                     # [5, 39] counted helix/strand only. Old note: a DROPPED reference is a variable-length FULLY MASKED
+      drop_ref_len_range: [14, 80]   # T8 MEASURED by the D22 rule (p5-p95 of the served element count, 1,500 TRAIN
+                                     # references through this transform, drop_prob 0; t8_measure_drop_ref_len.py @f92c605,
+                                     # job 25853652, 2026-10-14): p5 14 / median 42 / p95 80, linear = nearest; loops count
+                                     # as elements here. The old [5, 39] counted helix/strand only. Old note: a DROPPED reference is a variable-length FULLY MASKED
                                      # scratch pad, not one dead token (user, D20). Range = the
                                      # p5-p95 of what training actually serves, MEASURED over 1,500
                                      # references (job 22502519: p5 5, median 20, p95 39).
