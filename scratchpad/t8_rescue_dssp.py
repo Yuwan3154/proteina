@@ -1,6 +1,6 @@
 """DSSP before vs after the rescue protocols (the index builds each template's topology from its DSSP, so a rescue must
 keep the secondary structure). Rosetta DSSP on heavy atoms only: input in/{tag}.pdb vs PyRosetta out/{tag}.{protocol}.pdb
-and tmol out/tmol_b1_{i:04d}.pdb (i = manifest row; hydrogens dropped). Per template: fraction of residues with the same
+and tmol out/tmol_b1_{i:04d}.pdb / out/tmol_kin_b1_{i:04d}.pdb (i = manifest row; hydrogens dropped). Per template: fraction of residues with the same
 H/E/L letter, and the helix / strand element counts (runs of H, runs of E) before -> after.
 Env: /orcd/scratch/orcd/011/chenxiou/envs/pyrosetta. Usage: python scratchpad/t8_rescue_dssp.py --dir DIR
 """
@@ -36,7 +36,8 @@ def main():
     for i, r in enumerate(rows):
         tag, group = r[0], r[1]
         s0 = ss_of(os.path.join(args.dir, "in", f"{tag}.pdb"))
-        cands = {"idealize": f"{tag}.idealize.pdb", "relax_cst": f"{tag}.relax_cst.pdb", "tmol_relax_cst": f"tmol_b1_{i:04d}.pdb"}
+        cands = {"idealize": f"{tag}.idealize.pdb", "relax_cst": f"{tag}.relax_cst.pdb", "tmol_relax_cst": f"tmol_b1_{i:04d}.pdb",
+                 "tmol_relax_cst_kin": f"tmol_kin_b1_{i:04d}.pdb"}
         for proto, fn in cands.items():
             p = os.path.join(args.dir, "out", fn)
             if not os.path.exists(p):
@@ -49,7 +50,7 @@ def main():
     for (group, proto), v in sorted(out.items()):
         v = np.array(v)
         dh, de = v[:, 2] - v[:, 1], v[:, 4] - v[:, 3]
-        print(f"{group:9s} {proto:15s} n={len(v):2d} | same DSSP letter median {np.median(v[:, 0]):.3f} min {v[:, 0].min():.3f} | "
+        print(f"{group:9s} {proto:18s} n={len(v):2d} | same DSSP letter median {np.median(v[:, 0]):.3f} min {v[:, 0].min():.3f} | "
               f"helices {np.median(v[:, 1]):.0f} -> {np.median(v[:, 2]):.0f} (changed in {int((dh != 0).sum())}) | "
               f"strands {np.median(v[:, 3]):.0f} -> {np.median(v[:, 4]):.0f} (changed in {int((de != 0).sum())})")
 
