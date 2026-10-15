@@ -179,15 +179,14 @@ validation_sampling:
   tmscore_mode: 5
   # FIXED chain set for the sampling metrics, so they are comparable across steps and
   # can rank checkpoints. 32 chains, one per 25%-identity val cluster, chosen so no pair
-  # reaches TM>=0.5 (max within the set is 0.450) and the length range is covered.
+  # reaches TM>=0.5 and the length range is covered (T8 values in the note below).
   # The val LOSS still runs over the whole val split; only sampling moves to this set.
-  # Cost: the whole set is scored each time the trajectory fires, so at 200 sampling
-  # steps that is ~80 s -- worth re-checking once the step sweep lands.
-  # max256 variant: this dataset config pads/TRUNCATES at 256, and the ground-truth
-  # topology is built at the chain's FULL length, so a truncated chain would be
-  # conditioned on a topology describing residues it no longer has. Same construction,
-  # pool restricted to <=256 residues (57 of the 69 isolated ones qualify).
-  fixed_chain_list: ???  # T8: choose from t8_template_list/val_chain_ids.txt -- the old val_fixed32_max256 list is 31/32 TRAIN chains
+  # (The max256 truncation caveat of the parent config does not apply: T8 has no PaddingTransform and max length 512.)
+  # T8 (user 2026-10-14): old val_fixed32 construction with "no pair TM >= 0.5 WITHIN the 32" (TM normalised by the
+  # shorter chain), one representative per 25% val cluster (cluster rep, else highest resolution), every member with a
+  # template in TM 0.5-0.9; 32 equal-size length groups, median-nearest member. t8_val_fixed32.py --mode within @ddbf8ad,
+  # job 25877410: lengths 56-459, max pair TM 0.4958. Copy in git: scratchpad/lists/val_fixed32_t8_within.txt
+  fixed_chain_list: /orcd/scratch/orcd/011/chenxiou/t8_valfixed/val_fixed32_t8_within.txt
 
 # ClusterSampler DDP fix is on by default (BaseLightningDataModule.cluster_sampler_v2=True).
 # To override per-dataset, set cluster_sampler_v2 / cluster_sampler_seed under
