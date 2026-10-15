@@ -87,9 +87,16 @@ LOCK=/orcd/scratch/orcd/011/chenxiou/c2c_store/.run.lock.${SLURM_JOB_NAME}
 if ! mkdir "$LOCK" 2>/dev/null; then
     HOLDER=$(cat "$LOCK/jobid" 2>/dev/null)
     if [ "$HOLDER" != "$SLURM_JOB_ID" ]; then
-        ST=$(squeue -h -j "$HOLDER" -o %T 2>/dev/null); RC=$?
+        # a job slurmctld has purged makes squeue exit 1 with "Invalid job id" (measured 2026-10-14): that is GONE, not a
+        # failed query (else a SIGKILL'd holder's lock blocks every later segment forever); ONE call gives state, error
+        # and exit code; an empty holder (killed between mkdir and the jobid write) is gone too
+        ST=""; RC=0; ERR=""
+        if [ -n "$HOLDER" ]; then
+            ST=$(squeue -h -j "$HOLDER" -o %T 2>"$TMPDIR/lock_sq.err"); RC=$?; ERR=$(cat "$TMPDIR/lock_sq.err")
+            if [ "$RC" -ne 0 ] && printf '%s' "$ERR" | grep -q "Invalid job id"; then ST=""; RC=0; fi
+        fi
         if [ "$RC" -ne 0 ]; then
-            echo "[lock] squeue failed (rc=$RC); refusing to judge whether $HOLDER is alive. Exiting."; exit 0
+            echo "[lock] squeue failed (rc=$RC: $ERR); refusing to judge whether $HOLDER is alive. Exiting."; exit 0
         fi
         # ⛔ Gate on a LIVE state, not on "squeue printed something". A predecessor killed by
         # SIGKILL (node failure, OOM-killer, scancel -9) never runs the EXIT trap, so its lock
