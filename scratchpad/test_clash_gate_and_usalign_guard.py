@@ -74,6 +74,12 @@ with tempfile.TemporaryDirectory() as td:
     assert len(qmap) == 38 and all(qmap[a] < 40 and rmap[b] < 35 for a, b in pairs)
     self_pairs, tm_self = B.usalign_pairs(pq, pq, len(qmap), len(qmap))
     assert tm_self > 0.999 and all(a == b for a, b in self_pairs) and len(self_pairs) == len(qmap)
+    # map-back in STRUCTURE indexing (ProteinEBMalign follow-up), CA-less residues 7 and 20 mid-chain: the residue set is
+    # right; a self-alignment uses the same map on both sides, so a SHIFT is caught by t8_align_remapfree_check.py instead
+    struct_pairs = [(qmap[a], qmap[b]) for a, b in self_pairs]
+    assert all(i == j for i, j in struct_pairs), struct_pairs[:5]
+    assert sorted(i for i, _ in struct_pairs) == [k for k in range(40) if k not in (7, 20)]
+    print("PASS map-back: self-alignment pairs are (k, k) in structure indexing; CA-less 7 and 20 in no pair")
     print(f"PASS usalign_pairs: TM {tm:.4f} parsed (Structure_1 label), self-alignment identity on {len(qmap)} residues")
     for wrong in ((len(qmap) + 1, len(rmap)), (len(qmap), len(rmap) - 1)):
         refused(pq, pr, *wrong, "RuntimeError: residues_read")
