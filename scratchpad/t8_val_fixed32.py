@@ -5,9 +5,14 @@ split's cluster rep, else the highest-resolution usable member (ties: chain id);
 chain (= the larger of the two US-align TMs); usable = a kept val chain with a template in the TM range (validation
 conditions on a synthetic template). Step (3), pending the user: sort the isolated pool by (length, id), split into
 --n-bins consecutive near-equal groups (np.array_split), take each group's median member (index (n-1)//2).
-Writes pool.tsv (every representative: length, max TM to any other rep, isolated flag) and the --n-bins pick.
+Writes pool.tsv (every representative: length, max TM to any other rep, isolated flag), pairs.tsv (every pair's TM)
+and the --n-bins pick. --mode within (user 2026-10-14 "(b)"): "no pair TM >= 0.5 WITHIN the chosen set" instead of
+isolation against all representatives, so the length range can reach 512: ALL representatives sorted by (length, id),
+split into --n-bins near-equal groups; groups visited in length order; in each, members ordered by distance from the
+group's median index (ties: id) and the first whose TM to every chain already picked is < --tm is taken; a group with
+no such member is reported and left empty.
 Usage (PYTHONPATH=repo): python scratchpad/t8_val_fixed32.py --clusters TSV --val TXT --eligible TXT --csv CSV
-    --pack PACK --out DIR [--n-bins 32]
+    --pack PACK --out DIR [--n-bins 32] [--mode isolated|within] [--tm 0.5] [--workers N]
 """
 
 import argparse
@@ -54,6 +59,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--n-bins", type=int, default=32)
     ap.add_argument("--tm", type=float, default=0.5)
+    ap.add_argument("--mode", choices=("isolated", "within"), default="isolated")
     ap.add_argument("--usalign", default="/home/chenxiou/.local/bin/USalign")
     ap.add_argument("--workers", type=int, default=int(os.environ.get("SLURM_CPUS_PER_TASK", 8)))
     args = ap.parse_args()
@@ -99,22 +105,41 @@ def main():
             length[c] = int(g.coords.shape[0])
     chains = sorted(reps.values())
     best = {c: 0.0 for c in chains}
+    tm = {}
     with Pool(args.workers, initializer=init, initargs=(args.usalign, os.path.join(args.out, "ca"))) as p:
         for a, b, t in p.imap_unordered(pair_tm, itertools.combinations(chains, 2), chunksize=64):
             best[a], best[b] = max(best[a], t), max(best[b], t)
+            tm[(a, b)] = tm[(b, a)] = t
+    with open(os.path.join(args.out, "pairs.tsv"), "w") as f:
+        f.write("a\tb\ttm_shorter\n")
+        for a, b in itertools.combinations(chains, 2):
+            f.write(f"{a}\t{b}\t{tm[(a, b)]:.4f}\n")
     iso = sorted((c for c in chains if best[c] < args.tm), key=lambda c: (length[c], c))
     with open(os.path.join(args.out, "pool.tsv"), "w") as f:
         f.write("chain\tlength\tmax_tm_to_other_rep\tisolated\n")
         for c in sorted(chains, key=lambda c: (length[c], c)):
             f.write(f"{c}\t{length[c]}\t{best[c]:.4f}\t{int(best[c] < args.tm)}\n")
-    print(f"representatives {len(chains)}; isolated (no other rep at TM >= {args.tm}) {len(iso)}; "
-          f"lengths {length[iso[0]]}-{length[iso[-1]]}", flush=True)
-    assert len(iso) >= args.n_bins, f"only {len(iso)} isolated representatives for {args.n_bins} bins"
-    pick = [g[(len(g) - 1) // 2] for g in np.array_split(np.array(iso, dtype=object), args.n_bins)]
-    with open(os.path.join(args.out, f"val_fixed{args.n_bins}_t8.txt"), "w") as f:
+    print(f"representatives {len(chains)}; isolated (no other rep at TM >= {args.tm}) {len(iso)}"
+          + (f"; lengths {length[iso[0]]}-{length[iso[-1]]}" if iso else ""), flush=True)
+    if args.mode == "isolated":
+        assert len(iso) >= args.n_bins, f"only {len(iso)} isolated representatives for {args.n_bins} bins"
+        pick = [g[(len(g) - 1) // 2] for g in np.array_split(np.array(iso, dtype=object), args.n_bins)]
+    else:
+        pick, empty = [], []
+        allr = sorted(chains, key=lambda c: (length[c], c))
+        for k, g in enumerate(np.array_split(np.array(allr, dtype=object), args.n_bins)):
+            mid = (len(g) - 1) // 2
+            order = sorted(range(len(g)), key=lambda i: (abs(i - mid), g[i]))
+            got = next((g[i] for i in order if all(tm[(g[i], q)] < args.tm for q in pick)), None)
+            if got is None:
+                empty.append(k)
+            else:
+                pick.append(got)
+        print(f"within mode: {len(pick)} picked, empty bins {empty}", flush=True)
+    within = max((tm[(a, b)] for a, b in itertools.combinations(pick, 2)), default=0.0)
+    with open(os.path.join(args.out, f"val_fixed{args.n_bins}_t8_{args.mode}.txt"), "w") as f:
         f.write("\n".join(pick) + "\n")
-    print(f"pick {len(pick)}: lengths {[length[c] for c in pick]}; max TM between picks <= max of their best "
-          f"{max(best[c] for c in pick):.3f}")
+    print(f"pick {len(pick)}: lengths {[length[c] for c in pick]}; max TM between picks {within:.4f}")
 
 
 if __name__ == "__main__":
