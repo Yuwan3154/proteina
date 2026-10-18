@@ -27,6 +27,6 @@ predict_coords: False
 # torch.compile (user 2026-10-10 "(a)") with static-shape buckets (user "(A)": L step 64 up to 512, T step 16 up to 96);
 # the model pads L and T up to the next edge (ContactMapTriSiT.configure_compile / _pad_batch)
 use_torch_compile: True
-use_torch_compile_sc: False   # no-grad forwards (self-cond, validation, sampling): pending the user
+use_torch_compile_sc: True    # no-grad forwards (self-cond, val, sampling): on after hang test 26219844 (2x H100) passed
 pad_len_buckets: [64, 128, 192, 256, 320, 384, 448, 512]
 pad_topo_buckets: [16, 32, 48, 64, 80, 96]
