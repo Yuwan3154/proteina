@@ -38,23 +38,23 @@ ACCUM="${ACCUM:?ACCUM (gradient accumulation) is required}"
 [ -f "$PACK_PATH" ] && [ -f "$PACK_PATH.idx.npz" ] || { echo "FATAL: no pack at $PACK_PATH"; exit 77; }
 
 module load cuda/12.8 2>/dev/null || module load cuda/12.6 2>/dev/null || true
-CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | tr -d ' ' | sort -u)
-[ -n "$CC" ] && [ "$(echo "$CC" | wc -l)" -eq 1 ] || { echo "FATAL: need exactly one GPU arch, got: '$CC'"; exit 79; }
+GPU_CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | tr -d ' ' | sort -u)
+[ -n "$GPU_CC" ] && [ "$(echo "$GPU_CC" | wc -l)" -eq 1 ] || { echo "FATAL: need exactly one GPU arch, got: '$GPU_CC'"; exit 79; }
 GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | sort -u)
 [ "$(echo "$GPU_NAME" | wc -l)" -eq 1 ] || { echo "FATAL: mixed GPU models: $GPU_NAME"; exit 79; }
 NGPU=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
 [ "$NGPU" -eq "${SLURM_GPUS_ON_NODE:-$NGPU}" ] || { echo "FATAL: nvidia-smi sees $NGPU GPUs, SLURM granted ${SLURM_GPUS_ON_NODE}"; exit 80; }
 [[ $BATCH =~ ^[1-9][0-9]*$ && $ACCUM =~ ^[1-9][0-9]*$ ]] || { echo "FATAL: BATCH='$BATCH' ACCUM='$ACCUM' must be positive integers"; exit 81; }
 [ $((NGPU * BATCH * ACCUM)) -eq 32 ] || { echo "FATAL: $NGPU x $BATCH x $ACCUM != 32 (effective batch, user D4)"; exit 81; }
-export CUE_HOST=engaging TORCH_CUDA_ARCH_LIST="$CC"
+export CUE_HOST=engaging TORCH_CUDA_ARCH_LIST="$GPU_CC"
 source "$ENV_DIR/.venv/bin/activate"
 source "$ENV_DIR/activate.sh"
 
 export SKIP_CONFIND_PRECOMPUTE=1 DATALOADER_TIMEOUT_S=1800
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 # ⛔ compile caches on /orcd/compute/so3/002, never scratch (user 2026-10-11: tens of thousands of files filled the
-# scratch file quota); per arch, since compiled kernels are arch-specific
-CACHE=/orcd/compute/so3/002/chenxi/t8_compile_cache/sm${CC/./}
+# scratch file quota); per arch, since compiled kernels are arch-specific; GPU_CC, not CC: activate.sh exports CC=gcc
+CACHE=/orcd/compute/so3/002/chenxi/t8_compile_cache/sm${GPU_CC/./}
 export TORCHINDUCTOR_CACHE_DIR=$CACHE/inductor TRITON_CACHE_DIR=$CACHE/triton
 export TMPDIR=/tmp/chenxiou_${SLURM_JOB_ID:-nojob}
 mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$REPO/logs" "$TMPDIR"
