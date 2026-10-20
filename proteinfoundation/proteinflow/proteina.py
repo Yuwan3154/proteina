@@ -386,7 +386,9 @@ class Proteina(ModelTrainerBase):
         
         # Apply rotation: x_rot = x R (since x is row vectors)
         # [bs, N, 3] @ [bs, 3, 3] -> [bs, N, 3]
-        x_rot_flat = torch.matmul(x_flat, rots)
+        # fp32 outside autocast: under bf16-mixed the matmul returned bf16 coordinates (errors up to ~0.24 A)
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            x_rot_flat = torch.matmul(x_flat.float(), rots.float()).to(x.dtype)
         
         # Reshape back
         x_rot = x_rot_flat.view(original_shape)
