@@ -48,6 +48,11 @@ def main():
         d = (old.coords - g.coords).abs().amax(-1)
         bad = (mo != mn) | ((mo & mn) & (d > 0))
         r, k = torch.nonzero(bad, as_tuple=True)
+        off = ~(mo | mn)
+        no, nn = int(torch.isnan(old.coords).any(-1).sum()), int(torch.isnan(g.coords).any(-1).sum())
+        nb = int((torch.isnan(old.coords) & torch.isnan(g.coords)).any(-1)[off].sum())
+        print(f"  unresolved slots {int(off.sum())} (NaN in both {nb}); NaN slots overall old {no} new {nn}; differing unresolved slots {int((off & ~(d == 0)).sum())} "
+              f"(old values {torch.unique(old.coords[off]).tolist()[:4]}, new {torch.unique(g.coords[off]).tolist()[:4]}); dtype {old.coords.dtype}/{g.coords.dtype}")
         print(f"  differing (residue, atom): {len(r)} of {int((mo | mn).sum())}; mask-only {int((mo != mn).sum())}; max |d| {float(d[mo & mn].max()) if bool((mo & mn).any()) else float('nan'):.3f} A")
         atoms = PandasMmcif().read_mmcif(str(path)).df["ATOM"]
         atoms = atoms[(atoms["label_asym_id"].astype(str) == chain) & (atoms["pdbx_PDB_model_num"].astype(int) == 1)]   # processing reads get_model(1)
