@@ -331,6 +331,7 @@ def read_pdb_to_dataframe(
     pdb_code: Optional[str] = None,
     uniprot_id: Optional[str] = None,
     model_index: int = 1,
+    mmcif_seqres_fields: bool = False,
 ) -> pd.DataFrame:
     """
     Reads PDB file to ``PandasPDB`` object.
@@ -349,6 +350,10 @@ def read_pdb_to_dataframe(
     :param model_index: Index of model to read. Only relevant for structures
         containing ensembles. Defaults to ``1``.
     :type model_index: int, optional
+    :param mmcif_seqres_fields: mmCIF only. Fill ``insertion`` from
+        ``pdbx_PDB_ins_code`` and add a numeric ``label_seq_id`` column.
+        Defaults to ``False``.
+    :type mmcif_seqres_fields: bool, optional
     :returns: ``pd.DataFrame`` containing protein structure
     :rtype: pd.DataFrame
     """
@@ -384,12 +389,17 @@ def read_pdb_to_dataframe(
             # Store label_asym_id (standardized chain IDs) before conversion
             label_asym_ids = []
             dfs_to_concat = []
+            ins_codes, label_seq_ids, auth_seq_ids = [], [], []
             
             for record_type in ["ATOM", "HETATM"]:
                 if record_type in pmcif.df and len(pmcif.df[record_type]) > 0:
                     df = pmcif.df[record_type]
                     if "label_asym_id" in df.columns:
                         label_asym_ids.append(df["label_asym_id"].values)
+                    if mmcif_seqres_fields:
+                        ins_codes.append(df["pdbx_PDB_ins_code"].values.astype(object))
+                        label_seq_ids.append(df["label_seq_id"].values.astype(object))
+                        auth_seq_ids.append(df["auth_seq_id"].values.astype(object))
             
             # Convert to PDB format (this uses auth_asym_id by default)
             atomic_df = pmcif.convert_to_pandas_pdb()
@@ -405,6 +415,18 @@ def read_pdb_to_dataframe(
                 label_asym_id_combined = np.concatenate(label_asym_ids)
                 atomic_df = atomic_df.reset_index(drop=True)
                 atomic_df["chain_id"] = label_asym_id_combined
+
+            # biopandas 0.5.1 convert_to_pandas_pdb blanks every insertion code; '?'/'.' arrive as the string 'None'
+            if mmcif_seqres_fields:
+                ins = pd.Series(np.concatenate(ins_codes), dtype=object)
+                auth = pd.to_numeric(pd.Series(np.concatenate(auth_seq_ids)), errors="coerce").to_numpy()
+                assert len(ins) == len(atomic_df) == len(auth), (len(ins), len(atomic_df), len(auth))
+                assert np.array_equal(atomic_df["residue_number"].to_numpy(), auth), "auth_seq_id misaligned"
+                atomic_df = atomic_df.reset_index(drop=True)
+                atomic_df["insertion"] = ins.where(ins.notna() & ~ins.isin(["?", ".", "None"]), "").astype(str).to_numpy()
+                atomic_df["label_seq_id"] = pd.to_numeric(
+                    pd.Series(np.concatenate(label_seq_ids)), errors="coerce"
+                ).to_numpy()
         else:
             raise ValueError(
                 f"File {path} must be either .pdb(.gz), .mmtf(.gz), .(mm)cif(.gz) or .ent, not {path.split('.')[-1]}"
@@ -750,6 +772,18 @@ def residue_type_tensor(
     return residues
 
 
+class SeqresMissingError(Exception):
+    """A kept ATOM row has no numeric mmCIF label_seq_id (``residue_order="label_seq"``)."""
+
+
+class SeqresCollideError(Exception):
+    """Two graph positions share one (chain_id, label_seq_id), e.g. microheterogeneity."""
+
+
+class SeqresMergeError(Exception):
+    """One graph position spans several label_seq_id values."""
+
+
 def protein_to_pyg(
     path: Optional[Union[str, os.PathLike]] = None,
     pdb_code: Optional[str] = None,
@@ -765,6 +799,7 @@ def protein_to_pyg(
     store_het: bool = False,
     store_bfactor: bool = False,
     fill_value_coords: float = 1e-5,
+    residue_order: str = "auth",
 ) -> Data:
     """
     Parses a protein (from either: a PDB code, PDB file or a UniProt ID
@@ -821,11 +856,19 @@ def protein_to_pyg(
     :param fill_value_coords: Fill value to use for positions in atom37
         representation that are not filled. Defaults to 1e-5
     :type fill_value_coords: float
+    :param residue_order: ``"auth"`` sorts by author numbering (legacy);
+        ``"label_seq"`` sorts by mmCIF ``label_seq_id`` (needs
+        ``read_pdb_to_dataframe(mmcif_seqres_fields=True)``) and also returns
+        ``label_seq_id``. Defaults to ``"auth"``.
+    :type residue_order: str
     :returns: ``Data`` object with attributes: ``x`` (AtomTensor), ``residues``
         (list of 3-letter residue codes), id (ID of protein), residue_id (E.g.
         ``"A:SER:1"``), residue_type (torch.Tensor), ``chains`` (torch.Tensor).
     :rtype: torch_geometric.data.Data
     """
+
+    if residue_order not in ("auth", "label_seq"):
+        raise ValueError(f"residue_order must be 'auth' or 'label_seq', not {residue_order}")
 
     # Get ID
     if path is not None:
@@ -901,8 +944,16 @@ def protein_to_pyg(
         raise ValueError(
             "No standard protein atoms found after filtering; likely ligand-only chain."
         )
+    # Messages below avoid the words pdb_data keyword-matches for its auto-exclude list
+    if residue_order == "label_seq" and (
+        "label_seq_id" not in df.columns or df["label_seq_id"].isna().any()
+    ):
+        raise SeqresMissingError(f"{id}: ATOM rows without a numeric label_seq_id")
     df = pd.concat([df] + hets)
-    df = sort_dataframe(df)
+    if residue_order == "label_seq":
+        df = df.sort_values(by=["chain_id", "label_seq_id", "atom_number"], kind="stable")
+    else:
+        df = sort_dataframe(df)
 
     df["residue_id"] = (
         df["chain_id"]
@@ -913,6 +964,15 @@ def protein_to_pyg(
     )
     if keep_insertions:
         df["residue_id"] = df.residue_id + ":" + df.insertion
+
+    if residue_order == "label_seq":
+        pairs = df.loc[df["label_seq_id"].notna(), ["residue_id", "chain_id", "label_seq_id"]].drop_duplicates()
+        shared = pairs[pairs.duplicated(["chain_id", "label_seq_id"], keep=False)]
+        if len(shared) > 0:
+            raise SeqresCollideError(f"{id}: one label_seq_id carries several ids: {shared.residue_id.tolist()[:6]}")
+        split = pairs[pairs.duplicated("residue_id", keep=False)]
+        if len(split) > 0:
+            raise SeqresMergeError(f"{id}: one id spans several label_seq_id: {split.residue_id.tolist()[:6]}")
 
     out = Data(
         coords=protein_df_to_tensor(
@@ -931,6 +991,11 @@ def protein_to_pyg(
         residue_type=residue_type_tensor(df),
         chains=protein_df_to_chain_tensor(df),
     )
+
+    if residue_order == "label_seq":
+        out.label_seq_id = torch.from_numpy(
+            df.drop_duplicates("residue_id")["label_seq_id"].to_numpy(dtype=np.int64)
+        )
 
     if store_het:
         out.hetatms = [het_data]

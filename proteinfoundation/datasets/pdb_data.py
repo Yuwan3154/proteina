@@ -1119,6 +1119,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
         store_het: bool = False,
         store_bfactor: bool = True,
         use_multiprocessing: bool = True,
+        seqres_order: bool = False,
         # arguments for BaseLightningDataModule
         batch_padding: bool = True,
         sampling_mode: Literal["random", "cluster-random", "cluster-reps"] = "random",
@@ -1159,6 +1160,8 @@ class PDBLightningDataModule(BaseLightningDataModule):
                 Defaults to True.
             use_multiprocessing (bool, optional): Whether to use multiprocessing for data processing.
                 Defaults to True.
+            seqres_order (bool, optional): Process mmCIFs in label_seq_id order with real insertion
+                codes in residue_id (chains with a shared label_seq_id are dropped). Defaults to False.
             batch_padding (bool, optional): Whether batches should be padded to a dense representation
                 with the length being either a pre-specified max length or the maximum length of the
                 sample in the batch (base PyTorch batch) or whether a sparse representation should be
@@ -1220,6 +1223,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
         self.store_het = store_het
         self.store_bfactor = store_bfactor
         self.use_multiprocessing = use_multiprocessing
+        self.seqres_order = seqres_order
         self.overfit_pdb_chains = overfit_pdb_chains
         self.max_samples = max_samples
         self.df_data = None
@@ -1784,6 +1788,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
                 pre_filter=self.pre_filter,
                 database_tag=database_tag,
                 shard_manifest=self.shard_manifest,
+                seqres_order=self.seqres_order,
             )
             
             chunksize = max(1, len(index_pdb_tuples) // (self.num_workers * 4))
@@ -1823,6 +1828,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
         pre_filter: Optional[Callable] = None,
         database_tag: str = "pdb",
         shard_manifest: Optional[dict] = None,
+        seqres_order: bool = False,
     ) -> Optional[str]:
         """
         Static method for processing a single PDB file - suitable for multiprocessing.
@@ -1838,6 +1844,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
             pre_filter: Optional pre-filter function
             database_tag: Source database ("pdb" or "afdb"). Controls ext_lig computation:
                 "pdb" computes from full deposit; "afdb" sets all to unknown.
+            seqres_order: Order residues by mmCIF label_seq_id and keep real insertion codes.
             
         Returns:
             Optional[str]: The filename of the saved processed graph, or None if processing failed.
@@ -1869,7 +1876,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
             fill_value_coords = 1e-5
 
             # Read full deposit df once for ext_lig and protein_to_pyg
-            full_df = read_pdb_to_dataframe(path=path)
+            full_df = read_pdb_to_dataframe(path=path, mmcif_seqres_fields=seqres_order)
 
             graph = protein_to_pyg(
                 df=full_df.copy(),
@@ -1879,7 +1886,10 @@ class PDBLightningDataModule(BaseLightningDataModule):
                 store_het=store_het,
                 store_bfactor=store_bfactor,
                 fill_value_coords=fill_value_coords,
+                residue_order="label_seq" if seqres_order else "auth",
             )
+            if seqres_order:
+                del graph.label_seq_id
 
             fname = f"{pdb}.pt" if chains == "all" else f"{pdb}_{chains}.pt"
 
@@ -1986,7 +1996,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
 
             fill_value_coords = 1e-5
 
-            full_df = read_pdb_to_dataframe(path=path)
+            full_df = read_pdb_to_dataframe(path=path, mmcif_seqres_fields=self.seqres_order)
 
             graph = protein_to_pyg(
                 df=full_df.copy(),
@@ -1996,7 +2006,10 @@ class PDBLightningDataModule(BaseLightningDataModule):
                 store_het=self.store_het,
                 store_bfactor=self.store_bfactor,
                 fill_value_coords=fill_value_coords,
+                residue_order="label_seq" if self.seqres_order else "auth",
             )
+            if self.seqres_order:
+                del graph.label_seq_id
 
         except Exception as e:
             error_msg = str(e)
