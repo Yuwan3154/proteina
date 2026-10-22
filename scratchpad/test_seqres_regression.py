@@ -26,8 +26,8 @@ import torch
 from biopandas.mmcif import PandasMmcif
 
 from proteinfoundation.graphein_utils.graphein_utils import STANDARD_AMINO_ACID_MAPPING_1_TO_3, read_pdb_to_dataframe
-from proteinfoundation.utils.reprocess_seqres_chains import (label_seq_of, load_entry, old_to_new, open_pack, raw_path,
-                                                             reprocess_chain)
+from proteinfoundation.utils.reprocess_seqres_chains import (altloc_rows, label_seq_of, load_entry, old_to_new, open_pack,
+                                                             raw_path, reprocess_chain)
 
 SKIP = ("contact_map_confind",)
 G = {}
@@ -107,8 +107,9 @@ def integration(pack, data_dir, out_dir):
         status, g = reprocess_chain(stem, raw, staging, man, True, old)
         assert g is not None, (stem, status)
         path = str(raw_path(raw, pdb, man))
-        ls = label_seq_of(read_pdb_to_dataframe(path=path, mmcif_seqres_fields=True), path, chain, g)
-        m = old_to_new(old, g)
+        df = read_pdb_to_dataframe(path=path, mmcif_seqres_fields=True)
+        ls = label_seq_of(df, path, chain, g)
+        m = old_to_new(old, g, altloc_rows(df, chain))
         assert bool((ls[1:] > ls[:-1]).all()), f"{stem}: label_seq not strictly increasing"
         if stem == "1dle_B":
             ps = PandasMmcif().read_mmcif(path).data["pdbx_poly_seq_scheme"]

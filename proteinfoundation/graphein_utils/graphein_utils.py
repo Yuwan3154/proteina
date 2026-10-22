@@ -14,6 +14,7 @@
 import collections
 import gzip
 import math
+import operator
 import os
 import shutil
 import subprocess
@@ -351,8 +352,10 @@ def read_pdb_to_dataframe(
         containing ensembles. Defaults to ``1``.
     :type model_index: int, optional
     :param mmcif_seqres_fields: mmCIF only. Fill ``insertion`` from
-        ``pdbx_PDB_ins_code`` and add a numeric ``label_seq_id`` column.
-        Defaults to ``False``.
+        ``pdbx_PDB_ins_code`` and add a numeric ``label_seq_id`` column plus
+        ``label_alt_id`` (``"."`` when absent), ``label_comp_id``,
+        ``label_atom_id`` and ``atom_site_id`` (``_atom_site.id``). Defaults to
+        ``False``.
     :type mmcif_seqres_fields: bool, optional
     :returns: ``pd.DataFrame`` containing protein structure
     :rtype: pd.DataFrame
@@ -390,6 +393,7 @@ def read_pdb_to_dataframe(
             label_asym_ids = []
             dfs_to_concat = []
             ins_codes, label_seq_ids, auth_seq_ids = [], [], []
+            label_alt_ids, label_comp_ids, label_atom_ids, atom_site_ids = [], [], [], []
             
             for record_type in ["ATOM", "HETATM"]:
                 if record_type in pmcif.df and len(pmcif.df[record_type]) > 0:
@@ -400,6 +404,10 @@ def read_pdb_to_dataframe(
                         ins_codes.append(df["pdbx_PDB_ins_code"].values.astype(object))
                         label_seq_ids.append(df["label_seq_id"].values.astype(object))
                         auth_seq_ids.append(df["auth_seq_id"].values.astype(object))
+                        label_alt_ids.append(df["label_alt_id"].values.astype(object))
+                        label_comp_ids.append(df["label_comp_id"].values.astype(object))
+                        label_atom_ids.append(df["label_atom_id"].values.astype(object))
+                        atom_site_ids.append(df["id"].values)
             
             # Convert to PDB format (this uses auth_asym_id by default)
             atomic_df = pmcif.convert_to_pandas_pdb()
@@ -427,6 +435,13 @@ def read_pdb_to_dataframe(
                 atomic_df["label_seq_id"] = pd.to_numeric(
                     pd.Series(np.concatenate(label_seq_ids)), errors="coerce"
                 ).to_numpy()
+                # '.'/'?' arrive as None, the string 'None' or (all-numeric column) ints; AF3 treats '.' and '?' alike
+                alt = pd.Series(np.concatenate(label_alt_ids), dtype=object)
+                atomic_df["label_alt_id"] = alt.where(alt.notna() & ~alt.isin(["?", ".", "None"]), ".").astype(str).to_numpy()
+                atomic_df["label_comp_id"] = pd.Series(np.concatenate(label_comp_ids), dtype=object).astype(str).to_numpy()
+                atomic_df["label_atom_id"] = pd.Series(np.concatenate(label_atom_ids), dtype=object).astype(str).to_numpy()
+                # convert_to_pandas_pdb offsets atom_number per chain and record type; keep the raw serial
+                atomic_df["atom_site_id"] = np.concatenate(atom_site_ids).astype(np.int64)
         else:
             raise ValueError(
                 f"File {path} must be either .pdb(.gz), .mmtf(.gz), .(mm)cif(.gz) or .ent, not {path.split('.')[-1]}"
@@ -784,6 +799,143 @@ class SeqresMergeError(Exception):
     """One graph position spans several label_seq_id values."""
 
 
+class AltlocDuplicateError(Exception):
+    """Several rows still fill one (residue_id, atom_name) slot after ``resolve_altlocs``."""
+
+
+def _atom_equiv(lhs: str, rhs: str) -> bool:
+    """AlphaFold3 AtomEquiv: equal names, or equal after swapping a leading H/D (deuterium is hydrogen)."""
+    if lhs == rhs:
+        return True
+    if (lhs == "") != (rhs == ""):
+        return False
+    if (lhs[0], rhs[0]) in (("H", "D"), ("D", "H")):
+        return lhs[1:] == rhs[1:]
+    return False
+
+
+def _group_by(values, start: int, count: int, is_equal) -> List[Tuple[int, int]]:
+    """AlphaFold3 GroupBy: (start, count) of each run whose values equal the run's FIRST value."""
+    groups, span_start = [], start
+    if count > 0:
+        for i in range(start + 1, start + count):
+            if not is_equal(values[i], values[span_start]):
+                groups.append((span_start, i - span_start))
+                span_start = i
+        groups.append((span_start, start + count - span_start))
+    return groups
+
+
+def _altloc_partial(start, count, atom_ids, alt_ids, occ, parsed, keep) -> None:
+    """AlphaFold3 ProcessAltLocGroupPartial: per run of equivalent atom names keep the highest occupancy, ties smaller id."""
+    for s, n in _group_by(atom_ids, start, count, _atom_equiv):
+        if n == 1:
+            keep.append(s)
+            continue
+        parsed[s : s + n] = True
+        best_occ, best_index, best_group = occ[s], s, alt_ids[s]
+        for i in range(s, s + n):
+            if occ[i] > best_occ or (occ[i] == best_occ and alt_ids[i] < best_group):
+                best_occ, best_index, best_group = occ[i], i, alt_ids[i]
+        keep.append(best_index)
+
+
+def _altloc_whole(start, count, comp_ids, atom_ids, alt_ids, occ, parsed, keep) -> None:
+    """AlphaFold3 ProcessAltLocGroupsWhole: pick the comp_id run, then its best alt id, then one row per atom name."""
+    parsed[start : start + count] = True
+    best_split = (start, count)
+    best_occupancy = np.float32(-np.inf)
+    best_group = alt_ids[start]
+    for s, n in _group_by(comp_ids, start, count, operator.eq):
+        groups, stats = [], []  # stats[k] = [row count, occupancy sum] of alt id groups[k]
+        for i in range(s, s + n):
+            if alt_ids[i] in groups:
+                stat = stats[groups.index(alt_ids[i])]
+                stat[0] += 1
+                stat[1] = stat[1] + occ[i]
+            else:
+                groups.append(alt_ids[i])
+                stats.append([1, occ[i]])
+        total_occupancy = np.float32(0.0)
+        for c, t in stats:
+            total_occupancy = total_occupancy + t / np.float32(c)
+        group = min(groups)
+        # AF3 tie-breaks this comp_id run's smallest id against the chosen run's BEST id, not its smallest
+        if total_occupancy > best_occupancy or (total_occupancy == best_occupancy and group < best_group):
+            best_group = groups[0]
+            best_amount = stats[0][1] / np.float32(stats[0][0])
+            for k in range(1, len(stats)):
+                amount = stats[k][1] / np.float32(stats[k][0])
+                if amount > best_amount or (amount == best_amount and groups[k] < best_group):
+                    best_amount, best_group = amount, groups[k]
+            best_occupancy = total_occupancy
+            best_split = (s, n)
+    for s, n in _group_by(atom_ids, best_split[0], best_split[1], _atom_equiv):
+        best_index = s
+        for i in range(s + 1, s + n):
+            if alt_ids[i] == best_group:
+                best_index = i
+                break
+        keep.append(best_index)
+
+
+def resolve_altlocs_af3(df: pd.DataFrame) -> Tuple[np.ndarray, int]:
+    """Port of AlphaFold3 ResolveMmcifAltLocs (structure/cpp/mmcif_altlocs.cc) over ``df`` rows in file order.
+
+    Residues are consecutive rows with equal (``chain_id`` = label_asym_id, ``residue_number`` = auth_seq_id,
+    ``insertion`` = pdbx_PDB_ins_code) when both author columns are present, else equal (``chain_id``,
+    ``label_seq_id``), as AF3 ReadMmcifLayout (mmcif_layout_lib.cc); alt id = first character of ``label_alt_id``
+    (``"."``/``"?"`` = none); grouping uses ``label_comp_id`` / ``label_atom_id`` as AF3 does.
+    Occupancy is parsed as AF3 SimpleAtof: an unparseable value counts as 0.0.
+
+    :returns: (ascending positional indices of the rows to keep, number of unparseable occupancies AF3 would read)
+    """
+    n_rows = len(df)
+    chain = df["chain_id"].to_numpy()
+    if "residue_number" in df.columns and "insertion" in df.columns:
+        keys = [df["residue_number"].to_numpy(), df["insertion"].astype(str).to_numpy()]
+    else:
+        keys = [df["label_seq_id"].to_numpy(dtype=np.float64)]
+    alt_ids = [a[0] for a in df["label_alt_id"].astype(str).tolist()]
+    has_alt = np.array([a not in (".", "?") for a in alt_ids], dtype=bool)
+    occ_num = pd.to_numeric(df["occupancy"], errors="coerce").to_numpy(dtype=np.float64)
+    occ_bad = np.isnan(occ_num)
+    occ = np.where(occ_bad, 0.0, occ_num).astype(np.float32)
+    comp_ids = df["label_comp_id"].astype(str).tolist()
+    atom_ids = df["label_atom_id"].astype(str).tolist()
+    same = chain[1:] == chain[:-1]
+    for v in keys:
+        eq = v[1:] == v[:-1]
+        if v.dtype.kind == "f":
+            eq |= np.isnan(v[1:]) & np.isnan(v[:-1])  # AF3 compares strings: two missing values ('.') are equal
+        same &= eq
+    starts = np.concatenate([[0], np.flatnonzero(~same) + 1]) if n_rows else np.zeros(0, dtype=np.int64)
+    ends = np.concatenate([starts[1:], [n_rows]]) if n_rows else np.zeros(0, dtype=np.int64)
+    parsed = np.zeros(n_rows, dtype=bool)
+    keep = []
+    for a, b in zip(starts.tolist(), ends.tolist()):
+        if not has_alt[a:b].any():
+            keep.extend(range(a, b))
+            continue
+        run_start, run_count = a, 0
+        for i in range(a, b):
+            if not has_alt[i]:
+                if run_count > 0:
+                    _altloc_partial(run_start, run_count, atom_ids, alt_ids, occ, parsed, keep)
+                    run_count = 0
+                keep.append(i)
+            else:
+                if run_count == 0:
+                    run_start = i
+                run_count += 1
+        if run_count > 0:
+            if b - a == run_count:
+                _altloc_whole(run_start, run_count, comp_ids, atom_ids, alt_ids, occ, parsed, keep)
+            else:
+                _altloc_partial(run_start, run_count, atom_ids, alt_ids, occ, parsed, keep)
+    return np.asarray(keep, dtype=np.int64), int((occ_bad & parsed).sum())
+
+
 def protein_to_pyg(
     path: Optional[Union[str, os.PathLike]] = None,
     pdb_code: Optional[str] = None,
@@ -800,6 +952,7 @@ def protein_to_pyg(
     store_bfactor: bool = False,
     fill_value_coords: float = 1e-5,
     residue_order: str = "auth",
+    resolve_altlocs: bool = False,
 ) -> Data:
     """
     Parses a protein (from either: a PDB code, PDB file or a UniProt ID
@@ -861,6 +1014,12 @@ def protein_to_pyg(
         ``read_pdb_to_dataframe(mmcif_seqres_fields=True)``) and also returns
         ``label_seq_id``. Defaults to ``"auth"``.
     :type residue_order: str
+    :param resolve_altlocs: Keep one row per atom with the AlphaFold3 altloc
+        rule (:func:`resolve_altlocs_af3`) on the selected chains' ATOM and
+        HETATM rows in file order (before the ATOM / ``keep_hets`` selection),
+        then fail on any atom slot filled twice. Needs
+        ``residue_order="label_seq"``. Defaults to ``False``.
+    :type resolve_altlocs: bool
     :returns: ``Data`` object with attributes: ``x`` (AtomTensor), ``residues``
         (list of 3-letter residue codes), id (ID of protein), residue_id (E.g.
         ``"A:SER:1"``), residue_type (torch.Tensor), ``chains`` (torch.Tensor).
@@ -869,6 +1028,8 @@ def protein_to_pyg(
 
     if residue_order not in ("auth", "label_seq"):
         raise ValueError(f"residue_order must be 'auth' or 'label_seq', not {residue_order}")
+    if resolve_altlocs and residue_order != "label_seq":
+        raise ValueError("resolve_altlocs needs residue_order='label_seq'")
 
     # Get ID
     if path is not None:
@@ -905,6 +1066,20 @@ def protein_to_pyg(
         if isinstance(chain_selection, str):
             chain_selection = [chain_selection]
         df = select_chains(df, chain_selection)
+
+    # Before deprotonation and every record/het/sort filter: AF3 resolves ATOM+HETATM rows in _atom_site order
+    if resolve_altlocs:
+        needed = ("label_seq_id", "label_alt_id", "label_comp_id", "label_atom_id", "atom_site_id")
+        if any(c not in df.columns for c in needed):
+            raise SeqresMissingError(f"{id}: resolve_altlocs needs {needed} (read_pdb_to_dataframe(mmcif_seqres_fields=True))")
+        # biopandas lists ATOM rows before HETATM rows; the _atom_site.id serial restores file order
+        order = np.argsort(df["atom_site_id"].to_numpy(), kind="stable")
+        kept, n_bad_occupancy = resolve_altlocs_af3(df.iloc[order])
+        if n_bad_occupancy > 0:
+            log.error(f"{id}: {n_bad_occupancy} unparseable occupancy values read as 0.0 (AlphaFold3 OccupancyToFloat)")
+        keep = np.zeros(len(df), dtype=bool)
+        keep[order[kept]] = True
+        df = df.loc[keep]
 
     if deprotonate:
         df = deprotonate_structure(df)
@@ -973,6 +1148,15 @@ def protein_to_pyg(
         split = pairs[pairs.duplicated("residue_id", keep=False)]
         if len(split) > 0:
             raise SeqresMergeError(f"{id}: one id spans several label_seq_id: {split.residue_id.tolist()[:6]}")
+
+    if resolve_altlocs:
+        slots = df.loc[df["atom_name"].isin(atom_types), ["residue_id", "atom_name"]]
+        dup = slots[slots.duplicated(keep=False)].drop_duplicates()
+        if len(dup) > 0:
+            raise AltlocDuplicateError(
+                f"{id}: {len(dup)} atom slots filled by several rows after altloc resolution: "
+                f"{list(zip(dup.residue_id, dup.atom_name))[:6]}"
+            )
 
     out = Data(
         coords=protein_df_to_tensor(

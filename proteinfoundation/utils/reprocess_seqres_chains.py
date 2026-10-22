@@ -12,18 +12,40 @@ contact_map_confind is left OUT (status column confind=pending, filled by the la
 skips files that already carry the key, so a placeholder would survive that step silently, while a missing key fails
 loudly (train.py guard / transforms.py "contact_map_confind is missing").
 
-Status per stem: written | dropped_collide (side-table status collide; never processed) | dropped_over512 (new
-processed_length = coord_mask.any(-1).sum() > 512, the T8 config max_length) | failed:process_returned_none (the entry
-point logs the exception and returns None).
-Sidecars (<out-root>/sidecars/part_K_of_N.pt), written stems only:
-  label_seq  {stem: int32 mmCIF label_seq_id per new residue} (protein_to_pyg(residue_order="label_seq").label_seq_id)
-  old_to_new {stem: {"index": int32 [L_old] new residue index (-1 = no match), "chimera": bool, "exact": bool}}: each old
-    residue is matched on coordinates among the new residues sharing its chain:resname:authnum (insertion code
-    stripped); winner = the candidate whose atom equals the old CA (first present atom when CA is missing); chimera =
-    some present old atom is not the winner's (merged residue built from several); exact = winner's coords and
-    coord_mask rows equal the old ones.
+Since 2026-10-22 seqres_order=True also resolves altlocs with the AlphaFold3 rule (graphein_utils.resolve_altlocs_af3).
+
+Modes:
+  --stems STEMS.txt  the repair set (audit categories merged / nonmonotone / ok_ins / collide); collide stems are
+                     dropped unprocessed.
+  --all-stems        every stem of the pack index (partitioned by --part / --n-parts); collide stems ARE processed and
+                     recorded (whether they enter T8b is open with the user); stems missing from the audit get category
+                     not_in_audit.
+  --write-changed-only (either mode) writes a stem's .pt + sidecars only if some field differs from the stored entry.
+Every processed stem is compared with its stored pack entry over all fields except contact_map_confind: fields = the
+differing field names; rid_exact / rid_mod_ins = residue_id equal exactly / modulo the insertion code; backbone_changed =
+residue count or order (residue_id modulo insertion code) or any N/CA/C/O coordinate or mask differs; raw_mtime = mtime of
+the raw mmCIF.
+Status per stem: written (stems mode) | changed (written; --write-changed-only) | unchanged (--write-changed-only; nothing
+written) | dropped_collide (stems mode: side-table status collide; never processed) | dropped_over512 (new
+processed_length = coord_mask.any(-1).sum() > 512, the T8 config max_length; checked before unchanged) |
+failed:process_returned_none (the entry point logs the exception and returns None) | failed:unmatched (--all-stems: a
+non-collide stem with n_unmatched > 0; nothing written; --stems mode asserts instead). No stem is skipped without a row:
+rows per part == stems assigned to it (asserted; n_stems in the sidecar), and the status TSV is the source of truth.
+Sidecars (<out-root>/sidecars/part_K_of_N.pt):
+  label_seq  {stem: int32 mmCIF label_seq_id per new residue} (protein_to_pyg(residue_order="label_seq").label_seq_id),
+    for EVERY processed stem (incl. unchanged / dropped_over512 / failed:unmatched)
+  old_to_new (written stems only) {stem: {"index": int32 [L_old] new residue index (-1 = no match), "match": int8,
+    "chimera": bool, "exact": bool}}: each old residue is matched on coordinates among the new residues sharing its chain:resname:authnum
+    (insertion code stripped) on its reference atom (CA; first present atom when CA is missing). match 1 = the old atom
+    equals the candidate's resolved atom; else match 2 = every coordinate component of the old atom equals that
+    component of some raw altloc row of that atom in the candidate (a whole altloc row the old last-row-wins scatter
+    stored, or a per-component chimera of rows); 0 = unmatched (status columns n_matched_exact / n_matched_altloc /
+    n_unmatched; n_unmatched must be 0 except for collide stems, whose unchosen component's residue has no
+    counterpart). chimera = some present old atom is not the winner's; exact = winner's coords and coord_mask rows
+    equal the old ones.
 Usage: python -m proteinfoundation.utils.reprocess_seqres_chains --pack PACK --data-dir DATA_PATH/pdb_train \
-           --audit SEQRES_AUDIT.tsv --stems STEMS.txt --part K --n-parts N --out-root OUT_ROOT
+           --audit SEQRES_AUDIT.tsv (--stems STEMS.txt | --all-stems) [--write-changed-only] --part K --n-parts N \
+           --out-root OUT_ROOT
 """
 
 import argparse
@@ -36,16 +58,19 @@ import pathlib
 import time
 
 import numpy as np
+import pandas as pd
 import torch
 
 from proteinfoundation.datasets.pdb_data import PDBLightningDataModule, _processed_path_sharded, _resolve_raw_sharded
-from proteinfoundation.graphein_utils.graphein_utils import protein_to_pyg, read_pdb_to_dataframe
+from proteinfoundation.graphein_utils.graphein_utils import PROTEIN_ATOMS, protein_to_pyg, read_pdb_to_dataframe
 from proteinfoundation.utils.precompute_dssp_targets import _compute_dssp
 
 MAX_LEN = 512  # configs/datasets_config/pdb/pdb_train_contact-confind-synthtopo_S25_max512_t8.yaml max_length
 REPROCESS = ("merged", "nonmonotone", "ok_ins")
 COLUMNS = ("stem", "category", "status", "L_old", "L_new", "n_ins_new", "label_seq_increasing", "n_unmatched",
-           "n_chimera", "n_inexact", "confind")
+           "n_matched_exact", "n_matched_altloc", "n_chimera", "n_inexact", "fields", "rid_exact", "rid_mod_ins",
+           "backbone_changed", "raw_mtime", "confind")
+SKIP = ("contact_map_confind",)
 
 
 def load_audit(path) -> dict:
@@ -100,18 +125,32 @@ def reprocess_chain(stem, raw_dir, staging, man, seqres_order, old):
 def label_seq_of(df, path, chain, g) -> torch.Tensor:
     """int32 label_seq_id per residue of g, from the same flag-on protein_to_pyg call processing made."""
     ls = protein_to_pyg(df=df.copy(), path=path, chain_selection=chain, keep_insertions=True, store_het=False,
-                        store_bfactor=True, fill_value_coords=1e-5, residue_order="label_seq")
+                        store_bfactor=True, fill_value_coords=1e-5, residue_order="label_seq",
+                        resolve_altlocs=True)
     assert list(ls.residue_id) == list(g.residue_id), "label_seq parse disagrees with the processed graph"
     return ls.label_seq_id.to(torch.int32)
 
 
-def old_to_new(old, new) -> dict:
+def altloc_rows(df, chain) -> dict:
+    """residue_id -> atom name -> float32 [n, 3] of EVERY model-1 ATOM row of the chain (all altlocs), keyed like
+    protein_to_pyg builds residue_id; df = read_pdb_to_dataframe(mmcif_seqres_fields=True)."""
+    a = df.loc[(df["chain_id"] == chain) & (df["record_name"] == "ATOM")]
+    rid = a["chain_id"] + ":" + a["residue_name"] + ":" + a["residue_number"].astype(str) + ":" + a["insertion"]
+    xyz = a[["x_coord", "y_coord", "z_coord"]].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float32)
+    out = collections.defaultdict(lambda: collections.defaultdict(list))
+    for r, n, c in zip(rid.tolist(), a["atom_name"].tolist(), xyz):
+        out[r][n].append(c)
+    return {r: {n: torch.from_numpy(np.stack(v)) for n, v in d.items()} for r, d in out.items()}
+
+
+def old_to_new(old, new, alt_rows) -> dict:
     """Coordinate match of every old residue to a new residue (see module docstring)."""
     cand = collections.defaultdict(list)
     for j, r in enumerate(new.residue_id):
         cand[r.rsplit(":", 1)[0]].append(j)
     n_old = len(old.residue_id)
     index = np.full(n_old, -1, dtype=np.int32)
+    match = np.zeros(n_old, dtype=np.int8)
     chimera = np.zeros(n_old, dtype=bool)
     exact = np.zeros(n_old, dtype=bool)
     for i, r in enumerate(old.residue_id):
@@ -119,14 +158,53 @@ def old_to_new(old, new) -> dict:
         if not bool(m.any()):
             continue
         ref = 1 if bool(m[1]) else int(m.nonzero()[0, 0])
-        for j in cand.get(r.rsplit(":", 1)[0], []):
-            if bool(new.coord_mask[j, ref]) and torch.equal(new.coords[j, ref], old.coords[i, ref]):
-                index[i] = j
-                same = (new.coords[j][m] == old.coords[i][m]).all(-1) & new.coord_mask[j][m]
-                chimera[i] = not bool(same.all())
-                exact[i] = torch.equal(new.coords[j], old.coords[i]) and torch.equal(new.coord_mask[j], m)
-                break
-    return {"index": index, "chimera": chimera, "exact": exact}
+        xyz = old.coords[i, ref]
+        js = cand.get(r.rsplit(":", 1)[0], [])
+        hit = [j for j in js if bool(new.coord_mask[j, ref]) and torch.equal(new.coords[j, ref], xyz)]
+        if hit:
+            match[i] = 1
+        else:
+            # every component equals some altloc row's component (covers a whole row and a per-component chimera)
+            hit = [j for j in js if PROTEIN_ATOMS[ref] in alt_rows.get(new.residue_id[j], {})
+                   and bool((alt_rows[new.residue_id[j]][PROTEIN_ATOMS[ref]] == xyz).any(0).all())]
+            match[i] = 2 if hit else 0
+        if hit:
+            j = hit[0]
+            index[i] = j
+            same = (new.coords[j][m] == old.coords[i][m]).all(-1) & new.coord_mask[j][m]
+            chimera[i] = not bool(same.all())
+            exact[i] = torch.equal(new.coords[j], old.coords[i]) and torch.equal(new.coord_mask[j], m)
+    return {"index": index, "match": match, "chimera": chimera, "exact": exact}
+
+
+def tensor_equal(a, b) -> bool:
+    if not (isinstance(b, torch.Tensor) and a.dtype == b.dtype and a.shape == b.shape):
+        return False
+    if a.dtype.is_floating_point:
+        return bool(torch.allclose(a, b, rtol=0.0, atol=0.0, equal_nan=True))
+    return torch.equal(a, b)
+
+
+def diff_fields(old, new) -> tuple:
+    """(differing field names, residue_id equal exactly, residue_id equal modulo insertion code); SKIP excluded."""
+    ko, kn = set(old.keys()) - set(SKIP), set(new.keys()) - set(SKIP)
+    fields = [f"keys:{'|'.join(sorted(ko ^ kn))}"] if ko != kn else []
+    for k in sorted(ko & kn):
+        a, b = old[k], new[k]
+        nan_pair = isinstance(a, float) and isinstance(b, float) and a != a and b != b
+        if not (tensor_equal(a, b) if isinstance(a, torch.Tensor) else type(a) is type(b) and (a == b or nan_pair)):
+            fields.append(k)
+    rid_exact = list(old.residue_id) == list(new.residue_id)
+    rid_mod_ins = [r.rsplit(":", 1)[0] for r in old.residue_id] == [r.rsplit(":", 1)[0] for r in new.residue_id]
+    return fields, rid_exact, rid_mod_ins
+
+
+def backbone_changed(old, new, rid_mod_ins) -> bool:
+    """Residue count / order (residue_id modulo insertion code) or any N/CA/C/O coordinate or mask differs."""
+    if not rid_mod_ins or old.coords.shape != new.coords.shape:
+        return True
+    return not (tensor_equal(old.coords[:, :4], new.coords[:, :4])
+                and tensor_equal(old.coord_mask[:, :4], new.coord_mask[:, :4]))
 
 
 def main():
@@ -134,25 +212,31 @@ def main():
     ap.add_argument("--pack", required=True)
     ap.add_argument("--data-dir", required=True)
     ap.add_argument("--audit", required=True)
-    ap.add_argument("--stems", required=True)
+    ap.add_argument("--stems", help="stems file (re-process set); or --all-stems")
+    ap.add_argument("--all-stems", action="store_true", help="every stem of the pack index; collide stems processed")
+    ap.add_argument("--write-changed-only", action="store_true", help="write a stem only if a field differs")
     ap.add_argument("--part", type=int, required=True)
     ap.add_argument("--n-parts", type=int, required=True)
     ap.add_argument("--out-root", required=True)
     a = ap.parse_args()
     assert 0 <= a.part < a.n_parts, (a.part, a.n_parts)
+    assert (a.stems is None) == a.all_stems, "exactly one of --stems / --all-stems"
     data_dir, out_root = pathlib.Path(a.data_dir).resolve(), pathlib.Path(a.out_root).resolve()
     assert out_root != data_dir and data_dir not in out_root.parents, "never write into the shared pdb_train tree"
     cats = load_audit(a.audit)
-    stems = sorted({l.split()[0] for l in open(a.stems) if l.strip()})
-    bad = [s for s in stems if cats.get(s) not in REPROCESS + ("collide",)]
-    assert not bad, f"{len(bad)} stems outside the re-process set, e.g. {bad[:5]}"
+    ent, mm, _fh = open_pack(a.pack)
+    if a.all_stems:
+        stems = sorted(ent)
+    else:
+        stems = sorted({l.split()[0] for l in open(a.stems) if l.strip()})
+        bad = [s for s in stems if cats.get(s) not in REPROCESS + ("collide",)]
+        assert not bad, f"{len(bad)} stems outside the re-process set, e.g. {bad[:5]}"
     by_pdb = collections.defaultdict(list)
     for s in stems:
         by_pdb[s.split("_")[0]].append(s)
     pdbs = sorted(by_pdb)[a.part::a.n_parts]
     man = json.load(open(data_dir / "shard_manifest.json"))
     raw_dir = data_dir / "raw"
-    ent, mm, _fh = open_pack(a.pack)
     staging = out_root / "staging" / f"part_{a.part:04d}" / "processed"
     rows, label_seq, o2n = [], {}, {}
     t0 = time.time()
@@ -161,43 +245,68 @@ def main():
         for stem in by_pdb[pdb]:
             old = load_entry(ent, mm, stem)
             row = dict.fromkeys(COLUMNS, "")
-            row.update(stem=stem, category=cats[stem], L_old=len(old.residue_id))
-            if cats[stem] == "collide":
+            row.update(stem=stem, category=cats.get(stem, "not_in_audit"), L_old=len(old.residue_id))
+            raw = raw_path(raw_dir, pdb, man)
+            if raw is not None:
+                row["raw_mtime"] = repr(os.path.getmtime(raw))
+            if row["category"] == "collide" and not a.all_stems:
                 row["status"] = "dropped_collide"
                 rows.append(row)
                 continue
             status, g = reprocess_chain(stem, raw_dir, staging, man, True, old)
             row["status"] = status
-            if g is not None:
-                want = {kk: v for kk, v in schema(old).items() if kk != "contact_map_confind"}
-                assert schema(g) == want, (stem, schema(g), want)
-                if df is None:
-                    path = str(raw_path(raw_dir, pdb, man))
-                    df = read_pdb_to_dataframe(path=path, mmcif_seqres_fields=True)
-                ls = label_seq_of(df, path, stem.split("_", 1)[1], g)
-                m = old_to_new(old, g)
-                row.update(L_new=int(g.coord_mask.any(-1).sum()), n_ins_new=sum(not r.endswith(":") for r in g.residue_id),
-                           label_seq_increasing=bool((ls[1:] > ls[:-1]).all()), n_unmatched=int((m["index"] < 0).sum()),
-                           n_chimera=int(m["chimera"].sum()), n_inexact=int((~m["exact"]).sum()))
-                assert row["label_seq_increasing"] and row["n_unmatched"] == 0, (stem, row)
-                if row["L_new"] > MAX_LEN:
-                    row["status"] = "dropped_over512"
-                else:
-                    target = _processed_path_sharded(out_root / "processed", stem, man)
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    tmp = target.with_name(target.name + ".tmp")
-                    torch.save(g, tmp)
-                    os.replace(tmp, target)
-                    row.update(status="written", confind="pending")
-                    label_seq[stem], o2n[stem] = ls, m
+            if g is None:
+                rows.append(row)
+                continue
+            want = {kk: v for kk, v in schema(old).items() if kk != "contact_map_confind"}
+            assert schema(g) == want, (stem, schema(g), want)
+            fields, rid_exact, rid_mod_ins = diff_fields(old, g)
+            row.update(fields=",".join(fields), rid_exact=rid_exact, rid_mod_ins=rid_mod_ins,
+                       backbone_changed=backbone_changed(old, g, rid_mod_ins),
+                       L_new=int(g.coord_mask.any(-1).sum()), n_ins_new=sum(not r.endswith(":") for r in g.residue_id))
+            if df is None:
+                path = str(raw)
+                df = read_pdb_to_dataframe(path=path, mmcif_seqres_fields=True)
+            chain = stem.split("_", 1)[1]
+            ls = label_seq_of(df, path, chain, g)
+            row["label_seq_increasing"] = bool((ls[1:] > ls[:-1]).all())
+            assert row["label_seq_increasing"], (stem, row)
+            label_seq[stem] = ls  # every processed stem, written or not: T8b needs SEQRES positions for all chains
+            if row["L_new"] > MAX_LEN:
+                row["status"] = "dropped_over512"
+                rows.append(row)
+                continue
+            if a.write_changed_only and not fields:
+                row["status"] = "unchanged"
+                rows.append(row)
+                continue
+            m = old_to_new(old, g, altloc_rows(df, chain))
+            row.update(n_unmatched=int((m["match"] == 0).sum()), n_matched_exact=int((m["match"] == 1).sum()),
+                       n_matched_altloc=int((m["match"] == 2).sum()), n_chimera=int(m["chimera"].sum()),
+                       n_inexact=int((~m["exact"]).sum()))
+            # a collide (microheterogeneity) stem loses the residue of the unchosen component: recorded, never failed
+            if row["n_unmatched"] > 0 and row["category"] != "collide":
+                assert a.all_stems, (stem, row)
+                row["status"] = "failed:unmatched"
+                rows.append(row)
+                continue
+            target = _processed_path_sharded(out_root / "processed", stem, man)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp = target.with_name(target.name + ".tmp")
+            torch.save(g, tmp)
+            os.replace(tmp, target)
+            row.update(status="changed" if a.write_changed_only else "written", confind="pending")
+            o2n[stem] = m
             rows.append(row)
         if (k + 1) % 50 == 0:
             print(f"[part {a.part}] {k + 1}/{len(pdbs)} entries {time.time() - t0:.0f} s", flush=True)
+    n_stems = sum(len(by_pdb[p]) for p in pdbs)
+    assert len(rows) == n_stems, (len(rows), n_stems)
     tag = f"part_{a.part:04d}_of_{a.n_parts:04d}"
     for sub in ("sidecars", "status"):
         (out_root / sub).mkdir(parents=True, exist_ok=True)
     side = out_root / "sidecars" / f"{tag}.pt"
-    torch.save({"label_seq": label_seq, "old_to_new": o2n, "n_entries": len(pdbs)}, str(side) + ".tmp")
+    torch.save({"label_seq": label_seq, "old_to_new": o2n, "n_entries": len(pdbs), "n_stems": n_stems}, str(side) + ".tmp")
     os.replace(str(side) + ".tmp", side)
     tsv = out_root / "status" / f"{tag}.tsv"
     with open(str(tsv) + ".tmp", "w") as f:
@@ -207,7 +316,7 @@ def main():
     os.replace(str(tsv) + ".tmp", tsv)
     c = collections.Counter(r["status"] for r in rows)
     excl = staging.parent / "auto_excluded_non_canonical.txt"
-    print(f"[part {a.part}] DONE {len(pdbs)} entries, {len(rows)} chains, {time.time() - t0:.0f} s, status {dict(c)}; "
+    print(f"[part {a.part}] DONE {len(pdbs)} entries, {len(rows)} of {n_stems} stems, {time.time() - t0:.0f} s, status {dict(c)}; "
           f"auto_excluded entries {len(open(excl).readlines()) if excl.exists() else 0} -> {tsv}")
 
 

@@ -1161,7 +1161,8 @@ class PDBLightningDataModule(BaseLightningDataModule):
             use_multiprocessing (bool, optional): Whether to use multiprocessing for data processing.
                 Defaults to True.
             seqres_order (bool, optional): Process mmCIFs in label_seq_id order with real insertion
-                codes in residue_id (chains with a shared label_seq_id are dropped). Defaults to False.
+                codes in residue_id and AlphaFold3 altloc resolution (chains with a label_seq_id still shared
+                after it are dropped). Defaults to False.
             batch_padding (bool, optional): Whether batches should be padded to a dense representation
                 with the length being either a pre-specified max length or the maximum length of the
                 sample in the batch (base PyTorch batch) or whether a sparse representation should be
@@ -1844,7 +1845,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
             pre_filter: Optional pre-filter function
             database_tag: Source database ("pdb" or "afdb"). Controls ext_lig computation:
                 "pdb" computes from full deposit; "afdb" sets all to unknown.
-            seqres_order: Order residues by mmCIF label_seq_id and keep real insertion codes.
+            seqres_order: Order residues by mmCIF label_seq_id, keep real insertion codes, resolve altlocs (AF3).
             
         Returns:
             Optional[str]: The filename of the saved processed graph, or None if processing failed.
@@ -1887,6 +1888,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
                 store_bfactor=store_bfactor,
                 fill_value_coords=fill_value_coords,
                 residue_order="label_seq" if seqres_order else "auth",
+                resolve_altlocs=seqres_order,
             )
             if seqres_order:
                 del graph.label_seq_id
@@ -2007,6 +2009,7 @@ class PDBLightningDataModule(BaseLightningDataModule):
                 store_bfactor=self.store_bfactor,
                 fill_value_coords=fill_value_coords,
                 residue_order="label_seq" if self.seqres_order else "auth",
+                resolve_altlocs=self.seqres_order,
             )
             if self.seqres_order:
                 del graph.label_seq_id

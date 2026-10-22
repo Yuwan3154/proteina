@@ -5,8 +5,9 @@ Synthetic mmCIFs, each run through the legacy path (defaults) and the fixed path
   2 9bbb author 100, 101, 1, 2 at label 1-4: legacy sorts by author number; fixed follows label_seq
   3 9ccc 82A listed before 82 in the file: fixed still orders by label_seq
   4 9ddd same-resname altloc A/B on one position: both paths agree (pinned: altloc B CA wins)
-  5 9eee SER/THR microheterogeneity on one label_seq_id -> SeqresCollideError (and pdb_data drops it without
-    touching auto_excluded_non_canonical.txt); 9iii one id at two label_seq_id -> SeqresMergeError;
+  5 9eee SER/THR microheterogeneity on one label_seq_id -> SeqresCollideError (pdb_data resolves altlocs -> SER);
+    9kkk partial microhet (SER N without alt id) survives resolution -> pdb_data drops it without touching
+    auto_excluded_non_canonical.txt; 9iii one id at two label_seq_id -> SeqresMergeError;
     label_seq mode on a legacy df -> SeqresMissingError
   6 9fff HETATM MSE inside the chain: dropped in both paths
   7 9ggg two chains, no insertion codes, monotone numbering, water '.': fixed == legacy on every field
@@ -148,14 +149,22 @@ def case5(d, data_dir):
     must_raise(fixed_cmd(p), "SeqresCollideError")
     write_cif(os.path.join(data_dir, "raw"), "9eee", [atom("ALA", 1, 1, x=1.0), atom("SER", 2, 2, x=2.0, alt="A"),
                                                       atom("THR", 2, 2, x=2.5, alt="B"), atom("GLY", 3, 3, x=3.0)])
-    out, processed = process_static(data_dir, "9eee", "A", True)
+    out, processed = process_static(data_dir, "9eee", "A", True)  # pdb_data resolves altlocs: occupancy tie -> SER (A)
+    assert out == "9eee_A.pt" and torch.load(processed / out, weights_only=False).sequence == "ASG", out
+    # SER N carries no alt id -> AF3 PARTIAL keeps SER CA and THR CB -> still a collision, dropped
+    write_cif(os.path.join(data_dir, "raw"), "9kkk", [atom("ALA", 1, 1, x=1.0), atom("SER", 2, 2, x=2.0, name="N"),
+                                                      atom("SER", 2, 2, x=2.1, alt="A"),
+                                                      atom("THR", 2, 2, x=2.5, alt="B", name="CB"),
+                                                      atom("GLY", 3, 3, x=3.0)])
+    out, processed = process_static(data_dir, "9kkk", "A", True)
     assert out is None and not (processed.parent / "auto_excluded_non_canonical.txt").exists()
     pm = write_cif(d, "9iii", [atom("ALA", 1, 1, x=1.0), atom("LYS", 2, 21, x=2.0), atom("LYS", 3, 21, x=3.0)])
     must_raise(fixed_cmd(pm), "SeqresMergeError")
     must_raise("from proteinfoundation.graphein_utils.graphein_utils import protein_to_pyg, read_pdb_to_dataframe\n"
                f"protein_to_pyg(df=read_pdb_to_dataframe(path={p!r}), path={p!r}, residue_order='label_seq')",
                "SeqresMissingError")
-    print("PASS 5 microhet -> SeqresCollideError (pdb_data: dropped, no auto_excluded entry); "
+    print("PASS 5 microhet -> SeqresCollideError (pdb_data: resolved to SER; partial microhet dropped, no auto_excluded "
+          "entry); "
           "merge -> SeqresMergeError; legacy df -> SeqresMissingError")
 
 
