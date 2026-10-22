@@ -11,6 +11,8 @@ Synthetic mmCIFs, each run through the legacy path (defaults) and the fixed path
   6 9fff HETATM MSE inside the chain: dropped in both paths
   7 9ggg two chains, no insertion codes, monotone numbering, water '.': fixed == legacy on every field
   8 9hhh insertion codes '?' and '.' (biopandas turns both into the string 'None') -> ""
+  9 9jjj case-1 chain A + a chain B atom 3 A from the CA of 82A only: through _process_single_pdb, ext_lig is set on
+    82A with the flag on; legacy's merged 82 keeps the last CA (82B) and misses the contact
 Cases 1 and 7 also go through PDBLightningDataModule._process_single_pdb / _load_and_process_pdb.
 Must-raise checks run in a child process (non-zero exit + error class name in stderr).
 Usage: python scratchpad/test_mmcif_seqres_parse.py   (CPU, temp dir only)
@@ -197,6 +199,21 @@ def case8(d):
     print(f"PASS 8 '?' and '.' -> '': {list(gf.residue_id)}")
 
 
+def case9(data_dir):
+    write_cif(os.path.join(data_dir, "raw"), "9jjj", [
+        atom("SER", 1, 82, "?", 10.0), atom("SER", 2, 82, "A", 20.0), atom("SER", 3, 82, "B", 30.0),
+        atom("GLY", 4, 83, "?", 40.0), atom("LYS", 1, 1, x=20.0, lasym="B", aasym="B")])  # y = row 4 -> 3 A from 82A
+    graphs = {}
+    for so in (False, True):
+        out, processed = process_static(data_dir, "9jjj", "A", so)
+        assert out == "9jjj_A.pt", out
+        graphs[so] = torch.load(processed / out, weights_only=False)
+    assert graphs[True].ext_lig.tolist() == [0, 1, 0, 0], (graphs[True].residue_id, graphs[True].ext_lig)
+    assert graphs[False].ext_lig.tolist() == [0, 0], graphs[False].ext_lig
+    print(f"PASS 9 ext_lig near 82A: fixed {dict(zip(graphs[True].residue_id, graphs[True].ext_lig.tolist()))}, "
+          f"legacy {graphs[False].ext_lig.tolist()}")
+
+
 def entry_points(data_dir):
     raw = os.path.join(data_dir, "raw")
     write_cif(raw, "9aaa", [atom("SER", 1, 82, "?", 10.0), atom("SER", 2, 82, "A", 20.0),
@@ -239,6 +256,7 @@ def main():
     case6(d)
     case7(d)
     case8(d)
+    case9(data_dir)
     entry_points(data_dir)
     print("ALL PASS")
 
