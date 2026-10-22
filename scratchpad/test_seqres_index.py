@@ -48,7 +48,8 @@ def main():
     os.makedirs(os.path.join(d, "pdb_train", "raw"))
     path = os.path.join(d, "pdb_train", "raw", "9zzz.cif")
     write_cif(path)
-    mapping = residue_label_seq(path)
+    mapping, ins = residue_label_seq(path)
+    assert ins["B:THR:13:"] == {"A"} and ins["B:SER:13:"] == {""} and ins["C:LYS:21:"] == {"", "A"}, dict(ins)
 
     gb = protein_to_pyg(df=read_pdb_to_dataframe(path=path), path=path, chain_selection=["B"], keep_insertions=True)
     rids_b = list(gb.residue_id)
@@ -96,6 +97,7 @@ def main():
     assert t["offset"].tolist() == [0, 5, 5], t["offset"]
     assert t["label_seq_flat"].tolist() == [1, 2, 4, 5, 8], t["label_seq_flat"]
     assert t["audit"]["merged_residue_ids"] == 1 and t["audit"]["gapped_ok"] == 1, t["audit"]
+    assert t["audit"]["ok_with_insertion_codes"] == 1, t["audit"]  # chain B: THR 13A (distinct resname, never merged)
     print(f"PASS cmd_part + cmd_merge on a 2-chain pack: audit {t['audit']}")
     print("ALL PASS")
 

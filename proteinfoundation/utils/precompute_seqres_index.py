@@ -37,24 +37,29 @@ DEFINITION = ("label_seq_id (mmCIF _atom_site, 1-based SEQRES position) of each 
 STATUSES = ("ok", "nonmonotone", "merged", "collide", "no_label_seq", "unmapped", "no_cif")
 
 
-def residue_label_seq(path: str) -> dict:
-    """residue_id -> set of label_seq_id (None if absent) over ATOM records, built like read_pdb_to_dataframe + protein_to_pyg."""
+def residue_label_seq(path: str) -> tuple:
+    """(residue_id -> set of label_seq_id (None if absent), residue_id -> set of real mmCIF insertion codes) over ATOM records,
+    keyed like read_pdb_to_dataframe + protein_to_pyg build residue_id (biopandas 0.5.1 blanks the insertion code there)."""
     pmcif = PandasMmcif().read_mmcif(path).get_model(1)
-    label_asym, label_seq = [], []
+    label_asym, label_seq, ins_code = [], [], []
     for rec in ("ATOM", "HETATM"):
         if rec in pmcif.df and len(pmcif.df[rec]) > 0:
             label_asym.append(pmcif.df[rec]["label_asym_id"].values)
             label_seq.append(pmcif.df[rec]["label_seq_id"].values)
+            ins_code.append(pmcif.df[rec]["pdbx_PDB_ins_code"].values)
     conv = pmcif.convert_to_pandas_pdb()
     df = pd.concat([conv.df[r] for r in ("ATOM", "HETATM") if r in conv.df and len(conv.df[r]) > 0]).reset_index(drop=True)
     df["chain_id"] = np.concatenate(label_asym)
     df["label_seq_id"] = np.concatenate(label_seq)
+    df["ins_code"] = np.concatenate(ins_code)
     df = df.loc[df.record_name == "ATOM"]
     rid = df["chain_id"] + ":" + df["residue_name"] + ":" + df["residue_number"].astype(str) + ":" + df["insertion"]
-    out = collections.defaultdict(set)
-    for r, s in zip(rid.values, df["label_seq_id"].values):
+    out, ins = collections.defaultdict(set), collections.defaultdict(set)
+    for r, s, c in zip(rid.values, df["label_seq_id"].values, df["ins_code"].values):
         out[r].add(None if s is None else int(s))
-    return out
+        # biopandas 0.5.1 maps '?'/'.' to None, then astype(str) turns that into the string 'None'
+        ins[r].add("" if c is None or c in ("?", ".", "None") else str(c))
+    return out, ins
 
 
 def chain_positions(residue_ids, mapping) -> tuple:
@@ -91,7 +96,7 @@ def cmd_part(a):
     t0 = time.time()
     for k, pdb in enumerate(pdbs):
         path = _resolve_raw_sharded(raw_dir, pdb.lower(), "cif", man) or _resolve_raw_sharded(raw_dir, pdb, "cif", man)
-        mapping = residue_label_seq(str(path)) if path is not None else None
+        mapping, ins = residue_label_seq(str(path)) if path is not None else (None, None)
         for stem in by_pdb[pdb]:
             assert stem in ent, f"{stem} not in pack"
             off, n = ent[stem]
@@ -103,8 +108,9 @@ def cmd_part(a):
             else:
                 status, pos, n_merged = chain_positions(rids, mapping)
             n_gaps = int((np.diff(pos) > 1).sum()) if status == "ok" else -1
+            n_ins = sum(1 for r in rids if any(ins.get(r, ()))) if mapping is not None else -1
             rows.append({"stem": stem, "status": status, "L": len(rids), "pos": pos, "n_gaps": n_gaps,
-                         "n_merged": n_merged})
+                         "n_merged": n_merged, "n_ins": n_ins})
         if (k + 1) % 200 == 0:
             print(f"[part {a.part}] {k + 1}/{len(pdbs)} entries {time.time() - t0:.0f} s", flush=True)
     out = pathlib.Path(a.out_dir) / f"part_{a.part:04d}_of_{a.n_parts:04d}.pt"
@@ -138,6 +144,7 @@ def cmd_merge(a):
         "status": {s: int(c.get(s, 0)) for s in STATUSES},
         "gapped_ok": int(sum(r["n_gaps"] > 0 for r in with_pos)),
         "merged_residue_ids": int(sum(r["n_merged"] for r in rows)),
+        "ok_with_insertion_codes": int(sum(r["status"] == "ok" and r["n_ins"] > 0 for r in rows)),
         "biopandas": biopandas.__version__,
         "pandas": pd.__version__,
     }
@@ -151,9 +158,9 @@ def cmd_merge(a):
         "audit": audit,
     }, a.out)
     with open(a.out + ".audit.tsv", "w") as f:
-        f.write("stem\tstatus\tL\tn_gaps\tn_merged\n")
+        f.write("stem\tstatus\tL\tn_gaps\tn_merged\tn_ins\n")
         for r in rows:
-            f.write(f"{r['stem']}\t{r['status']}\t{r['L']}\t{r['n_gaps']}\t{r['n_merged']}\n")
+            f.write(f"{r['stem']}\t{r['status']}\t{r['L']}\t{r['n_gaps']}\t{r['n_merged']}\t{r['n_ins']}\n")
     print(f"[merge] {len(rows)} chains -> {a.out}; audit {audit}")
 
 
