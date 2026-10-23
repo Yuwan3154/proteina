@@ -189,14 +189,20 @@ def cb8_contacts(coords: torch.Tensor, atom_mask: torch.Tensor, cb_idx: int) -> 
     return (cm & has_ca[:, None] & has_ca[None, :]).float()
 
 
-def topology_row(cm, coords, atom_mask, dssp, min_len):
+_FROM_GLOBALS = object()
+
+
+def topology_row(cm, coords, atom_mask, dssp, min_len, element_types=_FROM_GLOBALS, loop_axis=_FROM_GLOBALS):
     """(runs, contact bytes, T, structural bytes, stats, elem_of_residue) for one structure, or None
-    when the DSSP carries no usable residue."""
+    when the DSSP carries no usable residue. element_types / loop_axis default to the module globals the
+    `build` command sets; the CAT-pair builder passes them explicitly."""
+    element_types = _ELEMENT_TYPES if element_types is _FROM_GLOBALS else element_types
+    loop_axis = _LOOP_AXIS if loop_axis is _FROM_GLOBALS else loop_axis
     if dssp is None or bool((dssp < 0).all()):
         return None
     runs = dssp_to_runs(dssp, min_len=min_len)
-    ref, keep = sse_contact_reference(cm, runs, keep_types=_ELEMENT_TYPES)
-    structural = sse_structural_pair_features(cm, coords, atom_mask, runs, keep, loop_axis=_LOOP_AXIS)
+    ref, keep = sse_contact_reference(cm, runs, keep_types=element_types)
+    structural = sse_structural_pair_features(cm, coords, atom_mask, runs, keep, loop_axis=loop_axis)
     feat = assemble_pair_features(ref, structural, runs, keep)
     flat = feat.reshape(-1, N_PAIR_FEATURES)
     el = element_lengths(runs, keep)  # stats for the per-element length feature (standardised by the transform)
@@ -233,10 +239,10 @@ def write_ca_pdb(ca_xyz: np.ndarray, present: np.ndarray, path: str):
     return idx_map
 
 
-def usalign_pairs(pdb_q: str, pdb_r: str, n_q: int, n_r: int):
+def usalign_pairs(pdb_q: str, pdb_r: str, n_q: int, n_r: int, binary: str = None):
     """Aligned (query_written, ref_written) pairs and the query-normalised TM, sequence-independent. n_q / n_r = residues
     written to each file: USalign must have read exactly those (it reads ATOM records only), or the indices would shift."""
-    out = subprocess.run([_USALIGN, pdb_q, pdb_r, "-TMscore", "0"], capture_output=True, text=True, timeout=600)
+    out = subprocess.run([binary or _USALIGN, pdb_q, pdb_r, "-TMscore", "0"], capture_output=True, text=True, timeout=600)
     if out.returncode != 0:
         raise RuntimeError(f"rc={out.returncode}")
     lines = out.stdout.splitlines()

@@ -1,0 +1,47 @@
+# CAT-topology regime dataset (T2 CATH v4.4 + TED units + synthetic templates; RAW 279-317, 442, 450-459 of the T2 tracking
+# files). Twin of pdb_train_contact-confind-synthtopo_S25_max512_t8.yaml: every reference / augmentation value below is copied
+# from that T8 config (same model, same reference format); only what differs for the CAT regime is new, and says so.
+# ??? = not grounded yet (see the loader hand-off list).
+datamodule:
+  _target_: "proteinfoundation.datasets.cat_pair_data.CATPairLightningDataModule"  # NEW: members (entry, CAT, domain), one per CAT per epoch
+  store_dir: ${oc.env:CAT_STORE_DIR}          # NEW: unit store written by t2cat_pack_units.py + utils/precompute_cat_pair_index.py
+  batch_padding: True
+  epoch_batch_plan: True                       # T8 (user 2026-10-10 "(A)"); the CAT is the cluster of the plan
+  epoch_batch_plan_len_edges: [64, 128, 192, 256, 320, 384, 448, 512]   # T8: the torch.compile L buckets
+  cluster_sampler_seed: 0                      # ??? the seed of the epoch draws (T8 inherits the base default 0)
+  cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/
+  multilabel_mode: "sample"
+  transforms:
+    - _target_: "proteinfoundation.datasets.transforms.GlobalRotationTransform"
+    - _target_: "proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform"
+    # no CATHLabelTransform: the dataset sets graph.cath_code = [CAT] of the member it draws
+    - _target_: "proteinfoundation.datasets.transforms.CATHToIndicesTransform"
+      cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/
+    - _target_: "proteinfoundation.datasets.transforms.DSSPTargetTransform"
+    - _target_: "proteinfoundation.datasets.transforms.ContactMapTransform"
+      contact_method: confind                    # reads the dataset's contact_map_confind (whole-chain Frame2ConFind, cut to the domain)
+      confind_rotamer_lib: ${oc.env:DATA_PATH}/rotlibs
+      confind_contact_threshold: 0.01
+    - _target_: "proteinfoundation.datasets.transforms.SequenceDropoutTransform"
+      prob: 0.25
+    - _target_: "proteinfoundation.datasets.cat_pair_data.CATPairReferenceTransform"
+      index_path: ${oc.env:CAT_STORE_DIR}/cat_pair_index.pt   # NEW: per-member index (utils/precompute_cat_pair_index merge)
+      usalign: ${oc.env:USALIGN_BIN}             # NEW: the reference binary, run per pair in the (persistent) workers
+      exclude_own_synthetic: False               # ??? NEW: a synthetic template edited from the query's own unit is a different entry; the T8 regime used exactly that
+      sse_types: [0, 1, 2]
+      single_token_types: [0]
+      element_types: [0, 1, 2]
+      elem_features: True
+      max_topology_len: 128
+      max_topology_he_len: 96
+      sigma_frac: 0.15
+      mutate_prob: 0.3
+      type_mutate_prob: 0.1
+      token_mask_prob: 0.1
+      drop_prob: 0.25
+      drop_ref_len_range: [14, 80]
+      min_len: 1
+  batch_size: 1
+  num_workers: 8
+  pin_memory: True
+  prefetch_factor: 2

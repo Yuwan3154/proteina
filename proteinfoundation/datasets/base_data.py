@@ -23,7 +23,7 @@ from torch_geometric.loader import DataLoader
 
 from proteinfoundation.utils import io_audit
 from proteinfoundation.datasets.epoch_batch_plan import EpochBatchPlanSampler
-from proteinfoundation.utils.cluster_utils import ClusterSampler, CATBalancedSampler
+from proteinfoundation.utils.cluster_utils import ClusterSampler, CATBalancedSampler, CATUniformSampler
 from proteinfoundation.utils.dense_padding_data_loader import DensePaddingDataLoader
 
 
@@ -43,7 +43,7 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
     def __init__(
         self,
         batch_padding: bool = True,
-        sampling_mode: Literal["random", "cluster-random", "cluster-reps", "cath-balanced"] = "random",
+        sampling_mode: Literal["random", "cluster-random", "cluster-reps", "cath-balanced", "cat-pair"] = "random",
         transforms: Optional[List[Callable]] = None,
         pre_transforms: Optional[List[Callable]] = None,
         pre_filters: Optional[List[Callable]] = None,
@@ -315,9 +315,12 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             raise ValueError(
                 "Sampling mode not set, should be one of 'random', 'cluster-random' or 'cluster-reps'"
             )
-        assert shard or self.sampling_mode in ("cluster-random", "cluster-reps"), \
-            f"shard=False is implemented for ClusterSampler only, not sampling_mode={self.sampling_mode}"
-        if clusterid_to_seqid_mapping and self.sampling_mode == "cath-balanced":
+        assert shard or self.sampling_mode in ("cluster-random", "cluster-reps", "cat-pair"), \
+            f"shard=False is implemented for ClusterSampler and CATUniformSampler only, not sampling_mode={self.sampling_mode}"
+        if self.sampling_mode == "cat-pair":
+            sampler = self._make_cat_pair_sampler(dataset, shard)
+            shuffle = False
+        elif clusterid_to_seqid_mapping and self.sampling_mode == "cath-balanced":
             sampler = CATBalancedSampler(
                 dataset=dataset,
                 clusterid_to_seqid_mapping=clusterid_to_seqid_mapping,
@@ -452,7 +455,7 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             cat_cluster_sample_counts_init=self._train_cat_cluster_sample_counts_restore,
             member_sample_counts_init=self._train_member_sample_counts_restore,
         )
-        if isinstance(getattr(train_dl, "sampler", None), (ClusterSampler, CATBalancedSampler)):
+        if isinstance(getattr(train_dl, "sampler", None), (ClusterSampler, CATBalancedSampler, CATUniformSampler)):
             self._train_cluster_sampler = train_dl.sampler
         if isinstance(getattr(train_dl, "batch_sampler", None), EpochBatchPlanSampler):
             self._train_plan_sampler = train_dl.batch_sampler
@@ -470,13 +473,17 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
     def _make_plan_sampler(self, dataset, clusterid_to_seqid_mapping, cluster_sampler) -> EpochBatchPlanSampler:
         """Epoch batch plan over the same clusters (eligible-restricted) and seq-id -> index map the ClusterSampler
         built for this dataset; lengths from the subclass's _dataset_lengths."""
-        assert self.sampling_mode == "cluster-random" and isinstance(cluster_sampler, ClusterSampler), \
-            f"epoch_batch_plan needs sampling_mode cluster-random, got {self.sampling_mode}"
+        cat_pair = self.sampling_mode == "cat-pair"
+        assert cat_pair or (self.sampling_mode == "cluster-random" and isinstance(cluster_sampler, ClusterSampler)), \
+            f"epoch_batch_plan needs sampling_mode cluster-random or cat-pair, got {self.sampling_mode}"
         assert self.epoch_batch_plan_len_edges, "epoch_batch_plan needs epoch_batch_plan_len_edges"
         assert not getattr(getattr(self, "trainer", None), "reload_dataloaders_every_n_epochs", 0), \
             "epoch_batch_plan: a reloaded loader would re-apply the stale restore"
-        idx = cluster_sampler.sequence_id_to_idx
-        members = [[idx[s] for s in seqs] for seqs in cluster_sampler.clusterid_to_seqid_mapping.values()]
+        if cat_pair:  # the CAT plays the cluster: one member per CAT per epoch
+            members = self._cat_plan_members(dataset)
+        else:
+            idx = cluster_sampler.sequence_id_to_idx
+            members = [[idx[s] for s in seqs] for seqs in cluster_sampler.clusterid_to_seqid_mapping.values()]
         dist = torch.distributed.is_available() and torch.distributed.is_initialized()
         rank, world = (torch.distributed.get_rank(), torch.distributed.get_world_size()) if dist else (0, 1)
         if self._train_plan_restore is not None:
@@ -491,6 +498,12 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         return EpochBatchPlanSampler(members, self._dataset_lengths(dataset), self.batch_size,
                                      self.epoch_batch_plan_len_edges, self.cluster_sampler_seed, rank, world,
                                      restore=self._train_plan_restore, position_fn=position)
+
+    def _make_cat_pair_sampler(self, dataset, shard: bool):
+        raise NotImplementedError(f"{type(self).__name__} does not provide a cat-pair sampler")
+
+    def _cat_plan_members(self, dataset) -> List[List[int]]:
+        raise NotImplementedError(f"{type(self).__name__} does not provide CAT members for epoch_batch_plan")
 
     def _dataset_lengths(self, dataset) -> List[int]:
         """Residue count of every dataset index (used to group batches by length)."""
@@ -515,7 +528,7 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             member_sample_counts_init=self._val_member_sample_counts_restore,
             shard=self.val_shard_across_ranks,
         )
-        if isinstance(getattr(val_dl, "sampler", None), (ClusterSampler, CATBalancedSampler)):
+        if isinstance(getattr(val_dl, "sampler", None), (ClusterSampler, CATBalancedSampler, CATUniformSampler)):
             self._val_cluster_sampler = val_dl.sampler
         return val_dl
 

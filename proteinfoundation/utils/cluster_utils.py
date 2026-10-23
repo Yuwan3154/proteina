@@ -1103,3 +1103,57 @@ def fasta_to_df(fasta_input_file: str) -> pd.DataFrame:
 
         df = pd.DataFrame(data, columns=["id", "sequence"])
     return df
+
+
+class CATUniformSampler(Sampler):
+    """CAT-regime epoch sampler: one member drawn uniformly from EVERY CAT per epoch (user 2026-10-20 "fold-balanced
+    training ... per epoch one uniformly sampled entry per CAT"). ``members_by_cat[c]`` = dataset indices of CAT c.
+
+    Epoch e (identical on every rank from (seed, e) alone): CAT order = randperm from stream 0, one member per CAT from
+    stream 1; the list is padded to a multiple of the world size by repeating its head (as ClusterSampler pads) and rank r
+    takes [r::world]. ``shard=False`` yields the full list on every rank.
+    ``fixed=True`` (validation, user 2026-10-23: the checkpoint-selection metric needs a fixed set) ignores set_epoch, so
+    every pass draws the same member of every CAT.
+    """
+
+    def __init__(self, members_by_cat: List[List[int]], seed: int = 0, shard: bool = True, fixed: bool = False):
+        assert members_by_cat and all(len(m) for m in members_by_cat), "every CAT needs at least one member"
+        self.members_by_cat = members_by_cat
+        self.seed = int(seed)
+        self.shard = bool(shard)
+        self.fixed = bool(fixed)
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        if not self.fixed:
+            self.epoch = int(epoch)
+
+    def _world(self):
+        if self.shard and torch.distributed.is_available() and torch.distributed.is_initialized():
+            return torch.distributed.get_rank(), torch.distributed.get_world_size()
+        return 0, 1
+
+    @staticmethod
+    def _generator(seed: int, *parts: int) -> torch.Generator:
+        s = seed & 0xFFFFFFFF
+        for p in parts:
+            s = ((s * 0x9E3779B97F4A7C15) ^ (int(p) & 0xFFFFFFFFFFFFFFFF)) & 0xFFFFFFFFFFFFFFFF
+        g = torch.Generator()
+        g.manual_seed(s if s != 0 else 1)
+        return g
+
+    def __iter__(self):
+        rank, world = self._world()
+        order = torch.randperm(len(self.members_by_cat), generator=self._generator(self.seed, self.epoch, 0)).tolist()
+        g_member = self._generator(self.seed, self.epoch, 1)
+        picks = []
+        for c in order:
+            m = self.members_by_cat[c]
+            picks.append(m[int(torch.randint(0, len(m), (1,), generator=g_member))])
+        pad = -len(picks) % world
+        picks += (picks * (pad // len(picks) + 1))[:pad]
+        return iter(picks[rank::world])
+
+    def __len__(self):
+        _, world = self._world()
+        return -(-len(self.members_by_cat) // world)
