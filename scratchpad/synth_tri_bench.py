@@ -163,7 +163,7 @@ def load_tri(ckpt, store):
     cfg_exp.hardware.nnodes_ = 1
     cfg_exp.log.log_wandb = False
     cfg_exp.log.checkpoint = False
-    assert ckpt.endswith("-EMA.ckpt"), f"--tri-ckpt must be a frozen EMA checkpoint (*-EMA.ckpt): {ckpt}"
+    assert "-EMA" in os.path.basename(ckpt), f"--tri-ckpt must be a frozen EMA checkpoint (name contains -EMA): {ckpt}"
     with open(ckpt, "rb") as fh:
         md5 = hashlib.file_digest(fh, "md5").hexdigest()
     print(f"[tri] {ckpt} md5={md5}", flush=True)
