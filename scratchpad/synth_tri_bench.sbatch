@@ -30,7 +30,8 @@ mkdir -p "$TMPDIR" "$OUT" /home/gridsan/cou/logs
 export SIGMA_DATA=16.0 ALIGN_W=0.3 MLM_W=0.3 SKIP_CONFIND_PRECOMPUTE=1
 export SYNTH_INDEX_DIR DATA_PATH
 # Frame2ConFind is imported as a package from its parent directory (the builder's --f2c-parent default: ~)
-export PYTHONPATH="$REPO:/home/gridsan/cou${PYTHONPATH:+:$PYTHONPATH}"
+F2C_PARENT=${F2C_PARENT:-/home/gridsan/cou}   # directory holding the Frame2ConFind package (FRAME2SEQ_HOME, if set, locates Frame2seq)
+export PYTHONPATH="$REPO:$F2C_PARENT${PYTHONPATH:+:$PYTHONPATH}"
 export OMP_NUM_THREADS=20
 INDEX=$SYNTH_INDEX_DIR/topology_index_confind_synth.pt
 for f in "$PAIRS" "$TRI_CKPT" "$C2C_CKPT" "$INDEX" "$F2C_CKPT_DIR/best.pt"; do
@@ -38,6 +39,7 @@ for f in "$PAIRS" "$TRI_CKPT" "$C2C_CKPT" "$INDEX" "$F2C_CKPT_DIR/best.pt"; do
 done
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
 git -C "$REPO" log -1 --format="[repo] $REPO HEAD %h"
+git -C "$F2C_PARENT/Frame2ConFind" log -1 --format="[f2c] $F2C_PARENT/Frame2ConFind HEAD %h"; echo "[f2s] FRAME2SEQ_HOME=${FRAME2SEQ_HOME:-unset}"
 echo "[ckpt] tri md5=$(md5sum < "$TRI_CKPT" | cut -c1-12) c2c md5=$(md5sum < "$C2C_CKPT" | cut -c1-12)"
 NODE=${SLURM_ARRAY_TASK_ID:-0}
 [[ "$N_NODES" =~ ^[1-9][0-9]*$ ]] && [ "$NODE" -lt "$N_NODES" ] || { echo "FATAL: N_NODES=$N_NODES, task $NODE"; exit 77; }
