@@ -840,13 +840,22 @@ def _altloc_partial(start, count, atom_ids, alt_ids, occ, parsed, keep) -> None:
         keep.append(best_index)
 
 
-def _altloc_whole(start, count, comp_ids, atom_ids, alt_ids, occ, parsed, keep) -> None:
-    """AlphaFold3 ProcessAltLocGroupsWhole: pick the comp_id run, then its best alt id, then one row per atom name."""
+def _altloc_whole(start, count, comp_ids, atom_ids, alt_ids, occ, parsed, keep, is_atom=None) -> None:
+    """AlphaFold3 ProcessAltLocGroupsWhole: pick the comp_id run, then its best alt id, then one row per atom name.
+
+    One deliberate deviation (user 2026-10-24, "Prefer the ATOM altloc"): when ``is_atom`` is given and the comp_id runs
+    mix all-ATOM runs with runs holding HETATM rows (e.g. LYS / KPI, MET / MSE), only the all-ATOM runs compete.
+    """
     parsed[start : start + count] = True
     best_split = (start, count)
     best_occupancy = np.float32(-np.inf)
     best_group = alt_ids[start]
-    for s, n in _group_by(comp_ids, start, count, operator.eq):
+    runs = _group_by(comp_ids, start, count, operator.eq)
+    if is_atom is not None:
+        atom_runs = [(s, n) for s, n in runs if bool(is_atom[s : s + n].all())]
+        if 0 < len(atom_runs) < len(runs):
+            runs = atom_runs
+    for s, n in runs:
         groups, stats = [], []  # stats[k] = [row count, occupancy sum] of alt id groups[k]
         for i in range(s, s + n):
             if alt_ids[i] in groups:
@@ -887,6 +896,8 @@ def resolve_altlocs_af3(df: pd.DataFrame) -> Tuple[np.ndarray, int]:
     ``label_seq_id``), as AF3 ReadMmcifLayout (mmcif_layout_lib.cc); alt id = first character of ``label_alt_id``
     (``"."``/``"?"`` = none); grouping uses ``label_comp_id`` / ``label_atom_id`` as AF3 does.
     Occupancy is parsed as AF3 SimpleAtof: an unparseable value counts as 0.0.
+    The one deliberate deviation from AF3 (user 2026-10-24): with a ``record_name`` column, a whole-residue altloc that
+    mixes standard ATOM and modified HETATM components keeps an ATOM component (see :func:`_altloc_whole`).
 
     :returns: (ascending positional indices of the rows to keep, number of unparseable occupancies AF3 would read)
     """
@@ -902,6 +913,7 @@ def resolve_altlocs_af3(df: pd.DataFrame) -> Tuple[np.ndarray, int]:
     occ_bad = np.isnan(occ_num)
     occ = np.where(occ_bad, 0.0, occ_num).astype(np.float32)
     comp_ids = df["label_comp_id"].astype(str).tolist()
+    is_atom = (df["record_name"] == "ATOM").to_numpy() if "record_name" in df.columns else None
     atom_ids = df["label_atom_id"].astype(str).tolist()
     same = chain[1:] == chain[:-1]
     for v in keys:
@@ -930,7 +942,7 @@ def resolve_altlocs_af3(df: pd.DataFrame) -> Tuple[np.ndarray, int]:
                 run_count += 1
         if run_count > 0:
             if b - a == run_count:
-                _altloc_whole(run_start, run_count, comp_ids, atom_ids, alt_ids, occ, parsed, keep)
+                _altloc_whole(run_start, run_count, comp_ids, atom_ids, alt_ids, occ, parsed, keep, is_atom)
             else:
                 _altloc_partial(run_start, run_count, atom_ids, alt_ids, occ, parsed, keep)
     return np.asarray(keep, dtype=np.int64), int((occ_bad & parsed).sum())

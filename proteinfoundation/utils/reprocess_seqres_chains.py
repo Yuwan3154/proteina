@@ -24,7 +24,9 @@ Modes:
 Every processed stem is compared with its stored pack entry over all fields except contact_map_confind: fields = the
 differing field names; rid_exact / rid_mod_ins = residue_id equal exactly / modulo the insertion code; backbone_changed =
 residue count or order (residue_id modulo insertion code) or any N/CA/C/O coordinate or mask differs; raw_mtime = mtime of
-the raw mmCIF.
+the raw mmCIF; raw_used = its path; raw_replaced = both the flat raw/<id>.cif(.gz) (which _resolve_raw_sharded checks
+first, e.g. a 2026-05-27 re-download) and the bucketed raw/<bucket>/<id>.cif(.gz) exist and their decompressed contents
+differ (user: re-process from the current raw file; old_to_new then allows match 4).
 Status per stem: written (stems mode) | changed (written; --write-changed-only) | unchanged (--write-changed-only; nothing
 written) | dropped_collide (stems mode: side-table status collide; never processed) | dropped_over512 (new
 processed_length = coord_mask.any(-1).sum() > 512, the T8 config max_length; checked before unchanged) |
@@ -39,8 +41,12 @@ Sidecars (<out-root>/sidecars/part_K_of_N.pt):
     (insertion code stripped) on its reference atom (CA; first present atom when CA is missing). match 1 = the old atom
     equals the candidate's resolved atom; else match 2 = every coordinate component of the old atom equals that
     component of some raw altloc row of that atom in the candidate (a whole altloc row the old last-row-wins scatter
-    stored, or a per-component chimera of rows); 0 = unmatched (status columns n_matched_exact / n_matched_altloc /
-    n_unmatched; n_unmatched must be 0 except for collide stems, whose unchosen component's residue has no
+    stored, or a per-component chimera of rows); else match 3 = every component equals that component of some raw row
+    of that atom among the UNION of all candidates (an old merged residue mixing insertion-code residues, e.g. 129 /
+    129A); winner = the candidate supplying the most components, ties -> lowest new index; chimera = True; else, only
+    when raw_replaced, match 4 = the new residue with the identical residue_id (none -> still unmatched: the stem fails
+    closed); 0 = unmatched (status columns
+    n_matched_exact / n_matched_altloc / n_matched_merged / n_matched_id / n_unmatched; n_unmatched must be 0 except for collide stems, whose unchosen component's residue has no
     counterpart). chimera = some present old atom is not the winner's; exact = winner's coords and coord_mask rows
     equal the old ones.
 Usage: python -m proteinfoundation.utils.reprocess_seqres_chains --pack PACK --data-dir DATA_PATH/pdb_train \
@@ -50,6 +56,8 @@ Usage: python -m proteinfoundation.utils.reprocess_seqres_chains --pack PACK --d
 
 import argparse
 import collections
+import gzip
+import hashlib
 import io
 import json
 import mmap
@@ -61,7 +69,8 @@ import numpy as np
 import pandas as pd
 import torch
 
-from proteinfoundation.datasets.pdb_data import PDBLightningDataModule, _processed_path_sharded, _resolve_raw_sharded
+from proteinfoundation.datasets.pdb_data import (PDBLightningDataModule, _bucket_from_manifest, _processed_path_sharded,
+                                                  _resolve_raw_sharded)
 from proteinfoundation.graphein_utils.graphein_utils import PROTEIN_ATOMS, protein_to_pyg, read_pdb_to_dataframe
 from proteinfoundation.utils.precompute_dssp_targets import _compute_dssp
 
@@ -69,7 +78,7 @@ MAX_LEN = 512  # configs/datasets_config/pdb/pdb_train_contact-confind-synthtopo
 REPROCESS = ("merged", "nonmonotone", "ok_ins")
 COLUMNS = ("stem", "category", "status", "L_old", "L_new", "n_ins_new", "label_seq_increasing", "n_unmatched",
            "n_matched_exact", "n_matched_altloc", "n_chimera", "n_inexact", "fields", "rid_exact", "rid_mod_ins",
-           "backbone_changed", "raw_mtime", "confind")
+           "backbone_changed", "raw_mtime", "raw_used", "raw_replaced", "n_matched_merged", "n_matched_id", "confind")
 SKIP = ("contact_map_confind",)
 
 
@@ -143,11 +152,12 @@ def altloc_rows(df, chain) -> dict:
     return {r: {n: torch.from_numpy(np.stack(v)) for n, v in d.items()} for r, d in out.items()}
 
 
-def old_to_new(old, new, alt_rows) -> dict:
-    """Coordinate match of every old residue to a new residue (see module docstring)."""
+def old_to_new(old, new, alt_rows, by_id=False) -> dict:
+    """Coordinate match of every old residue to a new residue (see module docstring); by_id enables match 4."""
     cand = collections.defaultdict(list)
     for j, r in enumerate(new.residue_id):
         cand[r.rsplit(":", 1)[0]].append(j)
+    rid_index = {r: j for j, r in enumerate(new.residue_id)}
     n_old = len(old.residue_id)
     index = np.full(n_old, -1, dtype=np.int32)
     match = np.zeros(n_old, dtype=np.int8)
@@ -160,21 +170,46 @@ def old_to_new(old, new, alt_rows) -> dict:
         ref = 1 if bool(m[1]) else int(m.nonzero()[0, 0])
         xyz = old.coords[i, ref]
         js = cand.get(r.rsplit(":", 1)[0], [])
+        rows = [alt_rows.get(new.residue_id[j], {}).get(PROTEIN_ATOMS[ref]) for j in js]
+        comp = [torch.zeros(3, dtype=torch.bool) if x is None else (x == xyz).any(0) for x in rows]
         hit = [j for j in js if bool(new.coord_mask[j, ref]) and torch.equal(new.coords[j, ref], xyz)]
-        if hit:
-            match[i] = 1
-        else:
+        kind = 1
+        if not hit:
             # every component equals some altloc row's component (covers a whole row and a per-component chimera)
-            hit = [j for j in js if PROTEIN_ATOMS[ref] in alt_rows.get(new.residue_id[j], {})
-                   and bool((alt_rows[new.residue_id[j]][PROTEIN_ATOMS[ref]] == xyz).any(0).all())]
-            match[i] = 2 if hit else 0
+            hit, kind = [j for j, c in zip(js, comp) if bool(c.all())], 2
+        if not hit and js and bool(torch.stack(comp).any(0).all()):
+            # merged insertion-code residues: components drawn from several candidates' rows (e.g. 129 and 129A)
+            k = max(range(len(js)), key=lambda q: (int(comp[q].sum()), -js[q]))
+            hit, kind = [js[k]], 3
+        if not hit and by_id and r in rid_index:
+            hit, kind = [rid_index[r]], 4
         if hit:
             j = hit[0]
-            index[i] = j
+            index[i], match[i] = j, kind
             same = (new.coords[j][m] == old.coords[i][m]).all(-1) & new.coord_mask[j][m]
-            chimera[i] = not bool(same.all())
+            chimera[i] = kind == 3 or not bool(same.all())
             exact[i] = torch.equal(new.coords[j], old.coords[i]) and torch.equal(new.coord_mask[j], m)
     return {"index": index, "match": match, "chimera": chimera, "exact": exact}
+
+
+def raw_versions(raw_dir, pdb, man) -> tuple:
+    """(flat path or None, bucket path or None) for the id spelling raw_path resolves (lower case first)."""
+    for pid in (pdb.lower(), pdb):
+        names = [f"{pid}.cif", f"{pid}.cif.gz"]
+        flat = next((raw_dir / x for x in names if (raw_dir / x).exists()), None)
+        bucket = _bucket_from_manifest(pid, man)
+        buck = next((raw_dir / bucket / x for x in names if bucket and (raw_dir / bucket / x).exists()), None)
+        if flat is not None or buck is not None:
+            return flat, buck
+    return None, None
+
+
+def decompressed_md5(path) -> str:
+    h = hashlib.md5()
+    with (gzip.open(path, "rb") if str(path).endswith(".gz") else open(path, "rb")) as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def tensor_equal(a, b) -> bool:
@@ -242,13 +277,16 @@ def main():
     t0 = time.time()
     for k, pdb in enumerate(pdbs):
         df, path = None, None
+        flat, buck = raw_versions(raw_dir, pdb, man)
+        # the flat raw/<id>.cif.gz shadows the bucketed file the stored pack was built from; re-processing uses the flat
+        raw_replaced = flat is not None and buck is not None and decompressed_md5(flat) != decompressed_md5(buck)
         for stem in by_pdb[pdb]:
             old = load_entry(ent, mm, stem)
             row = dict.fromkeys(COLUMNS, "")
             row.update(stem=stem, category=cats.get(stem, "not_in_audit"), L_old=len(old.residue_id))
             raw = raw_path(raw_dir, pdb, man)
             if raw is not None:
-                row["raw_mtime"] = repr(os.path.getmtime(raw))
+                row.update(raw_mtime=repr(os.path.getmtime(raw)), raw_used=str(raw), raw_replaced=raw_replaced)
             if row["category"] == "collide" and not a.all_stems:
                 row["status"] = "dropped_collide"
                 rows.append(row)
@@ -280,9 +318,10 @@ def main():
                 row["status"] = "unchanged"
                 rows.append(row)
                 continue
-            m = old_to_new(old, g, altloc_rows(df, chain))
+            m = old_to_new(old, g, altloc_rows(df, chain), by_id=raw_replaced)
             row.update(n_unmatched=int((m["match"] == 0).sum()), n_matched_exact=int((m["match"] == 1).sum()),
-                       n_matched_altloc=int((m["match"] == 2).sum()), n_chimera=int(m["chimera"].sum()),
+                       n_matched_altloc=int((m["match"] == 2).sum()), n_matched_merged=int((m["match"] == 3).sum()),
+                       n_matched_id=int((m["match"] == 4).sum()), n_chimera=int(m["chimera"].sum()),
                        n_inexact=int((~m["exact"]).sum()))
             # a collide (microheterogeneity) stem loses the residue of the unchosen component: recorded, never failed
             if row["n_unmatched"] > 0 and row["category"] != "collide":

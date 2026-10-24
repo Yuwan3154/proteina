@@ -15,6 +15,8 @@ Through mmCIF files (protein_to_pyg(residue_order="label_seq", resolve_altlocs=T
   F5 unparseable occupancy in a file    F6 reader: '.', '?', numeric alt ids     F7 resolve_altlocs + auth order -> ValueError
   F8 determinism (two calls identical)  F9 hydrogens resolved before deprotonation
   F10 CYS (ATOM) / CSO (HETATM) whole microhet resolved over both record types (file order from _atom_site.id)
+  D1/D2 the one deviation from AF3 (user 2026-10-24): ATOM components win over HETATM ones in a mixed whole-residue
+     altloc (CSO .6 / CYS .4 -> CYS; KPI .68 / LYS .32 -> LYS); all-HETATM (MSE .4 / CSO .6 -> CSO) and ATOM-only (F2) as AF3
   P1-P3 inner tie, mean-not-sum, float32 arithmetic;  A1 residues split by author number + insertion code (AF3 layout)
   L  legacy: default read_pdb_to_dataframe == HEAD's, and resolve_altlocs=False graphs == HEAD graphs on every synthetic
      file (test_mmcif_seqres_parse cases + the altloc files here), default and seqres df, all chains and chain A
@@ -111,6 +113,18 @@ def unit_resolver():
     assert kept([("SER", 1, "CA", "A", 0.4), ("GLY", 2, "CA", "B", 0.6)]) == ([0, 1], 0)
     # P0 whole: within an atom-name run the FIRST later row with the best id wins (the run's first row is the default)
     assert kept([("SER", 1, "N", "B", 0.4), ("SER", 1, "N", "A", 0.5), ("SER", 1, "N", "A", 0.5)]) == ([1], 0)
+    # D0 unit: with record_name the ATOM run wins (deviation); without it AF3 keeps the higher-occupancy KPI
+    d = rdf([("KPI", 1, "N", "A", 0.68), ("KPI", 1, "CA", "A", 0.68), ("LYS", 1, "N", "B", 0.32), ("LYS", 1, "CA", "B", 0.32)])
+    assert resolve_altlocs_af3(d)[0].tolist() == [0, 1]
+    assert resolve_altlocs_af3(d.assign(record_name=["HETATM", "HETATM", "ATOM", "ATOM"]))[0].tolist() == [2, 3]
+    assert resolve_altlocs_af3(d.assign(record_name=["HETATM"] * 4))[0].tolist() == [0, 1]
+    assert resolve_altlocs_af3(d.assign(record_name=["ATOM"] * 4))[0].tolist() == [0, 1]
+    # D0b mixed groups whose ATOM part is itself microheterogeneous (ATOM runs compete as AF3 among themselves)
+    rec = lambda rows: ["HETATM" if r[0] == "KPI" else "ATOM" for r in rows]
+    for rows, want in (([("KPI", 1, "CA", "A", 0.5), ("LYS", 1, "CA", "B", 0.2), ("ARG", 1, "CA", "C", 0.3)], [2]),
+                       ([("LYS", 1, "CA", "A", 0.2), ("LYS", 1, "CA", "B", 0.3), ("KPI", 1, "CA", "C", 0.5)], [1]),
+                       ([("LYS", 1, "CA", "A", 0.1), ("KPI", 1, "CA", "B", 0.6), ("LYS", 1, "CA", "C", 0.3)], [2])):
+        assert resolve_altlocs_af3(rdf(rows).assign(record_name=rec(rows)))[0].tolist() == want, (rows, want)
     # P1 inner tie: one comp, ids B then A at .5 -> A
     assert kept([("SER", 1, "N", "B", 0.5), ("SER", 1, "N", "A", 0.5)]) == ([1], 0)
     # P2 mean, not sum: SER A 3 rows x .4 (mean .4, sum 1.2) vs THR B 1 row .6 -> THR
@@ -193,6 +207,12 @@ ALT_FILES = {
     "8iii": [at("ALA", 1, "CA", x=1.0), at("CYS", 2, "N", "A", "0.40", 2.0), at("CYS", 2, "CA", "A", "0.40", 2.1),
              at("CSO", 2, "N", "B", "0.60", 2.2, rec="HETATM"), at("CSO", 2, "CA", "B", "0.60", 2.3, rec="HETATM"),
              at("GLY", 3, "CA", x=3.0)],
+    "8jjj": [at("ALA", 1, "CA", x=1.0), at("KPI", 2, "N", "A", "0.68", 2.0, rec="HETATM"),
+             at("KPI", 2, "CA", "A", "0.68", 2.1, rec="HETATM"), at("LYS", 2, "N", "B", "0.32", 2.2),
+             at("LYS", 2, "CA", "B", "0.32", 2.3), at("GLY", 3, "CA", x=3.0)],
+    "8kkk": [at("ALA", 1, "CA", x=1.0), at("MSE", 2, "N", "A", "0.40", 2.0, rec="HETATM"),
+             at("MSE", 2, "CA", "A", "0.40", 2.1, rec="HETATM"), at("CSO", 2, "N", "B", "0.60", 2.2, rec="HETATM"),
+             at("CSO", 2, "CA", "B", "0.60", 2.3, rec="HETATM"), at("GLY", 3, "CA", x=3.0)],
 }
 
 
@@ -250,17 +270,21 @@ def file_cases(d, data_dir):
     g = res(p["8ggg"])
     assert xs(g, 0) == [1.0, 2.0] and xs(g, 1) == [1.1, 2.3], (xs(g, 0), xs(g, 1))
     print(f"PASS F9 resolution before deprotonation: SER N x {xs(g, 0)[1]}, CA x {xs(g, 1)[1]} (PARTIAL)")
-    # F10 CYS A (ATOM) / CSO B (HETATM) on one position: WHOLE over both record types, as AF3
+    # F10 CYS A (ATOM) / CSO B (HETATM) on one position: WHOLE over both record types (file order from _atom_site.id)
     g = res(p["8hhh"])
     assert g.residues == ["ALA", "CYS", "GLY"] and xs(g, 1) == [1.0, 2.1, 3.0], (g.residues, xs(g, 1))
-    g = res(p["8iii"])  # CSO wins -> CYS rows are gone and the HETATM CSO is not a standard residue
-    assert g.residues == ["ALA", "GLY"] and g.label_seq_id.tolist() == [1, 3], g.residues
-    g = protein_to_pyg(df=read_pdb_to_dataframe(path=p["8iii"], mmcif_seqres_fields=True), path=p["8iii"],
-                       keep_insertions=True, residue_order="label_seq", resolve_altlocs=True, keep_hets=["CSO"],
+    # D1 deviation (user 2026-10-24 "Prefer the ATOM altloc"): CSO .6 (HETATM) vs CYS .4 (ATOM) -> CYS, AF3 would take CSO
+    g = res(p["8iii"])
+    assert g.residues == ["ALA", "CYS", "GLY"] and xs(g, 1) == [1.0, 2.1, 3.0], (g.residues, xs(g, 1))
+    g = res(p["8jjj"])  # KPI A .68 (HETATM) / LYS B .32 (ATOM) -> LYS
+    assert g.residues == ["ALA", "LYS", "GLY"] and xs(g, 1) == [1.0, 2.3, 3.0], (g.residues, xs(g, 1))
+    # D2 all-HETATM microhet keeps AF3 behaviour: MSE A .4 / CSO B .6 -> CSO
+    g = protein_to_pyg(df=read_pdb_to_dataframe(path=p["8kkk"], mmcif_seqres_fields=True), path=p["8kkk"],
+                       keep_insertions=True, residue_order="label_seq", resolve_altlocs=True, keep_hets=["MSE", "CSO"],
                        remove_nonstandard=False)
     assert list(g.residue_id) == ["A:ALA:1:", "A:CSO:2:", "A:GLY:3:"] and xs(g, 1) == [1.0, 2.3, 3.0], g.residue_id
-    print("PASS F10 CYS(ATOM)/CSO(HETATM) microhet: CYS .6 -> CYS; CSO .6 -> residue dropped (HETATM), "
-          "kept as resolved het with keep_hets=['CSO']")
+    print("PASS F10/D1/D2 CYS(ATOM)/CSO(HETATM): CYS .6 -> CYS; CSO .6 vs CYS .4 -> CYS (ATOM preferred); KPI .68 / "
+          "LYS .32 -> LYS; all-HETATM MSE .4 / CSO .6 -> CSO (AF3); ATOM-only microhet = F2")
     return p
 
 
