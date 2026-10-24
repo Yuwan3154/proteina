@@ -297,8 +297,7 @@ def main():
     transform = build_transform(args.index)
     transform._ensure_loaded()
     pro_donor = check_index_matches_builder(transform._index)
-    print(f"[ref] index dssp_def={transform._index['dssp_def']!r} contact_def={transform._index['contact_def']!r}",
-          flush=True)
+    print(f"[ref] proline donor mask {pro_donor}; index contact_def={transform._index['contact_def']!r}", flush=True)
     predictor = load_predictor(args.f2c_ckpt_dir, args.f2c_dtype)
     model, cfg_exp = load_tri(args.tri_ckpt, os.path.join(args.out, f".store_shard{args.shard}"))
     model = model.to(dev).eval()
