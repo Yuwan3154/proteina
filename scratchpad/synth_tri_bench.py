@@ -77,10 +77,16 @@ def check_index_matches_builder(index):
     """The index records how it was built; the reference below must be built the same way."""
     assert index["contact_def"] == builder.CONTACT_DEF_CONFIND, f"index contact_def {index['contact_def']!r}"
     assert int(index["min_len"]) == REF_EXPECT["min_len"], f"index min_len {index['min_len']}"
-    assert tuple(index["element_types"]) == builder._ELEMENT_TYPES == (DSSP_HELIX, DSSP_STRAND), index["element_types"]
-    assert index["loop_axis"] is None and builder._LOOP_AXIS is None, index["loop_axis"]
-    assert index["dssp_def"] in (builder.DSSP_DEF, builder.DSSP_DEF_PRO), index["dssp_def"]
-    return index["dssp_def"] == builder.DSSP_DEF_PRO
+    # an index built before 63e943f (synth_index_confind_v1, 09-24) has no element_types / loop_axis / dssp_def keys: that
+    # builder took helix + strand elements only, no loop elements, and plain DSSP (the proline donor mask came with 63e943f)
+    element_types = tuple(index.get("element_types", (DSSP_HELIX, DSSP_STRAND)))
+    assert element_types == builder._ELEMENT_TYPES == (DSSP_HELIX, DSSP_STRAND), element_types
+    assert index.get("loop_axis") is None and builder._LOOP_AXIS is None, index.get("loop_axis")
+    dssp_def = index.get("dssp_def", builder.DSSP_DEF)
+    assert dssp_def in (builder.DSSP_DEF, builder.DSSP_DEF_PRO), dssp_def
+    print(f"[index] element_types {element_types}, loop_axis {index.get('loop_axis')}, dssp_def {dssp_def!r}"
+          f"{'' if 'dssp_def' in index else ' (key absent: pre-63e943f index)'}", flush=True)
+    return dssp_def == builder.DSSP_DEF_PRO
 
 
 def template_reference(full, amask, aatype, predictor, transform, length, pro_donor):
