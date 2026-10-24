@@ -19,7 +19,8 @@ Modes:
                      dropped unprocessed.
   --all-stems        every stem of the pack index (partitioned by --part / --n-parts); collide stems ARE processed and
                      recorded (whether they enter T8b is open with the user); stems missing from the audit get category
-                     not_in_audit.
+                     not_in_audit. --stems-subset FILE restricts it to the listed stems (each must be in the pack
+                     index), e.g. to rerun failed rows; nothing else changes.
   --write-changed-only (either mode) writes a stem's .pt + sidecars only if some field differs from the stored entry.
 Every processed stem is compared with its stored pack entry over all fields except contact_map_confind: fields = the
 differing field names; rid_exact / rid_mod_ins = residue_id equal exactly / modulo the insertion code; backbone_changed =
@@ -50,7 +51,7 @@ Sidecars (<out-root>/sidecars/part_K_of_N.pt):
     counterpart). chimera = some present old atom is not the winner's; exact = winner's coords and coord_mask rows
     equal the old ones.
 Usage: python -m proteinfoundation.utils.reprocess_seqres_chains --pack PACK --data-dir DATA_PATH/pdb_train \
-           --audit SEQRES_AUDIT.tsv (--stems STEMS.txt | --all-stems) [--write-changed-only] --part K --n-parts N \
+           --audit SEQRES_AUDIT.tsv (--stems STEMS.txt | --all-stems [--stems-subset FILE]) [--write-changed-only] --part K --n-parts N \
            --out-root OUT_ROOT
 """
 
@@ -249,6 +250,7 @@ def main():
     ap.add_argument("--audit", required=True)
     ap.add_argument("--stems", help="stems file (re-process set); or --all-stems")
     ap.add_argument("--all-stems", action="store_true", help="every stem of the pack index; collide stems processed")
+    ap.add_argument("--stems-subset", help="with --all-stems: only these pack stems (same --all-stems semantics)")
     ap.add_argument("--write-changed-only", action="store_true", help="write a stem only if a field differs")
     ap.add_argument("--part", type=int, required=True)
     ap.add_argument("--n-parts", type=int, required=True)
@@ -256,11 +258,16 @@ def main():
     a = ap.parse_args()
     assert 0 <= a.part < a.n_parts, (a.part, a.n_parts)
     assert (a.stems is None) == a.all_stems, "exactly one of --stems / --all-stems"
+    assert a.stems_subset is None or a.all_stems, "--stems-subset needs --all-stems"
     data_dir, out_root = pathlib.Path(a.data_dir).resolve(), pathlib.Path(a.out_root).resolve()
     assert out_root != data_dir and data_dir not in out_root.parents, "never write into the shared pdb_train tree"
     cats = load_audit(a.audit)
     ent, mm, _fh = open_pack(a.pack)
-    if a.all_stems:
+    if a.all_stems and a.stems_subset is not None:
+        stems = sorted({l.split()[0] for l in open(a.stems_subset) if l.strip()})
+        missing = [s for s in stems if s not in ent]
+        assert not missing, f"{len(missing)} --stems-subset stems not in the pack index, e.g. {missing[:5]}"
+    elif a.all_stems:
         stems = sorted(ent)
     else:
         stems = sorted({l.split()[0] for l in open(a.stems) if l.strip()})

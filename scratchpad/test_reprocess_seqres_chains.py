@@ -18,6 +18,8 @@ comparison must skip); main() then runs as a child process on a 2-part split.
        flat, SER 3 matched by residue_id (match 4, n_matched_id 1), nothing fails
 label_seq sidecar: every processed stem (all but 7ggg), unchanged 7aaa included; n_stems summed over parts == 10.
 Stems mode (--stems [7eee_A, 7fff_A]): 7eee written, 7fff dropped_collide.
+Subset mode (--all-stems --stems-subset [7aaa, 7fff, 7ggg, 7jjj]): rows identical to the full all-stems run; --stems on
+the same file fails (ok-category stems), a stem outside the pack and --stems-subset without --all-stems fail.
 old_to_new unit: 7bbb without altloc rows -> unmatched (the reviewer's 9ddd repro); per-component chimera (1, 5, 3) of
 rows (1, 2, 3) / (4, 5, 6) -> match 2; (1, 5, 7) -> 0.
 Usage: python scratchpad/test_reprocess_seqres_chains.py   (CPU, temp dir only)
@@ -45,6 +47,7 @@ import raw_version_audit as R  # noqa: E402
 import test_mmcif_seqres_parse as T  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+G = {}
 
 
 def bb(comp, lseq, x, aseq=None, ins="?", alt_ca=None, alt_cb=None):
@@ -209,6 +212,7 @@ def all_stems(root, data_dir, pack, audit):
     assert sorted(ls) == sorted(s for s in CATS if s != "7ggg_A") and ls["7aaa_A"].tolist() == [1, 2, 3] + list(
         range(101, 109)), sorted(ls)
     assert side["7bbb_A"]["match"].tolist() == [1, 2] + [1] * 9, side["7bbb_A"]["match"]
+    G["rows_all"] = rows
     print(f"PASS all-stems --write-changed-only: {len(rows)} stems over 2 parts, status {st}; backbone_changed "
           f"{bc}; written + sidecars = changed only {changed}")
 
@@ -221,6 +225,29 @@ def stems_mode(root, data_dir, pack, audit):
     assert {s: r["status"] for s, r in rows.items()} == {"7eee_A": "written", "7fff_A": "dropped_collide"}, rows
     assert written == ["7eee_A"] and rows["7eee_A"]["fields"] != ""
     print("PASS stems mode: 7eee_A written, 7fff_A dropped_collide")
+
+
+def subset_mode(root, data_dir, pack, audit, rows_all):
+    sub = ["7aaa_A", "7fff_A", "7ggg_A", "7jjj_A"]
+    sf = root / "subset.txt"
+    sf.write_text("\n".join(sub) + "\n")
+    base = ["--pack", str(pack), "--data-dir", str(data_dir), "--audit", str(audit)]
+    rows, _, ls, written = run_main(base + ["--all-stems", "--stems-subset", str(sf), "--write-changed-only"],
+                                    root / "out_subset")
+    assert sorted(rows) == sub and written == ["7fff_A"] and sorted(ls) == ["7aaa_A", "7fff_A", "7jjj_A"], (rows, written)
+    for st in sub:  # identical rows to the full --all-stems run
+        assert rows[st] == rows_all[st], (st, rows[st], rows_all[st])
+    for extra, err in ((["--stems", str(sf)], "stems outside the re-process set"),
+                       (["--all-stems", "--stems-subset", str(root / "bad.txt")], "not in the pack index"),
+                       (["--stems", str(sf), "--stems-subset", str(sf)], "--stems-subset needs --all-stems")):
+        (root / "bad.txt").write_text("7aaa_A\n9zzz_A\n")
+        p = subprocess.run([sys.executable, "-m", "proteinfoundation.utils.reprocess_seqres_chains", *base, *extra,
+                            "--part", "0", "--n-parts", "1", "--out-root", str(root / "out_bad")], cwd=REPO,
+                           env=os.environ.copy(), capture_output=True, text=True)
+        assert p.returncode != 0 and err in p.stderr, (extra, p.returncode, p.stderr[-1500:])
+    print(f"PASS subset mode: {len(sub)} stems (unchanged / collide changed / failed raw / failed:unmatched ok-category) "
+          "rows == full all-stems rows; --stems rejects the ok stems, a stem outside the pack and --stems-subset without "
+          "--all-stems fail")
 
 
 def unit_old_to_new(data_dir, olds):
@@ -324,6 +351,7 @@ def main():
     unit_old_to_new(data_dir, olds)
     all_stems(root, data_dir, pack, audit)
     stems_mode(root, data_dir, pack, audit)
+    subset_mode(root, data_dir, pack, audit, G["rows_all"])
     raw_audit(root, data_dir, pack)
     print("ALL PASS")
 
