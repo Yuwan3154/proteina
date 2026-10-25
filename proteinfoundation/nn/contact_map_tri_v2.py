@@ -262,6 +262,11 @@ class ContactMapTriV2(nn.Module):
         if self.pair_ref_features not in PAIR_FEATURE_MODES:
             raise ValueError(f"pair_ref_features must be one of {sorted(PAIR_FEATURE_MODES)}, got {self.pair_ref_features!r}")
         self.pair_feat_idx = _pair_feature_indices(self.pair_ref_features)
+        # T8b (user 2026-10-20 "SEQRES position (AF2)"): query positions from batch["residue_seqres_idx"] (mmCIF
+        # label_seq_id, rebased so the first modelled residue = 0); "index" = arange(L), the T8 behaviour
+        self.query_pos = kwargs.get("query_pos", "index")
+        if self.query_pos not in ("index", "seqres"):
+            raise ValueError(f"query_pos must be 'index' or 'seqres', got {self.query_pos!r}")
 
         self.contact_map_mode = True
         self.contact_map_input_dim = int(kwargs.get("contact_map_input_dim", 1))
@@ -306,6 +311,9 @@ class ContactMapTriV2(nn.Module):
         ef = batch.get("topology_he_elem_feat")
         if ef is not None and Tp > ef.shape[1]:
             out["topology_he_elem_feat"] = F.pad(ef, (0, 0, 0, Tp - ef.shape[1]))
+        qp = batch.get("residue_seqres_idx")
+        if qp is not None and Lp > qp.shape[1]:
+            out["residue_seqres_idx"] = F.pad(qp, (0, Lp - qp.shape[1]))
         return out
 
     def _forward_impl_sc(self, batch: Dict) -> Dict:
@@ -362,7 +370,12 @@ class ContactMapTriV2(nn.Module):
         pair_mask = (tok_mask[:, :, None] & tok_mask[:, None, :]).to(dtype)
         N = L + T
 
-        q_pos = torch.arange(L, device=device, dtype=torch.float32)[None].expand(B, L)
+        if self.query_pos == "seqres":
+            if "residue_seqres_idx" not in batch:
+                raise KeyError("query_pos='seqres' needs batch['residue_seqres_idx'] (SeqresIndexTransform)")
+            q_pos = batch["residue_seqres_idx"].float()
+        else:
+            q_pos = torch.arange(L, device=device, dtype=torch.float32)[None].expand(B, L)
         pos = torch.cat([q_pos, he_pos], dim=1)
         rel = (pos[:, :, None] - pos[:, None, :]).round().long()
         rel = rel.clamp(-self.max_rel_pos, self.max_rel_pos) + self.max_rel_pos

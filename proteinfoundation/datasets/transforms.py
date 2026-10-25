@@ -9,6 +9,7 @@
 # its affiliates is strictly prohibited.
 
 import gzip
+import hashlib
 import os
 import pickle
 import re
@@ -34,6 +35,7 @@ from torch_geometric.data import Data
 from proteinfoundation.datasets.cath_utils import load_cath_mapping, parse_cath_codes_to_indices
 from proteinfoundation.utils.ff_utils.pdb_utils import extract_cath_code_by_level
 from proteinfoundation.utils.dense_padding_data_loader import FLOAT_PADDING_VALUE
+from proteinfoundation.utils.constants import residue_type_to_sequence
 from proteinfoundation.utils.frozen_str_map import FrozenStrMap
 
 # Keys that carry ONE value per graph, not one per residue. They are stored as shape [1], which the
@@ -171,6 +173,65 @@ class ChainBreakPerResidueTransform(T.BaseTransform):
                 torch.tensor([False], dtype=torch.bool, device=chain_breaks_per_residue.device),
             )
         )
+        return graph
+
+
+class SeqresIndexError(RuntimeError):
+    """A chain without valid SEQRES positions. PDBDataset re-raises it instead of swapping in another chain."""
+
+
+def residue_type_sha1(residue_type) -> str:
+    """sha1 of a graph's one-letter sequence in array order: the side table's per-stem residue-order fingerprint."""
+    return hashlib.sha1(residue_type_to_sequence(residue_type).encode()).hexdigest()
+
+
+class SeqresIndexTransform(T.BaseTransform):
+    """T8b: ``graph.residue_seqres_idx`` = each residue's mmCIF label_seq_id (SEQRES position, user 2026-10-20
+    "SEQRES position (AF2)"), rebased so the first modelled residue is 0 (user: "R2"). Read from the side table of
+    utils/precompute_seqres_index.py. Never falls back to array order: a missing stem, a length mismatch, a
+    non-increasing position or a sequence fingerprint (``seq_sha1``) different from the graph's raises
+    SeqresIndexError. Must run before TopologyReferenceTransform.
+
+    Args:
+        index_path: the side table ({stems, offset, label_seq_flat, length, seq_sha1, ...}).
+        required_ids_files: id lists (one stem per line) whose every stem must have valid positions at load.
+    """
+
+    def __init__(self, index_path: str, required_ids_files: Tuple[str, ...] = ()):
+        self.index_path = index_path
+        table = torch.load(index_path, map_location="cpu", weights_only=False, mmap=True)
+        if "seq_sha1" not in table:
+            raise SeqresIndexError(f"{index_path} has no seq_sha1 residue-order fingerprint; rebuild it")
+        self._sha1 = table["seq_sha1"]
+        self._offset = table["offset"]
+        self._flat = table["label_seq_flat"]
+        self._length = table["length"]
+        self._row = {s: i for i, s in enumerate(table["stems"])}
+        for path in required_ids_files:
+            with open(path) as fh:
+                ids = [line.strip() for line in fh if line.strip()]
+            for stem in ids:
+                self._positions(stem, None)
+            rank_zero_info(f"SeqresIndexTransform: all {len(ids)} ids in {path} have valid SEQRES positions")
+
+    def _positions(self, stem: str, L: Optional[int]) -> torch.Tensor:
+        row = self._row.get(stem)
+        if row is None:
+            raise SeqresIndexError(f"{stem} is not in the SEQRES side table {self.index_path}")
+        pos = self._flat[int(self._offset[row]):int(self._offset[row + 1])].long()
+        n = int(self._length[row]) if L is None else L
+        if pos.numel() != n:
+            raise SeqresIndexError(f"{stem}: {pos.numel()} SEQRES positions in {self.index_path}, chain has {n} residues")
+        if not bool((pos[1:] > pos[:-1]).all()):
+            raise SeqresIndexError(f"{stem}: SEQRES positions are not strictly increasing in {self.index_path}")
+        return pos
+
+    def forward(self, graph: Data) -> Data:
+        stem = str(getattr(graph, "protein_id", getattr(graph, "id", "")))
+        pos = self._positions(stem, int(graph.coords.shape[0]))
+        if residue_type_sha1(graph.residue_type) != self._sha1[self._row[stem]]:
+            raise SeqresIndexError(f"{stem}: residue sequence differs from the one {self.index_path} was built on")
+        graph.residue_seqres_idx = pos - pos[0]
         return graph
 
 

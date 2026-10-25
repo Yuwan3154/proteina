@@ -34,6 +34,7 @@ from proteinfoundation.openfold_stub.np.residue_constants import resname_to_idx
 
 
 from proteinfoundation.datasets.base_data import BaseLightningDataModule
+from proteinfoundation.datasets.transforms import SeqresIndexError
 from proteinfoundation.utils.cluster_utils import (
     cluster_sequences,
     df_to_fasta,
@@ -1083,6 +1084,8 @@ class PDBDataset(Dataset):
                 try:
                     graph = self.transform(graph)
                 except Exception as e:
+                    if isinstance(e, SeqresIndexError):  # T8b: missing/invalid SEQRES positions are fatal, never a swap
+                        raise
                     if debug:
                         logger.warning(
                             f"{self._data_load_log_prefix()} skip fname={fname} "

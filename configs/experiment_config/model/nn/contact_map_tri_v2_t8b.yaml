@@ -1,0 +1,34 @@
+name: contact_map_tri_v2_t8b
+nn_class: ContactMapTriV2   # dispatches Proteina's NN_REGISTRY
+# T8 ConFind tri v2 (user 2026-10-09). Stage A: n_blocks_ref blocks on the joint (L+T)^2 query+reference grid; the
+# align and MLM heads read its END ("right before the transition", answer (b)); stage B: n_blocks_query blocks on L^2.
+pair_dim: 128            # user: "pair width 128"
+tri_hidden: 128          # user 2026-10-09 (Q5: "Yes")
+n_blocks_ref: 4          # user: "4 blocks ... with the topology reference"
+n_blocks_query: 4        # user: "4 blocks ... without the topology reference"
+transition_hidden: 512   # SwiGLU hidden width, user 2026-10-09: "Do 512"
+dim_cond: 128            # user 2026-10-09 (Q5: "Yes")
+# T8b (user 2026-10-20): copy of contact_map_tri_v2_t8 + query_pos seqres; everything else identical.
+query_pos: seqres       # T8b: query relpos from residue_seqres_idx (mmCIF label_seq_id, first modelled = 0), user "SEQRES position (AF2)"
+max_rel_pos: 32          # AlphaFold 2 relative-position clip (user 2026-10-10: follow AlphaFold values when unspecified)
+topology_cond: True      # read by the trainer (see contact_map_tri_30M_cb8.yaml)
+max_topology_he_len: 96  # user: "Raise the max template elements to 96". Informational here: the cap in force is
+                         # the dataset config's TopologyReferenceTransform max_topology_he_len (must also be 96)
+topology_vocab_size: 45  # 2 special + helix/strand x 21 length slots + 1 loop token (user: single loop token)
+n_elem_features: 1       # per-element length feature (user 2026-10-09 Q7)
+n_residue_types: 22
+align_head:
+  enabled: True
+mlm_head:
+  enabled: True
+pair_ref_features: both
+contact_map_mode: True
+contact_map_input_dim: 1
+non_contact_value: 0
+predict_coords: False
+# torch.compile (user 2026-10-10 "(a)") with static-shape buckets (user "(A)": L step 64 up to 512, T step 16 up to 96);
+# the model pads L and T up to the next edge (ContactMapTriSiT.configure_compile / _pad_batch)
+use_torch_compile: True
+use_torch_compile_sc: True    # no-grad forwards (self-cond, val, sampling): on after hang test 26219844 (2x H100) passed
+pad_len_buckets: [64, 128, 192, 256, 320, 384, 448, 512]
+pad_topo_buckets: [16, 32, 48, 64, 80, 96]

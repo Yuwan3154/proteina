@@ -1,0 +1,130 @@
+# T8b (user 2026-10-20/21): copy of pdb_train_contact-confind-synthtopo_S25_max512_t8.yaml. Changes: re-processed data
+# dir / overlay pack / T8b index (TODO: none built yet), regenerate_missing False (REQUIRED: regeneration would undo the
+# SEQRES-order fix), SeqresIndexTransform before the topology transform, placeholder_span seqres.
+# T8 ConFind tri v2 dataset (user 2026-10-09/10): max length 512; the FROZEN max512 split inherited from max384
+# ($S/t8_template_list/{train,val,test}_chain_ids.txt: Ca-only and no-file chains already dropped); the user's new
+# diverse synthetic templates in a NEW index built with --element-types 0,1,2 --loop-axis <user's choice>
+# --proline-donor-mask (ConFind contacts); loops are elements (one loop token), up to 96 elements, element-length
+# feature. Clone of the max384 ConFind synthtopo config; every changed line says why. ??? = not grounded yet.
+datamodule:
+  _target_: "proteinfoundation.datasets.pdb_data.PDBLightningDataModule"
+  data_dir: ${oc.env:DATA_PATH}/pdb_train_t8b/ # TODO(T8b): NOT BUILT YET -- the T8b data dir (REPAIR PLAN S8: symlinks + edited CSV copy)
+  in_memory: False
+  # Packed-mmap mode: training samples from ONE blob on so3/002 SSD (user 2026-10-06/07), not the HDD store that stalled
+  # 44 min on 10-06. PACK_PATH overrides; PDBDataset fails at startup if any declared stem is missing from the pack.
+  pack_path: ${oc.env:PACK_PATH,/orcd/compute/so3/002/chenxi/proteina_pack/tri_t8b_512.pack}  # TODO(T8b): NOT BUILT YET -- overlay pack
+             # (REPAIR PLAN S7: T8 pack with the re-processed chains replaced)
+  format: "cif" # format for file download
+  overwrite: False # Whether to overwrite existing dataset files and reprocess the raw data
+  regenerate_missing: False # T8b REQUIRED: regeneration (no seqres_order) would silently undo the SEQRES-order fix
+  # arguments for BaseLightningDataModule class
+  batch_padding: True # whether we want a sparse PyG batch or a padded dense batch
+  sampling_mode: "cluster-random" # sample randomly inside each sequence similarity cluster during training
+  # Only chains with a synthetic reference in the training TM range may be drawn (one id per line,
+  # written by the index merge). Clusters left without one are dropped and counted in the log --
+  # they are the clusters whose templates are still being generated. The transform's unconditional
+  # fallback therefore should never fire; if it does, the log says so loudly.
+  eligible_ids_file: ${oc.env:SYNTH_INDEX_DIR}/eligible_ids_tm0.5-0.9.txt  # TODO(T8b): SYNTH_INDEX_DIR = the T8b index dir, NOT BUILT YET
+  # Epoch batch plan (user 2026-10-10 "(A)"): one member per cluster drawn at epoch start, batches grouped by length,
+  # plan + consumed batches saved in checkpoints for an exact mid-epoch resume (datasets/epoch_batch_plan.py).
+  # Edges = the torch.compile L buckets (user 10-10 "(A)": step 64 up to 512).
+  epoch_batch_plan: True
+  epoch_batch_plan_len_edges: [64, 128, 192, 256, 320, 384, 448, 512]
+  cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/  # For CATH index conversion when fold_cond
+  multilabel_mode: "sample"  # sample | average | sum | transformer
+  transforms:
+    - _target_: "proteinfoundation.datasets.transforms.GlobalRotationTransform" # Transforms to apply to dataset examples
+    - _target_: "proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform"
+    - _target_: "proteinfoundation.datasets.transforms.CATHLabelTransform" # activate for fold-conditional training
+      root_dir: ${oc.env:DATA_PATH}/cathdata/ # Root directory for CATH labels
+    - _target_: "proteinfoundation.datasets.transforms.CATHToIndicesTransform"  # Convert CATH strings to indices for model
+      cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/
+    - _target_: "proteinfoundation.datasets.transforms.DSSPTargetTransform"  # 3-state secondary structure for DSSP aux loss
+    - _target_: "proteinfoundation.datasets.transforms.ContactMapTransform"  # Required for contact_map_mode training
+      # ConFind twin of the CB-8 synthtopo config (user 2026-09-23: ConFind tri fine-tune, pure ConFind): ONLY this
+      # contact block and the index filename below differ. Same keys/values as the original ConFind tri config.
+      contact_method: confind  # Expects precomputed contact_map_confind in processed .pt files
+      confind_rotamer_lib: ${oc.env:DATA_PATH}/rotlibs
+      confind_contact_threshold: 0.01
+    - _target_: "proteinfoundation.datasets.transforms.SequenceDropoutTransform"
+      # Whole query sequence dropped, length preserved (user 2026-09-10). Drawn INDEPENDENTLY of the
+      # topology drop_prob below, so ~0.25 x 0.25 = 6.25% of training sees neither sequence nor
+      # reference. 0 disables the mechanism entirely.
+      prob: 0.25
+    - _target_: "proteinfoundation.datasets.transforms.SeqresIndexTransform"  # T8b: before the topology transform
+      # TODO(T8b): v1 table (spec path); must be REBUILT on the overlay pack -- v1 has no positions for merged / nonmonotone
+      # chains, so the load-time coverage check below fails on them until then
+      index_path: ${oc.env:SEQRES_INDEX_PATH,/orcd/compute/so3/002/chenxi/t8b_index/seqres_index_t8.pt}
+      required_ids_files:  # every stem must have valid positions at load: training-eligible ids + validation fixed list
+        - ${oc.env:SYNTH_INDEX_DIR}/eligible_ids_tm0.5-0.9.txt
+        - /orcd/scratch/orcd/011/chenxiou/t8_valfixed/val_fixed32_t8_within.txt  # = training yaml fixed_chain_list
+    - _target_: "proteinfoundation.datasets.topology_reference.TopologyReferenceTransform"
+      index_path: ${oc.env:SYNTH_INDEX_DIR}/topology_index_confind_synth_t8b.pt  # TODO(T8b): NOT BUILT YET -- T8b index (rebuilt from final_selection)
+      reference_source: synthetic
+      tm_range: [0.5, 0.9]           # user decision 2026-09-10 (D1)
+      sse_types: [0, 1, 2]           # T8: loops are tokenised too ...
+      single_token_types: [0]        # ... as ONE token of any length (user 2026-10-09) -> vocab 45
+      element_types: [0, 1, 2]       # loops are reference elements (must equal the index's element_types)
+      elem_features: True            # per-element length feature (user 2026-10-09 Q7)
+      max_topology_len: 128          # covers the element-count distribution; see plan for percentiles
+      max_topology_he_len: 96        # user: "Raise the max template elements to 96" (loops included)
+      sigma_frac: 0.15               # augmentation sigma as a fraction of each element's own length
+      mutate_prob: 0.3               # per-element probability of a length perturbation
+      type_mutate_prob: 0.1          # per-element probability of a helix <-> strand flip (user, D5)
+      token_mask_prob: 0.1           # per-element probability of MASKing the token; target kept for the MLM loss (user, D5)
+      drop_prob: 0.25                # train an unconditional branch for classifier-free guidance.
+      drop_ref_len_range: [14, 80]   # T8 MEASURED by the D22 rule (p5-p95 of the served element count, 1,500 TRAIN
+                                     # references through this transform, drop_prob 0; t8_measure_drop_ref_len.py @f92c605,
+                                     # job 25853652, 2026-10-14): p5 14 / median 42 / p95 80, linear = nearest; loops count
+                                     # as elements here. The old [5, 39] counted helix/strand only. Old note: a DROPPED reference is a variable-length FULLY MASKED
+                                     # scratch pad, not one dead token (user, D20). Range = the
+                                     # p5-p95 of what training actually serves, MEASURED over 1,500
+                                     # references (job 22502519: p5 5, median 20, p95 39).
+                                     # Drawn independently of the chain, so the unconditional branch
+                                     # cannot leak the query's own topology. [1, 1] = old behaviour.
+      self_fallback: True            # irrelevant in synthetic mode (never self); kept for the cluster-mode reader
+      min_len: 1                     # 1-residue elements are kept: 16.87% of all elements
+      placeholder_span: seqres       # T8b (user 2026-10-20): dropped-reference midpoints over the query's SEQRES span
+    # No PaddingTransform (user 2026-10-10 "Yes"): it padded every residue axis to 512; the dense collate now pads each
+    # batch to its longest chain, and the model pads to its torch.compile buckets. Measured on CB-8 data (50 chains,
+    # scratchpad/check_padding_keys.py on branch cb8-plan-port @f86b340): valid regions and the model's residue mask unchanged; only the PADDED fills of
+    # chains / residue_pdb_idx / residue_type / seq_pos (0 -> -1) and ext_lig (2 -> -1) change -- residue_type is read
+    # under the pair mask, ext_lig only when the nn sets ext_lig_emb_dim (T8 does not), the rest not in training.
+  batch_size: 1 # T8: the 4M-param model is far smaller; 1 kept until measured (effective batch 32 via accumulation).
+                # Old note: MEASURED on a 95 GB RTX PRO 6000: the tri model fits batch 1 only, at every
+                # length tried. At L=384 (grid N=384+64=448) peak is 71.81 GB = 76% of the card;
+                # batch 2 OOMs.
+  num_workers: 8 # Number of workers for dataloader (overridden per rank by ncpus_per_task_train_)
+  pin_memory: True # Pin memory for dataloader
+  prefetch_factor: 2 # Prefetch factor for dataloader
+
+  dataselector:
+    _target_: "proteinfoundation.datasets.pdb_data.PDBDataSelector"
+    data_dir: ${oc.env:DATA_PATH}/pdb_train_t8b/ # TODO(T8b): NOT BUILT YET -- holds the edited CSV copy (REPAIR PLAN S8)
+    fraction: 1 # Fraction of dataset to use
+    molecule_type: "protein" # Type of molecule for which to select
+    experiment_types: ["diffraction", "EM"] # other options are "NMR" and "other"
+    min_length: 50 # Exclude peptides of length smaller than 50
+    max_length: 512 # T8: exclude polypeptides longer than 512
+    oligomeric_min: null
+    oligomeric_max: null
+    best_resolution: 0.0  # Include only proteins with resolution >= 0.0
+    worst_resolution: 5.0 # Include only proteins with resolution <= 5.0
+    has_ligands: [] # Include only proteins containing the ligand `ZN`
+    remove_ligands: [] # Exclude specific ligands from any available protein-ligand complexes
+    remove_non_standard_residues: True # Include only proteins containing standard amino acid residues
+    remove_pdb_unavailable: True # Include only proteins that are available to download
+    max_deposition_date: "2019-08-28" # Only include structures deposited on or before this date
+    exclude_ids: []  # Use exclude_ids_from_file in datasplitter (rosetta_decoys.txt)
+
+  datasplitter:
+    _target_: "proteinfoundation.datasets.pdb_data.PDBDataSplitter"
+    data_dir: ${oc.env:DATA_PATH}/pdb_train_t8b/ # TODO(T8b): NOT BUILT YET -- holds the edited CSV copy (REPAIR PLAN S8)
+    train_val_test: [0.98, 0.019, 0.001] # Cross-validation ratios to use for train, val, and test splits
+    split_type: "sequence_similarity" # Split sequences by sequence similarity clustering, other option is "random"
+    split_sequence_similarity: 0.25 # Clustering at 25% sequence similarity (argument is ignored if split_type!="sequence_similarity")
+    overwrite_sequence_clusters: False # Previous clusterings at same sequence similarity are reused and not overwritten (argument is ignored if split_type!="sequence_similarity")
+    exclude_ids: []  # Inline IDs excluded from train, distributed to val/test
+    exclude_ids_from_file: ${oc.env:DATA_PATH}/pdb_train/rosetta_decoys.txt  # One chain ID per line
+    drop_ids_from_file: ${oc.env:DATA_PATH}/pdb_train/unusable_chains.txt
+    split_dir: /orcd/scratch/orcd/011/chenxiou/t8_template_list  # T8 FROZEN split (inherit from max384; never redrawn); T8b keeps it

@@ -43,6 +43,7 @@ from proteinfoundation.datasets.sse_topology import (
     perturb_runs,
     sse_sequence_gap,
 )
+from proteinfoundation.datasets.transforms import SeqresIndexError
 
 # Sentinel written to graph.topology_ref_id when the sample is unconditioned (dropped, no index
 # row, or -- under require_nonself -- no non-self template available). Downstream, a sample is
@@ -87,6 +88,9 @@ class TopologyReferenceTransform(T.BaseTransform):
         single_token_types: alphabet types with one token regardless of length (T8: loops).
         elem_features: emit ``topology_he_elem_feat`` [T, 1] = element length, standardised by the index's
             ``elem_feature_mean`` / ``elem_feature_std`` (T8, user 2026-10-09: "Add a per-element length feature").
+        placeholder_span: span the dropped / masked reference's midpoints are spread over. "length" = the query's
+            modelled length L (T8); "seqres" = the query's SEQRES span last - first + 1, from
+            ``graph.residue_seqres_idx`` (T8b, user 2026-10-20; needs SeqresIndexTransform before this one).
     """
 
     def __init__(
@@ -113,6 +117,7 @@ class TopologyReferenceTransform(T.BaseTransform):
         element_types: Sequence[int] = (DSSP_HELIX, DSSP_STRAND),
         single_token_types: Sequence[int] = (),
         elem_features: bool = False,
+        placeholder_span: str = "length",
     ):
         if reference_source not in ("cluster", "synthetic"):
             raise ValueError(f"reference_source must be 'cluster' or 'synthetic', got {reference_source!r}")
@@ -146,6 +151,9 @@ class TopologyReferenceTransform(T.BaseTransform):
         if not set(self.element_types) <= set(self.alphabet.types):
             raise ValueError(f"element_types {self.element_types} must all be tokenised by the alphabet {self.alphabet.types}")
         self.elem_features = bool(elem_features)
+        if placeholder_span not in ("length", "seqres"):
+            raise ValueError(f"placeholder_span must be 'length' or 'seqres', got {placeholder_span!r}")
+        self.placeholder_span = placeholder_span
         self._elem_mean, self._elem_std = 0.0, 1.0
         self.seed = seed
         self._index = None
@@ -466,7 +474,8 @@ class TopologyReferenceTransform(T.BaseTransform):
             return None
         return self._build_reference(t_row, length, augment=False), str(self._index["ids"][t_row])
 
-    def masked_reference(self, stem: str, length: int, seed: int = 0) -> Dict[str, torch.Tensor]:
+    def masked_reference(self, stem: str, length: int, seed: int = 0,
+                         seqres_idx: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """This model's TRAINING-TIME no-reference case (``_set_empty``), served as a validation
         reference for the unconditional ("mask") arm.
 
@@ -476,8 +485,13 @@ class TopologyReferenceTransform(T.BaseTransform):
         path), which is the OLD model's convention, so a floor measured that way is out of this
         model's training distribution (user 2026-09-22). Built by ``_set_empty`` itself so the two
         cannot drift apart; seeded per (seed, stem) so every pass draws the same element count.
+        ``seqres_idx``: the query's rebased SEQRES positions, required when placeholder_span == "seqres".
         """
         g = Data()
+        if self.placeholder_span == "seqres":
+            if seqres_idx is None:
+                raise ValueError("placeholder_span='seqres' needs the query's seqres_idx")
+            g.residue_seqres_idx = seqres_idx
         saved = self._generator
         self._generator = torch.Generator().manual_seed((seed + zlib.crc32(stem.encode())) % (2**63))
         try:
@@ -589,8 +603,14 @@ class TopologyReferenceTransform(T.BaseTransform):
         else:
             n_el = 1
         n_el = max(1, min(n_el, self.max_topology_he_len))
-        # Midpoints of n_el equal slices of the query: (i + 0.5) * L / n_el.
-        pos = (torch.arange(n_el, dtype=torch.float32) + 0.5) * (float(L) / max(n_el, 1))
+        span = L
+        if self.placeholder_span == "seqres":  # T8b: the query's SEQRES span [0, last - first + 1)
+            if getattr(graph, "residue_seqres_idx", None) is None:
+                raise SeqresIndexError("placeholder_span='seqres' needs graph.residue_seqres_idx (SeqresIndexTransform)")
+            q = graph.residue_seqres_idx
+            span = int(q[-1] - q[0]) + 1
+        # Midpoints of n_el equal slices of the query: (i + 0.5) * span / n_el.
+        pos = (torch.arange(n_el, dtype=torch.float32) + 0.5) * (float(span) / max(n_el, 1))
         if missing:
             logger.warning(
                 f"[topology] NO synthetic reference for {stem!r} (TM range {self.tm_range}) -- "

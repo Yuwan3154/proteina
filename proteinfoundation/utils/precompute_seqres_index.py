@@ -9,6 +9,8 @@ Per chain status (never silent): ok; nonmonotone (label_seq_id not strictly incr
 residue_id covers several label_seq_id -- biopandas 0.5.1 drops insertion codes, so e.g. 82/82A/82B of one resname collapse);
 collide (two graph residues on one label_seq_id, e.g. microheterogeneity); no_label_seq (an ATOM row without label_seq_id);
 unmapped (a residue_id with no ATOM row); no_cif. Positions are stored for ok and nonmonotone only.
+Every chain also gets seq_sha1 = sha1 of its one-letter residue_type sequence in array order (transforms.residue_type_sha1),
+so a reader can detect a graph whose residues differ from the ones the table was built on.
 
 Usage:
   part:  python -m proteinfoundation.utils.precompute_seqres_index part  --pack PACK --data-dir DATA_PATH/pdb_train \
@@ -31,6 +33,7 @@ import torch
 from biopandas.mmcif import PandasMmcif
 
 from proteinfoundation.datasets.pdb_data import _resolve_raw_sharded
+from proteinfoundation.datasets.transforms import residue_type_sha1
 
 DEFINITION = ("label_seq_id (mmCIF _atom_site, 1-based SEQRES position) of each modelled residue in array order, mapped "
               "via residue_id = label_asym_id:resname:auth_seq_id:ins from the same biopandas read as processing")
@@ -110,7 +113,7 @@ def cmd_part(a):
             n_gaps = int((np.diff(pos) > 1).sum()) if status == "ok" else -1
             n_ins = sum(1 for r in rids if any(ins.get(r, ()))) if mapping is not None else -1
             rows.append({"stem": stem, "status": status, "L": len(rids), "pos": pos, "n_gaps": n_gaps,
-                         "n_merged": n_merged, "n_ins": n_ins})
+                         "n_merged": n_merged, "n_ins": n_ins, "seq_sha1": residue_type_sha1(g["residue_type"])})
         if (k + 1) % 200 == 0:
             print(f"[part {a.part}] {k + 1}/{len(pdbs)} entries {time.time() - t0:.0f} s", flush=True)
     out = pathlib.Path(a.out_dir) / f"part_{a.part:04d}_of_{a.n_parts:04d}.pt"
@@ -155,6 +158,7 @@ def cmd_merge(a):
         "offset": torch.from_numpy(offset),
         "label_seq_flat": torch.from_numpy(np.concatenate(flat) if flat else np.zeros(0, dtype=np.int32)),
         "length": torch.tensor([r["L"] for r in rows], dtype=torch.int32),
+        "seq_sha1": [r["seq_sha1"] for r in rows],  # residue-order fingerprint, checked by SeqresIndexTransform
         "audit": audit,
     }, a.out)
     with open(a.out + ".audit.tsv", "w") as f:
