@@ -25,7 +25,8 @@ case "$MODE" in
   compare) python "$S/t8b_confind_compare.py" --gate --gate-dir "$OUT/gate" --status-dir "$OUT/status/gate" ;;
   cache) python "$S/t8b_confind_cache.py" --status-tsv "$TSV" --tree "$FIX" --workers "$W" \
            --out-cache "$OUT/cache_full.json" --out-stems "$OUT/stems_full.txt" ;;
-  check) python "$S/t8b_confind_compare.py" --check --cache "$OUT/cache_full.json" --status-tsv "$TSV" \
+  # one torch thread per worker: 48 workers x 48 intra-op threads stalled the first check (26832562 TIMEOUT at 12 h)
+  check) OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python "$S/t8b_confind_compare.py" --check --cache "$OUT/cache_full.json" --status-tsv "$TSV" \
            --status-dir "$OUT/status/full" --ref-maps "$OUT/gate/ref_maps.pt" --workers "$W" ;;
   *) echo "bad MODE=$MODE"; exit 2 ;;
 esac
