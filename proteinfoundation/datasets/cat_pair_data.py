@@ -16,7 +16,7 @@ baked in the way the per-native T8 index bakes it.
 import os
 import tempfile
 import zlib
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -26,7 +26,7 @@ from torch_geometric.data import Data
 from proteinfoundation.datasets.base_data import BaseLightningDataModule
 from proteinfoundation.datasets.cat_unit_store import UnitStore, seg_positions
 from proteinfoundation.datasets.topology_reference import ALIGN_NONE, MASK_REF_ID, TopologyReferenceTransform
-from proteinfoundation.utils.cluster_utils import CATUniformSampler  # noqa: F401  (re-exported for configs)
+from proteinfoundation.utils.cluster_utils import CATUniformSampler
 from proteinfoundation.utils.precompute_synthetic_topology_index import usalign_pairs, write_ca_pdb
 
 AA = "ARNDCQEGHILKMFPSTWYV"  # openfold restype order (the unit store's aatype)
@@ -104,7 +104,7 @@ class CATPairReferenceTransform(TopologyReferenceTransform):
         pair_seed = getattr(graph, "pair_seed", None)  # fixed validation set: every draw of this item is a function of the member id
         if pair_seed is not None:
             del graph.pair_seed
-            running, self._generator = self._generator, torch.Generator().manual_seed(int(pair_seed) % (2**63))
+            running, self._generator = self._generator, torch.Generator().manual_seed(int(pair_seed))
         drop = float(torch.rand(1, generator=self._generator)) < self.drop_prob
         # resolved BEFORE the drop is honoured, as in synthetic mode: topology_missing_ref then reports coverage, not coverage after dropout
         t_row = self._pick_cat_template(row) if row is not None else -1
