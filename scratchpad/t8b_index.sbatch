@@ -38,7 +38,7 @@ MODE="${MODE:?MODE}"
 mkdir -p "$OUT/parts" "$MAPS" "$S/t8b_index_logs"
 # Frame2ConFind _make_s_init computes dihedrals without the mask -> padded chains get a corrupt C-term (diag 2026-10-25)
 [ "${F2C_BS:-}" = 1 ] && [ "${REUSE_T8:-}" = 0 ] || { echo "FATAL: need F2C_BS=1 REUSE_T8=0 (decided 2026-10-25)"; exit 2; }
-T8B_INDEX_SHA=__SET_TO_COMMIT_SHA__   # TODO(coordinator): the commit that introduces --final-selection (set after commit)
+T8B_INDEX_SHA=eafcec395dc2545e71fe0b9b018d0c14e5ae07a2   # the commit that introduces --final-selection
 cd "$REPO" || exit 3
 git log --oneline -1
 case "$T8B_INDEX_SHA" in __*) echo "FATAL: T8B_INDEX_SHA placeholder not set"; exit 3;; esac
