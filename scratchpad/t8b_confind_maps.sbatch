@@ -16,14 +16,16 @@
 # Before the first submit (login node): mkdir -p /orcd/compute/so3/002/chenxi/t8b_confind/logs (the -o / --chdir dirs must exist).
 # -t 06:00:00 = mit_normal_gpu MaxTime (mit_preemptable allows 2 days). GPU pinned to L40S = the original run's type (bf16
 # kernels differ by architecture; the gate only covers the type it ran on). --chdir keeps the checkout off sys.path.
+# full uses bs 1: Frame2ConFind _make_s_init computes dihedrals on the padded batch without the mask, so a chain padded in a
+# mixed-length batch gets wrong last-residue psi/omega; June batches were single-length (unpadded); bs 1 = that value (diag 10-25).
 #   sbatch --export=ALL,MODE=gate scratchpad/t8b_confind_maps.sbatch
 source /orcd/pool/006/chenxiou/backfill/env.sh
 set -u
 : "${MODE:?MODE=gate|full}"
 OUT=/orcd/compute/so3/002/chenxi/t8b_confind
 case "$MODE" in
-  gate) FULL=$OUT/gate/cache_gate.json; PROC=$OUT/gate/processed; OVW=--overwrite ;;
-  full) FULL=$OUT/cache_full.json; PROC=/orcd/compute/so3/002/chenxi/pdb_train_seqres_fix/processed; OVW= ;;
+  gate) FULL=$OUT/gate/cache_gate.json; PROC=$OUT/gate/processed; OVW=--overwrite; BS=8 ;;
+  full) FULL=$OUT/cache_full.json; PROC=/orcd/compute/so3/002/chenxi/pdb_train_seqres_fix/processed; OVW=; BS=1 ;;
   *) echo "bad MODE=$MODE"; exit 2 ;;
 esac
 SDIR=$OUT/status/$MODE
@@ -72,10 +74,10 @@ rc=$?
 n=$(python -c "import json;print(len(json.load(open('$REM'))))")
 if [ "$n" -eq 0 ]; then echo "[$(date)] $MODE complete (0 remaining)"; exit 0; fi
 
-echo "[$(date)] === $MODE: $n remaining, max-len 512, bs 8 $OVW ==="
+echo "[$(date)] === $MODE: $n remaining, max-len 512, bs $BS $OVW ==="
 python -m proteinfoundation.utils.precompute_frame2confind_maps \
   --checkpoint "$CKPT" --processed-dir "$PROC" --length-cache "$REM" \
-  --max-len 512 --batch-size 8 --amp-dtype bf16 --save-workers 8 $OVW \
+  --max-len 512 --batch-size $BS --amp-dtype bf16 --save-workers 8 $OVW \
   --status-csv "$SDIR/band1_${JOB}.csv" --log "$OUT/logs/t8b_confind_${MODE}_${JOB}.log"
 rc=$?
 python - "$SDIR/band1_${JOB}.csv" <<'PY'
