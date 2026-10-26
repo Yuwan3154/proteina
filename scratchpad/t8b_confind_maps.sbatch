@@ -11,21 +11,26 @@
 #SBATCH --dependency=singleton
 #SBATCH --chdir=/orcd/compute/so3/002/chenxi/t8b_confind
 # T8b native ConFind maps on 1 GPU = the winner rerun (backfill/winner_rerun.sh, job 15356272) band1 settings.
-# MODE=gate: the 100 copied originals (--overwrite); MODE=full: every status==changed chain of the fix tree.
+# MODE=gate: the 100 copied originals (--overwrite); MODE=full: every status==changed chain of the fix tree;
+# MODE=padfix: the June pad-fix copies of UNCHANGED chains in the fix tree (t8b_confind_cpu.sbatch MODE=padfix_cache;
+#   --overwrite on those copies only, bs 1; the cache must equal padfix/stems_padfix.txt, every row under the fix tree).
 # Resumable: remaining = cache minus status=processed basenames over all session CSVs of the mode; resubmit (singleton: one session at a time).
 # Before the first submit (login node): mkdir -p /orcd/compute/so3/002/chenxi/t8b_confind/logs (the -o / --chdir dirs must exist).
 # -t 06:00:00 = mit_normal_gpu MaxTime (mit_preemptable allows 2 days). GPU pinned to L40S = the original run's type (bf16
 # kernels differ by architecture; the gate only covers the type it ran on). --chdir keeps the checkout off sys.path.
 # full uses bs 1: Frame2ConFind _make_s_init computes dihedrals on the padded batch without the mask, so a chain padded in a
-# mixed-length batch gets wrong last-residue psi/omega; June batches were single-length (unpadded); bs 1 = that value (diag 10-25).
+# mixed-length batch gets wrong last-residue psi/omega; June batches were length-sorted, so most were single-length
+# (unpadded) but mixed-length boundary batches padded their shorter chains (fixed by MODE=padfix); bs 1 = the unpadded value.
 #   sbatch --export=ALL,MODE=gate scratchpad/t8b_confind_maps.sbatch
 source /orcd/pool/006/chenxiou/backfill/env.sh
 set -u
-: "${MODE:?MODE=gate|full}"
+: "${MODE:?MODE=gate|full|padfix}"
 OUT=/orcd/compute/so3/002/chenxi/t8b_confind
 case "$MODE" in
   gate) FULL=$OUT/gate/cache_gate.json; PROC=$OUT/gate/processed; OVW=--overwrite; BS=8 ;;
   full) FULL=$OUT/cache_full.json; PROC=/orcd/compute/so3/002/chenxi/pdb_train_seqres_fix/processed; OVW=; BS=1 ;;
+  padfix) FULL=$OUT/padfix/cache_padfix.json; PROC=/orcd/compute/so3/002/chenxi/pdb_train_seqres_fix/processed
+          OVW=--overwrite; BS=1; STEMS=$OUT/padfix/stems_padfix.txt ;;
   *) echo "bad MODE=$MODE"; exit 2 ;;
 esac
 SDIR=$OUT/status/$MODE
@@ -56,11 +61,15 @@ F=$(python -c 'import proteinfoundation.utils.precompute_frame2confind_maps as m
 [ "$(md5sum "$F" | cut -d' ' -f1)" = cbe6c67e747d85285909c89a70c0f14e ] || { echo "PRECOMPUTE_MD5_MISMATCH $F"; exit 6; }
 echo "[code] $F; Frame2ConFind $(python -c 'import Frame2ConFind; print(Frame2ConFind.__file__)')"
 
-python - "$FULL" "$SDIR" "$REM" "$PROC" <<'PY'
+python - "$FULL" "$SDIR" "$REM" "$PROC" "${STEMS:-}" <<'PY'
 import csv, glob, json, os, sys
-full_path, sdir, rem_path, proc = sys.argv[1:5]
+full_path, sdir, rem_path, proc, stems = sys.argv[1:6]
 full = json.load(open(full_path))
 assert all(e[0].startswith(proc.rstrip("/") + "/") and "/orcd/pool/006/chenxiou/proteina/data/" not in e[0] for e in full), "cache row outside PROC"
+if stems:
+    want = {l.strip() + ".pt" for l in open(stems) if l.strip()}
+    names = [os.path.basename(e[0]) for e in full]
+    assert len(names) == len(set(names)) and set(names) == want, f"cache != {stems}"
 done = set()
 for c in glob.glob(os.path.join(sdir, "*.csv")):
     with open(c) as fh:

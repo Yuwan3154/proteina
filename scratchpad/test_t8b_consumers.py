@@ -1,7 +1,7 @@
 """T8b SEQRES positions through their CONSUMERS, at the T8b yaml's values (CPU, toy files in a temp dir).
 
 1. End to end: toy chains with SEQRES gaps wider than the AF2 clip -> the T8b dataset yaml's SeqresIndexTransform +
-   TopologyReferenceTransform (drop_prob 0.25, drop_ref_len_range [14, 80], a toy synthetic index with real template
+   TopologyReferenceTransform (drop_prob 0.25, drop_ref_len_range [13, 78], a toy synthetic index with real template
    rows) -> the real DensePaddingDataLoader collate -> ContactMapTriV2 built from the T8b nn yaml. The relpos the model
    embeds equals AF2 clip(p_i - p_j, -32, 32) + 32 on the rebased label_seq_id (query-query and query-template), for
    both served and dropped references.
@@ -118,7 +118,7 @@ def af2_relpos(p, q):
 def test_end_to_end():
     torch.manual_seed(0)
     sq, tr = t8b_transforms()
-    assert tr.drop_prob == 0.25 and tuple(tr.drop_ref_len_range) == (14, 80) and tr.placeholder_span == "seqres"
+    assert tr.drop_prob == 0.25 and tuple(tr.drop_ref_len_range) == (13, 78) and tr.placeholder_span == "seqres"
     m = t8b_model()
     got = []
     m.z_embed.rel_pos.register_forward_pre_hook(lambda mod, a: got.append(a[0].clone()))

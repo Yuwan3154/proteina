@@ -172,8 +172,8 @@ def test_placeholder_spread_and_frame_c():
     sq = hydra.utils.instantiate(specs[i_s], required_ids_files=[write_ids("ok2.txt", ["1abc_A"])])
     tr = hydra.utils.instantiate(specs[i_t])
     assert isinstance(tr, TopologyReferenceTransform) and tr.placeholder_span == "seqres"
-    assert tuple(tr.drop_ref_len_range) == (14, 80)
-    print(f"PASS T8b yaml: {names[i_s]} directly before {names[i_t]}; placeholder_span seqres; drop_ref_len_range (14, 80)")
+    assert tuple(tr.drop_ref_len_range) == (13, 78)
+    print(f"PASS T8b yaml: {names[i_s]} directly before {names[i_t]}; placeholder_span seqres; drop_ref_len_range (13, 78)")
 
     g = sq(graph("1abc_A", 6))
     span = 17 + 1
@@ -182,9 +182,9 @@ def test_placeholder_spread_and_frame_c():
         tr._set_empty(g, L=6)
         n = g.topology_he_pos_raw.numel()
         want = (torch.arange(n, dtype=torch.float32) + 0.5) * (span / n)
-        assert 14 <= n <= 80 and torch.equal(g.topology_he_pos_raw, want) and torch.equal(g.topology_he_pos, want)
+        assert 13 <= n <= 78 and torch.equal(g.topology_he_pos_raw, want) and torch.equal(g.topology_he_pos, want)
         assert float(g.topology_he_pos_raw[-1]) > 6, "spread over the SEQRES span 18, not the modelled length 6"
-    print(f"PASS _set_empty midpoints = (i + 0.5) * 18 / n_el (SEQRES span 0..17), 20 of 20 draws, n_el in [14, 80]")
+    print(f"PASS _set_empty midpoints = (i + 0.5) * 18 / n_el (SEQRES span 0..17), 20 of 20 draws, n_el in [13, 78]")
 
     stem, seed = "1abc_A", 3
     ref = tr.masked_reference(stem, 6, seed=seed, seqres_idx=g.residue_seqres_idx)

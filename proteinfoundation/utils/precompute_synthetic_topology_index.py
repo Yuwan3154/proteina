@@ -877,6 +877,9 @@ def cmd_build(args):
             "element_types": list(_ELEMENT_TYPES), "loop_axis": _LOOP_AXIS, "template_gate": _gate_def()}
     if _TEMPLATE_SOURCE is not None:
         part["template_source"] = _TEMPLATE_SOURCE
+        if args.native_pack:  # final-selection mode only (T8 parts stay byte-identical): which natives built the rows
+            part["native_source"] = json.dumps({"native_pack": os.path.abspath(args.native_pack),
+                                                "native_idx_md5": _md5(args.native_pack + ".idx.npz")}, sort_keys=True)
     torch.save(part, part_path)
     with open(os.path.join(args.out_dir, f"skips_{args.part:04d}.tsv"), "w") as fh:
         fh.write("\n".join(skip_lines) + ("\n" if skip_lines else ""))
@@ -1275,6 +1278,7 @@ def cmd_merge(args):
                 elem_count += stats[3]
 
     min_len, contact_def, dssp_defs, elem_defs, gate_defs, src_defs = None, None, set(), set(), set(), set()
+    nat_defs = set()
     for part in range(args.n_parts):
         p = os.path.join(args.parts_dir, f"part_{part:04d}.pt")
         if not os.path.exists(p):
@@ -1285,6 +1289,7 @@ def cmd_merge(args):
         elem_defs.add((tuple(d.get("element_types", (DSSP_HELIX, DSSP_STRAND))), d.get("loop_axis", None)))
         gate_defs.add(d.get("template_gate", "none"))  # parts written before the key existed had no gate
         src_defs.add(d.get("template_source"))  # None = not final-selection mode
+        nat_defs.add(d.get("native_source"))  # None = parts without the stamp (T8 / pre-stamp final-selection)
         for ch in d["chains"]:
             if ch["native"] is None:
                 continue                                # skipped chains are in the skip logs
@@ -1336,6 +1341,8 @@ def cmd_merge(args):
         raise ValueError(f"parts disagree on the template gate: {sorted(gate_defs)}")
     if len(src_defs) != 1:
         raise ValueError(f"parts disagree on the template source: {sorted(src_defs, key=str)}")
+    if len(nat_defs) != 1:
+        raise ValueError(f"parts disagree on the native source: {sorted(nat_defs, key=str)}")
     out = {
         "ids": ids,
         "cluster_of": torch.tensor(cluster_of, dtype=torch.int32),
@@ -1371,6 +1378,9 @@ def cmd_merge(args):
     template_source = src_defs.pop()
     if template_source is not None:
         out["template_source"] = template_source
+    native_source = nat_defs.pop()
+    if native_source is not None:
+        out["native_source"] = native_source
     if elem_count:
         em = elem_sum / elem_count
         out["elem_feature_names"] = ["length"]

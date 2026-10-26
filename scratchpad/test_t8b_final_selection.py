@@ -7,6 +7,7 @@ absent, the plan's missing-N/CA/C count, and the T8 pack-mode path bit-identical
 subprocess runs from a neutral cwd so the HEAD arm really imports HEAD).
 Run (local: conda synthbench_cpu; needs git + USalign): python scratchpad/test_t8b_final_selection.py [USALIGN]"""
 
+import hashlib
 import io
 import json
 import os
@@ -380,11 +381,13 @@ def main():
     run(["merge", "--parts-dir", parts, "--n-parts", "2", "--out", td + "/idx.pt", "--eligible-out", td + "/elig.txt"])
     idx = torch.load(td + "/idx.pt", weights_only=False)
     assert json.loads(idx["template_source"]) == src
+    assert json.loads(idx["native_source"]) == {"native_pack": os.path.abspath(natp), "native_idx_md5":
+                                                hashlib.md5(open(natp + ".idx.npz", "rb").read()).hexdigest()}
     assert sorted(open(td + "/elig.txt").read().split()) == ["a_A", "b_B"]
     tpl_ids = [i for i, n in zip(idx["ids"], idx["row_is_native"].tolist()) if not n]
     assert sorted(tpl_ids) == sorted(f"{s}@rw125#{k}" for s in ("a_A", "b_B") for k in exp_rows[s]), tpl_ids
     assert len(set(idx["ids"])) == len(idx["ids"])
-    print(f"PASS merge: {len(tpl_ids)} template rows, ids e.g. {tpl_ids[0]}, template_source carried, eligible a_A b_B")
+    print(f"PASS merge: {len(tpl_ids)} template rows, ids e.g. {tpl_ids[0]}, template_source + native_source carried, eligible a_A b_B")
 
     # --- CLI guards
     o = run(["build", *SEL, *BLD, "--max-templates", "64", "--part", "0", "--n-parts", "1", "--f2c-maps", maps,

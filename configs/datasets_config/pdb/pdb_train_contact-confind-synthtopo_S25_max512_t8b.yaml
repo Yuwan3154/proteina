@@ -72,7 +72,8 @@ datamodule:
       type_mutate_prob: 0.1          # per-element probability of a helix <-> strand flip (user, D5)
       token_mask_prob: 0.1           # per-element probability of MASKing the token; target kept for the MLM loss (user, D5)
       drop_prob: 0.25                # train an unconditional branch for classifier-free guidance.
-      drop_ref_len_range: [14, 80]   # T8 MEASURED by the D22 rule (p5-p95 of the served element count, 1,500 TRAIN
+      drop_ref_len_range: [13, 78]   # T8b RE-MEASURED by the same D22 rule on the T8b index (user 2026-10-26 'Yes'; same script,
+                                     # job 26901008: p5 13 / median 43 / p95 78). T8: [14, 80], MEASURED by the D22 rule (p5-p95 of the served element count, 1,500 TRAIN
                                      # references through this transform, drop_prob 0; t8_measure_drop_ref_len.py @f92c605,
                                      # job 25853652, 2026-10-14): p5 14 / median 42 / p95 80, linear = nearest; loops count
                                      # as elements here. The old [5, 39] counted helix/strand only. Old note: a DROPPED reference is a variable-length FULLY MASKED

@@ -16,6 +16,9 @@
 #   MODE=build      CPU: build of one part (array)
 #   MODE=audit      CPU: audit the N_PARTS parts (strict: exits non-zero on any failure class)
 #   MODE=merge      CPU: audit (strict) then merge
+#   MODE=diff       CPU: June pad-fix v1 ($C/t8b_index) vs this OUT_DIR (v2): only the CHECKED pad-fix natives
+#                   (check_padfix.tsv) may differ; v2's native_source stamp must be NATIVE_PACK
+# A non-default OUT_DIR (v2) needs NATIVE_PACK given explicitly (a v2 index built from the v1 pack would be silent).
 # F2C_BS=1 and REUSE_T8=0 are required (decided 2026-10-25): every template map recomputed unpadded, no T8 copies
 # (T8 ran batch 8, padded); f2c_plan still counts what would have been reusable, for the record.
 # Pass --gres / --partition / cpus / mem / time at submit (GPU: L40S / H100 / H200 only, checked below).
@@ -30,17 +33,26 @@ DATA="${DATA_DIR:-/orcd/pool/006/chenxiou/proteina/data/pdb_train_t8b}"
 PACK=$C/t2_synth_v2/pack
 PRE_IDX=$PACK/tmpl.idx.npz.pre-append    # the index the T8 maps were computed from (pack before the 10-16/18 appends)
 T8B_PACK=$C/t2_synth_v2_t8b/pack
-NATIVE_PACK=$C/proteina_pack/tri_t8b_512.pack
 CHAINS="${CHAINS:-$S/t8_template_list/template_chains.txt}"
 OVERRIDE=$S/t8b_template_list/template_chains.txt
 N_PARTS="${N_PARTS:-60}"
 MODE="${MODE:?MODE}"
+case "$MODE" in smoke|build|merge|diff)
+  if [ "$OUT" != "$C/t8b_index" ] && [ -z "${NATIVE_PACK:-}" ]; then
+    echo "FATAL: OUT_DIR=$OUT is not the default: give NATIVE_PACK explicitly (pad-fix v2: tri_t8b_512_v2.pack)"; exit 2
+  fi
+  if [ "$OUT" = "$C/t8b_index" ] && [ -n "${NATIVE_PACK:-}" ] && [ "$NATIVE_PACK" != "$C/proteina_pack/tri_t8b_512.pack" ]; then
+    echo "FATAL: NATIVE_PACK=$NATIVE_PACK would rebuild into the v1 index dir $OUT: set OUT_DIR (v2)"; exit 2
+  fi;;
+esac
+NATIVE_PACK="${NATIVE_PACK:-$C/proteina_pack/tri_t8b_512.pack}"
 mkdir -p "$OUT/parts" "$MAPS" "$S/t8b_index_logs"
 # Frame2ConFind _make_s_init computes dihedrals without the mask -> padded chains get a corrupt C-term (diag 2026-10-25)
 [ "${F2C_BS:-}" = 1 ] && [ "${REUSE_T8:-}" = 0 ] || { echo "FATAL: need F2C_BS=1 REUSE_T8=0 (decided 2026-10-25)"; exit 2; }
 T8B_INDEX_SHA=eafcec395dc2545e71fe0b9b018d0c14e5ae07a2   # the commit that introduces --final-selection
 cd "$REPO" || exit 3
 git log --oneline -1
+echo "NATIVE_PACK=$NATIVE_PACK OUT=$OUT MAPS=$MAPS"
 case "$T8B_INDEX_SHA" in __*) echo "FATAL: T8B_INDEX_SHA placeholder not set"; exit 3;; esac
 git merge-base --is-ancestor "$T8B_INDEX_SHA" HEAD || { echo "FATAL: $REPO predates $T8B_INDEX_SHA (final-selection mode)"; exit 3; }
 for f in "$PACK/final_selection.npz" "$PRE_IDX" "$T8B_PACK/final_selection.npz" "$OVERRIDE" "$CHAINS"; do
@@ -116,6 +128,16 @@ case "$MODE" in
           --eligible-out "$OUT/eligible_ids_tm0.5-0.9.txt" --tm-range 0.5 0.9
       RC=$?
     fi
+    ;;
+  diff)
+    cpu_env
+    V1=$C/t8b_index
+    [ "$(realpath "$OUT")" != "$(realpath "$V1")" ] || { echo "FATAL: OUT_DIR is v1 itself"; exit 3; }
+    python scratchpad/t8b_index_diff.py --old "$V1/topology_index_confind_synth_t8b.pt" \
+        --new "$OUT/topology_index_confind_synth_t8b.pt" --old-eligible "$V1/eligible_ids_tm0.5-0.9.txt" \
+        --new-eligible "$OUT/eligible_ids_tm0.5-0.9.txt" --expect-native-pack "$NATIVE_PACK" \
+        --checked-tsv "${CHECKED_TSV:-$C/t8b_confind/padfix/check_padfix.tsv}"
+    RC=$?
     ;;
   *) echo "unknown MODE=$MODE"; RC=2;;
 esac
