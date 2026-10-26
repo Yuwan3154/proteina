@@ -9,6 +9,8 @@
 # T8b SEQRES side table (proteinfoundation/utils/precompute_seqres_index.py). CPU only; partition / --array / --time at
 # submit. Env: MODE=part|merge, STEMS (one stem per line), OUT_DIR (parts dir), N_PARTS (part mode; the array index is
 # the part), OUT (merge mode). PACK defaults to the T8 pack.
+# REAL_INS=1 keys residue_id on the real mmCIF insertion code (required for the T8b overlay pack: its re-processed
+# graphs carry real codes; blank keying left 6,943 of them 'unmapped', v3 2026-10-25).
 source /etc/profile >/dev/null 2>&1 || true
 set -uo pipefail
 # sbatch runs a spooled copy of this file, so the checkout comes from the environment
@@ -24,7 +26,8 @@ if [ "$MODE" = part ]; then
     mkdir -p "$OUT_DIR"
     python -m proteinfoundation.utils.precompute_seqres_index part --pack "$PACK" \
         --data-dir /orcd/pool/006/chenxiou/proteina/data/pdb_train --stems "$STEMS" \
-        --part "${SLURM_ARRAY_TASK_ID:?array index = part}" --n-parts "$N_PARTS" --out-dir "$OUT_DIR"
+        --part "${SLURM_ARRAY_TASK_ID:?array index = part}" --n-parts "$N_PARTS" --out-dir "$OUT_DIR" \
+        $([ "${REAL_INS:-0}" = 1 ] && echo --real-ins)
 elif [ "$MODE" = merge ]; then
     python -m proteinfoundation.utils.precompute_seqres_index merge --stems "$STEMS" --parts-dir "$OUT_DIR" --out "$OUT"
 else

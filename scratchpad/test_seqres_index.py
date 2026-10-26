@@ -66,6 +66,19 @@ def main():
     assert chain_positions(rids_c, mapping) == ("merged", None, 1)
     print(f"PASS chain C: LYS 21 + 21A collapse into {rids_c[1]} -> merged (label_seq {sorted(mapping[rids_c[1]])})")
 
+    # SEQRES-order processing (T8b re-process) keeps the real insertion code in residue_id -> key the table the same way
+    real_map, _ = residue_label_seq(path, real_ins=True)
+    for ch, want in (("B", [1, 2, 4, 5, 8]), ("C", None)):
+        gr = protein_to_pyg(df=read_pdb_to_dataframe(path=path, mmcif_seqres_fields=True), path=path, chain_selection=[ch],
+                            keep_insertions=True, residue_order="label_seq", resolve_altlocs=True)
+        rids_r = list(gr.residue_id)
+        status, pos, _ = chain_positions(rids_r, real_map)
+        assert status == "ok" and (want is None or pos.tolist() == want), (ch, rids_r, status, pos)
+        assert ch != "C" or len(rids_r) == 3, rids_r  # LYS 21 and 21A are separate residues again
+        assert any(r.split(":")[3] for r in rids_r), (ch, rids_r)
+        assert chain_positions(rids_r, mapping)[0] == "unmapped", ch  # blank keying cannot match real insertion codes
+        print(f"PASS real insertion codes, chain {ch}: {rids_r} -> label_seq_id {pos.tolist()}; blank keying -> unmapped")
+
     status, pos, _ = chain_positions(["X:ALA:1:", "X:GLY:2:", "X:SER:3:"], {"X:ALA:1:": {3}, "X:GLY:2:": {1}, "X:SER:3:": {2}})
     assert status == "nonmonotone" and pos.tolist() == [3, 1, 2], (status, pos)
     assert chain_positions(["X:VAL:2:", "X:ILE:2:"], {"X:VAL:2:": {2}, "X:ILE:2:": {2}}) == ("collide", None, 0)
@@ -92,7 +105,7 @@ def main():
     open(stems, "w").write("9zzz_B\n9zzz_C\n")
     parts = os.path.join(d, "parts")
     os.makedirs(parts)
-    cmd_part(argparse.Namespace(pack=pack, data_dir=os.path.join(d, "pdb_train"), stems=stems, part=0, n_parts=1,
+    cmd_part(argparse.Namespace(pack=pack, data_dir=os.path.join(d, "pdb_train"), stems=stems, part=0, n_parts=1, real_ins=False,
                                 out_dir=parts))
     out = os.path.join(d, "seqres.pt")
     cmd_merge(argparse.Namespace(stems=stems, parts_dir=parts, out=out))
