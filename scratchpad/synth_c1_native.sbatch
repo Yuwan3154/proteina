@@ -9,7 +9,7 @@
 #SBATCH --output=/home/gridsan/cou/logs/%x-%j.out
 #SBATCH --error=/home/gridsan/cou/logs/%x-%j.err
 # Control C1 of the synthetic-template benchmark (synth_c1_native.py): c2c twin from each target's native ConFind map, one GPU.
-#   PAIRS=<ladder pairs JSONL>  OUT  C2C_CKPT  F2C_CKPT_DIR  REPO  optional F2C_PARENT FRAME2SEQ_HOME K
+#   PAIRS=<ladder pairs JSONL>  OUT  C2C_CKPT  F2C_CKPT_DIR  REPO  optional F2C_PARENT FRAME2SEQ_HOME K C1_ARGS (e.g. C1b: --map confind ...)
 # Same environment as synth_tri_bench.sbatch; no -u (Z97-byobu.sh reads an unset LC_BYOBU).
 source /etc/profile
 set -eo pipefail
@@ -33,6 +33,6 @@ echo "[ckpt] c2c md5=$(md5sum < "$C2C_CKPT" | cut -c1-12)"
 cd "$REPO"
 rc=0
 python scratchpad/synth_c1_native.py --pairs "$PAIRS" --c2c-ckpt "$C2C_CKPT" --f2c-ckpt-dir "$F2C_CKPT_DIR" \
-    --out "$OUT" --k "${K:-8}" || rc=$?
+    --out "$OUT" --k "${K:-8}" ${C1_ARGS:-} || rc=$?
 echo "[rc] $rc"
 exit $rc
