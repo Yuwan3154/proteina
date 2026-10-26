@@ -9,7 +9,17 @@ the batch's infer_sec if its save raised) in as_completed order, before the next
 rows, chunk the rest into consecutive groups of bs; only the final group may be shorter. Checked: one infer_sec per
 group, adjacent groups differ, no group longer than the previous group's shortest chain. Padded = L < its group's max L.
 
-list:  python t8b_padfix_list.py list --june-csv band1_15356272.csv --bs 8 --status-tsv reproc_status_final.tsv \
+Exact attribution (pdb_train held some stems twice -- a flat processed/<stem>.pt and a bucket copy -- and the CSV keys on
+the basename): the June pending list is REPLAYED from the length cache winner_rerun.sh fed to the precompute (rows with
+L <= --max-len, stable sort by L desc, load failures skip their slot, chunks of bs) and asserted equal to the CSV batches
+(same (basename, L) multiset per batch). Each T8b stem is then mapped to the copy T8b reads, _processed_path_sharded(
+<data-dir>/processed, stem, <data-dir>/shard_manifest.json), compared to the cache LEXICALLY as a path relative to
+<data-dir>/processed (the cache spells <data-dir>/processed/...; processed has since become a symlink and the flat
+copies are deleted, so nothing is resolved on disk); that path must be in the cache exactly once, and its batch decides
+padding. n_june_rows (CSV rows with the stem's basename) is information only.
+
+list:  python t8b_padfix_list.py list --june-csv band1_15356272.csv --length-cache full_pdb_train_band1.json \
+           --data-dir DATA_PATH/pdb_train --max-len 512 --bs 8 --status-tsv reproc_status_final.tsv \
            --template-list template_chains.txt --eligible eligible_ids_tm0.5-0.9.txt --val-fixed val_fixed32.txt \
            --n-parts 60 --out-tsv padfix_list.tsv
 table: python t8b_padfix_list.py table --status-tsv reproc_status_final.tsv --padfix-list padfix_list.tsv \
@@ -22,10 +32,14 @@ import argparse
 import collections
 import csv
 import io
+import json
 import os
+import pathlib
 import statistics as st
 
-LIST_COLS = ["stem", "L_june", "batch", "batch_n", "batch_max_L", "pad", "L_old", "L_new", "in_template_list",
+from proteinfoundation.datasets.pdb_data import _processed_path_sharded
+
+LIST_COLS = ["stem", "L_june", "batch", "batch_n", "batch_max_L", "pad", "n_june_rows", "L_old", "L_new", "in_template_list",
              "index_part", "eligible", "val_fixed"]
 PAD_CATEGORY, PAD_FIELDS = "confind_pad", "contact_map_confind"
 
@@ -38,8 +52,9 @@ def june_batches(csv_path, bs):
     """(batches = [[row, ...]] in CSV order, load-failure rows, save-failure rows)."""
     with open(csv_path, newline="") as fh:
         rows = list(csv.DictReader(fh))
-    names = [r["file"] for r in rows]
-    assert len(names) == len(set(names)), f"{csv_path}: a file occurs twice (more than one session in one CSV?)"
+    # pdb_train holds some stems twice (flat + bucket copies): the CSV 'file' column is a basename, so a stem can have 2 rows
+    mult = collections.Counter(collections.Counter(r["file"] for r in rows).values())
+    print(f"[june] basename multiplicity {dict(sorted(mult.items()))}", flush=True)
     assert {r["status"] for r in rows} <= {"processed", "failed"}, {r["status"] for r in rows}
     load_failed = [r for r in rows if is_load_failure(r)]
     in_batch = [r for r in rows if not is_load_failure(r)]
@@ -54,6 +69,39 @@ def june_batches(csv_path, bs):
             assert max(int(r["length"]) for r in b) <= min(int(r["length"]) for r in prev), \
                 f"group {k} has a chain longer than group {k - 1}'s shortest (pending is sorted by L desc)"
     return batches, load_failed, save_failed
+
+
+def replay(cache_path, root, max_len, bs, batches, load_failed):
+    """June pending replayed from the length cache -> {path relative to root: batch index}; asserted against the CSV."""
+    with open(cache_path) as fh:
+        cache = json.load(fh)
+    root = os.path.normpath(root)
+    rel = []
+    for p, L, _ in cache:
+        q = os.path.normpath(p)
+        assert q.startswith(root + "/"), f"cache path {p} is not under {root}"
+        rel.append((os.path.relpath(q, root), int(L)))
+    assert len({r for r, _ in rel}) == len(rel), "cache paths are not unique after normalisation"
+    pending = [x for x in rel if x[1] <= max_len]
+    pending.sort(key=lambda x: x[1], reverse=True)  # stable, = the precompute's pending.sort(reverse=True)
+    lf = collections.Counter(r["file"] for r in load_failed)
+    n_by_name = collections.Counter(os.path.basename(r) for r, _ in pending)
+    amb = [f for f in lf if n_by_name[f] != 1 or lf[f] != 1]
+    assert not amb, f"load-failure basenames not unique in pending (which copy failed is unknown: ask): {amb[:5]}"
+    slots = [x for x in pending if os.path.basename(x[0]) not in lf]
+    groups = [slots[i:i + bs] for i in range(0, len(slots), bs)]
+    print(f"[replay] {cache_path}: {len(rel)} paths, {len(pending)} with L <= {max_len}, {len(lf)} load failures skipped, "
+          f"{len(groups)} batches (CSV {len(batches)})", flush=True)
+    assert len(groups) == len(batches), "replayed batch count != CSV batch count"
+    bad_name = [k for k, (g, b) in enumerate(zip(groups, batches))
+                if collections.Counter(os.path.basename(r) for r, _ in g) != collections.Counter(x["file"] for x in b)]
+    bad_len = [k for k, (g, b) in enumerate(zip(groups, batches))
+               if collections.Counter((os.path.basename(r), L) for r, L in g)
+               != collections.Counter((x["file"], int(x["length"])) for x in b)]
+    print(f"[replay] batches whose basename multiset differs from the CSV: {len(bad_name)} {bad_name[:5]}; "
+          f"(basename, L) multiset differs: {len(bad_len)} {bad_len[:5]}", flush=True)
+    assert not bad_name and not bad_len, "replay does not reproduce the June CSV batches"
+    return {r: k for k, g in enumerate(groups) for r, _ in g}, {r: L for r, L in rel}
 
 
 def read_lines(path):
@@ -91,13 +139,24 @@ def cmd_list(a):
           f"(final batch {len(batches[-1]) if batches else 0} rows) + {len(load_failed)} load failures; "
           f"{len(save_failed)} save failures inside batches; {len(mixed)} mixed-length batches", flush=True)
 
-    info, save_failed_names = {}, {r["file"] for r in save_failed}
-    for k, b in enumerate(batches):
-        mx = max(int(r["length"]) for r in b)
-        for r in b:
-            info[r["file"][:-3]] = (int(r["length"]), k, len(b), mx, r["file"] in save_failed_names)
-    padded_all = [s for s, v in info.items() if v[0] < v[3]]
-    print(f"[june] padded chains (L < batch max L): {len(padded_all)} of {len(info)} in batches", flush=True)
+    pos, cache_L = replay(a.length_cache, os.path.join(a.data_dir, "processed"), a.max_len, a.bs, batches, load_failed)
+    mx = [max(int(r["length"]) for r in b) for b in batches]
+    sf_in = [{r["file"] for r in b if r["status"] == "failed"} for b in batches]
+    n_rows_of = collections.Counter(r["file"][:-3] for b in batches for r in b)
+    n_rows_of.update(r["file"][:-3] for r in load_failed)
+    print(f"[june] paths padded (L < batch max L): {sum(cache_L[r] < mx[k] for r, k in pos.items())} of {len(pos)}",
+          flush=True)
+    man = json.load(open(os.path.join(a.data_dir, "shard_manifest.json")))
+    root = pathlib.Path(os.path.normpath(os.path.join(a.data_dir, "processed")))
+    info = {}  # stem -> (L, batch, batch size, batch max L, save failure in that batch, n_june_rows) of the READ copy
+    for s in table:
+        r = os.path.relpath(_processed_path_sharded(root, s, man), root)
+        if r in pos:
+            k = pos[r]
+            info[s] = (cache_L[r], k, len(batches[k]), mx[k], f"{s}.pt" in sf_in[k], n_rows_of[s])
+    dup = [s for s in info if info[s][5] > 1]
+    print(f"[june] table stems with > 1 June row (duplicate copies): {len(dup)}; their read copy padded: "
+          f"{sum(info[s][0] < info[s][3] for s in dup)}", flush=True)
 
     by_status = collections.defaultdict(list)
     for s, r in table.items():
@@ -107,8 +166,8 @@ def cmd_list(a):
         ss = by_status[stt]
         in_j = [s for s in ss if s in info]
         loadf = {r["file"][:-3] for r in load_failed}
-        print(f"[table] {stt}: {len(ss)} stems; in June batches {len(in_j)}, June load failure "
-              f"{sum(s in loadf for s in ss)}, absent from the June CSV {sum(s not in info and s not in loadf for s in ss)} "
+        print(f"[table] {stt}: {len(ss)} stems; read copy in a June batch {len(in_j)}, June load failure (basename) "
+              f"{sum(s in loadf for s in ss)}, read copy in no June batch {sum(s not in info and s not in loadf for s in ss)} "
               f"{[s for s in ss if s not in info and s not in loadf][:5]}; padded {sum(info[s][0] < info[s][3] for s in in_j)}",
               flush=True)
     unch = by_status["unchanged"]
@@ -116,15 +175,16 @@ def cmd_list(a):
     sf = [s for s in unch if s in info and info[s][4]]
     l_bad = [(s, info[s][0], table[s]["L_old"], table[s]["L_new"]) for s in unch if s in info
              and not (info[s][0] == int(table[s]["L_old"]) == int(table[s]["L_new"]))]
-    assert not absent, f"{len(absent)} unchanged stems have no June batch row (map provenance unknown: ask), e.g. {absent[:5]}"
+    assert not absent, (f"{len(absent)} unchanged stems: the copy T8b reads is in no June batch (map provenance unknown: "
+                        f"ask), e.g. {absent[:5]}")
     assert not sf, f"{len(sf)} unchanged stems had a June SAVE failure (map not from that batch: ask), e.g. {sf[:5]}"
     assert not l_bad, f"{len(l_bad)} unchanged stems: June L != L_old/L_new (file changed since June: ask), e.g. {l_bad[:5]}"
 
     hit = sorted(s for s in unch if info[s][0] < info[s][3])
     rows = []
     for s in hit:
-        L, k, n, mx, _ = info[s]
-        rows.append({"stem": s, "L_june": L, "batch": k, "batch_n": n, "batch_max_L": mx, "pad": mx - L,
+        L, k, n, mx, _, nr = info[s]
+        rows.append({"stem": s, "L_june": L, "batch": k, "batch_n": n, "batch_max_L": mx, "pad": mx - L, "n_june_rows": nr,
                      "L_old": table[s]["L_old"], "L_new": table[s]["L_new"], "in_template_list": int(s in part_of),
                      "index_part": part_of.get(s, ""), "eligible": int(s in elig), "val_fixed": int(s in val)})
     assert not os.path.exists(a.out_tsv), f"{a.out_tsv} exists"
@@ -203,6 +263,9 @@ if __name__ == "__main__":
     l = sub.add_parser("list")
     l.add_argument("--june-csv", required=True)
     l.add_argument("--bs", type=int, required=True, help="the June band's --batch-size (band1: 8, winner_rerun.sh)")
+    l.add_argument("--length-cache", required=True, help="the June band's length cache (backfill/caches/full_<ds>_<band>.json)")
+    l.add_argument("--data-dir", required=True, help="pdb_train: shard_manifest.json + the processed/ root the cache spells")
+    l.add_argument("--max-len", type=int, required=True, help="the June band's --max-len (band1: 512, winner_rerun.sh)")
     l.add_argument("--status-tsv", required=True)
     l.add_argument("--template-list", required=True)
     l.add_argument("--eligible", required=True)

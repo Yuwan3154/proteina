@@ -11,7 +11,8 @@
 # REPO = checkout holding scratchpad/t8b_confind_*.py + t8b_padfix_list.py
 # padfix_* = the June pad-fix (user 2026-10-26): list -> cache (copies originals into the fix tree) -> GPU
 #   t8b_confind_maps.sbatch MODE=padfix -> check -> table (NEW status TSV; the old one is never modified).
-#   JUNE_BS=8 = band1 --batch-size of backfill/winner_rerun.sh (job 15356272); N_PARTS 60 = t8b_index.sbatch default.
+#   JUNE_BS=8 / JUNE_MAXLEN=512 = band1 --batch-size / --max-len of backfill/winner_rerun.sh (job 15356272), which fed the
+#   precompute caches/full_pdb_train_band1.json; N_PARTS 60 = t8b_index.sbatch default.
 # gate_prep refuses an existing gate dir, so a preempted+requeued gate_prep fails loudly: rm -rf $OUT/gate and resubmit.
 #   sbatch --export=ALL,MODE=gate_prep,REPO=<checkout> scratchpad/t8b_confind_cpu.sbatch
 source /orcd/pool/006/chenxiou/backfill/env.sh
@@ -26,6 +27,7 @@ S=$REPO/scratchpad
 PF=$OUT/padfix
 JUNE_CSV=/orcd/pool/006/chenxiou/backfill/winner_status/pdb_train/band1_15356272.csv
 JUNE_BS=8
+JUNE_MAXLEN=512
 TSV_PADFIX=/orcd/scratch/orcd/011/chenxiou/t8b_seqres/reproc_status_final_padfix.tsv
 mkdir -p "$PF"
 echo "[$(date)] T8B CONFIND CPU mode=$MODE repo=$REPO ($(git -C "$REPO" rev-parse --short HEAD)) host=$(hostname)"
@@ -37,7 +39,10 @@ case "$MODE" in
   # one torch thread per worker: 48 workers x 48 intra-op threads stalled the first check (26832562 TIMEOUT at 12 h)
   check) OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python "$S/t8b_confind_compare.py" --check --cache "$OUT/cache_full.json" --status-tsv "$TSV" \
            --status-dir "$OUT/status/full" --ref-maps "$OUT/gate/ref_maps.pt" --workers "$W" ;;
-  padfix_list) python "$S/t8b_padfix_list.py" list --june-csv "$JUNE_CSV" --bs "$JUNE_BS" --status-tsv "$TSV" \
+  # PYTHONPATH=$REPO: the list imports _processed_path_sharded from this checkout (env.sh puts proteina-catbalanced first)
+  padfix_list) PYTHONPATH=$REPO:$PYTHONPATH python "$S/t8b_padfix_list.py" list --june-csv "$JUNE_CSV" \
+           --length-cache /orcd/pool/006/chenxiou/backfill/caches/full_pdb_train_band1.json \
+           --data-dir /orcd/pool/006/chenxiou/proteina/data/pdb_train --max-len "$JUNE_MAXLEN" --bs "$JUNE_BS" --status-tsv "$TSV" \
            --template-list /orcd/scratch/orcd/011/chenxiou/t8_template_list/template_chains.txt \
            --eligible /orcd/compute/so3/002/chenxi/t8b_index/eligible_ids_tm0.5-0.9.txt \
            --val-fixed /orcd/scratch/orcd/011/chenxiou/t8_valfixed/val_fixed32_t8_within.txt \

@@ -50,22 +50,29 @@ def test_june_batches(tmp_path):
     assert [r["file"] for r in lf] == ["x.pt"] and [r["file"] for r in sf] == ["e.pt"]
     bad = {"misaligned (a row lost)": JUNE[1:],
            "adjacent batches share infer_sec": [r if r[3] != 0.2 else (*r[:3], 0.1, r[4]) for r in JUNE],
-           "later batch has a longer chain": [r if r[0] != "f.pt" else ("f.pt", 11, "processed", 0.2, "") for r in JUNE],
-           "file twice": JUNE + [("a.pt", 3, "processed", 0.4, "")]}
+           "later batch has a longer chain": [r if r[0] != "f.pt" else ("f.pt", 11, "processed", 0.2, "") for r in JUNE]}
     for what, rows in bad.items():
         with pytest.raises(AssertionError):
             pl.june_batches(write_june(tmp_path / "bad.csv", rows), 3)
         print(f"  raises as expected [{what}]")
 
 
-def list_world(tmp_path, table_rows):
+def list_world(tmp_path, table_rows, june_rows=JUNE, cache_rel=None, man=None):
+    """cache_rel: [(path relative to processed/, L)] in cache order; default = one flat copy per CSV row, in CSV order."""
     tmp_path.mkdir(parents=True, exist_ok=True)
-    june = write_june(tmp_path / "j.csv", JUNE)
+    june = write_june(tmp_path / "j.csv", june_rows)
     tsv = write_tsv(tmp_path / "s.tsv", ["stem", "category", "status", "L_old", "L_new", "fields"], table_rows)
     (tmp_path / "tmpl.txt").write_text("q\nc\nd\n")
     (tmp_path / "elig.txt").write_text("c\n")
     (tmp_path / "val.txt").write_text("h\n")
-    return argparse.Namespace(june_csv=june, bs=3, status_tsv=tsv, template_list=str(tmp_path / "tmpl.txt"),
+    data = tmp_path / "pdb_train"
+    data.mkdir(exist_ok=True)
+    json.dump(man or {}, open(data / "shard_manifest.json", "w"))
+    rel = cache_rel if cache_rel is not None else [(f, L) for f, L, *_ in june_rows]
+    # spelled as the June cache spells it (<data>/processed/...), with a redundant ./ to exercise the normalisation
+    json.dump([[f"{data}/processed/./{r}", L, False] for r, L in rel], open(tmp_path / "cache.json", "w"))
+    return argparse.Namespace(june_csv=june, length_cache=str(tmp_path / "cache.json"), data_dir=str(data), max_len=512,
+                              bs=3, status_tsv=tsv, template_list=str(tmp_path / "tmpl.txt"),
                               eligible=str(tmp_path / "elig.txt"), val_fixed=str(tmp_path / "val.txt"), n_parts=2,
                               out_tsv=str(tmp_path / "out" / "padfix_list.tsv"))
 
@@ -73,6 +80,50 @@ def list_world(tmp_path, table_rows):
 TABLE = [("a", "ok", "unchanged", 10, 10, ""), ("b", "merged", "changed", 10, 11, "coords"),
          ("c", "ok", "unchanged", 9, 9, ""), ("d", "ok", "unchanged", 9, 9, ""), ("f", "ok", "unchanged", 9, 9, ""),
          ("g", "ok", "unchanged", 5, 5, ""), ("h", "ok", "unchanged", 4, 4, "")]
+
+
+# pdb_train held some stems twice (flat processed/<stem>.pt + the bucket copy T8b reads) -> two CSV rows per basename.
+# The CSV alone cannot tell which copy sat in which batch; the cache order does (stable sort, equal L keep cache order).
+DUP_MAN = {"depth_table": {k: 2 for k in ("aa", "bb", "cc", "dd", "gg", "hh")}}
+JUNE_DUP = [("1aaa_A.pt", 10, "processed", 0.1, ""), ("1bbb_A.pt", 10, "processed", 0.1, ""),
+            ("1ccc_A.pt", 9, "processed", 0.1, ""),
+            ("1ccc_A.pt", 9, "processed", 0.2, ""), ("1ddd_A.pt", 9, "processed", 0.2, ""), ("1ddd_A.pt", 9, "processed", 0.2, ""),
+            ("1ggg_A.pt", 5, "processed", 0.3, ""), ("1hhh_A.pt", 4, "processed", 0.3, "")]
+DUP_TABLE = [(s, "ok", "unchanged", L, L, "") for s, L in
+             (("1aaa_A", 10), ("1bbb_A", 10), ("1ccc_A", 9), ("1ddd_A", 9), ("1ggg_A", 5), ("1hhh_A", 4))]
+
+
+def dup_cache(c_read_first):
+    """Cache order: the 1ccc_A copy listed first among the L=9 rows lands in batch 0 (padded, max L 10)."""
+    c = [("cc/1ccc_A.pt", 9), ("1ccc_A.pt", 9)]
+    return ([("aa/1aaa_A.pt", 10), ("bb/1bbb_A.pt", 10)] + (c if c_read_first else c[::-1])
+            + [("1ddd_A.pt", 9), ("dd/1ddd_A.pt", 9), ("gg/1ggg_A.pt", 5), ("hh/1hhh_A.pt", 4)])
+
+
+def test_list_duplicate_copies(tmp_path):
+    got = {}
+    for read_first in (False, True):
+        a = list_world(tmp_path / f"read_first_{read_first}", DUP_TABLE, JUNE_DUP, dup_cache(read_first), DUP_MAN)
+        pl.cmd_list(a)
+        with open(a.out_tsv, newline="") as fh:
+            got[read_first] = {r["stem"]: r for r in csv.DictReader(fh, delimiter="\t")}
+    # flat copy padded, read (bucket) copy unpadded -> NOT listed; read copy padded -> listed
+    assert sorted(got[False]) == ["1hhh_A"], sorted(got[False])
+    assert sorted(got[True]) == ["1ccc_A", "1hhh_A"], sorted(got[True])
+    c = got[True]["1ccc_A"]
+    assert (c["batch"], c["batch_max_L"], c["pad"], c["n_june_rows"]) == ("0", "10", "1", "2"), c
+    assert got[True]["1hhh_A"]["n_june_rows"] == "1"
+    print("  duplicate copies: listed only when the copy T8b reads (bucket) was padded")
+    bad = {"cache misses a path (replay != CSV batches)": (dup_cache(True)[:-1], "replay does not reproduce"),
+           # replay still matches (same basenames), but the copy T8b reads (dd/) is not a cache path
+           "read copy absent from the cache": ([(("zz/1ddd_A.pt", L) if r == "dd/1ddd_A.pt" else (r, L))
+                                                for r, L in dup_cache(True)], "is in no June batch"),
+           "cache path twice after normalisation": (dup_cache(True) + [("aa//1aaa_A.pt", 10)], "not unique")}
+    for what, (rel, msg) in bad.items():
+        a = list_world(tmp_path / what.replace(" ", "_").replace("/", "_"), DUP_TABLE, JUNE_DUP, rel, DUP_MAN)
+        with pytest.raises(AssertionError, match=msg):
+            pl.cmd_list(a)
+        print(f"  raises as expected [{what}]")
 
 
 def test_list_and_table(tmp_path):
