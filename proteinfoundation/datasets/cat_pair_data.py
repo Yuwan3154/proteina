@@ -4,7 +4,9 @@
 """CAT-topology regime: query/template pairs drawn inside a CAT topology (T2 CATH + TED units + synthetic templates).
 
 Sampling unit = MEMBER (entry, CAT, domain), see cat_unit_store. One epoch = one uniformly drawn query member per CAT
-(CATUniformSampler / EpochBatchPlanSampler with CAT as the "cluster"), so the loader is fold-balanced. The query is the
+(CATUniformSampler / EpochBatchPlanSampler with CAT as the "cluster"), so the loader is fold-balanced. Inside a CAT the
+draw is source-stratified (user 2026-10-27, ESMFold2 mixture ratio): CATH with probability cath_draw_prob when the CAT-split has
+both CATH and TED query entries, else the available source. The query is the
 member's domain, cropped here (no DomainCropTransform: residue_pdb_idx stays un-renumbered, like DomainCrop). Its
 reference is a random NON-SELF member of the same (CAT, split) pool -- a different entry, which may be a synthetic
 template -- served through TopologyReferenceTransform.assemble_reference from the per-member index built by
@@ -143,6 +145,7 @@ class CATUnitDataset(torch.utils.data.Dataset):
         logger.info(f"CATUnitDataset[{split}]: {len(queries)} query members, {int((~has_partner).sum())} dropped "
                     f"(CAT pool holds a single entry), {n_cats} CATs")
         self.members = queries[has_partner].reset_index(drop=True)
+        self.members["kind"] = self.members.entry_id.map(self.store.entries.set_index("entry_id").kind)
         self.lengths = [int(sum(b - a for a, b in self._ranges(s))) for s in self.members.seg]
 
     @staticmethod
@@ -154,6 +157,19 @@ class CATUnitDataset(torch.utils.data.Dataset):
 
     def members_by_cat(self) -> List[List[int]]:
         return [g.index.tolist() for _, g in self.members.groupby("cat")]
+
+    def member_weights_by_cat(self, cath_draw_prob: float) -> List[List[float]]:
+        """Draw weights aligned with members_by_cat(): inside a CAT the CATH members share cath_draw_prob and the TED members
+        1 - cath_draw_prob (each source uniform over its members); a CAT with one source only draws it with probability 1.
+        Only the real sources 'cath' and 'ted' are queries (synthetic entries never are)."""
+        out = []
+        for _, g in self.members.groupby("cat"):
+            is_cath = (g["kind"] == "cath").to_numpy()
+            n_c, n_t = int(is_cath.sum()), int((~is_cath).sum())
+            assert n_c + n_t == len(g) and set(g["kind"]) <= {"cath", "ted"}, f"unexpected query kinds {set(g['kind'])}"
+            p_c = cath_draw_prob if n_c and n_t else float(n_c > 0)
+            out.append([p_c / n_c if c else (1.0 - p_c) / n_t for c in is_cath])
+        return out
 
     def __getitem__(self, i: int) -> Data:
         mem = self.members.iloc[i]
@@ -184,19 +200,25 @@ class CATPairLightningDataModule(BaseLightningDataModule):
     """Datamodule of the CAT regime. sampling_mode is fixed to "cat-pair"; batches are length-bucketed epoch plans
     (epoch_batch_plan: True) or a plain CATUniformSampler stream."""
 
-    def __init__(self, store_dir: str, **kwargs):
+    def __init__(self, store_dir: str, cath_draw_prob: float, **kwargs):
         super().__init__(sampling_mode="cat-pair", **kwargs)
+        assert 0.0 <= cath_draw_prob <= 1.0, cath_draw_prob
         self.store_dir = store_dir
+        self.cath_draw_prob = float(cath_draw_prob)
 
     def _get_dataset(self, split: str):
         fixed = self.cluster_sampler_seed if split == "val" else None
         return CATUnitDataset(self.store_dir, split, transform=self.transform, fixed_pair_seed=fixed)
 
     def _make_cat_pair_sampler(self, dataset: CATUnitDataset, shard: bool):
-        return CATUniformSampler(dataset.members_by_cat(), seed=self.cluster_sampler_seed, shard=shard, fixed=dataset.split == "val")
+        return CATUniformSampler(dataset.members_by_cat(), seed=self.cluster_sampler_seed, shard=shard, fixed=dataset.split == "val",
+                                 weights_by_cat=dataset.member_weights_by_cat(self.cath_draw_prob))
 
     def _cat_plan_members(self, dataset: CATUnitDataset) -> List[List[int]]:
         return dataset.members_by_cat()
+
+    def _cat_plan_weights(self, dataset: CATUnitDataset) -> List[List[float]]:
+        return dataset.member_weights_by_cat(self.cath_draw_prob)
 
     def _dataset_lengths(self, dataset) -> List[int]:
         return dataset.lengths

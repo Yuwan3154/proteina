@@ -116,6 +116,32 @@ def _transform(toy, **kw):
     return CATPairReferenceTransform(toy["index_path"], usalign=USALIGN, seed=1, **{**TR_KW, **kw})
 
 
+def test_source_weights_and_sampler_mixture():
+    from proteinfoundation.datasets.cat_pair_data import CATUnitDataset
+    ds = CATUnitDataset.__new__(CATUnitDataset)
+    ds.members = pd.DataFrame({"cat": ["a", "a", "a", "b", "b", "c", "d", "d"], "kind": ["cath", "ted", "ted", "ted", "ted", "cath", "cath", "cath"]})
+    w = ds.member_weights_by_cat(0.3)
+    assert [round(sum(x), 6) for x in w] == [1.0] * 4
+    assert w[0] == pytest.approx([0.3, 0.35, 0.35]) and w[1] == pytest.approx([0.5, 0.5]) and w[2] == [1.0] and w[3] == pytest.approx([0.5, 0.5])
+    by_cat = [[0, 1, 2], [3, 4], [5], [6, 7]]
+    n_cath, n = 0, 4000
+    for ep in range(n // 4):
+        s = CATUniformSampler(by_cat, seed=5, shard=False, weights_by_cat=w)
+        s.set_epoch(ep)
+        got = list(s)
+        n_cath += sum(g in (0, 5, 6, 7) for g in got)
+    # CATs a (p 0.3), b (0), c (1), d (1): expected CATH draws per epoch 0.3 + 0 + 1 + 1
+    assert n_cath / (n // 4) == pytest.approx(2.3, abs=0.1)
+    from proteinfoundation.datasets.epoch_batch_plan import build_epoch_plan
+    cath_plan = 0
+    for ep in range(500):
+        plan = build_epoch_plan(by_cat, [100] * 8, 2, [128], 3, ep, 1, cluster_weights=w)
+        cath_plan += sum(i in (0, 5, 6, 7) for b in plan[0] for i in b)
+    assert cath_plan / 500 == pytest.approx(2.3, abs=0.15)
+    plan_uniform = build_epoch_plan(by_cat, [100] * 8, 2, [128], 3, 0, 1)
+    assert plan_uniform == build_epoch_plan(by_cat, [100] * 8, 2, [128], 3, 0, 1, cluster_weights=None)
+
+
 @needs_toy
 def test_pairs_are_nonself_same_cat_and_aligned(toy):
     from proteinfoundation.datasets.cat_pair_data import CATUnitDataset
@@ -219,7 +245,7 @@ def test_datamodule_batches(toy):
     from proteinfoundation.datasets.transforms import ChainBreakPerResidueTransform, ContactMapTransform, DSSPTargetTransform, GlobalRotationTransform
     chain = [GlobalRotationTransform(), ChainBreakPerResidueTransform(), DSSPTargetTransform(),
              ContactMapTransform(contact_method="confind", confind_contact_threshold=0.01), _transform(toy)]
-    dm = CATPairLightningDataModule(os.path.join(TOY, "store"), transforms=chain, batch_size=2, num_workers=2, epoch_batch_plan=True,
+    dm = CATPairLightningDataModule(os.path.join(TOY, "store"), cath_draw_prob=0.3, transforms=chain, batch_size=2, num_workers=2, epoch_batch_plan=True,
                                     epoch_batch_plan_len_edges=[64, 128, 192, 256, 320, 384, 448, 512], cluster_sampler_seed=0)
     dm.setup("fit")
     progress = SimpleNamespace(current=SimpleNamespace(processed=0))

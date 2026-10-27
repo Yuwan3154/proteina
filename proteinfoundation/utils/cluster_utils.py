@@ -1116,12 +1116,14 @@ class CATUniformSampler(Sampler):
     every pass draws the same member of every CAT.
     """
 
-    def __init__(self, members_by_cat: List[List[int]], seed: int = 0, shard: bool = True, fixed: bool = False):
+    def __init__(self, members_by_cat: List[List[int]], seed: int = 0, shard: bool = True, fixed: bool = False,
+                 weights_by_cat: Optional[List[List[float]]] = None):
         assert members_by_cat and all(len(m) for m in members_by_cat), "every CAT needs at least one member"
         self.members_by_cat = members_by_cat
         self.seed = int(seed)
         self.shard = bool(shard)
         self.fixed = bool(fixed)
+        self.weights_by_cat = weights_by_cat  # per-member draw weights inside a CAT (source mixture); uniform when None
         self.epoch = 0
 
     def set_epoch(self, epoch: int) -> None:
@@ -1149,7 +1151,10 @@ class CATUniformSampler(Sampler):
         picks = []
         for c in order:
             m = self.members_by_cat[c]
-            picks.append(m[int(torch.randint(0, len(m), (1,), generator=g_member))])
+            if self.weights_by_cat is None:
+                picks.append(m[int(torch.randint(0, len(m), (1,), generator=g_member))])
+            else:
+                picks.append(m[int(torch.multinomial(torch.tensor(self.weights_by_cat[c], dtype=torch.float), 1, generator=g_member))])
         pad = -len(picks) % world
         picks += (picks * (pad // len(picks) + 1))[:pad]
         return iter(picks[rank::world])

@@ -497,10 +497,14 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
 
         return EpochBatchPlanSampler(members, self._dataset_lengths(dataset), self.batch_size,
                                      self.epoch_batch_plan_len_edges, self.cluster_sampler_seed, rank, world,
-                                     restore=self._train_plan_restore, position_fn=position)
+                                     restore=self._train_plan_restore, position_fn=position,
+                                     cluster_weights=self._cat_plan_weights(dataset) if cat_pair else None)
 
     def _make_cat_pair_sampler(self, dataset, shard: bool):
         raise NotImplementedError(f"{type(self).__name__} does not provide a cat-pair sampler")
+
+    def _cat_plan_weights(self, dataset) -> Optional[List[List[float]]]:
+        return None
 
     def _cat_plan_members(self, dataset) -> List[List[int]]:
         raise NotImplementedError(f"{type(self).__name__} does not provide CAT members for epoch_batch_plan")

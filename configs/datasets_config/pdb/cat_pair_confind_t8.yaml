@@ -4,6 +4,7 @@
 # ??? = not grounded yet (see the loader hand-off list).
 datamodule:
   _target_: "proteinfoundation.datasets.cat_pair_data.CATPairLightningDataModule"  # NEW: members (entry, CAT, domain), one per CAT per epoch
+  cath_draw_prob: 0.3                         # user 2026-10-27: CATH 30 % / TED 70 % (ESMFold2 ratio), per CAT; one source -> that source
   store_dir: ${oc.env:CAT_STORE_DIR}          # NEW: unit store written by t2cat_pack_units.py + utils/precompute_cat_pair_index.py
   batch_padding: True
   epoch_batch_plan: True                       # T8 (user 2026-10-10 "(A)"); the CAT is the cluster of the plan

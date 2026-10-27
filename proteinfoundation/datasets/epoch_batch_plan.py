@@ -31,14 +31,18 @@ def _generator(seed: int, *parts: int) -> torch.Generator:
 
 
 def build_epoch_plan(cluster_members: List[List[int]], lengths: List[int], batch_size: int, len_edges: List[int],
-                     seed: int, epoch: int, world: int) -> List[List[List[int]]]:
-    """Return plan[rank] = list of batches (lists of dataset indices). lengths[i] is dataset index i's length."""
+                     seed: int, epoch: int, world: int, cluster_weights: Optional[List[List[float]]] = None) -> List[List[List[int]]]:
+    """Return plan[rank] = list of batches (lists of dataset indices). lengths[i] is dataset index i's length.
+    cluster_weights[c][j] (optional) = draw probability weight of cluster_members[c][j]; uniform when None."""
     order = torch.randperm(len(cluster_members), generator=_generator(seed, epoch, 0)).tolist()
     g_member = _generator(seed, epoch, 1)
     members = []
     for c in order:
         m = cluster_members[c]
-        members.append(m[torch.randint(0, len(m), (1,), generator=g_member).item()])
+        if cluster_weights is None:
+            members.append(m[torch.randint(0, len(m), (1,), generator=g_member).item()])
+        else:
+            members.append(m[torch.multinomial(torch.tensor(cluster_weights[c], dtype=torch.float), 1, generator=g_member).item()])
     by_edge: Dict[int, List[int]] = {}
     for i in members:
         k = bisect.bisect_left(len_edges, lengths[i])
@@ -75,8 +79,10 @@ class EpochBatchPlanSampler(Sampler[List[int]]):
 
     def __init__(self, cluster_members: List[List[int]], lengths: List[int], batch_size: int, len_edges: List[int],
                  seed: int, rank: int, world: int, restore: Optional[Dict] = None,
-                 position_fn: Optional[Callable[[], Tuple[int, int]]] = None):
+                 position_fn: Optional[Callable[[], Tuple[int, int]]] = None,
+                 cluster_weights: Optional[List[List[float]]] = None):
         self.cluster_members, self.lengths = cluster_members, lengths
+        self.cluster_weights = cluster_weights
         self.batch_size, self.len_edges = int(batch_size), sorted(int(x) for x in len_edges)
         self.seed, self.rank, self.world = int(seed), int(rank), int(world)
         self.n_batches = -(-len(cluster_members) // self.batch_size)  # all ranks, before world padding
@@ -98,7 +104,7 @@ class EpochBatchPlanSampler(Sampler[List[int]]):
     def _ensure_plan(self):
         if self.plan is None:
             self.plan = build_epoch_plan(self.cluster_members, self.lengths, self.batch_size, self.len_edges,
-                                         self.seed, self.epoch, self.world)
+                                         self.seed, self.epoch, self.world, self.cluster_weights)
             assert len(self.plan[self.rank]) == self.n_per_rank, (len(self.plan[self.rank]), self.n_per_rank)
 
     def __iter__(self):
