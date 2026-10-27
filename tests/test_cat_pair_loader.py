@@ -113,7 +113,7 @@ def toy():
 
 def _transform(toy, **kw):
     from proteinfoundation.datasets.cat_pair_data import CATPairReferenceTransform
-    return CATPairReferenceTransform(toy["index_path"], usalign=USALIGN, seed=1, **{**TR_KW, **kw})
+    return CATPairReferenceTransform(toy["index_path"], usalign=USALIGN, **{"seed": 1, **TR_KW, **kw})
 
 
 def test_source_weights_and_sampler_mixture():
