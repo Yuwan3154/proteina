@@ -1,82 +1,93 @@
 #!/bin/bash
 #SBATCH --job-name=toporef_regimes
-#SBATCH --partition=mit_normal_gpu,mit_preemptable
+#SBATCH --partition=xeon-g6-volta
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:l40s:1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=48G
+#SBATCH --exclusive
+#SBATCH --gres=gpu:volta:2
+#SBATCH --ntasks-per-node=2
+#SBATCH --cpus-per-task=20
 #SBATCH --time=06:00:00
-#SBATCH --exclude=node5101,node5204,node1800,node1801,node1305,node3006,node2700
-#SBATCH --output=/orcd/pool/006/chenxiou/d36tc/logs/%x-%j.out
-# TopoRef inference regimes benchmark (Tasks 1.0, 1a, 1b, and Task 2 SSE evaluation) on Engaging L40S.
-set -uo pipefail
-S=/orcd/scratch/orcd/011/chenxiou
-P=/orcd/pool/006/chenxiou/d36tc
-REPO="${REPO:-$S/proteina_d36tc}"
-OUT="${OUT:-$P/toporef_regimes}"
-MODE="${MODE:-all}"
+#SBATCH --output=/home/gridsan/cou/logs/%x-%A_%a.out
+#SBATCH --error=/home/gridsan/cou/logs/%x-%A_%a.err
+# TopoRef inference regimes benchmark (Tasks 1.0, 1a, 1b, and Task 2 SSE evaluation) on SuperCloud (2x V100 per node).
+# Submit as an array over nodes (e.g. --array=0-4 with N_NODES=5 -> 10 shards = 1 target per GPU).
+source /etc/profile
+set -eo pipefail
 
-ENV_DIR=/home/chenxiou/cue-openfold-env-sm120
-module load cuda/12.8 2>/dev/null || module load cuda/12.6 2>/dev/null || true
-export CUE_HOST=engaging
-export TORCH_CUDA_ARCH_LIST="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d ' ')"
+W=/home/gridsan/cou/tri_synth_bench
+REPO="${REPO:-/home/gridsan/cou/proteina_toporef_regimes}"
+OUT="${OUT:-$W/toporef_regimes}"
+MODE="${MODE:-all}"
+N_NODES="${N_NODES:-5}"
+ARM_OVERRIDE="${ARM_OVERRIDE:-all3}"
+T_EVAL="${T_EVAL:-0.25}"
+
+ENV_DIR=/home/gridsan/cou/cue-openfold-env
+export CUE_HOST=supercloud
 source "$ENV_DIR/.venv/bin/activate"
 source "$ENV_DIR/activate.sh"
 
-# Ensure Frame2ConFind, Frame2seq, ContactEBM, and pydssp are importable
-export FRAME2SEQ_HOME="${FRAME2SEQ_HOME:-$S/Frame2seq}"
-CUE_CONDA_SP="/home/chenxiou/miniforge3/envs/cue_openfold/lib/python3.10/site-packages"
-[ -d "$CUE_CONDA_SP" ] || CUE_CONDA_SP="/orcd/home/002/chenxiou/miniforge3/envs/cue_openfold/lib/python3.10/site-packages"
-export PYTHONPATH="$REPO:$S:$S/Frame2seq:$S/ContactEBM${CUE_CONDA_SP:+:$CUE_CONDA_SP}${PYTHONPATH:+:$PYTHONPATH}"
-
-export DATA_PATH=/orcd/pool/006/chenxiou/proteina/data
-export SKIP_CONFIND_PRECOMPUTE=1
-export SIGMA_DATA=16.0
-export ALIGN_W=0.3
-export MLM_W=0.3
-export PYTHONUNBUFFERED=1
-export TMPDIR=/tmp/chenxiou_${SLURM_JOB_ID:-manual$$}
-mkdir -p "$TMPDIR" "$OUT" "$P/logs"
+export TMPDIR=/home/gridsan/cou/.tmp_toporef_${SLURM_JOB_ID:-manual$$}
+mkdir -p "$TMPDIR" "$OUT" /home/gridsan/cou/logs
 trap 'rm -rf "$TMPDIR"' EXIT
 
-nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+export SIGMA_DATA=16.0 ALIGN_W=0.3 MLM_W=0.3 SKIP_CONFIND_PRECOMPUTE=1 PYTHONUNBUFFERED=1
+export SYNTH_INDEX_DIR="$W/inputs"
+export DATA_PATH="$W/data"
+F2C_PARENT="${F2C_PARENT:-$W/pkgs}"
+export FRAME2SEQ_HOME="${FRAME2SEQ_HOME:-$W/pkgs/Frame2seq}"
+CEBM_REPO="${CEBM_REPO:-/home/gridsan/cou/ContactEBM}"
+export PYTHONPATH="$REPO:$F2C_PARENT:$FRAME2SEQ_HOME:$CEBM_REPO${PYTHONPATH:+:$PYTHONPATH}"
+export OMP_NUM_THREADS=20
+
+TRI_CKPT="${TRI_CKPT:-$W/inputs/cfft_tri_last-EMA_step60505.ckpt}"
+C2C_CKPT="${C2C_CKPT:-$W/inputs/final_twin_s29000.ckpt}"
+INDEX="${INDEX:-$W/inputs/topology_index_confind_synth.pt}"
+F2C_DIR="${F2C_DIR:-/home/gridsan/cou/Frame2ConFind/runs/f2s_v384_smoothap-pearson}"
+CEBM_CKPT="${CEBM_CKPT:-/home/gridsan/cou/c2cbench/yard/ckpt/confind_a1_prod100_epoch82.pt}"
+USALIGN="${USALIGN:-/home/gridsan/cou/USalign/USalign}"
+
+for f in "$TRI_CKPT" "$C2C_CKPT" "$INDEX" "$F2C_DIR/best.pt" "$CEBM_CKPT" "$USALIGN"; do
+  [ -e "$f" ] || { echo "FATAL: missing $f"; exit 77; }
+done
+
+nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
 cd "$REPO" || exit 76
 git log -1 --format="[repo] $REPO HEAD %h"
 
-TRI_CKPT="${TRI_CKPT:-$S/stageA/ckpt/cfft_tri_last-EMA_step60505.ckpt}"
-C2C_CKPT="${C2C_CKPT:-$S/c2c_store/c2c_confind_tbeta/final_twin_s29000.ckpt}"
-INDEX="${INDEX:-$P/data/topology_index_d36tc.pt}"
-F2C_DIR="${F2C_DIR:-$S/Frame2ConFind/runs/f2s_v384_smoothap-pearson}"
-CEBM_REPO="${CEBM_REPO:-$S/ContactEBM}"
-CEBM_CKPT="${CEBM_CKPT:-$S/ContactEBM/runs/confind_a1_prod100/checkpoints/model_step_100000.pt}"
+TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
+N_SHARDS=$(( N_NODES * 2 ))
+SHARD0=$(( TASK_ID * 2 ))
+SHARD1=$(( TASK_ID * 2 + 1 ))
 
-for f in "$TRI_CKPT" "$C2C_CKPT" "$INDEX" "$F2C_DIR/best.pt" "$CEBM_CKPT"; do
-  [ -f "$f" ] || { echo "FATAL: missing $f"; exit 77; }
-done
+COMMON=(
+  --mode "$MODE"
+  --tri-ckpt "$TRI_CKPT"
+  --c2c-ckpt "$C2C_CKPT"
+  --index "$INDEX"
+  --f2c-ckpt-dir "$F2C_DIR"
+  --f2c-dtype "${F2C_DTYPE:-fp32}"
+  --cebm-repo "$CEBM_REPO"
+  --cebm-ckpt "$CEBM_CKPT"
+  --usalign "$USALIGN"
+  --out "$OUT"
+  --arm-override "$ARM_OVERRIDE"
+  --k "${K:-8}"
+  --n-cycles "${N_CYCLES:-5}"
+  --t-eval "$T_EVAL"
+  --n-shards "$N_SHARDS"
+)
+[ -n "${MAX_TARGETS:-}" ] && COMMON+=(--max-targets "$MAX_TARGETS")
 
-EXTRA=()
-[ "${ONLY_BAD_AFDB22:-0}" = "1" ] && EXTRA+=(--only-bad-afdb22)
-[ -n "${MAX_TARGETS:-}" ] && EXTRA+=(--max-targets "$MAX_TARGETS")
-[ -n "${ARM_OVERRIDE:-}" ] && EXTRA+=(--arm-override "$ARM_OVERRIDE")
+echo "[launch] node task=$TASK_ID running shards $SHARD0 and $SHARD1 of $N_SHARDS (arm=$ARM_OVERRIDE t_eval=$T_EVAL)"
+CUDA_VISIBLE_DEVICES=0 python scratchpad/toporef_regimes_bench.py "${COMMON[@]}" --shard "$SHARD0" > "$OUT/shard_${SHARD0}.log" 2>&1 &
+PID0=$!
+CUDA_VISIBLE_DEVICES=1 python scratchpad/toporef_regimes_bench.py "${COMMON[@]}" --shard "$SHARD1" > "$OUT/shard_${SHARD1}.log" 2>&1 &
+PID1=$!
 
-python scratchpad/toporef_regimes_bench.py \
-  --mode "$MODE" \
-  --d36tc-dir "$P" \
-  --natives-dir "$S/d36u/natives" \
-  --tri-ckpt "$TRI_CKPT" \
-  --c2c-ckpt "$C2C_CKPT" \
-  --index "$INDEX" \
-  --f2c-ckpt-dir "$F2C_DIR" \
-  --f2c-dtype "${F2C_DTYPE:-fp32}" \
-  --cebm-repo "$CEBM_REPO" \
-  --cebm-ckpt "$CEBM_CKPT" \
-  --usalign "${USALIGN:-/home/chenxiou/.local/bin/USalign}" \
-  --out "$OUT" \
-  --k "${K:-8}" \
-  --n-cycles "${N_CYCLES:-5}" \
-  --t-eval "${T_EVAL:-0.05}" \
-  "${EXTRA[@]}"
-rc=$?
-echo "[done] toporef_regimes_bench mode=$MODE rc=$rc"
-exit $rc
+RC0=0; RC1=0
+wait "$PID0" || RC0=$?
+wait "$PID1" || RC1=$?
+echo "[done] shard $SHARD0 rc=$RC0 | shard $SHARD1 rc=$RC1"
+[ "$RC0" -eq 0 ] && [ "$RC1" -eq 0 ] || exit 1
+exit 0

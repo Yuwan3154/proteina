@@ -94,20 +94,26 @@ def build_toporef_transform(index_path):
     return TopologyReferenceTransform(index_path=index_path, **kw)
 
 
-def native_for(natives_dir, pid):
-    entry, chain = pid.rsplit("_", 1)
+def native_for(natives_dir, pid, qpath=None):
+    if qpath and os.path.exists(qpath):
+        return qpath, "A"
+    clean = pid.replace("badafdb36_", "")
+    pdb_cand = os.path.join(natives_dir, f"badafdb36_{clean}.pdb")
+    if os.path.exists(pdb_cand):
+        return pdb_cand, "A"
+    entry, chain = clean.rsplit("_", 1)
     native = os.path.join(natives_dir, entry + ".cif")
-    assert os.path.exists(native), f"{pid}: missing native cif {native}"
+    assert os.path.exists(native), f"{pid}: missing native {native} / {pdb_cand}"
     return native, chain
 
 
 def tm_vs_native(usalign, native, chain, pred_pdb):
-    r = subprocess.run(
-        [usalign, native, "-chain1", chain, pred_pdb, "-TMscore", "5", "-outfmt", "2"],
-        capture_output=True,
-        text=True,
-        timeout=300,
+    cmd = (
+        [usalign, native, "-chain1", chain, pred_pdb, "-TMscore", "5", "-outfmt", "2"]
+        if native.endswith(".cif")
+        else [usalign, native, pred_pdb, "-TMscore", "5", "-outfmt", "2"]
     )
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     for ln in r.stdout.splitlines():
         p = ln.split()
         if len(p) >= 7 and not ln.startswith("#"):
@@ -412,6 +418,15 @@ def generate_tri_with_trajectory(model, cfg_exp, topology, residue_type, mask, k
 
 
 # ───────────────────────── ContactEBM Loader, Scorer & Reverse Sampler ─────────────────────────
+def _cebm_pair_mask(rmask):
+    if hasattr(rmask, "bool"):
+        m = rmask.bool()
+        L = m.shape[1]
+        diag = torch.eye(L, dtype=torch.bool, device=m.device)[None]
+        return (m[:, :, None] & m[:, None, :] & ~diag).float()
+    raise TypeError(f"Expected tensor rmask, got {type(rmask)}")
+
+
 def load_contact_ebm(cebm_repo, cebm_ckpt, dev):
     ck = torch.load(cebm_ckpt, map_location="cpu", weights_only=False)
     cfg = ck["cfg"]
@@ -434,7 +449,7 @@ def load_contact_ebm(cebm_repo, cebm_ckpt, dev):
     state = ck["ema"] if "ema" in ck else ck["model"]
     model.load_state_dict(state, strict=True)
     model.eval()
-    print(f"[cebm] loaded {cebm_ckpt} arch={mc['arch']} step={ck.get('step')} ema={'ema' in ck}", flush=True)
+    print(f"[cebm] loaded {cebm_ckpt} arch={mc['arch']} step={ck.get('step', ck.get('gstep'))} ema={'ema' in ck}", flush=True)
     return model, diffusion, cfg
 
 
@@ -444,7 +459,7 @@ def score_maps_with_cebm(cebm_model, cebm_diff, prob_maps, aatype, Lq, t_eval, d
     binary_tokens = torch.from_numpy((prob_maps >= 0.5).astype(np.int64)).to(dev)
     aa_batch = aatype[:Lq].long().to(dev)[None].expand(k, Lq)
     rmask = torch.ones((k, Lq), dtype=torch.float32, device=dev)
-    pair_mask = cebm_model._pair_mask(rmask)
+    pair_mask = cebm_model._pair_mask(rmask) if hasattr(cebm_model, "_pair_mask") else _cebm_pair_mask(rmask)
     t_tensor = torch.full((k,), float(t_eval), device=dev, dtype=torch.float32)
     with torch.no_grad():
         e_clean = cebm_model.score_energy(binary_tokens, aa_batch, rmask, t_eval=float(t_eval)).detach().float().cpu().numpy()
@@ -454,21 +469,21 @@ def score_maps_with_cebm(cebm_model, cebm_diff, prob_maps, aatype, Lq, t_eval, d
     return e_clean, e_noised
 
 
-def cebm_reverse_sample_from_t0(cebm_model, cebm_diff, init_binary_map, aatype, Lq, t0, K_corrector, dev, seed=0):
+def cebm_reverse_sample_from_t0(cebm_model, cebm_diff, init_binary_map, aatype, Lq, t0, K_corrector, dev, t_eval=0.25, seed=0):
     """Forward-noise init_binary_map [Lq, Lq] to t0 and run reverse sampling (with K_corrector steps/interval).
 
     Saves EVERY network call's clean contact prediction (sigmoid(logits) >= 0.5) as bit-packed uint8 upper triangle.
+    Note: ContactEBM.compute_outputs computes logits via autograd.grad(energy.sum(), inp), so it must run with grad enabled.
     """
     torch.manual_seed(seed)
     x0 = torch.from_numpy((init_binary_map >= 0.5).astype(np.int64)).to(dev)[None]
     aa = aatype[:Lq].long().to(dev)[None]
     rmask = torch.ones((1, Lq), dtype=torch.float32, device=dev)
-    pair_mask = cebm_model._pair_mask(rmask)
+    pair_mask = cebm_model._pair_mask(rmask) if hasattr(cebm_model, "_pair_mask") else _cebm_pair_mask(rmask)
     pm_b = pair_mask.bool()
     diag = torch.arange(Lq, device=dev)
 
-    timesteps = int(cebm_diff.timesteps)
-    # Find grid index i0 where grid time t <= t0
+    timesteps = int(getattr(cebm_diff, "timesteps", 50))
     i0 = 0
     for i in range(timesteps):
         _, t_grid = cebm_diff.get_sampling_grid(i, timesteps)
@@ -484,17 +499,19 @@ def cebm_reverse_sample_from_t0(cebm_model, cebm_diff, init_binary_map, aatype, 
         zt[:, diag, diag] = 0
         zt = zt * pm_b.long()
 
-        step_times = []
-        step_kinds = []
-        step_energies_t = []
-        step_energies_005 = []
-        step_clean_maps = []
+    step_times = []
+    step_kinds = []
+    step_energies_t = []
+    step_energies_005 = []
+    step_clean_maps = []
+    sched_obj = getattr(cebm_diff, "noise_schedule", getattr(cebm_diff, "schedule", None))
 
-        def _renoise(z_s, s_val, t_val):
+    def _renoise(z_s, s_val, t_val):
+        with torch.no_grad():
             s_t = torch.full((1,), float(s_val), device=dev)
             t_t = torch.full((1,), float(t_val), device=dev)
-            alpha_t = cebm_diff.schedule.alpha(t_t).view(1, 1, 1)
-            alpha_s = cebm_diff.schedule.alpha(s_t).view(1, 1, 1)
+            alpha_t = sched_obj.alpha(t_t).view(1, 1, 1)
+            alpha_s = sched_obj.alpha(s_t).view(1, 1, 1)
             keep_prob = (alpha_t / alpha_s.clamp(min=1e-6)).clamp(0.0, 1.0)
             keep = torch.bernoulli(keep_prob.expand_as(z_s)).bool()
             if hasattr(cebm_diff, "mask_id"):
@@ -506,54 +523,58 @@ def cebm_reverse_sample_from_t0(cebm_model, cebm_diff, init_binary_map, aatype, 
             out[:, diag, diag] = 0
             return out * pm_b.long()
 
-        for i in range(i0, timesteps):
-            s, t = cebm_diff.get_sampling_grid(i, timesteps)
-            dt = t - s
-            t_tensor = torch.full((1,), float(t), device=dev, dtype=torch.float32)
-            if K_corrector > 0 and s > 0:
-                for kk in range(K_corrector):
+    for i in range(i0, timesteps):
+        s, t = cebm_diff.get_sampling_grid(i, timesteps)
+        t_tensor = torch.full((1,), float(t), device=dev, dtype=torch.float32)
+        if K_corrector > 0 and s > 0:
+            for kk in range(K_corrector):
+                with torch.enable_grad():
                     logits, energy_t, _ = cebm_model.compute_outputs(
                         cebm_model._onehot(zt), aa, rmask, t_tensor, create_graph=False
                     )
-                    p_clean = torch.sigmoid(logits.detach().float())[0, :Lq, :Lq].cpu().numpy()
-                    b_clean = (p_clean >= 0.5).astype(np.uint8)
-                    e005 = float(
+                logits_d = logits.detach()
+                p_clean = torch.sigmoid(logits_d.float())[0, :Lq, :Lq].cpu().numpy()
+                b_clean = (p_clean >= 0.5).astype(np.uint8)
+                with torch.no_grad():
+                    e_eval = float(
                         cebm_model.score_energy(
-                            torch.from_numpy(b_clean.astype(np.int64)).to(dev)[None], aa, rmask, t_eval=0.05
+                            torch.from_numpy(b_clean.astype(np.int64)).to(dev)[None], aa, rmask, t_eval=float(t_eval)
                         )[0].item()
                     )
-                    step_times.append(float(t))
-                    step_kinds.append(f"corrector_{kk}")
-                    step_energies_t.append(float(energy_t[0].item()))
-                    step_energies_005.append(e005)
-                    step_clean_maps.append(b_clean)
-
-                    zc = cebm_diff.sample_step(zt, logits.detach(), s, t, pair_mask=pair_mask)
+                    zc = cebm_diff.sample_step(zt, logits_d, s, t, pair_mask=pair_mask)
                     zt = _renoise(zc, s, t)
+                step_times.append(float(t))
+                step_kinds.append(f"corrector_{kk}")
+                step_energies_t.append(float(energy_t.detach()[0].item()))
+                step_energies_005.append(e_eval)
+                step_clean_maps.append(b_clean)
 
+        with torch.enable_grad():
             logits, energy_t, _ = cebm_model.compute_outputs(
                 cebm_model._onehot(zt), aa, rmask, t_tensor, create_graph=False
             )
-            p_clean = torch.sigmoid(logits.detach().float())[0, :Lq, :Lq].cpu().numpy()
-            b_clean = (p_clean >= 0.5).astype(np.uint8)
-            e005 = float(
+        logits_d = logits.detach()
+        p_clean = torch.sigmoid(logits_d.float())[0, :Lq, :Lq].cpu().numpy()
+        b_clean = (p_clean >= 0.5).astype(np.uint8)
+        with torch.no_grad():
+            e_eval = float(
                 cebm_model.score_energy(
-                    torch.from_numpy(b_clean.astype(np.int64)).to(dev)[None], aa, rmask, t_eval=0.05
+                    torch.from_numpy(b_clean.astype(np.int64)).to(dev)[None], aa, rmask, t_eval=float(t_eval)
                 )[0].item()
             )
-            step_times.append(float(t))
-            step_kinds.append("predictor")
-            step_energies_t.append(float(energy_t[0].item()))
-            step_energies_005.append(e005)
-            step_clean_maps.append(b_clean)
+            zt = cebm_diff.sample_step(zt, logits_d, s, t, pair_mask=pair_mask)
+        step_times.append(float(t))
+        step_kinds.append("predictor")
+        step_energies_t.append(float(energy_t.detach()[0].item()))
+        step_energies_005.append(e_eval)
+        step_clean_maps.append(b_clean)
 
-            zt = cebm_diff.sample_step(zt, logits.detach(), s, t, pair_mask=pair_mask)
-
-        z0 = cebm_diff.decode(zt, logits.detach(), pair_mask=pair_mask)
+    with torch.no_grad():
+        z0 = (torch.sigmoid(logits_d.float()) >= 0.5).long() * pm_b.long()
         final_binary = z0[0, :Lq, :Lq].detach().cpu().numpy().astype(np.uint8)
-        final_prob = torch.sigmoid(logits.detach().float())[0, :Lq, :Lq].cpu().numpy()
-        final_e005 = float(
-            cebm_model.score_energy(z0[:, :Lq, :Lq].long(), aa, rmask, t_eval=0.05)[0].item()
+        final_prob = torch.sigmoid(logits_d.float())[0, :Lq, :Lq].cpu().numpy()
+        final_e_eval = float(
+            cebm_model.score_energy(z0[:, :Lq, :Lq].long(), aa, rmask, t_eval=float(t_eval))[0].item()
         )
 
     packed_clean = pack_upper_triangle(np.stack(step_clean_maps, axis=0), Lq)
@@ -569,13 +590,140 @@ def cebm_reverse_sample_from_t0(cebm_model, cebm_diff, init_binary_map, aatype, 
         "packed_clean_steps": packed_clean,
         "final_binary": final_binary,
         "final_prob": final_prob.astype(np.float16),
-        "final_e005": final_e005,
+        "final_e005": final_e_eval,
     }
 
 
+def _ca_contacts_fallback(full, amask, cutoff=8.0):
+    ca = full[:, builder.CA_IDX].float()
+    m = amask[:, builder.CA_IDX].bool()
+    dist = torch.cdist(ca, ca)
+    valid = m[:, None] & m[None, :] & ~torch.eye(int(ca.shape[0]), dtype=torch.bool)
+    return ((dist < cutoff) & valid).float().numpy()
+
+
+def load_structure_any(path, predictor=None):
+    """Load either a .pt graph or a .pdb/.cif file and return (full [L,37,3], amask [L,37], aatype [L], cm [L,L] numpy)."""
+    if path.endswith(".pt"):
+        g = torch.load(path, map_location="cpu", weights_only=False)
+        full, amask, aatype = graph_to_atom37(g)
+        L = int(amask.shape[0])
+        if getattr(g, "contact_map_confind", None) is not None:
+            cm = builder.confind_native_contacts(g, L).numpy()
+        elif predictor is not None:
+            x, mask = builder._f2c_inputs(full[None], amask)
+            probs = predictor.predict_batch(x, mask[None])[:, :L, :L].float().cpu()
+            cm = (probs[0] >= builder.CONFIND_THRESHOLD).float().numpy()
+        else:
+            cm = _ca_contacts_fallback(full, amask)
+        return full, amask, aatype, cm
+    g, full, amask = structure_atom37(path, chain="A")
+    aatype = g.residue_type.long()
+    L = int(amask.shape[0])
+    if predictor is not None:
+        x, mask = builder._f2c_inputs(full[None], amask)
+        probs = predictor.predict_batch(x, mask[None])[:, :L, :L].float().cpu()
+        cm = (probs[0] >= builder.CONFIND_THRESHOLD).float().numpy()
+    else:
+        cm = _ca_contacts_fallback(full, amask)
+    return full, amask, aatype, cm
+
+
 # ───────────────────────── Step A0: Target Filtering ─────────────────────────
+def filter_targets_supercloud(args):
+    """Filter bad_afdb-22 targets on SuperCloud using eval_control.jsonl and eval_ladder.jsonl at rewind=0."""
+    eval_ctl = os.path.join(args.sc_eval_dir, "eval_control.jsonl")
+    eval_lad = os.path.join(args.sc_eval_dir, "eval_ladder.jsonl")
+    pairs_ctl = os.path.join(args.sc_pairs_dir, "pairs_control.jsonl")
+    pairs_lad = os.path.join(args.sc_pairs_dir, "pairs_ladder.jsonl")
+
+    p_ctl = {(d["pid"], d["rewind"], d["sample"]): d for d in map(json.loads, open(pairs_ctl))}
+    p_lad = {(d["pid"], d["rewind"], d["sample"]): d for d in map(json.loads, open(pairs_lad))}
+    e_ctl = {(d["pid"], d["rewind"], d["sample"]): d for d in map(json.loads, open(eval_ctl))}
+    e_lad = {(d["pid"], d["rewind"], d["sample"]): d for d in map(json.loads, open(eval_lad))}
+
+    pids = sorted({k[0] for k in e_lad if k[1] == 0 and k[2] == 0})
+    rows = []
+    for pid in pids:
+        el0 = e_lad[(pid, 0, 0)]
+        ec0 = e_ctl[(pid, 0, 0)]
+        el250 = e_lad.get((pid, 250, 0), el0)
+        pl0 = p_lad[(pid, 0, 0)]
+        pc0 = p_ctl[(pid, 0, 0)]
+        pl250 = p_lad.get((pid, 250, 0), pl0)
+        vs = el0["tri_tm_samples"]
+        vt = ec0["tri_tm_samples"]
+        v250 = el250["tri_tm_samples"]
+        short_pid = pid.replace("badafdb36_", "")
+        ref_stem = os.path.splitext(os.path.basename(pc0["tpath"]))[0].replace("badafdb36_", "")
+        rows.append({
+            "pid": short_pid,
+            "full_pid": pid,
+            "in_bad_afdb22": True,
+            "Lq": int(el0["Lq"]),
+            "ref_stem": ref_stem,
+            "Lt": int(ec0["Lt"]),
+            "qpath": pl0["qpath"],
+            "tpath_self": pl0["tpath"],
+            "tpath_tmpl": pc0["tpath"],
+            "tpath_lad_r250": pl250["tpath"],
+            "tmpl_mean8": float(np.mean(vt)),
+            "tmpl_median8": float(np.median(vt)),
+            "tmpl_best8": float(np.max(vt)),
+            "self_mean8": float(np.mean(vs)),
+            "self_median8": float(np.median(vs)),
+            "self_best8": float(np.max(vs)),
+            "lad_r250_mean8": float(np.mean(v250)),
+            "lad_r250_tmpl_tm": float(el250.get("template_tm", float("nan"))),
+            "native_mean8": float(np.mean(vs)),
+        })
+
+    tmpl_pass = [r for r in rows if r["tmpl_mean8"] >= args.tm_threshold]
+    self_pass = [r for r in rows if r["self_mean8"] >= args.tm_threshold]
+    if len(tmpl_pass) >= 4:
+        selected_arm = "tmpl"
+        selected = tmpl_pass
+    else:
+        selected_arm = "self"
+        selected = self_pass
+
+    print("\n=== STEP A0: SUPERCLOUD BAD_AFDB-22 TARGET FILTERING SUMMARY ===")
+    print(f"Threshold: default tri+c2c mean TM >= {args.tm_threshold:.2f} at rewind 0")
+    print(f"  non-self Foldseek template (control rewind=0): {len(tmpl_pass)} / {len(rows)} targets: {[r['pid'] for r in tmpl_pass]}")
+    print(f"  self-reference template    (ladder  rewind=0): {len(self_pass)} / {len(rows)} targets: {[r['pid'] for r in self_pass]}")
+    print(f"Selected target set (rule: non-self if >= 4 else self): arm={selected_arm!r}, n={len(selected)} targets: {[r['pid'] for r in selected]}")
+    print(f"\n{'pid':<10} {'Lq':>4} {'ref_stem':<10} {'Lt':>4} | {'tmpl_mean':>9} {'tmpl_best':>9} | {'self_mean':>9} {'self_best':>9} | {'r250_tmpl':>9} {'r250_mean':>9}")
+    for r in rows:
+        mark = "*" if any(s["pid"] == r["pid"] for s in selected) else " "
+        print(
+            f"{r['pid'] + mark:<10} {r['Lq']:>4d} {r['ref_stem']:<10} {r['Lt']:>4d} | "
+            f"{r['tmpl_mean8']:>9.4f} {r['tmpl_best8']:>9.4f} | "
+            f"{r['self_mean8']:>9.4f} {r['self_best8']:>9.4f} | "
+            f"{r['lad_r250_tmpl_tm']:>9.4f} {r['lad_r250_mean8']:>9.4f}"
+        )
+
+    os.makedirs(args.out, exist_ok=True)
+    filter_out = {
+        "tm_threshold": args.tm_threshold,
+        "only_bad_afdb22": True,
+        "selected_arm": selected_arm,
+        "selected_pids": [r["pid"] for r in selected],
+        "tmpl_pass_all30": [r["pid"] for r in tmpl_pass],
+        "self_pass_all30": [r["pid"] for r in self_pass],
+        "tmpl_pass_22": [r["pid"] for r in tmpl_pass],
+        "self_pass_22": [r["pid"] for r in self_pass],
+        "rows": rows,
+    }
+    if args.shard == 0:
+        with open(os.path.join(args.out, "filter_summary.json"), "w") as fh:
+            json.dump(filter_out, fh, indent=2)
+    return filter_out
+
+
 def filter_targets(args):
     """Filter bad_afdb / D36tc Group A targets with default tri+c2c mean TM >= 0.5."""
+    if getattr(args, "sc_eval_dir", None) and os.path.exists(os.path.join(args.sc_eval_dir, "eval_ladder.jsonl")):
+        return filter_targets_supercloud(args)
     group_a_file = os.path.join(args.d36tc_dir, "inputs", "groupA.txt")
     tmap_file = os.path.join(args.d36tc_dir, "inputs", "d36tc_template_map.json")
     proc_dir = os.path.join(args.d36tc_dir, "data", "processed")
@@ -694,41 +842,73 @@ def filter_targets(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=("filter", "traj_aa", "cycling", "cebm_langevin", "sse_tmalign", "all"), default="all")
+    ap.add_argument("--mode", choices=("filter", "traj_aa", "cycling", "cebm_langevin", "sse_tmalign", "report", "all"), default="all")
     ap.add_argument("--d36tc-dir", default="/orcd/pool/006/chenxiou/d36tc")
-    ap.add_argument("--natives-dir", default="/orcd/scratch/orcd/011/chenxiou/d36u/natives")
-    ap.add_argument("--tri-ckpt", default="/orcd/scratch/orcd/011/chenxiou/stageA/ckpt/cfft_tri_last-EMA_step60505.ckpt")
-    ap.add_argument("--c2c-ckpt", default="/orcd/scratch/orcd/011/chenxiou/c2c_store/c2c_confind_tbeta/final_twin_s29000.ckpt")
-    ap.add_argument("--index", default="/orcd/pool/006/chenxiou/d36tc/data/topology_index_d36tc.pt")
-    ap.add_argument("--f2c-ckpt-dir", default="/orcd/scratch/orcd/011/chenxiou/Frame2ConFind/runs/f2s_v384_smoothap-pearson")
+    ap.add_argument("--natives-dir", default="/home/gridsan/cou/ProteinEBMalign_data/synth_ladder/natives")
+    ap.add_argument("--sc-eval-dir", default="/home/gridsan/cou/tri_synth_bench/analysis/eval")
+    ap.add_argument("--sc-pairs-dir", default="/home/gridsan/cou/ProteinEBMalign_data/synth_tri")
+    ap.add_argument("--sc-pt-dir", default="/home/gridsan/cou/tri_synth_bench/inputs/c1b/stored_pt")
+    ap.add_argument("--tri-ckpt", default="/home/gridsan/cou/tri_synth_bench/inputs/cfft_tri_last-EMA_step60505.ckpt")
+    ap.add_argument("--c2c-ckpt", default="/home/gridsan/cou/tri_synth_bench/inputs/final_twin_s29000.ckpt")
+    ap.add_argument("--index", default="/home/gridsan/cou/tri_synth_bench/inputs/topology_index_confind_synth.pt")
+    ap.add_argument("--f2c-ckpt-dir", default="/home/gridsan/cou/Frame2ConFind/runs/f2s_v384_smoothap-pearson")
     ap.add_argument("--f2c-dtype", choices=("fp32", "bf16", "fp16"), default="fp32")
-    ap.add_argument("--cebm-repo", default="/orcd/scratch/orcd/011/chenxiou/ContactEBM")
-    ap.add_argument("--cebm-ckpt", default="/orcd/scratch/orcd/011/chenxiou/ContactEBM/runs/confind_a1_prod100/checkpoints/model_step_100000.pt")
-    ap.add_argument("--usalign", default="/home/chenxiou/.local/bin/USalign")
+    ap.add_argument("--cebm-repo", default="/home/gridsan/cou/ContactEBM")
+    ap.add_argument("--cebm-ckpt", default="/home/gridsan/cou/c2cbench/yard/ckpt/confind_a1_prod100_epoch82.pt")
+    ap.add_argument("--usalign", default="/home/gridsan/cou/USalign/USalign")
     ap.add_argument("--out", required=True)
     ap.add_argument("--tm-threshold", type=float, default=0.5)
     ap.add_argument("--only-bad-afdb22", action="store_true", help="Restrict candidate pool strictly to the 22 bad_afdb-22 targets")
-    ap.add_argument("--arm-override", choices=("auto", "tmpl", "self", "both"), default="both",
-                    help="Which template arm(s) to run on the filtered targets ('both' runs non-self tmpl AND self)")
+    ap.add_argument("--arm-override", choices=("auto", "tmpl", "self", "lad_r250", "both", "all3"), default="both",
+                    help="Which template arm(s) to run on the filtered targets ('both'=tmpl+self, 'all3'=lad_r250+tmpl+self)")
     ap.add_argument("--k", type=int, default=8)
     ap.add_argument("--pad-to", type=int, default=384)
     ap.add_argument("--n-cycles", type=int, default=5)
-    ap.add_argument("--t-eval", type=float, default=0.05)
+    ap.add_argument("--t-eval", type=float, default=0.25)
+    ap.add_argument("--shard", type=int, default=0)
+    ap.add_argument("--n-shards", type=int, default=1)
     ap.add_argument("--max-targets", type=int, default=0, help="0 = all filtered targets")
     args = ap.parse_args()
+    assert 0 <= args.shard < args.n_shards
 
     os.makedirs(args.out, exist_ok=True)
     filt = filter_targets(args)
     if args.mode == "filter":
         return 0
 
+    rows_by_pid = {r["pid"]: r for r in filt["rows"]}
+    selected_pids_all = list(filt["selected_pids"])
+    if args.max_targets > 0:
+        selected_pids_all = selected_pids_all[: args.max_targets]
+
+    if args.arm_override == "auto":
+        arms_to_run = [filt["selected_arm"]]
+    elif args.arm_override == "both":
+        arms_to_run = ["tmpl", "self"]
+    elif args.arm_override == "all3":
+        arms_to_run = ["lad_r250", "tmpl", "self"]
+    else:
+        arms_to_run = [args.arm_override]
+
+    if args.mode == "report":
+        print_final_report(args.out, selected_pids_all, arms_to_run, "all", t_eval=args.t_eval)
+        return 0
+
+    selected_pids = selected_pids_all[args.shard :: args.n_shards]
+    print(f"[shard {args.shard}/{args.n_shards}] assigned {len(selected_pids)}/{len(selected_pids_all)} targets: {selected_pids}", flush=True)
+    if not selected_pids:
+        return 0
+
     assert os.environ.get("SIGMA_DATA") is not None and SIGMA_DATA == 16.0, f"SIGMA_DATA={SIGMA_DATA} (env must be 16)"
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     proc_dir = os.path.join(args.d36tc_dir, "data", "processed")
+    if not os.path.isdir(proc_dir) and os.path.isdir(args.sc_pt_dir):
+        proc_dir = args.sc_pt_dir
     all_pt_stems = sorted(os.path.splitext(os.path.basename(p))[0] for p in glob.glob(os.path.join(proc_dir, "*.pt")))
     aa_stats = build_natural_aa_pair_stats(proc_dir, all_pt_stems)
-    np.savez_compressed(os.path.join(args.out, "natural_aa_pair_stats.npz"), **aa_stats)
+    if args.shard == 0:
+        np.savez_compressed(os.path.join(args.out, "natural_aa_pair_stats.npz"), **aa_stats)
     print(f"[aa_stats] built 20x20 natural ConFind AA-pair matrix from {aa_stats['n_chains']} chains "
           f"(overall contact rate |i-j|>=6: {aa_stats['p_contact_overall']:.4f})", flush=True)
 
@@ -737,36 +917,34 @@ def main():
     pro_donor = check_index_matches_builder(transform._index)
     predictor = load_predictor(args.f2c_ckpt_dir, args.f2c_dtype) if args.f2c_ckpt_dir else None
     assert predictor is not None or args.mode not in ("cycling", "all"), "--f2c-ckpt-dir required for cycling"
-    model, cfg_exp = load_tri(args.tri_ckpt, os.path.join(args.out, ".store_tri"))
+    model, cfg_exp = load_tri(args.tri_ckpt, os.path.join(args.out, f".store_tri_shard{args.shard}"))
     model = model.to(dev).eval()
     c2c = load_c2c(args.c2c_ckpt).to(dev).eval()
     cebm_model, cebm_diff, _ = load_contact_ebm(args.cebm_repo, args.cebm_ckpt, dev)
     topo_keys = model._topology_keys()
 
-    rows_by_pid = {r["pid"]: r for r in filt["rows"]}
-    selected_pids = filt["selected_pids"]
-    if args.max_targets > 0:
-        selected_pids = selected_pids[: args.max_targets]
-
-    arms_to_run = [filt["selected_arm"]] if args.arm_override == "auto" else (
-        ["tmpl", "self"] if args.arm_override == "both" else [args.arm_override]
-    )
     all_pids_sorted = sorted(rows_by_pid.keys())
     ci_of = {p: i for i, p in enumerate(all_pids_sorted)}
 
     for arm in arms_to_run:
-        print(f"\n==================== RUNNING ARM: {arm} (n={len(selected_pids)} targets) ====================", flush=True)
+        print(f"\n==================== RUNNING ARM: {arm} (shard {args.shard}/{args.n_shards}: {len(selected_pids)} targets) ====================", flush=True)
         for pid in selected_pids:
             rinfo = rows_by_pid[pid]
-            ref_stem = rinfo["ref_stem"] if arm == "tmpl" else pid
-            gq = torch.load(os.path.join(proc_dir, f"{pid}.pt"), map_location="cpu", weights_only=False)
-            gt = torch.load(os.path.join(proc_dir, f"{ref_stem}.pt"), map_location="cpu", weights_only=False)
-            full_q, amask_q, aatype_q = graph_to_atom37(gq)
-            full_t0, amask_t0, aatype_t0 = graph_to_atom37(gt)
+            ref_stem = rinfo["ref_stem"] if arm == "tmpl" else (f"{pid}_r250" if arm == "lad_r250" else pid)
+            if "qpath" in rinfo and os.path.exists(rinfo["qpath"]):
+                q_src = rinfo["qpath"]
+                t_src = (
+                    rinfo["tpath_tmpl"]
+                    if arm == "tmpl"
+                    else (rinfo.get("tpath_lad_r250", rinfo["tpath_self"]) if arm == "lad_r250" else rinfo["tpath_self"])
+                )
+            else:
+                q_src = os.path.join(proc_dir, f"{pid}.pt")
+                t_src = os.path.join(proc_dir, f"{rinfo['ref_stem'] if arm == 'tmpl' else pid}.pt")
+            full_q, amask_q, aatype_q, cm_nat = load_structure_any(q_src, predictor=predictor)
+            full_t0, amask_t0, aatype_t0, cm_tmpl0 = load_structure_any(t_src, predictor=predictor)
             Lq, Lt0 = int(amask_q.shape[0]), int(amask_t0.shape[0])
-            cm_nat = builder.confind_native_contacts(gq, Lq).numpy()
-            cm_tmpl0 = builder.confind_native_contacts(gt, Lt0).numpy()
-            native_cif, native_ch = native_for(args.natives_dir, pid)
+            native_cif, native_ch = native_for(args.natives_dir, pid, qpath=rinfo.get("qpath"))
             c2c_seed = C2C_SEED_BASE + ci_of[pid]
             n_pad = Lq if args.pad_to == 0 else args.pad_to
 
@@ -788,7 +966,7 @@ def main():
                 Lq,
                 pro_donor,
                 dssp_def="h_bond",
-                cm_t_override=cm_tmpl0 if predictor is None else None,
+                cm_t_override=cm_tmpl0,
             )
             topology0 = {kk: Proteina._stack_topology([ref0[kk]] * args.k).to(dev) for kk in topo_keys}
             mask_q = torch.zeros(args.k, n_pad, dtype=torch.bool, device=dev)
@@ -958,7 +1136,7 @@ def main():
                     for K_corr in (0, 20):
                         t_l0 = time.time()
                         res_lang = cebm_reverse_sample_from_t0(
-                            cebm_model, cebm_diff, init_bmap, aatype_q, Lq, t0=t0, K_corrector=K_corr, dev=dev, seed=TRI_SEED
+                            cebm_model, cebm_diff, init_bmap, aatype_q, Lq, t0=t0, K_corrector=K_corr, dev=dev, t_eval=args.t_eval, seed=TRI_SEED
                         )
                         # Save every step's bit-packed uint8 clean contact map prediction
                         npz_path = os.path.join(pair_dir, f"cebm_t{int(t0*100):03d}_K{K_corr}.npz")
@@ -980,7 +1158,6 @@ def main():
                         unpacked_all = unpack_upper_triangle(res_lang["packed_clean_steps"], Lq)
                         pred_indices = [idx for idx, kd in enumerate(res_lang["step_kinds"]) if kd == "predictor"]
                         mid_pred_idx = pred_indices[len(pred_indices) // 2]
-                        last_pred_idx = pred_indices[-1]
 
                         c14_mid = c2c_rollout_atom14(c2c, unpacked_all[mid_pred_idx], aatype_q, Lq, n_pad, c2c_seed, dev)
                         pdb_mid = os.path.join(pair_dir, f"cebm_t{int(t0*100):03d}_K{K_corr}_mid.pdb")
@@ -1020,7 +1197,7 @@ def main():
                         langevin_rows.append(row_l)
                         print(
                             f"[1b cebm] {pid} ({arm}) t0={t0:.1f} K={K_corr:2d}: calls={res_lang['n_calls']:4d} "
-                            f"E005 {e_clean0[best_idx0]:.2f}->{res_lang['final_e005']:.2f} | "
+                            f"E(t={args.t_eval:g}) {e_clean0[best_idx0]:.2f}->{res_lang['final_e005']:.2f} | "
                             f"TM init={r0_tms[best_idx0]:.4f} mid={tm_mid:.4f} final={tm_fin:.4f} (dTM={tm_fin - r0_tms[best_idx0]:+.4f}) "
                             f"F1={cm_fin_vs_nat['f1']:.3f} ({sec_l:.1f}s)",
                             flush=True,
@@ -1041,7 +1218,7 @@ def main():
                         Lq,
                         pro_donor,
                         dssp_def=ddef,
-                        cm_t_override=cm_tmpl0 if predictor is None else None,
+                        cm_t_override=cm_tmpl0,
                     )
                     n_h = int((dssp_vec == DSSP_HELIX).sum().item())
                     n_e = int((dssp_vec == DSSP_STRAND).sum().item())
@@ -1089,8 +1266,8 @@ def main():
                 with open(os.path.join(pair_dir, "sse_tmalign.json"), "w") as fh:
                     json.dump({"pid": pid, "arm": arm, "ref_stem": ref_stem, "variants": sse_rows}, fh, indent=2)
 
-    print_final_report(args.out, selected_pids, arms_to_run, args.mode)
-    print("\n=== ALL REQUESTED MODES COMPLETED ===", flush=True)
+    print_final_report(args.out, selected_pids_all, arms_to_run, args.mode, t_eval=args.t_eval)
+    print(f"\n=== SHARD {args.shard}/{args.n_shards} COMPLETED ===", flush=True)
     return 0
 
 
@@ -1112,7 +1289,7 @@ def _spearman(xs, ys):
     return _pearson(rx, ry)
 
 
-def print_final_report(out_dir, selected_pids, arms, mode):
+def print_final_report(out_dir, selected_pids, arms, mode, t_eval=0.25):
     for arm in arms:
         print(f"\n==================== FINAL AGGREGATE REPORT (arm={arm}, n={len(selected_pids)}) ====================", flush=True)
         if mode in ("traj_aa", "all"):
@@ -1152,7 +1329,7 @@ def print_final_report(out_dir, selected_pids, arms, mode):
                         f"{rds[-1]['pick_tm_vs_tmpl0']:>8.3f} {rds[-1]['pick_tm_vs_prev']:>8.3f}"
                     )
                 if all_e:
-                    print(f"  [ContactEBM E(t=0.05) vs TM across all cycling maps (n={len(all_e)})]: "
+                    print(f"  [ContactEBM E(t={t_eval:g}) vs TM across all cycling maps (n={len(all_e)})]: "
                           f"Pearson r={_pearson(all_e, all_tm):+.4f}, Spearman rho={_spearman(all_e, all_tm):+.4f}")
 
         if mode in ("cebm_langevin", "all"):
@@ -1173,7 +1350,7 @@ def print_final_report(out_dir, selected_pids, arms, mode):
                         f"{r['init_e005']:>7.2f} {r['final_e005']:>7.2f} | {r['final_f1_vs_nat']:>6.3f}"
                     )
             if lang_e:
-                print(f"  [ContactEBM E(t=0.05) vs TM across Langevin trajectory checkpoints (n={len(lang_e)})]: "
+                print(f"  [ContactEBM E(t={t_eval:g}) vs TM across Langevin trajectory checkpoints (n={len(lang_e)})]: "
                       f"Pearson r={_pearson(lang_e, lang_tm):+.4f}, Spearman rho={_spearman(lang_e, lang_tm):+.4f}")
 
         if mode in ("sse_tmalign", "all"):
