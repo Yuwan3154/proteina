@@ -68,6 +68,13 @@ class CATPairReferenceTransform(TopologyReferenceTransform):
         self.usalign = usalign
         self.exclude_own_synthetic = bool(exclude_own_synthetic)
 
+    def __getstate__(self):
+        # a spawn-context DataLoader pickles the dataset into every worker; the preloaded multi-GB index must not travel through
+        # shared memory, the worker reloads it lazily. Forked workers inherit it without any pickling.
+        state = self.__dict__.copy()
+        state.update(_index=None, _id_to_row=None, _generator=None, _generator_pid=None)
+        return state
+
     def _ensure_loaded(self) -> None:
         fresh = self._index is None  # an early return here would skip the base class's per-worker generator re-seed
         super()._ensure_loaded()

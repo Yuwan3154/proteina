@@ -266,6 +266,19 @@ def test_preloaded_index_worker_generator(toy):
 
 
 @needs_toy
+def test_preloaded_transform_pickles_without_the_index(toy):
+    import pickle
+    tr = _transform(toy, index_mmap=False)
+    tr._ensure_loaded()
+    blob = pickle.dumps(tr)
+    assert len(blob) < 1_000_000, len(blob)
+    tr2 = pickle.loads(blob)
+    assert tr2._index is None and tr2._generator is None
+    tr2._ensure_loaded()
+    assert tr2._index is not None and tr2._generator_pid == os.getpid()
+
+
+@needs_toy
 def test_datamodule_batches(toy):
     from proteinfoundation.datasets.cat_pair_data import CATPairLightningDataModule
     from proteinfoundation.datasets.transforms import ChainBreakPerResidueTransform, ContactMapTransform, DSSPTargetTransform, GlobalRotationTransform
