@@ -39,7 +39,7 @@ AlphaFold conventions for everything the user did not specify (user 2026-10-10: 
 """
 
 import math
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -54,6 +54,7 @@ from proteinfoundation.nn.contact_map_tri import (
     ContactMapTriSiT,
     _pair_feature_indices,
 )
+from proteinfoundation.nn.mpnn_topology_encoder import MPNNChunk9TopologyModule, extract_backbone_atom4
 from proteinfoundation.openfold_stub.model.primitives import LayerNorm, Linear, lecun_normal_init_
 from proteinfoundation.openfold_stub.model.triangular_multiplicative_update import (
     TriangleMultiplicationIncoming,
@@ -184,10 +185,22 @@ class CleanPairEmbedding(nn.Module):
     Two instances: one starts the pair representation z, one starts the pair conditioning s (user 2026-10-10: separate
     weights)."""
 
-    def __init__(self, dim: int, n_residue_types: int, vocab: int, n_elem_features: int, max_rel_pos: int):
+    def __init__(
+        self,
+        dim: int,
+        n_residue_types: int,
+        vocab: int,
+        n_elem_features: int,
+        max_rel_pos: int,
+        chunk_dim: Optional[int] = None,
+    ):
         super().__init__()
         self.seq_i, self.seq_j = OneHotLinear(n_residue_types, dim), OneHotLinear(n_residue_types, dim)
-        self.topo_i, self.topo_j = OneHotLinear(vocab, dim), OneHotLinear(vocab, dim)
+        if chunk_dim is None:
+            self.topo_i, self.topo_j = OneHotLinear(vocab, dim), OneHotLinear(vocab, dim)
+        else:
+            self.topo_i = Linear(chunk_dim, dim, init="default")
+            self.topo_j = Linear(chunk_dim, dim, init="default")
         self.elem_i = Linear(n_elem_features, dim, init="default")  # AF2 LeCun-normal init
         self.elem_j = Linear(n_elem_features, dim, init="default")
         self.block_type = OneHotLinear(N_BLOCK_TYPES, dim)
@@ -202,8 +215,9 @@ class CleanPairEmbedding(nn.Module):
             ej = F.pad(self.seq_j(rtype) * keep, (0, 0, 0, T))
             x = x + ei[:, :, None, :] + ej[:, None, :, :]
         ef = elem_feat.to(x.dtype)
-        ti = F.pad((self.topo_i(tok) + self.elem_i(ef)) * tok_valid, (0, 0, L, 0))
-        tj = F.pad((self.topo_j(tok) + self.elem_j(ef)) * tok_valid, (0, 0, L, 0))
+        tok_in = tok.to(x.dtype) if tok.is_floating_point() else tok
+        ti = F.pad((self.topo_i(tok_in) + self.elem_i(ef)) * tok_valid, (0, 0, L, 0))
+        tj = F.pad((self.topo_j(tok_in) + self.elem_j(ef)) * tok_valid, (0, 0, L, 0))
         return x + ti[:, :, None, :] + tj[:, None, :, :]
 
 
@@ -267,20 +281,37 @@ class ContactMapTriV2(nn.Module):
         self.query_pos = kwargs.get("query_pos", "index")
         if self.query_pos not in ("index", "seqres"):
             raise ValueError(f"query_pos must be 'index' or 'seqres', got {self.query_pos!r}")
+        self.reference_mode = kwargs.get("reference_mode", "sse")
+        if self.reference_mode not in ("sse", "mpnn_chunk9"):
+            raise ValueError(f"reference_mode must be 'sse' or 'mpnn_chunk9', got {self.reference_mode!r}")
 
         self.contact_map_mode = True
         self.contact_map_input_dim = int(kwargs.get("contact_map_input_dim", 1))
         self.non_contact_value = int(kwargs.get("non_contact_value", 0))
         self.predict_coords = None  # see ContactMapTriSiT: None, not False
 
+        chunk_dim = self.dim if self.reference_mode == "mpnn_chunk9" else None
         emb_args = (int(kwargs.get("n_residue_types", 22)), self.topology_vocab_size, self.n_elem_features,
-                    self.max_rel_pos)
+                    self.max_rel_pos, chunk_dim)
         self.z_embed = CleanPairEmbedding(self.dim, *emb_args)
         self.cell_in = Linear(2 + len(self.pair_feat_idx), self.dim, init="default")
         # pair conditioning s (user 2026-10-10): the clean inputs only (no noisy / self-conditioning map), own weights;
         # AF3 time embedding added to every cell, then 2 transitions; fixed across all blocks
         self.s_embed = CleanPairEmbedding(self.dim_cond, *emb_args)
         self.s_ref_in = Linear(len(self.pair_feat_idx), self.dim_cond, init="default")
+        self.mpnn_topo = None
+        self.s_edge_in = None
+        if self.reference_mode == "mpnn_chunk9":
+            self.mpnn_topo = MPNNChunk9TopologyModule(
+                d=self.dim,
+                num_chunk_layers=int(kwargs.get("mpnn_chunk_layers", 2)),
+                num_heads=int(kwargs.get("mpnn_chunk_heads", 4)),
+                ffn_expansion=int(kwargs.get("mpnn_ffn_expansion", 4)),
+                k_neighbors=int(kwargs.get("mpnn_k_neighbors", 48)),
+                edge_pool=kwargs.get("mpnn_edge_pool", "mean"),
+                mpnn_ckpt_path=kwargs.get("mpnn_ckpt_path", None),
+            )
+            self.s_edge_in = Linear(self.dim, self.dim_cond, init="default")
         # AF3 pair_cond_initial_norm (no offset) + pair_cond_initial_projection (bias-free, default init), user 10-10 "Yes"
         self.s_in_norm = nn.LayerNorm(self.dim_cond, bias=False)
         self.s_in_proj = Linear(self.dim_cond, self.dim_cond, bias=False, init="default")
@@ -297,7 +328,8 @@ class ContactMapTriV2(nn.Module):
         if dict(kwargs.get("align_head") or {}).get("enabled", False):
             self.align_head = Linear(self.dim, 1, init="final")  # AF2 heads: 'final' (zero) init
             self.align_none = Linear(self.dim, 1, init="final")
-        if dict(kwargs.get("mlm_head") or {}).get("enabled", False):
+        # Task 3 (user 2026-10-28): SSE MLM loss is disabled in mpnn_chunk9 mode.
+        if self.reference_mode == "sse" and dict(kwargs.get("mlm_head") or {}).get("enabled", False):
             self.mlm_head = Linear(self.dim, self.topology_vocab_size, init="final")
         self.out = Linear(self.dim, 1, init="final")  # AF2/OpenFold DistogramHead: final init, bias, no LayerNorm
         self.configure_compile(kwargs)
@@ -390,7 +422,32 @@ class ContactMapTriV2(nn.Module):
             seq_dropped = batch.get("seq_dropped")
             if seq_dropped is not None:
                 keep = 1.0 - seq_dropped.reshape(B, -1)[:, :1, None].to(dtype)
-        clean = (rel, block_idx, rtype, keep, he_tokens.clamp(min=0), elem_feat, he_valid[..., None])
+
+        edge_pair_emb = None
+        if self.reference_mode == "mpnn_chunk9":
+            chunk_masked = batch.get("topology_chunk_masked")
+            if chunk_masked is None:
+                chunk_masked = he_tokens == TOPOLOGY_MASK_TOKEN
+            tmpl_coords = batch.get("template_backbone_coords")
+            tmpl_mask = batch.get("template_backbone_mask")
+            if tmpl_coords is not None and tmpl_coords.shape[-2] != 4:
+                if tmpl_mask is None:
+                    tmpl_mask = torch.ones(tmpl_coords.shape[:-1], device=device, dtype=dtype)
+                tmpl_coords, tmpl_mask = extract_backbone_atom4(tmpl_coords, tmpl_mask)
+            tmpl_res_idx = batch.get("template_residue_idx")
+            topo_repr, edge_pair_emb = self.mpnn_topo(
+                tmpl_backbone_coords=tmpl_coords,
+                tmpl_backbone_mask=tmpl_mask,
+                target_T=T,
+                chunk_valid=he_valid,
+                chunk_masked=chunk_masked,
+                tmpl_residue_idx=tmpl_res_idx,
+                dtype=dtype,
+            )
+        else:
+            topo_repr = he_tokens.clamp(min=0)
+
+        clean = (rel, block_idx, rtype, keep, topo_repr, elem_feat, he_valid[..., None])
         ref_feat = he_feat[..., self.pair_feat_idx].to(dtype)
         pm = pair_mask[..., None]
 
@@ -401,9 +458,15 @@ class ContactMapTriV2(nn.Module):
         cells[:, :L, :L, 0] = cm_t
         cells[:, :L, :L, 1] = cm_sc
         cells[:, L:, L:, 2:] = ref_feat
-        z = (self.z_embed(*clean) + self.cell_in(cells)) * pm
+        z_base = self.z_embed(*clean) + self.cell_in(cells)
+        if edge_pair_emb is not None:
+            z_base = z_base + F.pad(edge_pair_emb, (0, 0, L, 0, L, 0))
+        z = z_base * pm
 
-        s = self.s_embed(*clean) + F.pad(self.s_ref_in(ref_feat), (0, 0, L, 0, L, 0))
+        s_ref = self.s_ref_in(ref_feat)
+        if edge_pair_emb is not None:
+            s_ref = s_ref + self.s_edge_in(edge_pair_emb)
+        s = self.s_embed(*clean) + F.pad(s_ref, (0, 0, L, 0, L, 0))
         s = self.s_in_proj(self.s_in_norm(s))
         s = s + self.cond_in(self.fourier_ln(self.fourier(batch["t"])))[:, None, None, :].to(s.dtype)
         for tr in self.cond_transitions:

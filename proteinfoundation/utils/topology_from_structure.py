@@ -69,12 +69,16 @@ def parse_structure(structure_path: str, chain: str = "all") -> "Data":
     return graph
 
 
-def load_structure(structure_path: str, chain: str = "all"):
+def load_structure(
+    structure_path: str,
+    chain: str = "all",
+    dssp_def: str = "h_bond",
+):
     """PDB/CIF -> (coords [L, 37, 3] in OpenFold atom order, coord_mask [L, 37], dssp [L])."""
-    return atom37_and_dssp(parse_structure(structure_path, chain=chain))
+    return atom37_and_dssp(parse_structure(structure_path, chain=chain), dssp_def=dssp_def)
 
 
-def atom37_and_dssp(graph):
+def atom37_and_dssp(graph, dssp_def: str = "h_bond"):
     """Graph in PDB atom order -> the atom37 view the topology featurisation expects, plus DSSP.
 
     Mirrors ``pdb_data.PDBDataset`` exactly: same reorder, and DSSP read from the atom37 layout
@@ -88,6 +92,7 @@ def atom37_and_dssp(graph):
         torch.ones(1, L, dtype=torch.bool),
         coord_mask[None],
         coord_layout="atom37",
+        dssp_def=dssp_def,
     )
     if dssp is None:
         raise ValueError(
@@ -106,6 +111,7 @@ def structure_to_topology_source(
     rotlib_path: Optional[str] = None,
     confind_bin: str = "confind",
     raw_contact_map: Optional[torch.Tensor] = None,
+    dssp_def: str = "h_bond",
 ) -> Tuple[Sequence[Tuple[int, int]], torch.Tensor, torch.Tensor]:
     """Structure file -> (runs, element contact map, structural pair features).
 
@@ -126,7 +132,7 @@ def structure_to_topology_source(
     min_len = int(index["min_len"])
 
     graph = parse_structure(structure_path, chain=chain)
-    coords, coord_mask, dssp = atom37_and_dssp(graph)
+    coords, coord_mask, dssp = atom37_and_dssp(graph, dssp_def=dssp_def)
     L = coords.shape[0]
 
     if raw_contact_map is None:
@@ -170,6 +176,7 @@ def topology_reference_from_structure(
     rotlib_path: Optional[str] = None,
     confind_bin: str = "confind",
     raw_contact_map: Optional[torch.Tensor] = None,
+    dssp_def: str = "h_bond",
 ) -> Dict[str, torch.Tensor]:
     """The six ``topology_*`` tensors for a structure file, rescaled onto ``target_len``.
 
@@ -185,6 +192,7 @@ def topology_reference_from_structure(
         rotlib_path=rotlib_path,
         confind_bin=confind_bin,
         raw_contact_map=raw_contact_map,
+        dssp_def=dssp_def,
     )
     transform = TopologyReferenceTransform(
         index_path=index_path,

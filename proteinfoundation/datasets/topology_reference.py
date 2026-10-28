@@ -118,9 +118,15 @@ class TopologyReferenceTransform(T.BaseTransform):
         single_token_types: Sequence[int] = (),
         elem_features: bool = False,
         placeholder_span: str = "length",
+        reference_mode: str = "sse",
+        chunk_size: int = 9,
     ):
         if reference_source not in ("cluster", "synthetic"):
             raise ValueError(f"reference_source must be 'cluster' or 'synthetic', got {reference_source!r}")
+        if reference_mode not in ("sse", "mpnn_chunk9"):
+            raise ValueError(f"reference_mode must be 'sse' or 'mpnn_chunk9', got {reference_mode!r}")
+        self.reference_mode = reference_mode
+        self.chunk_size = int(chunk_size)
         self.index_path = index_path
         self.max_topology_len = max_topology_len
         self.max_topology_he_len = max_topology_he_len
@@ -382,13 +388,16 @@ class TopologyReferenceTransform(T.BaseTransform):
 
         # Token masking (BERT-style, token identity only; positions and pair features stay): the
         # pre-mask token is the target for the masked-token loss, 0 (= PAD) where not masked.
+        # In mpnn_chunk9 mode (user 2026-10-28, answer 3d), random chunk token masking is kept
+        # without MLM loss (he_target stays all 0).
         he_target = torch.zeros_like(he_tokens)
         if augment and self.token_mask_prob > 0.0 and he_tokens.numel():
             masked = torch.rand(he_tokens.shape, generator=self._generator) < self.token_mask_prob
-            if self.alphabet.single_token_types:  # T8 (user 2026-10-10): a one-token type (loop) is never an MLM target
+            if self.reference_mode == "sse" and self.alphabet.single_token_types:
                 single = torch.tensor([self.alphabet.token(t, 1) for t in self.alphabet.single_token_types])
                 masked = masked & ~torch.isin(he_tokens, single)
-            he_target = torch.where(masked, he_tokens, he_target)
+            if self.reference_mode == "sse":
+                he_target = torch.where(masked, he_tokens, he_target)
             he_tokens = torch.where(masked, torch.full_like(he_tokens, MASK_TOKEN), he_tokens)
             if self.elem_features:  # T8 (user 2026-10-10): hide a masked element's length, else it gives the length slot away
                 elem_feat = torch.where(masked[:, None], torch.zeros_like(elem_feat), elem_feat)
@@ -597,18 +606,22 @@ class TopologyReferenceTransform(T.BaseTransform):
         """
         if L is None:
             L = int(graph.coords.shape[0])
-        lo, hi = self.drop_ref_len_range
-        if hi >= lo >= 1:
-            n_el = int(torch.randint(int(lo), int(hi) + 1, (1,), generator=self._generator))
-        else:
-            n_el = 1
-        n_el = max(1, min(n_el, self.max_topology_he_len))
         span = L
         if self.placeholder_span == "seqres":  # T8b: the query's SEQRES span [0, last - first + 1)
             if getattr(graph, "residue_seqres_idx", None) is None:
                 raise SeqresIndexError("placeholder_span='seqres' needs graph.residue_seqres_idx (SeqresIndexTransform)")
             q = graph.residue_seqres_idx
             span = int(q[-1] - q[0]) + 1
+        if self.reference_mode == "mpnn_chunk9":
+            # User 2026-10-28 (answer 3d): fixed-length learned mask embedding (ceil(span / 9) chunks).
+            n_el = (max(span, 1) + self.chunk_size - 1) // self.chunk_size
+        else:
+            lo, hi = self.drop_ref_len_range
+            if hi >= lo >= 1:
+                n_el = int(torch.randint(int(lo), int(hi) + 1, (1,), generator=self._generator))
+            else:
+                n_el = 1
+        n_el = max(1, min(n_el, self.max_topology_he_len))
         # Midpoints of n_el equal slices of the query: (i + 0.5) * span / n_el.
         pos = (torch.arange(n_el, dtype=torch.float32) + 0.5) * (float(span) / max(n_el, 1))
         if missing:
