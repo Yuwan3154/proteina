@@ -19,6 +19,7 @@ non-self reference regardless of cluster size; a chain that still has none falls
 unconditional MASK reference and says so loudly (topology_missing_ref = 1 + a warning).
 """
 
+import os
 import zlib
 from typing import Dict, Optional, Sequence, Tuple
 
@@ -113,6 +114,7 @@ class TopologyReferenceTransform(T.BaseTransform):
         element_types: Sequence[int] = (DSSP_HELIX, DSSP_STRAND),
         single_token_types: Sequence[int] = (),
         elem_features: bool = False,
+        index_mmap: bool = True,
     ):
         if reference_source not in ("cluster", "synthetic"):
             raise ValueError(f"reference_source must be 'cluster' or 'synthetic', got {reference_source!r}")
@@ -148,9 +150,11 @@ class TopologyReferenceTransform(T.BaseTransform):
         self.elem_features = bool(elem_features)
         self._elem_mean, self._elem_std = 0.0, 1.0
         self.seed = seed
+        self.index_mmap = bool(index_mmap)  # False: the index is read into RAM (a datamodule that preloads it in the parent shares it with forked workers)
         self._index = None
         self._id_to_row = None
         self._generator = None
+        self._generator_pid = None
         self.has_pair_features = False
         self._feat_mean = torch.zeros(N_PAIR_FEATURES)
         self._feat_std = torch.ones(N_PAIR_FEATURES)
@@ -159,11 +163,14 @@ class TopologyReferenceTransform(T.BaseTransform):
     # dataloader workers rather than being deserialised in each of them.
     def _ensure_loaded(self) -> None:
         if self._index is not None:
+            if self._generator_pid != os.getpid():  # a forked worker of a transform whose index the parent loaded: its own random stream
+                self._generator = torch.Generator().manual_seed((self.seed + torch.initial_seed()) % (2**63))
+                self._generator_pid = os.getpid()
             return
         # mmap: the index carries a per-element-pair feature block, so a resident copy in each of
         # the dataloader workers would multiply a multi-gigabyte allocation by num_workers. Memory
         # mapping leaves it in the page cache, shared by every worker.
-        index = torch.load(self.index_path, map_location="cpu", weights_only=False, mmap=True)
+        index = torch.load(self.index_path, map_location="cpu", weights_only=False, mmap=self.index_mmap)
         # validated BEFORE it is kept: a failed check must not leave a half-initialised transform behind
         built = tuple(int(t) for t in index.get("element_types", (DSSP_HELIX, DSSP_STRAND)))
         if sorted(built) != sorted(self.element_types):
@@ -180,6 +187,7 @@ class TopologyReferenceTransform(T.BaseTransform):
         self._generator = torch.Generator().manual_seed(
             (self.seed + torch.initial_seed()) % (2**63)
         )
+        self._generator_pid = os.getpid()
         self.has_pair_features = "feat_flat" in self._index
         if self.has_pair_features:
             self._feat_mean = self._index["pair_feature_mean"].float()

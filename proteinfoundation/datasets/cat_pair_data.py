@@ -26,13 +26,24 @@ from loguru import logger
 from torch_geometric.data import Data
 
 from proteinfoundation.datasets.base_data import BaseLightningDataModule
-from proteinfoundation.datasets.cat_unit_store import UnitStore, seg_positions
+from proteinfoundation.datasets.cat_unit_store import UnitStore, prime_page_cache, seg_positions
 from proteinfoundation.datasets.topology_reference import ALIGN_NONE, MASK_REF_ID, TopologyReferenceTransform
 from proteinfoundation.utils.cluster_utils import CATUniformSampler
-from proteinfoundation.utils.precompute_synthetic_topology_index import usalign_pairs, write_ca_pdb
+from proteinfoundation.utils.precompute_synthetic_topology_index import usalign_pairs
 
 AA = "ARNDCQEGHILKMFPSTWYV"  # openfold restype order (the unit store's aatype)
 CA_IDX = 1
+
+
+def write_ca_pdb(ca_xyz: np.ndarray, present: np.ndarray, path: str) -> List[int]:
+    """CA-only PDB, byte-identical to precompute_synthetic_topology_index.write_ca_pdb but formatted from python floats in one pass
+    (the original spent ~10 ms per call in a per-atom generator); returns written_index -> structure_index."""
+    keep = np.flatnonzero(present)
+    lines = ["ATOM  %5d  CA  GLY A%4d    %8.3f%8.3f%8.3f  1.00  0.00           C\n" % (k, k, x, y, z) for k, (x, y, z) in enumerate(ca_xyz[keep].tolist(), 1)]
+    with open(path, "w") as fh:
+        fh.write("".join(lines))
+        fh.write("TER\nEND\n")
+    return keep.tolist()
 
 
 def _tmpdir() -> str:
@@ -58,9 +69,10 @@ class CATPairReferenceTransform(TopologyReferenceTransform):
         self.exclude_own_synthetic = bool(exclude_own_synthetic)
 
     def _ensure_loaded(self) -> None:
-        if self._index is not None:
-            return
+        fresh = self._index is None  # an early return here would skip the base class's per-worker generator re-seed
         super()._ensure_loaded()
+        if not fresh:
+            return
         for key in ("ca_flat", "elem_flat", "ca_offset", "row_entry", "row_pool", "pool_members_flat", "pool_members_offset", "row_src"):
             assert key in self._index, f"{self.index_path} lacks {key}: not an index of utils/precompute_cat_pair_index"
 
@@ -200,11 +212,22 @@ class CATPairLightningDataModule(BaseLightningDataModule):
     """Datamodule of the CAT regime. sampling_mode is fixed to "cat-pair"; batches are length-bucketed epoch plans
     (epoch_batch_plan: True) or a plain CATUniformSampler stream."""
 
-    def __init__(self, store_dir: str, cath_draw_prob: float, **kwargs):
+    def __init__(self, store_dir: str, cath_draw_prob: float, prime_store: bool = False, **kwargs):
         super().__init__(sampling_mode="cat-pair", **kwargs)
         assert 0.0 <= cath_draw_prob <= 1.0, cath_draw_prob
         self.store_dir = store_dir
         self.cath_draw_prob = float(cath_draw_prob)
+        self.prime_store = bool(prime_store)
+
+    def setup(self, stage=None):
+        super().setup(stage)
+        # the reference index is loaded HERE, in the main process, so forked DataLoader workers share it (copy-on-write) instead of each
+        # paying the file-system latency of a memory-mapped read per item (measured 60 ms of a ~95 ms warm item)
+        for t in getattr(self.transform, "transforms", [self.transform]):
+            if isinstance(t, CATPairReferenceTransform):
+                t._ensure_loaded()
+        if self.prime_store:
+            logger.info(f"primed the page cache with {prime_page_cache(self.store_dir) / 1e9:.1f} GB of store arrays")
 
     def _get_dataset(self, split: str):
         fixed = self.cluster_sampler_seed if split == "val" else None

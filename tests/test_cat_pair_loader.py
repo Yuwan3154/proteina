@@ -116,6 +116,22 @@ def _transform(toy, **kw):
     return CATPairReferenceTransform(toy["index_path"], usalign=USALIGN, **{"seed": 1, **TR_KW, **kw})
 
 
+def test_fast_ca_writer_identical_and_prime(tmp_path):
+    from proteinfoundation.datasets.cat_pair_data import write_ca_pdb as fast
+    from proteinfoundation.utils.precompute_synthetic_topology_index import write_ca_pdb as slow
+    rng = np.random.default_rng(0)
+    for n in (1, 7, 137, 530):
+        ca = (rng.normal(size=(n, 3)) * 25).astype(np.float32)
+        present = rng.random(n) > 0.15
+        present[0] = True
+        m0 = slow(ca, present, str(tmp_path / "a.pdb"))
+        m1 = fast(ca, present, str(tmp_path / "b.pdb"))
+        assert m0 == m1 and (tmp_path / "a.pdb").read_text() == (tmp_path / "b.pdb").read_text()
+    os.makedirs(tmp_path / "shards" / "s0000")
+    np.save(tmp_path / "shards" / "s0000" / "x.npy", np.arange(10, dtype=np.int64))
+    assert cus.prime_page_cache(str(tmp_path)) > 80
+
+
 def test_source_weights_and_sampler_mixture():
     from proteinfoundation.datasets.cat_pair_data import CATUnitDataset
     ds = CATUnitDataset.__new__(CATUnitDataset)
@@ -237,6 +253,16 @@ def test_fixed_validation_pairs(toy):
     assert a == b, "fixed validation: the same pair and reference for any torch / transform seed"
     assert not any(x[3] for x in a), "pair_seed must be consumed by the transform"
     assert run(0, 1, 0) != run(0, 1, 7), "a different fixed seed must change the draws"
+
+
+@needs_toy
+def test_preloaded_index_worker_generator(toy):
+    tr = _transform(toy, index_mmap=False)
+    tr._ensure_loaded()
+    assert tr._generator_pid == os.getpid()
+    tr._generator_pid = -1  # as a forked worker sees it: index present, generator belongs to the parent
+    tr._ensure_loaded()
+    assert tr._generator_pid == os.getpid()
 
 
 @needs_toy

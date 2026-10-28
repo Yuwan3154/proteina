@@ -20,6 +20,7 @@ Layout (every table is a TSV, every array an .npy so workers memory-map instead 
 Files per directory are bounded: one directory per shard of <= SHARD_ENTRIES entries.
 """
 
+import glob
 import os
 from typing import Dict, List, Tuple
 
@@ -51,6 +52,20 @@ def positions_to_seg(pos: np.ndarray) -> str:
     starts = np.concatenate([[0], breaks + 1])
     ends = np.concatenate([breaks, [len(pos) - 1]])
     return format_seg([(int(pos[s]), int(pos[e]) + 1) for s, e in zip(starts, ends)])
+
+
+def prime_page_cache(root: str, chunk: int = 64 << 20) -> int:
+    """Read every shard array once, sequentially, so random member reads hit the page cache (35 GB took 95 s at 368 MB/s on
+    SuperCloud; a random-access first touch costs ~50-100 ms per item). Returns the bytes read."""
+    n = 0
+    for path in sorted(glob.glob(os.path.join(root, "shards", "*", "*.npy"))):
+        with open(path, "rb") as fh:
+            while True:
+                block = fh.read(chunk)
+                if not block:
+                    break
+                n += len(block)
+    return n
 
 
 def write_shard(shard_dir: str, entries: List[Dict]) -> None:

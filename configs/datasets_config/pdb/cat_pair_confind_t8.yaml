@@ -4,6 +4,7 @@
 # ??? = not grounded yet (see the loader hand-off list).
 datamodule:
   _target_: "proteinfoundation.datasets.cat_pair_data.CATPairLightningDataModule"  # NEW: members (entry, CAT, domain), one per CAT per epoch
+  prime_store: True                            # read the store arrays once at setup (page cache); first-touch random reads cost ~50-100 ms per item
   cath_draw_prob: 0.3                         # user 2026-10-27: CATH 30 % / TED 70 % (ESMFold2 ratio), per CAT; one source -> that source
   store_dir: ${oc.env:CAT_STORE_DIR}          # NEW: unit store written by t2cat_pack_units.py + utils/precompute_cat_pair_index.py
   batch_padding: True
@@ -28,6 +29,7 @@ datamodule:
     - _target_: "proteinfoundation.datasets.cat_pair_data.CATPairReferenceTransform"
       index_path: ${oc.env:CAT_STORE_DIR}/cat_pair_index.pt   # NEW: per-member index (utils/precompute_cat_pair_index merge)
       usalign: ${oc.env:USALIGN_BIN}             # NEW: the reference binary, run per pair in the (persistent) workers
+      index_mmap: False                          # read the index into RAM in the datamodule setup, shared with the forked workers (mmap cost ~60 ms per item on the shared file system)
       exclude_own_synthetic: False               # ??? NEW: a synthetic template edited from the query's own unit is a different entry; the T8 regime used exactly that
       sse_types: [0, 1, 2]
       single_token_types: [0]
