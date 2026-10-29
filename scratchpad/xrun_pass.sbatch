@@ -36,7 +36,11 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 case "${MODEL:?}" in
   cb8) REPO=$S/xrun_repo_cb8; CFG=training_contact_tri_full384_cb8synth_v1; CKPT=$X/ckpt/cb8/cb8_chk_epoch305_step123500-EMA.ckpt ;;
   t8)  REPO=$S/xrun_repo_t8;  CFG=training_contact_tri_t8_confind_v1;        CKPT=$X/ckpt/t8/t8_last-EMA_step125775.ckpt ;;
-  t8b) REPO=$S/xrun_repo_t8b; CFG=training_contact_tri_t8b_confind_v1;       CKPT=${T8B_CKPT:?T8B_CKPT = the captured ckpt} ;;
+  t8b) REPO=$S/xrun_repo_t8b; CFG=training_contact_tri_t8b_confind_v1;       CKPT=${T8B_CKPT:?T8B_CKPT = the captured ckpt}
+       # run_tri_t8b.sbatch REQUIRES these (no defaults: the yaml's default pack is the deleted v1); values = the running
+       # T8b segment 27011662's own log line "pack=... seqres=..."
+       export PACK_PATH=$C/proteina_pack/tri_t8b_512_v2.pack SEQRES_INDEX_PATH=$C/t8b_index/seqres_index_t8b_v4.pt
+       [ -f "$PACK_PATH" ] && [ -f "$PACK_PATH.idx.npz" ] && [ -f "$SEQRES_INDEX_PATH" ] || { echo "FATAL: T8b pack/seqres"; exit 77; } ;;
   *) echo "FATAL: MODEL=$MODEL"; exit 77 ;;
 esac
 case "${ARM:?}" in
