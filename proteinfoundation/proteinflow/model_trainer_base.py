@@ -3539,6 +3539,26 @@ class ModelTrainerBase(L.LightningModule):
                 )
             prev_sampling_grid = getattr(self.discrete_diffusion, "sampling_grid", None)
             self.discrete_diffusion.sampling_grid = sampling_grid
+        # Opt-in (T8 alignment-bias study, user 2026-10-09): record the alignment head's outputs on the FIRST and LAST
+        # network call of this trajectory, for _dump_contact_sample. Off => no hook, nothing changes.
+        # (XRUN 2026-10-28: ported verbatim from t8b-launch 49a967f for the cross-run comparison; harness only.)
+        align_hooks = []
+        self._align_calls = None
+        if (val_sampling_cfg.get("dump_align_calls", False) and val_sampling_cfg.get("contact_dump_dir", None)
+                and topology is not None):
+            rec = {"n": 0, "first": None, "last": None}
+
+            def _rec(_mod, _inp, out):
+                if isinstance(out, dict) and "align_logits" in out:
+                    cur = {k: out[k].detach().float().cpu() for k in ("align_logits", "align_none_logits")}
+                    rec["first"] = cur if rec["first"] is None else rec["first"]
+                    rec["last"] = cur
+                    rec["n"] += 1
+
+            for mod in {id(m): m for m in (self.nn, getattr(self, "nn_sc", None)) if m is not None}.values():
+                align_hooks.append(mod.register_forward_hook(_rec))
+            self._align_calls = rec
+            self._align_topology = topology
         try:
             result = self.generate(
                 nsamples=nsamples,
@@ -3572,6 +3592,8 @@ class ModelTrainerBase(L.LightningModule):
         finally:
             if prev_sampling_grid is not None:
                 self.discrete_diffusion.sampling_grid = prev_sampling_grid
+            for h in align_hooks:
+                h.remove()
 
         coords = result.get("coords")
         contact_map = result.get("contact_map")
@@ -3769,11 +3791,29 @@ class ModelTrainerBase(L.LightningModule):
         os.makedirs(dump_dir, exist_ok=True)
         prob = torch.sigmoid(logits.detach().float())[:L, :L].cpu().numpy()
         gt_c = gt.detach().float()[:L, :L].cpu().numpy()
+        # The template this sample was conditioned on (built for this same batch by
+        # _build_self_reference_topology), so two tris can be checked to have seen the SAME pairs.
+        ref_ids = getattr(self, "_last_sampling_ref_ids", None) or []
+        ref_id = str(ref_ids[s]) if s < len(ref_ids) else None
         path = os.path.join(dump_dir, f"{stem}_s{k:02d}.npz")
+        extra = {}
+        rec = getattr(self, "_align_calls", None)
+        if rec is not None and rec["first"] is not None:
+            topo = self._align_topology
+            tok = topo["topology_he_tokens"][s].detach().cpu()
+            T = int((tok > 0).sum())
+            assert bool((tok[:T] > 0).all()), f"{stem}: element tokens are not a valid prefix"
+            for which in ("first", "last"):
+                extra[f"align_logits_{which}"] = rec[which]["align_logits"][s, :L, :T].numpy()
+                extra[f"align_none_{which}"] = rec[which]["align_none_logits"][s, :L].numpy()
+            extra["he_tokens"] = tok[:T].numpy()
+            extra["he_pos_raw"] = topo["topology_he_pos_raw"][s, :T].detach().cpu().numpy()
+            extra["n_nn_calls"] = np.int32(rec["n"])
         np.savez_compressed(path, contact_prob=prob, contact_gt=gt_c,
-                            L=np.int32(L), stem=stem, sample_index=np.int32(k))
+                            L=np.int32(L), stem=stem, sample_index=np.int32(k),
+                            ref_id=("" if ref_id is None else ref_id), **extra)
         with open(os.path.join(dump_dir, "samples.jsonl"), "a") as fh:
-            fh.write(json.dumps({"stem": stem, "sample_index": k, "L": L,
+            fh.write(json.dumps({"stem": stem, "sample_index": k, "L": L, "ref_id": ref_id,
                                  "file": os.path.basename(path),
                                  "metrics": metrics or {}}) + "\n")
 
