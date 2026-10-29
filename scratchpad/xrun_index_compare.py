@@ -41,6 +41,7 @@ def main():
     cnt, bad, absent = Counter(), [], []
     max_feat = 0.0
     feat_ch = Counter()
+    scal = {}  # scalar field -> max |a - b| over differing rows
     n_struct = len(STRUCTURAL_PAIR_FEATURES)
     for s, ra in ia.items():
         nat = bool(A["row_is_native"][ra])
@@ -65,6 +66,7 @@ def main():
         for k in ("he_size", "row_tm", "row_rewind", "row_usalign_tm", "row_is_native"):
             if not torch.equal(A[k][ra], B[k][rb]):
                 diff.append(k)
+                scal[k] = max(scal.get(k, 0.0), abs(float(A[k][ra]) - float(B[k][rb])))
         for d in diff:
             cnt[f"differs:{d}"] += 1
         if diff:
@@ -78,6 +80,8 @@ def main():
     print(f"[compare] {a.a} vs {a.b}: {dict(cnt)}; absent from b: {len(absent)}")
     if feat_ch:
         print(f"[compare] feat max|diff| {max_feat:.6g}; rows differing per channel {dict(feat_ch)}")
+    if scal:
+        print(f"[compare] scalar fields max|diff| {scal}")
     for s, d in bad[:20]:
         print(f"[compare] DIFF {s}: {d}")
     for s in absent[:10]:
