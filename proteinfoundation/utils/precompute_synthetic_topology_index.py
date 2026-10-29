@@ -1387,6 +1387,27 @@ def cmd_merge(args):
         out["elem_feature_mean"] = torch.tensor(em, dtype=torch.float32)
         out["elem_feature_std"] = torch.tensor(max(elem_sumsq / elem_count - em ** 2, 0.0) ** 0.5, dtype=torch.float32)
         print(f"  element length            mean={em:10.4f} std={float(out['elem_feature_std']):10.4f}", flush=True)
+    if args.stats_from:
+        # XRUN eval index (2026-10-28): a few-row index must standardise with the PRODUCTION index's statistics (the
+        # ones the model trained on), not with stats of its own handful of rows
+        prod = torch.load(args.stats_from, map_location="cpu", weights_only=False, mmap=True)
+        assert list(prod["pair_feature_names"]) == list(PAIR_FEATURE_NAMES), "pair feature names differ from production"
+        for k, dflt in (("contact_def", None), ("dssp_def", DSSP_DEF), ("element_types", (DSSP_HELIX, DSSP_STRAND)),
+                        ("loop_axis", None), ("structural_feature_names", None), ("min_len", None)):
+            if k not in prod and dflt is None:
+                continue  # a key production predates (no default to compare against)
+            got, want = out.get(k), prod.get(k, dflt)
+            assert (list(got) if isinstance(got, (list, tuple)) else got) == \
+                (list(want) if isinstance(want, (list, tuple)) else want), f"{k}: {got!r} != production {want!r}"
+        # mirror production's stat keys: an index built before the element-length stats (v4) has none, and the
+        # transform reads them only with elem_features on
+        for k in ("elem_feature_names", "elem_feature_mean", "elem_feature_std"):
+            out.pop(k, None)
+        for k in ("pair_feature_mean", "pair_feature_std", "elem_feature_names", "elem_feature_mean", "elem_feature_std"):
+            if k in prod:
+                out[k] = prod[k].clone() if torch.is_tensor(prod[k]) else prod[k]
+        out["stats_source"] = os.path.abspath(args.stats_from)
+        print(f"  standardisation stats REPLACED by {args.stats_from}", flush=True)
     torch.save(out, args.out)
     n_native = int(sum(row_is_native))
     print(f"wrote {args.out}: {len(ids)} rows = {n_native} natives + {len(ids) - n_native} template rows; "
@@ -1482,6 +1503,8 @@ def main():
     m.add_argument("--out", required=True)
     m.add_argument("--eligible-out", default="")
     m.add_argument("--tm-range", type=float, nargs=2, default=(0.5, 0.9))
+    m.add_argument("--stats-from", default="", help="copy pair / element-length standardisation stats from this "
+                                                    "(production) index instead of computing them from the parts")
     args = ap.parse_args()
     if hasattr(args, "tm_min"):  # pack mode requires them explicitly; the band-tree path keeps its 0.0-1.0 defaults
         args.tm_min_given, args.tm_max_given = args.tm_min, args.tm_max
