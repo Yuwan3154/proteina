@@ -9,10 +9,14 @@
 source /etc/profile
 set -eo pipefail
 
+W=/home/gridsan/cou/tri_synth_bench
 REPO="${REPO:-/home/gridsan/cou/proteina_toporef_regimes}"
 ENV_DIR=/home/gridsan/cou/cue-openfold-env
+export CUE_HOST=supercloud
 source "$ENV_DIR/.venv/bin/activate"
-export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
+source "$ENV_DIR/activate.sh"
+F2C_PARENT="${F2C_PARENT:-$W/pkgs}"
+export PYTHONPATH="$REPO:$F2C_PARENT${PYTHONPATH:+:$PYTHONPATH}"
 export OMP_NUM_THREADS=8
 export PYTHONUNBUFFERED=1
 
