@@ -81,10 +81,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--x-dir", required=True)
     ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--models", default=",".join(MODELS), help="subset for a partial (smoke) scoring")
+    ap.add_argument("--arms", default=",".join(ARMS))
+    ap.add_argument("--chunks", default="", help="comma list of chunk ids (partial scoring); default every chunk")
     a = ap.parse_args()
+    models, arms = a.models.split(","), a.arms.split(",")
+    assert set(arms) <= set(ARMS) and set(models) <= set(MODELS), (models, arms)
     os.makedirs(a.out_dir, exist_ok=True)
     rec = []
-    for m in MODELS:
+    for m in models:
         tfs = {}
         for idx_arm in ("equal", "indel"):
             tf = TopologyReferenceTransform(index_path=os.path.join(a.x_dir, "index", f"{m}_{idx_arm}", INDEX_FILE[m]),
@@ -92,19 +97,27 @@ def main():
                                             element_types=ELEMENT_TYPES[m])
             tf._ensure_loaded()
             tfs[idx_arm] = tf
-        for arm in ARMS:
+        for arm in arms:
             tf = tfs["equal" if arm == "equal" else "indel"]
             tm_rows = {}
-            pat = re.compile(rf"{m}_{arm}_c\d+(\.jsonl)?$")
-            for f in sorted(g for g in glob.glob(os.path.join(a.x_dir, "stageB", f"{m}_{arm}_c*.jsonl"))
-                            if pat.match(os.path.basename(g))):
+            ck = "|".join(a.chunks.split(",")) if a.chunks else r"\d+"
+            pat = re.compile(rf"{m}_{arm}_c({ck})(\.jsonl)?$")
+            fb = sorted(g for g in glob.glob(os.path.join(a.x_dir, "stageB", f"{m}_{arm}_c*.jsonl"))
+                        if pat.match(os.path.basename(g)))
+            fd = sorted(g for g in glob.glob(os.path.join(a.x_dir, "dumps", f"{m}_{arm}_c*"))
+                        if pat.match(os.path.basename(g)))
+            if a.chunks:  # a requested chunk with no files must not shrink the chain set silently
+                want = set(a.chunks.split(","))
+                got_b = {pat.match(os.path.basename(g)).group(1) for g in fb}
+                got_d = {pat.match(os.path.basename(g)).group(1) for g in fd}
+                assert got_b == want and got_d == want, (m, arm, sorted(want), sorted(got_b), sorted(got_d))
+            for f in fb:
                 for l in open(f):
                     r = json.loads(l)
                     k = (r["stem"], r["sample_index"])
                     assert k not in tm_rows, f"{f}: duplicate {k}"
                     tm_rows[k] = r["tm"]
-            for d in sorted(g for g in glob.glob(os.path.join(a.x_dir, "dumps", f"{m}_{arm}_c*"))
-                            if pat.match(os.path.basename(g))):
+            for d in fd:
                 for l in open(os.path.join(d, "samples.jsonl")):
                     r = json.loads(l)
                     z = np.load(os.path.join(d, r["file"]))
@@ -145,15 +158,15 @@ def main():
     for x in rec:
         by[(x["arm"], x["stem"])][x["model"]].append(x)
     for (arm, s), d in by.items():
-        assert set(d) == set(MODELS), (arm, s, sorted(d))
+        assert set(d) == set(models), (arm, s, sorted(d))
         assert len({len(v) for v in d.values()}) == 1, (arm, s)
         assert len({x["ref_id"] for v in d.values() for x in v}) == 1, (arm, s, {m: v[0]["ref_id"] for m, v in d.items()})
     out = []
-    for arm in ARMS:
+    for arm in arms:
         stems = sorted(s for (ar, s) in by if ar == arm)
-        out.append(f"\n## arm {arm}: {len(stems)} chains, {len(by[(arm, stems[0])]['cb8'])} samples each")
+        out.append(f"\n## arm {arm}: {len(stems)} chains, {len(by[(arm, stems[0])][models[0]])} samples each")
         per = {}
-        for m in MODELS:
+        for m in models:
             for k in ("pq", "pq_base", "pq_he", "pq_he_base", "pl", "tm"):
                 vals = {}
                 for s in stems:
@@ -161,6 +174,10 @@ def main():
                     if v:
                         vals[s] = float(np.mean(v))
                 per[(m, k)] = vals
+            # head minus its position-only baseline, per chain (the within-model alignment gain)
+            for k, base in (("pq_gain", "pq_base"), ("pq_he_gain", "pq_he_base")):
+                h = per[(m, k.replace("_gain", ""))]
+                per[(m, k)] = {s: h[s] - per[(m, base)][s] for s in h if s in per[(m, base)]}
             n_ex = sum(1 for s in stems for x in by[(arm, s)][m] if x["pq"] is None)
             n_ex_he = sum(1 for s in stems for x in by[(arm, s)][m] if x["pq_he"] is None)
             tms = [x["tm"] for s in stems for x in by[(arm, s)][m]]
@@ -169,15 +186,17 @@ def main():
                        f"samples with Q=0 excluded from P@Q {n_ex} (H/E-only {n_ex_he})")
         out.append("metric        model  chains   mean   [95% CI]")
         rng = np.random.default_rng(0)
-        for k in ("pq", "pq_base", "pq_he", "pq_he_base", "pl", "tm"):
-            for m in MODELS:
+        for k in ("pq", "pq_base", "pq_gain", "pq_he", "pq_he_base", "pq_he_gain", "pl", "tm"):
+            for m in models:
                 v = list(per[(m, k)].values())
                 if v:
                     mu, lo, hi = boot_ci(v, rng)
                     out.append(f"{k:<13} {m:>5} {len(v):>7} {mu:6.3f}  [{lo:.3f}, {hi:.3f}]")
         out.append("paired difference (per chain, chains present in both)  mean [95% CI]  chains B>A / n")
-        for k in ("pq", "pq_he", "pl", "tm"):
+        for k in ("pq", "pq_gain", "pq_he", "pq_he_gain", "pl", "tm"):
             for ma, mb in (("cb8", "t8"), ("cb8", "t8b"), ("t8", "t8b")):
+                if ma not in models or mb not in models:
+                    continue
                 if k == "pl" and "cb8" in (ma, mb):
                     continue  # CB-8 P@L is scored on its own CB-8 label: not comparable (user 2026-10-28)
                 common = sorted(set(per[(ma, k)]) & set(per[(mb, k)]))
@@ -186,7 +205,7 @@ def main():
                     mu, lo, hi = boot_ci(dlt, rng)
                     out.append(f"{k:<6} {mb}-{ma:<4} {mu:+.3f} [{lo:+.3f}, {hi:+.3f}]  {sum(x > 0 for x in dlt)}/{len(dlt)}")
         with open(os.path.join(a.out_dir, f"per_chain_{arm}.tsv"), "w") as fh:
-            keys = [(m, k) for m in MODELS for k in ("pq", "pq_base", "pq_he", "pq_he_base", "pl", "tm")]
+            keys = [(m, k) for m in models for k in ("pq", "pq_base", "pq_gain", "pq_he", "pq_he_base", "pq_he_gain", "pl", "tm")]
             fh.write("stem\t" + "\t".join(f"{m}_{k}" for m, k in keys) + "\n")
             for s in stems:
                 fh.write(s + "\t" + "\t".join(f"{per[mk].get(s, float('nan')):.4f}" for mk in keys) + "\n")
