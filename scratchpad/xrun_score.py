@@ -5,8 +5,8 @@ P@Q = the training metric (model_trainer_base._topology_aux_losses): per sample,
 element, the top-Q scored (residue, element) cells of the alignment logits (LAST network call of the trajectory), the
 fraction that are true. Baseline = the same with score -|query position - element midpoint| (query position = the
 SEQRES index for T8b, arange(L) otherwise; element midpoint = topology_he_pos_raw), as logged in training. Samples with
-Q = 0 are EXCLUDED (the logged training metric averaged in 0s of batches with no aligned row: "undiluted", user 2026-10-28). H/E-only variant: the rows restricted to
-residues whose target element is a helix or a strand (types from the reference row's DSSP runs).
+Q = 0 are EXCLUDED (the logged training metric averaged in 0s of batches with no aligned row: "undiluted", user 2026-10-28). H/E-only variant: Q = residues aligned to a helix or
+strand element; residues aligned to a LOOP element are removed from the candidate rows (unaligned rows stay).
 Targets: template arms = the eval index's USalign target (TopologyReferenceTransform._align_for, the training reader);
 self arm = each residue's own element in the native row's runs (an element beyond the shown T = none).
 Contact P@L = the trajectory's own contact_precision_at_L against the model's own native label (samples.jsonl).
@@ -137,7 +137,9 @@ def main():
                         _, types = elements_of(tf, row)
                     assert int(tgt.max()) < T
                     assert len(types) >= T, (m, arm, r["stem"], len(types), T)
-                    he_rows = (tgt >= 0) & np.isin(types[np.clip(tgt, 0, None)], HE_TYPES)
+                    # drop only the rows whose target is a LOOP element; unaligned rows stay as distractors exactly as in
+                    # the all-targets metric (so for CB-8, H/E elements only, the two coincide by construction)
+                    he_rows = ~((tgt >= 0) & ~np.isin(types[np.clip(tgt, 0, None)], HE_TYPES))
                     q_pos = (z["residue_seqres_idx"].astype(np.float64) if m == "t8b"
                              else np.arange(L, dtype=np.float64))
                     pos = -np.abs(q_pos[:, None] - z["he_pos_raw"][None, :T].astype(np.float64))
