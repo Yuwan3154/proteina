@@ -50,7 +50,8 @@ for m in ${MODELS:?}; do
       B=$(env REPO=$S/proteina_t7 CKPT=$C2C DATASET=$D CHAINS=$X/chunks/${arm}_c${k}_q.txt MAPS_DIR=$X/dumps/$L LABEL=$L \
           OUT=$X/stageB/$L.jsonl sbatch --parsable --export=ALL --dependency=afterok:$J -J xb_$L \
           --partition=mit_normal_gpu,mit_preemptable $G \
-          --output=$X/logs/%x-%j.out --error=$X/logs/%x-%j.err $S/proteina_t7/scratchpad/stageB_c2c_from_maps.sbatch) || exit 5
+          --output=$X/logs/%x-%j.out --error=$X/logs/%x-%j.err $S/proteina_t7/scratchpad/stageB_c2c_from_maps.sbatch) \
+          || { echo "$L PASS $J C2C NONE"; exit 5; }  # the pass is logged even when its c2c submit fails
       echo "$L PASS $J C2C $B"
     done
   done
