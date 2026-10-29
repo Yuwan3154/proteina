@@ -189,7 +189,9 @@ validation_sampling:
   # shorter chain), one representative per 25% val cluster (cluster rep, else highest resolution), every member with a
   # template in TM 0.5-0.9; 32 equal-size length groups, median-nearest member. t8_val_fixed32.py --mode within @ddbf8ad,
   # job 25877410: lengths 56-459, max pair TM 0.4958. Copy in git: scratchpad/lists/val_fixed32_t8_within.txt
-  fixed_chain_list: /orcd/scratch/orcd/011/chenxiou/t8_valfixed/val_fixed32_t8_within.txt
+  # CAT regime (user 2026-10-29): 32 val MEMBER ids built by t2cat_make_val_fixed.py (the T8 rule transposed: one member per CAT, 32 equal length groups, median-nearest,
+  # no pair TM >= 0.5 within the set); datamodule.fixed_val_dataset resolves them.
+  fixed_chain_list: /orcd/compute/so3/002/chenxi/t2_cat/val_fixed32_cat.txt
 
 # ClusterSampler DDP fix is on by default (BaseLightningDataModule.cluster_sampler_v2=True).
 # To override per-dataset, set cluster_sampler_v2 / cluster_sampler_seed under

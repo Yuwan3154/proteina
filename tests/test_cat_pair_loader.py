@@ -279,6 +279,24 @@ def test_preloaded_transform_pickles_without_the_index(toy):
 
 
 @needs_toy
+def test_validation_sampling_hooks(toy):
+    from proteinfoundation.datasets.cat_pair_data import CATUnitDataset
+    ds = CATUnitDataset(os.path.join(TOY, "store"), "train", transform=_transform(toy))
+    ids = [ds.members.member_id.iloc[0], ds.members.member_id.iloc[-1], ds.members.member_id.iloc[0]]
+    sub = CATUnitDataset(os.path.join(TOY, "store"), "train", transform=None, member_ids=ids)
+    assert list(sub.members.member_id) == ids and len(sub) == 3
+    tr = _transform(toy)
+    got = [tr.nonself_reference(i, 120, seed=0) for i in ids]
+    again = [tr.nonself_reference(i, 120, seed=0) for i in ids]
+    mem_tab = toy["store"].members.set_index("member_id")
+    for i, g, a in zip(ids, got, again):
+        assert g is not None and g[1] == a[1], "the same (seed, member) must give the same reference"
+        assert mem_tab.loc[g[1], "entry_id"] != mem_tab.loc[i, "entry_id"] and mem_tab.loc[g[1], "cat"] == mem_tab.loc[i, "cat"]
+        assert g[0]["topology_he_tokens"].numel() > 0
+    assert tr.nonself_reference("does_not_exist", 120, seed=0) is None
+
+
+@needs_toy
 def test_datamodule_batches(toy):
     from proteinfoundation.datasets.cat_pair_data import CATPairLightningDataModule
     from proteinfoundation.datasets.transforms import ChainBreakPerResidueTransform, ContactMapTransform, DSSPTargetTransform, GlobalRotationTransform

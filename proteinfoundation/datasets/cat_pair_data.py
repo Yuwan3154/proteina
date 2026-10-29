@@ -98,6 +98,22 @@ class CATPairReferenceTransform(TopologyReferenceTransform):
             return -1
         return int(cand[int(torch.randint(cand.numel(), (1,), generator=self._generator))])
 
+    def nonself_reference(self, stem: str, length: int, seed: Optional[int] = None):
+        """Validation sampling (model_trainer_base): a retrieved template of the member's (CAT, split) pool as (features, reference member id),
+        reproducible per (seed, member); None when the member has no partner entry (never a silent fallback to its own topology)."""
+        self._ensure_loaded()
+        row = self._id_to_row.get(stem)
+        if row is None:
+            return None
+        if seed is not None:
+            saved, self._generator = self._generator, torch.Generator().manual_seed((seed + row) % (2**63))
+        t_row = self._pick_cat_template(row)
+        if seed is not None:
+            self._generator = saved
+        if t_row < 0 or not self._runs_for(t_row):
+            return None
+        return self._build_reference(t_row, length, augment=False), str(self._index["ids"][t_row])
+
     def _cat_align(self, graph: Data, t_row: int, n_he: int) -> torch.Tensor:
         """Per-query-residue element index of the template (before the helix/strand cap), ALIGN_NONE where unaligned."""
         idx = self._index
@@ -151,7 +167,7 @@ class CATUnitDataset(torch.utils.data.Dataset):
     chain expects (openfold atom order, precomputed ``contact_map_confind``). Members whose (CAT, split) pool has no
     other entry are dropped (they cannot form a pair) and counted in the log; synthetic entries are never queries."""
 
-    def __init__(self, store_dir: str, split: str, transform=None, fixed_pair_seed: Optional[int] = None):
+    def __init__(self, store_dir: str, split: str, transform=None, fixed_pair_seed: Optional[int] = None, member_ids: Optional[List[str]] = None):
         self.store = UnitStore(store_dir)
         self.transform = transform
         self.split = split
@@ -166,6 +182,11 @@ class CATUnitDataset(torch.utils.data.Dataset):
                     f"(CAT pool holds a single entry), {n_cats} CATs")
         self.members = queries[has_partner].reset_index(drop=True)
         self.members["kind"] = self.members.entry_id.map(self.store.entries.set_index("entry_id").kind)
+        if member_ids is not None:  # an explicit ordered subset (a member may be listed several times, as the fixed validation chain list allows)
+            pos = {m: i for i, m in enumerate(self.members.member_id)}
+            absent = [m for m in member_ids if m not in pos]
+            assert not absent, f"{len(absent)} requested members are not {split} query members with a partner entry, e.g. {absent[:3]}"
+            self.members = self.members.iloc[[pos[m] for m in member_ids]].reset_index(drop=True)
         self.lengths = [int(sum(b - a for a, b in self._ranges(s))) for s in self.members.seg]
 
     @staticmethod
@@ -241,6 +262,10 @@ class CATPairLightningDataModule(BaseLightningDataModule):
     def _get_dataset(self, split: str):
         fixed = self.cluster_sampler_seed if split == "val" else None
         return CATUnitDataset(self.store_dir, split, transform=self.transform, fixed_pair_seed=fixed)
+
+    def fixed_val_dataset(self, member_ids: List[str]) -> CATUnitDataset:
+        """The trainer's fixed validation chain list (validation_sampling.fixed_chain_list) as a dataset of those val members."""
+        return CATUnitDataset(self.store_dir, "val", transform=self.transform, fixed_pair_seed=self.cluster_sampler_seed, member_ids=member_ids)
 
     def _make_cat_pair_sampler(self, dataset: CATUnitDataset, shard: bool):
         return CATUniformSampler(dataset.members_by_cat(), seed=self.cluster_sampler_seed, shard=shard, fixed=dataset.split == "val",

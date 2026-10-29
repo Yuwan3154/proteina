@@ -3341,16 +3341,19 @@ class ModelTrainerBase(L.LightningModule):
         with open(path) as fh:
             stems = [ln.strip() for ln in fh if ln.strip()]
         chunk = max(1, int(val_sampling_cfg.get("tmscore_n_samples", 4)))
-        ds = PDBDataset(
-            pdb_codes=[st.split("_", 1)[0] for st in stems],
-            chains=[st.split("_", 1)[1] if "_" in st else None for st in stems],
-            data_dir=str(dm.data_dir),
-            transform=dm.transform,
-            format=dm.format,
-            in_memory=False,
-            file_names=stems,
-            num_workers=0,
-        )
+        if hasattr(dm, "fixed_val_dataset"):  # datasets that are not PDB chains (the CAT store: stems are member ids) build their own
+            ds = dm.fixed_val_dataset(stems)
+        else:
+            ds = PDBDataset(
+                pdb_codes=[st.split("_", 1)[0] for st in stems],
+                chains=[st.split("_", 1)[1] if "_" in st else None for st in stems],
+                data_dir=str(dm.data_dir),
+                transform=dm.transform,
+                format=dm.format,
+                in_memory=False,
+                file_names=stems,
+                num_workers=0,
+            )
         # cath_code_dir / multilabel_mode are what turn the per-sample CATH lists into the
         # [b, 3] index tensor the fold embedding expects. Omitting them leaves a raw Python list
         # in the batch and the fold conditioning silently degrades to the null embedding.
