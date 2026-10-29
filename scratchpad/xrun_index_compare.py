@@ -42,6 +42,7 @@ def main():
     max_feat = 0.0
     feat_ch = Counter()
     scal = {}  # scalar field -> max |a - b| over differing rows
+    nan_side = {}  # scalar field -> Counter of which side is NaN on the differing rows
     n_struct = len(STRUCTURAL_PAIR_FEATURES)
     for s, ra in ia.items():
         nat = bool(A["row_is_native"][ra])
@@ -67,6 +68,8 @@ def main():
             if not torch.equal(A[k][ra], B[k][rb]):
                 diff.append(k)
                 scal[k] = max(scal.get(k, 0.0), abs(float(A[k][ra]) - float(B[k][rb])))
+                xa, xb = float(A[k][ra]), float(B[k][rb])
+                nan_side[k] = nan_side.get(k, Counter()) + Counter({f"a_nan={xa != xa},b_nan={xb != xb}": 1})
         for d in diff:
             cnt[f"differs:{d}"] += 1
         if diff:
@@ -82,6 +85,7 @@ def main():
         print(f"[compare] feat max|diff| {max_feat:.6g}; rows differing per channel {dict(feat_ch)}")
     if scal:
         print(f"[compare] scalar fields max|diff| {scal}")
+        print(f"[compare] scalar fields NaN side on differing rows { {k: dict(v) for k, v in nan_side.items()} }")
     for s, d in bad[:20]:
         print(f"[compare] DIFF {s}: {d}")
     for s in absent[:10]:
