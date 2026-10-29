@@ -18,6 +18,7 @@ baked in the way the per-native T8 index bakes it.
 import os
 import tempfile
 import zlib
+from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
@@ -223,6 +224,7 @@ class CATPairLightningDataModule(BaseLightningDataModule):
         super().__init__(sampling_mode="cat-pair", **kwargs)
         assert 0.0 <= cath_draw_prob <= 1.0, cath_draw_prob
         self.store_dir = store_dir
+        self.data_dir = Path(store_dir)  # train.py names the dataset CSV from datamodule.data_dir before prepare_data
         self.cath_draw_prob = float(cath_draw_prob)
         self.prime_store = bool(prime_store)
 

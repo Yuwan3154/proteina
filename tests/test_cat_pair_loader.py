@@ -286,6 +286,7 @@ def test_datamodule_batches(toy):
              ContactMapTransform(contact_method="confind", confind_contact_threshold=0.01), _transform(toy)]
     dm = CATPairLightningDataModule(os.path.join(TOY, "store"), cath_draw_prob=0.3, transforms=chain, batch_size=2, num_workers=2, epoch_batch_plan=True,
                                     epoch_batch_plan_len_edges=[64, 128, 192, 256, 320, 384, 448, 512], cluster_sampler_seed=0)
+    assert dm.data_dir.name == "store"
     dm.setup("fit")
     progress = SimpleNamespace(current=SimpleNamespace(processed=0))
     dm.trainer = SimpleNamespace(current_epoch=0, fit_loop=SimpleNamespace(epoch_loop=SimpleNamespace(batch_progress=progress)), reload_dataloaders_every_n_epochs=0)
