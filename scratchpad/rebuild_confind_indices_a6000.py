@@ -232,6 +232,8 @@ def _process_row_range(row_range):
     idx = _SRC_IDX
     ids = idx["ids"]
     is_native_arr = idx["row_is_native"]
+    cluster_of_arr = idx["cluster_of"]
+    members_off_arr = idx["members_offset"]
 
     # Smooth accumulators
     s_runs_flat = []
@@ -273,8 +275,10 @@ def _process_row_range(row_range):
 
         if is_nat:
             stem = row_id
+            cl = int(cluster_of_arr[r].item())
+            has_tpl = int(members_off_arr[cl + 1].item()) > int(members_off_arr[cl].item())
             g = None
-            if _PACK_IDX is not None and stem in _PACK_IDX:
+            if has_tpl and _PACK_IDX is not None and stem in _PACK_IDX:
                 off, ln = _PACK_IDX[stem]
                 try:
                     g = torch.load(io.BytesIO(_PACK_MM[off : off + ln]), map_location="cpu", weights_only=False)
@@ -373,21 +377,22 @@ def _process_row_range(row_range):
                 require_same_type=False,
             )
 
-            fs, fsq, fcnt, es, esq, ecnt = _stats_for_row(ref_s_u8, str_s_f16, runs_s, keep_s)
-            s_feat_sum.add_(fs)
-            s_feat_sumsq.add_(fsq)
-            s_feat_cnt += fcnt
-            s_elem_sum += es
-            s_elem_sumsq += esq
-            s_elem_cnt += ecnt
+            if (r & 15) == 0 or (r_end - r_start) < 64:
+                fs, fsq, fcnt, es, esq, ecnt = _stats_for_row(ref_s_u8, str_s_f16, runs_s, keep_s)
+                s_feat_sum.add_(fs)
+                s_feat_sumsq.add_(fsq)
+                s_feat_cnt += fcnt
+                s_elem_sum += es
+                s_elem_sumsq += esq
+                s_elem_cnt += ecnt
 
-            fs_c, fsq_c, fcnt_c, es_c, esq_c, ecnt_c = _stats_for_row(ref_c_u8, str_c_f16, runs_c, keep_c)
-            c_feat_sum.add_(fs_c)
-            c_feat_sumsq.add_(fsq_c)
-            c_feat_cnt += fcnt_c
-            c_elem_sum += es_c
-            c_elem_sumsq += esq_c
-            c_elem_cnt += ecnt_c
+                fs_c, fsq_c, fcnt_c, es_c, esq_c, ecnt_c = _stats_for_row(ref_c_u8, str_c_f16, runs_c, keep_c)
+                c_feat_sum.add_(fs_c)
+                c_feat_sumsq.add_(fsq_c)
+                c_feat_cnt += fcnt_c
+                c_elem_sum += es_c
+                c_elem_sumsq += esq_c
+                c_elem_cnt += ecnt_c
 
         # Append smooth row
         s_runs_flat.extend(runs_s)
