@@ -1,0 +1,95 @@
+# max384 ConFind tri dataset with:
+# (1) tmalign_smooth secondary structure classification in DSSPTargetTransform (for query chains in train + val);
+# (2) ConFind contact maps;
+# (3) 9-residue ProteinMPNN chunk topology references (reference_mode: mpnn_chunk9) with template backbone coordinates,
+#     template sequence input with 25% i.i.d. per-residue sequence identity masking (coordinate features unmasked),
+#     and 10% random chunk token masking without MLM loss.
+datamodule:
+  _target_: "proteinfoundation.datasets.pdb_data.PDBLightningDataModule"
+  data_dir: ${oc.env:DATA_PATH}/pdb_train/
+  in_memory: False
+  pack_path: ${oc.env:PACK_PATH,/home/jupyter-chenxi/sse1d_data/orcd/compute/so3/002/chenxi/proteina_pack/tri_v2.pack}
+  format: "cif"
+  overwrite: False
+  regenerate_missing: True
+  batch_padding: True
+  sampling_mode: "cluster-random"
+  eligible_ids_file: ${oc.env:SYNTH_INDEX_DIR}/eligible_ids_tm0.5-0.9.txt
+  epoch_batch_plan: True
+  epoch_batch_plan_len_edges: [64, 128, 192, 256, 320, 384]
+  cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/
+  multilabel_mode: "sample"
+  transforms:
+    - _target_: "proteinfoundation.datasets.transforms.GlobalRotationTransform"
+    - _target_: "proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform"
+    - _target_: "proteinfoundation.datasets.transforms.CATHLabelTransform"
+      root_dir: ${oc.env:DATA_PATH}/cathdata/
+    - _target_: "proteinfoundation.datasets.transforms.CATHToIndicesTransform"
+      cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/
+    - _target_: "proteinfoundation.datasets.transforms.DSSPTargetTransform"
+      dssp_def: tmalign_smooth
+      overwrite: True
+    - _target_: "proteinfoundation.datasets.transforms.ContactMapTransform"
+      contact_method: confind
+      confind_rotamer_lib: ${oc.env:DATA_PATH}/rotlibs
+      confind_contact_threshold: 0.01
+    - _target_: "proteinfoundation.datasets.transforms.SequenceDropoutTransform"
+      prob: 0.25
+    - _target_: "proteinfoundation.datasets.topology_reference.TopologyReferenceTransform"
+      index_path: ${oc.env:SYNTH_INDEX_DIR}/topology_index_confind_synth_mpnn_chunk9.pt
+      reference_source: synthetic
+      reference_mode: mpnn_chunk9
+      chunk_size: 9
+      dssp_def: tmalign_smooth
+      template_seq_mask_prob: 0.25
+      template_pool_dir: ${oc.env:TEMPLATE_POOL_DIR,/home/jupyter-chenxi/sse1d_idx/t2_pool_auth}
+      chain_alias_path: ${oc.env:CHAIN_ALIAS_PATH,/home/jupyter-chenxi/sse1d_idx/in/orcd/scratch/orcd/011/chenxiou/synth_alias/auth_key.tsv}
+      native_pack_path: ${oc.env:PACK_PATH,/home/jupyter-chenxi/sse1d_data/orcd/compute/so3/002/chenxi/proteina_pack/tri_v2.pack}
+      tm_range: [0.5, 0.9]
+      sse_types: [1, 2]
+      element_types: [1]
+      elem_features: True
+      max_topology_len: 128
+      max_topology_he_len: 64
+      sigma_frac: 0.0
+      mutate_prob: 0.0
+      type_mutate_prob: 0.0
+      token_mask_prob: 0.1
+      drop_prob: 0.25
+      drop_ref_len_range: [5, 39]
+      self_fallback: True
+      min_len: 1
+  batch_size: 1
+  num_workers: 8
+  pin_memory: True
+  prefetch_factor: 2
+
+  dataselector:
+    _target_: "proteinfoundation.datasets.pdb_data.PDBDataSelector"
+    data_dir: ${oc.env:DATA_PATH}/pdb_train/
+    fraction: 1
+    molecule_type: "protein"
+    experiment_types: ["diffraction", "EM"]
+    min_length: 50
+    max_length: 384
+    oligomeric_min: null
+    oligomeric_max: null
+    best_resolution: 0.0
+    worst_resolution: 5.0
+    has_ligands: []
+    remove_ligands: []
+    remove_non_standard_residues: True
+    remove_pdb_unavailable: True
+    max_deposition_date: "2019-08-28"
+    exclude_ids: []
+
+  datasplitter:
+    _target_: "proteinfoundation.datasets.pdb_data.PDBDataSplitter"
+    data_dir: ${oc.env:DATA_PATH}/pdb_train/
+    train_val_test: [0.98, 0.019, 0.001]
+    split_type: "sequence_similarity"
+    split_sequence_similarity: 0.25
+    overwrite_sequence_clusters: False
+    exclude_ids: []
+    exclude_ids_from_file: ${oc.env:DATA_PATH}/pdb_train/rosetta_decoys.txt
+    drop_ids_from_file: ${oc.env:DATA_PATH}/pdb_train/unusable_chains.txt

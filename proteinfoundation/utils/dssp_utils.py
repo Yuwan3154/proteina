@@ -34,30 +34,25 @@ def smooth_tmalign_dssp(sec: torch.Tensor, valid_mask: Optional[torch.Tensor] = 
     out = sec.clone()
     B, L = out.shape
     for b in range(B):
-        s = out[b]
+        s = out[b].tolist()
         # Pass 1: --x-- -> -----
         if L >= 5:
             for i in range(2, L - 2):
-                v = int(s[i].item())
+                v = s[i]
                 if v in (1, 2):
-                    if (
-                        int(s[i - 2].item()) != v
-                        and int(s[i - 1].item()) != v
-                        and int(s[i + 1].item()) != v
-                        and int(s[i + 2].item()) != v
-                    ):
+                    if s[i - 2] != v and s[i - 1] != v and s[i + 1] != v and s[i + 2] != v:
                         s[i] = 0
         # Pass 2: --xx-- -> ------
         if L > 5:
             for i in range(2, L - 3):
                 for j in (1, 2):
                     if (
-                        int(s[i - 2].item()) != j
-                        and int(s[i - 1].item()) != j
-                        and int(s[i].item()) == j
-                        and int(s[i + 1].item()) == j
-                        and int(s[i + 2].item()) != j
-                        and int(s[i + 3].item()) != j
+                        s[i - 2] != j
+                        and s[i - 1] != j
+                        and s[i] == j
+                        and s[i + 1] == j
+                        and s[i + 2] != j
+                        and s[i + 3] != j
                     ):
                         s[i] = 0
                         s[i + 1] = 0
@@ -65,12 +60,9 @@ def smooth_tmalign_dssp(sec: torch.Tensor, valid_mask: Optional[torch.Tensor] = 
         if L >= 3:
             for i in range(1, L - 1):
                 for j in (1, 2):
-                    if (
-                        int(s[i - 1].item()) == j
-                        and int(s[i].item()) != j
-                        and int(s[i + 1].item()) == j
-                    ):
+                    if s[i - 1] == j and s[i] != j and s[i + 1] == j:
                         s[i] = j
+        out[b] = torch.tensor(s, dtype=out.dtype, device=out.device)
     if valid_mask is not None:
         out = torch.where(valid_mask, out, torch.full_like(out, -1))
     return out

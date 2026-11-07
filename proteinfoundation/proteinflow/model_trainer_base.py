@@ -2788,14 +2788,23 @@ class ModelTrainerBase(L.LightningModule):
     )
 
     def _topology_keys(self) -> Tuple[str, ...]:
-        """TOPOLOGY_KEYS, plus the per-element feature key when the nn consumes one (T8: n_elem_features).
+        """TOPOLOGY_KEYS, plus the per-element feature key when the nn consumes one (T8: n_elem_features),
+        and template residue keys when reference_mode == 'mpnn_chunk9'.
 
         Only then: every reference builder emits that key only when its transform has elem_features on, and the old
         arms' batches must keep exactly the key set they always had.
         """
+        keys = self.TOPOLOGY_KEYS
         if self.cfg_exp.model.nn.get("n_elem_features", None):
-            return self.TOPOLOGY_KEYS + ("topology_he_elem_feat",)
-        return self.TOPOLOGY_KEYS
+            keys = keys + ("topology_he_elem_feat",)
+        if self.cfg_exp.model.nn.get("reference_mode", "sse") == "mpnn_chunk9":
+            keys = keys + (
+                "template_backbone_coords",
+                "template_backbone_mask",
+                "template_aatype",
+                "template_residue_idx",
+            )
+        return keys
 
     def _find_topology_transform(self) -> Optional[TopologyReferenceTransform]:
         """The TopologyReferenceTransform in the datamodule's transform pipeline, or None."""
@@ -2809,17 +2818,24 @@ class ModelTrainerBase(L.LightningModule):
         return None
 
     @staticmethod
-    def _stack_topology(values: List[Tensor]) -> Tensor:
+    def _stack_topology(values: List[Tensor], key: str = "") -> Tensor:
         """Pad a per-sample list to the batch maximum on every axis and stack.
 
         Uses the dense collate's padding values so the model's ``tokens > 0`` validity test means
         exactly the same thing for a reference built here as for one that came off the dataloader.
         """
-        pad_v = (
-            FLOAT_PADDING_VALUE
-            if torch.is_floating_point(values[0])
-            else NON_FLOAT_PADDING_VALUE
-        )
+        if key == "template_backbone_mask":
+            pad_v = 0.0
+        elif key == "template_aatype":
+            pad_v = 20
+        elif key == "template_residue_idx":
+            pad_v = 0
+        else:
+            pad_v = (
+                FLOAT_PADDING_VALUE
+                if torch.is_floating_point(values[0])
+                else NON_FLOAT_PADDING_VALUE
+            )
         sizes = [max(v.shape[d] for v in values) for d in range(values[0].dim())]
         out = []
         for v in values:
@@ -2967,13 +2983,15 @@ class ModelTrainerBase(L.LightningModule):
         if "topology_he_tokens" in blank:
             blank["topology_he_tokens"] = torch.full_like(present["topology_he_tokens"],
                                                           TOPOLOGY_MASK_TOKEN)
+        if "template_aatype" in blank:
+            blank["template_aatype"] = torch.full_like(present["template_aatype"], 21)
         n_blank = sum(1 for r in refs if r is None)
         if n_blank:
             logger.warning(f"validation_sampling: {n_blank} of {len(refs)} chains sample "
                            "unconditioned (masked reference); the others are conditioned.")
         refs = [r if r is not None else blank for r in refs]
         return {
-            k: self._stack_topology([r[k] for r in refs]).to(self.device)
+            k: self._stack_topology([r[k] for r in refs], key=k).to(self.device)
             for k in self._topology_keys()
         }
 

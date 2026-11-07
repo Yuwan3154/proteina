@@ -10,11 +10,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ProteinMPNN.protein_mpnn_utils import ProteinMPNN, gather_nodes
 from proteinfoundation.datasets.sse_topology import MASK_TOKEN, N_PAIR_FEATURES
+from proteinfoundation.datasets.topology_reference import TopologyReferenceTransform
 from proteinfoundation.nn.contact_map_tri_v2 import ContactMapTriV2
 from proteinfoundation.nn.mpnn_topology_encoder import (
     CHUNK_SIZE,
+    TEMPLATE_SEQ_MASK_TOKEN,
     MPNNBackboneEncoder,
     chunk9_coarse_reference_from_template,
+    chunk9_runs,
 )
 
 
@@ -120,6 +123,10 @@ def test_contact_map_tri_v2_mpnn_chunk9_forward_backward():
     # Mask chunk 2 in sample 0 to test random chunk token masking without MLM loss
     he_tokens[0, 2] = MASK_TOKEN
 
+    tmpl_aatype = torch.randint(0, 20, (B, L_tmpl), dtype=torch.long)
+    # Mask ~25% of template residues i.i.d. with TEMPLATE_SEQ_MASK_TOKEN (21)
+    tmpl_aatype[0, ::4] = TEMPLATE_SEQ_MASK_TOKEN
+
     batch = {
         "contact_map_t": torch.rand(B, L_q, L_q),
         "mask": torch.ones(B, L_q, dtype=torch.bool),
@@ -131,6 +138,7 @@ def test_contact_map_tri_v2_mpnn_chunk9_forward_backward():
         "topology_he_elem_feat": coarse["topology_he_elem_feat"][None].expand(B, T, 1).clone(),
         "template_backbone_coords": x4_tmpl,
         "template_backbone_mask": mask_tmpl,
+        "template_aatype": tmpl_aatype,
     }
 
     out = model(batch)
@@ -165,6 +173,7 @@ def test_contact_map_tri_v2_mpnn_chunk9_forward_backward():
         assert torch.isfinite(p.grad).all(), f"Trainable param {name} has non-finite gradient"
 
     assert model.mpnn_topo.chunk_transformer.mask_chunk_emb.grad.abs().max().item() > 0.0
+    assert model.mpnn_topo.chunk_transformer.seq_emb.weight.grad.abs().max().item() > 0.0
     assert model.mpnn_topo.edge_ffn.fc1.weight.grad.abs().max().item() > 0.0
     assert model.mpnn_topo.edge_ffn.fc2.weight.grad.abs().max().item() > 0.0
     print("[PASS] ContactMapTriV2(reference_mode='mpnn_chunk9') normal mode forward/backward verified")
@@ -204,7 +213,226 @@ def test_contact_map_tri_v2_mpnn_chunk9_forward_backward():
     print("[PASS] ContactMapTriV2(reference_mode='mpnn_chunk9') 0-edge / unconditional mode DDP gradient flow verified")
 
 
+def test_topology_reference_transform_mpnn_chunk9_seq_masking():
+    from torch_geometric.data import Data
+
+    L_t = 36  # 4 chunks of 9
+    runs = chunk9_runs(L_t, chunk_size=9)
+    T = len(runs)
+    assert T == 4
+    x4_tmpl, m4_tmpl = make_synthetic_backbone(B=1, L=L_t, seed=55)
+    aatype_tmpl = torch.arange(L_t, dtype=torch.long) % 20
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        idx_path = os.path.join(tmpdir, "mock_chunk9_index.pt")
+        index = {
+            "ids": ["test_A", "test_A@rw150#0"],
+            "cluster_of": torch.tensor([0, 0], dtype=torch.int32),
+            "members_flat": torch.tensor([1], dtype=torch.int32),
+            "members_offset": torch.tensor([0, 1], dtype=torch.int64),
+            "seq_hash": torch.tensor([123, 123], dtype=torch.int64),
+            "runs_flat": torch.tensor(runs + runs, dtype=torch.int16),
+            "runs_offset": torch.tensor([0, T, 2 * T], dtype=torch.int64),
+            "he_offset": torch.tensor([0, T * T, 2 * T * T], dtype=torch.int64),
+            "he_size": torch.tensor([T, T], dtype=torch.int16),
+            "he_flat": torch.ones(2 * T * T, dtype=torch.uint8),
+            "feat_offset": torch.tensor([0, T * T * 2, 2 * T * T * 2], dtype=torch.int64),
+            "feat_flat": torch.zeros(2 * T * T * 2, dtype=torch.float16),
+            "align_offset": torch.tensor([0, 0, L_t], dtype=torch.int64),
+            "align_flat": (torch.arange(L_t, dtype=torch.int16) // 9),
+            "row_tm": torch.tensor([1.0, 0.72], dtype=torch.float16),
+            "row_is_native": torch.tensor([True, False], dtype=torch.bool),
+            "row_rewind": torch.tensor([0, 150], dtype=torch.int16),
+            "row_usalign_tm": torch.tensor([1.0, 0.72], dtype=torch.float16),
+            "pair_feature_mean": torch.zeros(N_PAIR_FEATURES, dtype=torch.float32),
+            "pair_feature_std": torch.ones(N_PAIR_FEATURES, dtype=torch.float32),
+            "elem_feature_mean": torch.tensor(9.0, dtype=torch.float32),
+            "elem_feature_std": torch.tensor(1.0, dtype=torch.float32),
+            "element_types": (1,),
+            "dssp_def": "chunk9",
+            "tmpl_res_offset": torch.tensor([0, L_t, 2 * L_t], dtype=torch.int64),
+            "tmpl_atom4_flat": torch.cat([x4_tmpl[0], x4_tmpl[0]], dim=0).to(torch.float16),
+            "tmpl_mask_flat": torch.cat([m4_tmpl[0], m4_tmpl[0]], dim=0).to(torch.bool),
+            "tmpl_aatype_flat": torch.cat([aatype_tmpl, aatype_tmpl], dim=0).to(torch.int8),
+        }
+        torch.save(index, idx_path)
+
+        tf = TopologyReferenceTransform(
+            index_path=idx_path,
+            reference_source="synthetic",
+            reference_mode="mpnn_chunk9",
+            element_types=(1,),
+            sse_types=(1, 2),
+            elem_features=True,
+            token_mask_prob=0.1,
+            template_seq_mask_prob=0.25,
+            drop_prob=0.0,
+            seed=1234,
+        )
+
+        masked_fracs = []
+        for i in range(40):
+            g = Data(
+                coords=torch.zeros(L_t, 37, 3),
+                coord_mask=torch.ones(L_t, 37, dtype=torch.bool),
+                protein_id="test_A",
+            )
+            g = tf(g)
+            # Coordinate features must NEVER be masked
+            assert torch.allclose(g.template_backbone_coords, x4_tmpl[0].half().float(), atol=1e-3)
+            assert torch.equal(g.template_backbone_mask, torch.ones(L_t, dtype=torch.float32))
+            is_seq_masked = g.template_aatype == TEMPLATE_SEQ_MASK_TOKEN
+            masked_fracs.append(is_seq_masked.float().mean().item())
+            # Unmasked positions must equal original template sequence
+            assert torch.equal(g.template_aatype[~is_seq_masked], aatype_tmpl[~is_seq_masked])
+            # MLM target must remain all zeros in mpnn_chunk9 mode
+            assert int((g.topology_he_tokens_target != 0).sum().item()) == 0
+
+        mean_mask_rate = sum(masked_fracs) / len(masked_fracs)
+        assert 0.18 <= mean_mask_rate <= 0.32, f"Expected ~0.25 seq mask rate, got {mean_mask_rate:.3f}"
+
+        # Self/nonself validation reference (augment=False) must have 0% sequence masking
+        ref_val, _ = tf.nonself_reference("test_A", L_t, seed=0)
+        assert torch.equal(ref_val["template_aatype"], aatype_tmpl)
+        print(f"[PASS] TopologyReferenceTransform(mpnn_chunk9) 25% i.i.d. seq masking verified (mean={mean_mask_rate:.3f})")
+
+
+def test_rebuild_confind_indices_script():
+    import subprocess
+    import zlib
+    import numpy as np
+    from torch_geometric.data import Data
+
+    L_t = 36
+    old_runs = [(1, 10), (0, 2), (1, 10), (0, 4), (2, 10)]  # 3 SSE elements (2 helix, 1 strand)
+    T_old = 3
+    x4_tmpl, _ = make_synthetic_backbone(B=1, L=L_t, seed=77)
+    aatype_tmpl = (torch.arange(L_t, dtype=torch.long) % 20).numpy().astype(np.int8)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        src_idx = os.path.join(tmpdir, "src_index.pt")
+        src_elig = os.path.join(tmpdir, "eligible_ids_tm0.5-0.9.txt")
+        with open(src_elig, "w") as fh:
+            fh.write("test_A\n")
+
+        index = {
+            "ids": ["test_A", "test_A@rw150#0"],
+            "cluster_of": torch.tensor([0, 0], dtype=torch.int32),
+            "members_flat": torch.tensor([1], dtype=torch.int32),
+            "members_offset": torch.tensor([0, 1], dtype=torch.int64),
+            "seq_hash": torch.tensor([123, 123], dtype=torch.int64),
+            "runs_flat": torch.tensor(old_runs + old_runs, dtype=torch.int16),
+            "runs_offset": torch.tensor([0, len(old_runs), 2 * len(old_runs)], dtype=torch.int64),
+            "he_offset": torch.tensor([0, T_old * T_old, 2 * T_old * T_old], dtype=torch.int64),
+            "he_size": torch.tensor([T_old, T_old], dtype=torch.int16),
+            "he_flat": torch.ones(2 * T_old * T_old, dtype=torch.uint8),
+            "feat_offset": torch.tensor([0, T_old * T_old * 2, 2 * T_old * T_old * 2], dtype=torch.int64),
+            "feat_flat": torch.full((2 * T_old * T_old * 2,), 0.25, dtype=torch.float16),
+            "align_offset": torch.tensor([0, 0, L_t], dtype=torch.int64),
+            "align_flat": (torch.arange(L_t, dtype=torch.int16) % T_old),
+            "row_tm": torch.tensor([1.0, 0.72], dtype=torch.float16),
+            "row_is_native": torch.tensor([True, False], dtype=torch.bool),
+            "row_rewind": torch.tensor([0, 150], dtype=torch.int16),
+            "row_usalign_tm": torch.tensor([1.0, 0.72], dtype=torch.float16),
+            "pair_feature_mean": torch.zeros(N_PAIR_FEATURES, dtype=torch.float32),
+            "pair_feature_std": torch.ones(N_PAIR_FEATURES, dtype=torch.float32),
+            "elem_feature_mean": torch.tensor(10.0, dtype=torch.float32),
+            "elem_feature_std": torch.tensor(1.0, dtype=torch.float32),
+            "element_types": (1, 2),
+            "dssp_def": "h_bond",
+        }
+        torch.save(index, src_idx)
+
+        # Create mock template pool with shardXXXX/test_auth_A.npz
+        pool_dir = os.path.join(tmpdir, "pool")
+        auth_stem = "test_auth_A"
+        shard_dir = os.path.join(pool_dir, f"shard{zlib.crc32(auth_stem.encode()) % 1000:04d}")
+        os.makedirs(shard_dir, exist_ok=True)
+        amask = np.zeros((L_t, 37), dtype=bool)
+        amask[:, [0, 1, 2, 4]] = True
+        full = np.zeros((L_t, 37, 3), dtype=np.float32)
+        full[:, [0, 1, 2, 4], :] = x4_tmpl[0].numpy()
+        tcoords = full[amask][None, :, :]  # [1, N_present, 3]
+        np.savez(
+            os.path.join(shard_dir, f"{auth_stem}.npz"),
+            coords=tcoords,
+            atom_mask=amask,
+            aatype=aatype_tmpl,
+            residue_index=np.arange(1, L_t + 1, dtype=np.int32),
+        )
+
+        alias_path = os.path.join(tmpdir, "auth_key.tsv")
+        with open(alias_path, "w") as fh:
+            fh.write("label_id\tauth_id\ntest_A\ttest_auth_A\n")
+
+        # Create mock native pack
+        pack_path = os.path.join(tmpdir, "tri_v2.pack")
+        g_nat = Data(
+            coords=x4_tmpl[0],
+            coord_mask=torch.ones(L_t, 4, dtype=torch.bool),
+            residue_type=torch.from_numpy(aatype_tmpl).long(),
+            contact_map_confind=torch.eye(L_t, dtype=torch.float32),
+            protein_id="test_A",
+        )
+        with open(pack_path, "wb") as fh:
+            torch.save(g_nat, fh)
+            ln = fh.tell()
+        np.savez(
+            pack_path + ".idx.npz",
+            stems=np.array(["test_A"], dtype=object),
+            offsets=np.array([0], dtype=np.int64),
+            lengths=np.array([ln], dtype=np.int64),
+        )
+
+        out_smooth = os.path.join(tmpdir, "smooth", "topology_index_confind_synth_tmalign_smooth.pt")
+        out_chunk9 = os.path.join(tmpdir, "chunk9", "topology_index_confind_synth_mpnn_chunk9.pt")
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rebuild_confind_indices_a6000.py")
+        cmd = [
+            sys.executable,
+            script,
+            "--src-index", src_idx,
+            "--src-eligible", src_elig,
+            "--native-pack", pack_path,
+            "--template-pool", pool_dir,
+            "--chain-alias", alias_path,
+            "--out-smooth", out_smooth,
+            "--out-chunk9", out_chunk9,
+            "--workers", "2",
+            "--num-chunks", "2",
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        assert "REBUILD_INDICES_DONE" in res.stdout
+
+        # Verify TopologyReferenceTransform loads the rebuilt chunk9 index + pool + pack cleanly
+        tf_c9 = TopologyReferenceTransform(
+            index_path=out_chunk9,
+            reference_source="synthetic",
+            reference_mode="mpnn_chunk9",
+            element_types=(1,),
+            sse_types=(1, 2),
+            elem_features=True,
+            token_mask_prob=0.1,
+            template_seq_mask_prob=0.25,
+            template_pool_dir=pool_dir,
+            chain_alias_path=alias_path,
+            native_pack_path=pack_path,
+            seed=99,
+        )
+        g_q = Data(
+            coords=torch.zeros(L_t, 37, 3),
+            coord_mask=torch.ones(L_t, 37, dtype=torch.bool),
+            protein_id="test_A",
+        )
+        g_q = tf_c9(g_q)
+        assert g_q.topology_he_tokens.shape[0] == 4
+        assert g_q.template_backbone_coords.shape == (L_t, 4, 3)
+        assert torch.allclose(g_q.template_backbone_coords, x4_tmpl[0], atol=1e-5)
+        print("[PASS] rebuild_confind_indices_a6000.py end-to-end build + TopologyReferenceTransform verified")
+
+
 if __name__ == "__main__":
     test_mpnn_backbone_encoder_matches_upstream()
     test_contact_map_tri_v2_mpnn_chunk9_forward_backward()
+    test_topology_reference_transform_mpnn_chunk9_seq_masking()
+    test_rebuild_confind_indices_script()
     print("ALL TOPOREF MPNN CPU TESTS PASSED")

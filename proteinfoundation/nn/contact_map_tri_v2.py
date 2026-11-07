@@ -54,7 +54,12 @@ from proteinfoundation.nn.contact_map_tri import (
     ContactMapTriSiT,
     _pair_feature_indices,
 )
-from proteinfoundation.nn.mpnn_topology_encoder import MPNNChunk9TopologyModule, extract_backbone_atom4
+from proteinfoundation.nn.mpnn_topology_encoder import (
+    CHUNK_SIZE,
+    TEMPLATE_SEQ_PAD_TOKEN,
+    MPNNChunk9TopologyModule,
+    extract_backbone_atom4,
+)
 from proteinfoundation.openfold_stub.model.primitives import LayerNorm, Linear, lecun_normal_init_
 from proteinfoundation.openfold_stub.model.triangular_multiplicative_update import (
     TriangleMultiplicationIncoming,
@@ -346,6 +351,30 @@ class ContactMapTriV2(nn.Module):
         qp = batch.get("residue_seqres_idx")
         if qp is not None and Lp > qp.shape[1]:
             out["residue_seqres_idx"] = F.pad(qp, (0, Lp - qp.shape[1]))
+        if self.reference_mode == "mpnn_chunk9":
+            Lp_t = Tp * CHUNK_SIZE
+            tc = batch.get("template_backbone_coords")
+            if tc is not None and tc.shape[1] != Lp_t:
+                out["template_backbone_coords"] = (
+                    F.pad(tc, (0, 0, 0, 0, 0, Lp_t - tc.shape[1])) if tc.shape[1] < Lp_t else tc[:, :Lp_t]
+                )
+            tm = batch.get("template_backbone_mask")
+            if tm is not None and tm.shape[1] != Lp_t:
+                out["template_backbone_mask"] = (
+                    F.pad(tm, (0, Lp_t - tm.shape[1]), value=0.0) if tm.shape[1] < Lp_t else tm[:, :Lp_t]
+                )
+            ta = batch.get("template_aatype")
+            if ta is not None and ta.shape[1] != Lp_t:
+                out["template_aatype"] = (
+                    F.pad(ta, (0, Lp_t - ta.shape[1]), value=TEMPLATE_SEQ_PAD_TOKEN)
+                    if ta.shape[1] < Lp_t
+                    else ta[:, :Lp_t]
+                )
+            tr = batch.get("template_residue_idx")
+            if tr is not None and tr.shape[1] != Lp_t:
+                out["template_residue_idx"] = (
+                    F.pad(tr, (0, Lp_t - tr.shape[1]), value=0) if tr.shape[1] < Lp_t else tr[:, :Lp_t]
+                )
         return out
 
     def _forward_impl_sc(self, batch: Dict) -> Dict:
@@ -360,7 +389,13 @@ class ContactMapTriV2(nn.Module):
         tok = batch.get("topology_he_tokens")
         T = tok.shape[1] if tok is not None else 1
         Lp, Tp = self._bucket(L, self.pad_len_buckets), self._bucket(T, self.pad_topo_buckets)
-        padded = (Lp, Tp) != (L, T)
+        tc = batch.get("template_backbone_coords")
+        need_tmpl_pad = (
+            self.reference_mode == "mpnn_chunk9"
+            and tc is not None
+            and tc.shape[1] != (Tp if tok is not None else T) * CHUNK_SIZE
+        )
+        padded = (Lp, Tp) != (L, T) or need_tmpl_pad
         if padded:
             batch = self._pad_batch(batch, Lp, Tp if tok is not None else T)
         if torch.is_grad_enabled():
@@ -435,6 +470,7 @@ class ContactMapTriV2(nn.Module):
                     tmpl_mask = torch.ones(tmpl_coords.shape[:-1], device=device, dtype=dtype)
                 tmpl_coords, tmpl_mask = extract_backbone_atom4(tmpl_coords, tmpl_mask)
             tmpl_res_idx = batch.get("template_residue_idx")
+            tmpl_aatype = batch.get("template_aatype")
             topo_repr, edge_pair_emb = self.mpnn_topo(
                 tmpl_backbone_coords=tmpl_coords,
                 tmpl_backbone_mask=tmpl_mask,
@@ -442,6 +478,7 @@ class ContactMapTriV2(nn.Module):
                 chunk_valid=he_valid,
                 chunk_masked=chunk_masked,
                 tmpl_residue_idx=tmpl_res_idx,
+                tmpl_aatype=tmpl_aatype,
                 dtype=dtype,
             )
         else:

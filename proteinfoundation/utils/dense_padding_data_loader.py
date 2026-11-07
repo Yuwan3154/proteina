@@ -196,11 +196,18 @@ def _dense_pad_tensor(
     cat_dim = None
     elem = values[0]
     dtype = elem.dtype
-    padding_value = (
-        float_padding_value
-        if torch.is_floating_point(elem)
-        else non_float_padding_value
-    )
+    if key == "template_backbone_mask":
+        padding_value = 0.0
+    elif key == "template_aatype":
+        padding_value = 20
+    elif key == "template_residue_idx":
+        padding_value = 0
+    else:
+        padding_value = (
+            float_padding_value
+            if torch.is_floating_point(elem)
+            else non_float_padding_value
+        )
     if elem.dim() == 0:
         values = [value.unsqueeze(0) for value in values]
     else:
@@ -270,11 +277,18 @@ def _dense_padded_collate(
 
     if isinstance(elem, torch.Tensor) and not is_sparse(elem):
         # Concatenate a list of `torch.Tensor` along a new `batch_dim=0`.
-        padding_value = (
-            float_padding_value
-            if torch.is_floating_point(elem)
-            else non_float_padding_value
-        )
+        if key == "template_backbone_mask":
+            padding_value = 0.0
+        elif key == "template_aatype":
+            padding_value = 20
+        elif key == "template_residue_idx":
+            padding_value = 0
+        else:
+            padding_value = (
+                float_padding_value
+                if torch.is_floating_point(elem)
+                else non_float_padding_value
+            )
         values, mask = _dense_pad_tensor(
             key,
             values,

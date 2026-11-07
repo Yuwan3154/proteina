@@ -90,6 +90,18 @@ class DSSPTargetTransform(T.BaseTransform):
     Skips if coords have fewer than 4 atoms (e.g. CA-only data).
     """
 
+    def __init__(
+        self,
+        proline_donor_mask: bool = False,
+        dssp_def: str = "tmalign_smooth",
+        overwrite: bool = False,
+    ):
+        if dssp_def not in ("h_bond", "tmalign", "tmalign_smooth"):
+            raise ValueError(f"dssp_def must be 'h_bond', 'tmalign', or 'tmalign_smooth', got {dssp_def!r}")
+        self.proline_donor_mask = bool(proline_donor_mask)
+        self.dssp_def = dssp_def
+        self.overwrite = bool(overwrite)
+
     def forward(self, graph: Data) -> Data:
         """Computes DSSP targets and adds to graph.
 
@@ -107,14 +119,40 @@ class DSSPTargetTransform(T.BaseTransform):
         Returns:
             Graph with dssp_target [L] added (or unchanged if <5 atoms)
         """
-        # Fast path: use pre-computed target from precompute_dssp_targets.py.
-        # Falls through to on-the-fly computation for files not yet processed.
-        if getattr(graph, "dssp_target", None) is not None:
+        # Fast path: use pre-computed target from precompute_dssp_targets.py only when
+        # dssp_def == 'h_bond' and overwrite is False (stored targets in pack are h_bond).
+        if (
+            not self.overwrite
+            and self.dssp_def == "h_bond"
+            and not self.proline_donor_mask
+            and getattr(graph, "dssp_target", None) is not None
+        ):
             return graph
 
         coords = getattr(graph, "coords", None)
         coord_mask = getattr(graph, "coord_mask", None)
-        if coords is None or coords.shape[1] < 5:
+        if coords is None:
+            return graph
+
+        if self.dssp_def in ("tmalign", "tmalign_smooth"):
+            if coords.shape[1] < 2:
+                return graph
+            from proteinfoundation.utils.dssp_utils import compute_dssp_target
+
+            L = int(coords.shape[0])
+            c_mask = (coord_mask.float() > 0.5)[None] if coord_mask is not None else None
+            dssp_out = compute_dssp_target(
+                coords[None].float(),
+                torch.ones(1, L, dtype=torch.bool, device=coords.device),
+                coord_mask=c_mask,
+                coord_layout="atom37",
+                dssp_def=self.dssp_def,
+            )
+            if dssp_out is not None:
+                graph.dssp_target = dssp_out[0].long().clone()
+            return graph
+
+        if coords.shape[1] < 5:
             return graph
 
         import pydssp
@@ -123,7 +161,14 @@ class DSSPTargetTransform(T.BaseTransform):
         ncao = coords[:, [0, 1, 2, 4], :]  # [L, 4, 3]
         ncao_batch = ncao.unsqueeze(0)  # [1, L, 4, 3] for PyDSSP
 
-        dssp_out = pydssp.assign(ncao_batch, out_type="index")  # [1, L]
+        donor_mask = None
+        if self.proline_donor_mask and getattr(graph, "residue_type", None) is not None:
+            donor_mask = (torch.as_tensor(graph.residue_type, device=coords.device) != 14)[None]
+        dssp_out = (
+            pydssp.assign(ncao_batch, out_type="index", donor_mask=donor_mask)
+            if donor_mask is not None
+            else pydssp.assign(ncao_batch, out_type="index")
+        )  # [1, L]
         dssp_target = dssp_out[0].long().clone()  # [L]
 
         # Mask invalid residues (missing backbone atoms)
@@ -330,7 +375,7 @@ class PaddingTransform(T.BaseTransform):
                         # broadcast the sequence embedding from [1, 384, 320] to [384, 384, 320],
                         # blowing the pair grid up to ~92 GiB (tri_cb8synth 22501212 OOM).
                         continue
-                    if key.startswith("topology_"):
+                    if key.startswith("topology_") or key.startswith("template_"):
                         # Left unpadded on purpose: the dense collate pads each key to the BATCH
                         # maximum, so the topology axes cost what a batch actually needs (median
                         # ~42 elements) instead of a fixed worst-case cap. The transform has

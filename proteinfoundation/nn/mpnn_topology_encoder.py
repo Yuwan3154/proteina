@@ -25,6 +25,9 @@ from proteinfoundation.openfold_stub.model.primitives import LayerNorm, Linear, 
 CHUNK_SIZE = 9
 MPNN_DIM = 128
 MPNN_ATOM4_INDICES = (0, 1, 2, 4)  # N, CA, C, O in atom37 numbering
+TEMPLATE_SEQ_VOCAB = 22            # 0..19 standard AA, 20 UNK/pad, 21 = TEMPLATE_SEQ_MASK_TOKEN
+TEMPLATE_SEQ_PAD_TOKEN = 20
+TEMPLATE_SEQ_MASK_TOKEN = 21
 
 
 def extract_backbone_atom4(
@@ -237,7 +240,7 @@ class Chunk9TransformerBlock(nn.Module):
 
 
 class Chunk9Transformer(nn.Module):
-    """2-layer Transformer over 9-residue chunks + masked mean pooling + learned mask chunk embedding."""
+    """2-layer Transformer over 9-residue chunks + template sequence embedding + masked mean pooling + learned mask chunk embedding."""
 
     def __init__(
         self,
@@ -247,15 +250,19 @@ class Chunk9Transformer(nn.Module):
         num_heads: int = 4,
         ffn_expansion: int = 4,
         chunk_size: int = CHUNK_SIZE,
+        seq_vocab_size: int = TEMPLATE_SEQ_VOCAB,
     ):
         super().__init__()
         self.in_dim = in_dim
         self.d = d
         self.chunk_size = chunk_size
+        self.seq_vocab_size = seq_vocab_size
 
         self.in_proj = Linear(in_dim, d, init="default")
+        self.seq_emb = nn.Embedding(seq_vocab_size, d)
         self.intra_chunk_pos = nn.Parameter(torch.zeros(chunk_size, d))
         with torch.no_grad():
+            lecun_normal_init_(self.seq_emb.weight)
             lecun_normal_init_(self.intra_chunk_pos)
 
         self.layers = nn.ModuleList(
@@ -273,6 +280,7 @@ class Chunk9Transformer(nn.Module):
         target_T: int,
         chunk_valid: torch.Tensor,
         chunk_masked: Optional[torch.Tensor] = None,
+        tmpl_aatype: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Return [B, target_T, d] unit embeddings for each 9-residue chunk."""
         B, L, _ = h_V.shape
@@ -288,7 +296,18 @@ class Chunk9Transformer(nn.Module):
         x = h_pad.reshape(B * target_T, C, self.in_dim)
         m = m_pad.reshape(B * target_T, C).to(h_V.dtype)
 
-        x = (self.in_proj(x) + self.intra_chunk_pos[None].to(x.dtype)) * m.unsqueeze(-1)
+        if tmpl_aatype is not None:
+            L_seq = int(tmpl_aatype.shape[1])
+            if L_seq < total_res:
+                seq_pad = F.pad(tmpl_aatype.long(), (0, total_res - L_seq), value=TEMPLATE_SEQ_PAD_TOKEN)
+            else:
+                seq_pad = tmpl_aatype[:, :total_res].long()
+            seq_c = seq_pad.clamp(0, self.seq_vocab_size - 1).reshape(B * target_T, C)
+            seq_feat = self.seq_emb(seq_c).to(x.dtype)
+        else:
+            seq_feat = self.seq_emb.weight.sum() * 0.0
+
+        x = (self.in_proj(x) + seq_feat + self.intra_chunk_pos[None].to(x.dtype)) * m.unsqueeze(-1)
         for layer in self.layers:
             x = layer(x, m)
         x = self.out_norm(x) * m.unsqueeze(-1)
@@ -424,6 +443,7 @@ class MPNNChunk9TopologyModule(nn.Module):
         chunk_valid: torch.Tensor,
         chunk_masked: Optional[torch.Tensor] = None,
         tmpl_residue_idx: Optional[torch.Tensor] = None,
+        tmpl_aatype: Optional[torch.Tensor] = None,
         dtype: torch.dtype = torch.float32,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return (chunk_emb [B, T, d], edge_pair_emb [B, T, T, d])."""
@@ -466,6 +486,7 @@ class MPNNChunk9TopologyModule(nn.Module):
             target_T=target_T,
             chunk_valid=chunk_valid,
             chunk_masked=chunk_masked,
+            tmpl_aatype=tmpl_aatype,
         )
         edge_pair_emb = self.edge_ffn(
             h_E=h_E,

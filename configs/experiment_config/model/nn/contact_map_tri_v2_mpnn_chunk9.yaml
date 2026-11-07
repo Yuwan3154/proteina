@@ -1,0 +1,37 @@
+name: contact_map_tri_v2_mpnn_chunk9
+nn_class: ContactMapTriV2   # dispatches Proteina's NN_REGISTRY
+# ConFind TopoRef with fixed 9-residue ProteinMPNN chunk featurization + template sequence input (25% i.i.d. masking).
+# Stage A: n_blocks_ref blocks on the joint (L+T)^2 query+reference grid; the align head reads its END right before
+# the transition; Stage B: n_blocks_query blocks on L^2. SSE MLM head is disabled in mpnn_chunk9 mode.
+pair_dim: 128            # pair width 128 (matches ProteinMPNN hidden_dim=128)
+tri_hidden: 128
+n_blocks_ref: 4          # 4 blocks with the topology reference
+n_blocks_query: 4        # 4 blocks without the topology reference
+transition_hidden: 512   # SwiGLU hidden width (4x expansion)
+dim_cond: 128
+max_rel_pos: 32          # AlphaFold 2 relative-position clip
+topology_cond: True      # read by the trainer
+reference_mode: mpnn_chunk9
+mpnn_ckpt_path: ${oc.env:MPNN_CKPT_PATH,/home/jupyter-chenxi/ProteinMPNN/vanilla_model_weights/v_48_020.pt}
+mpnn_chunk_layers: 2
+mpnn_chunk_heads: 4
+mpnn_ffn_expansion: 4
+mpnn_k_neighbors: 48
+mpnn_edge_pool: mean
+max_topology_he_len: 64  # ceil(384 / 9) = 43 <= 64
+topology_vocab_size: 44  # 2 special + helix/strand x 21 length slots
+n_elem_features: 1       # per-chunk length feature (9 for full chunks, <9 for tail chunk)
+n_residue_types: 22
+align_head:
+  enabled: True
+mlm_head:
+  enabled: False         # SSE MLM loss is disabled in mpnn_chunk9 mode
+pair_ref_features: both
+contact_map_mode: True
+contact_map_input_dim: 1
+non_contact_value: 0
+predict_coords: False
+use_torch_compile: False
+use_torch_compile_sc: False
+pad_len_buckets: [64, 128, 192, 256, 320, 384]
+pad_topo_buckets: [16, 32, 48, 64]

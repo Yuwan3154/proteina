@@ -448,7 +448,7 @@ def main():
         help="Also run c2c on all 24 unrefined pool candidates (for benchmark diagnostics; default folds only the minE winner + pre-refinement pick)",
     )
     # validation pads every query to the dataset's PaddingTransform max_size (384), and stageB's c2c batches too
-    ap.add_argument("--pad-to", type=int, default=384, help="padded query width for tri and c2c; 0 = no padding")
+    ap.add_argument("--pad-to", type=int, default=0, help="padded query width for tri and c2c; 0 = no padding (default for 2.9x speedup on L<=192)")
     ap.add_argument("--max-pairs", type=int, default=0, help="shakedown: only the first N pairs of this shard (0 = all)")
     ap.add_argument("--pairs-filter", default=None, help="shakedown: file of 'pid<TAB>template' lines to keep")
     args = ap.parse_args()

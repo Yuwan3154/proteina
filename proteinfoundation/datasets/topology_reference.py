@@ -19,9 +19,13 @@ non-self reference regardless of cluster size; a chain that still has none falls
 unconditional MASK reference and says so loudly (topology_missing_ref = 1 + a warning).
 """
 
+import io
+import mmap
+import os
 import zlib
 from typing import Dict, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 import torch_geometric.transforms as T
 from loguru import logger
@@ -45,6 +49,11 @@ from proteinfoundation.datasets.sse_topology import (
     perturb_runs,
     runs_to_spans,
     sse_sequence_gap,
+)
+from proteinfoundation.nn.mpnn_topology_encoder import (
+    MPNN_ATOM4_INDICES,
+    TEMPLATE_SEQ_MASK_TOKEN,
+    TEMPLATE_SEQ_PAD_TOKEN,
 )
 try:
     from proteinfoundation.datasets.transforms import SeqresIndexError
@@ -129,6 +138,10 @@ class TopologyReferenceTransform(T.BaseTransform):
         reference_mode: str = "sse",
         chunk_size: int = 9,
         dssp_def: str = "tmalign_smooth",
+        template_seq_mask_prob: float = 0.25,
+        template_pool_dir: Optional[str] = None,
+        chain_alias_path: Optional[str] = None,
+        native_pack_path: Optional[str] = None,
     ):
         if reference_source not in ("cluster", "synthetic"):
             raise ValueError(f"reference_source must be 'cluster' or 'synthetic', got {reference_source!r}")
@@ -136,9 +149,19 @@ class TopologyReferenceTransform(T.BaseTransform):
             raise ValueError(f"reference_mode must be 'sse' or 'mpnn_chunk9', got {reference_mode!r}")
         if dssp_def not in ("h_bond", "tmalign", "tmalign_smooth"):
             raise ValueError(f"dssp_def must be 'h_bond', 'tmalign', or 'tmalign_smooth', got {dssp_def!r}")
+        if not 0.0 <= float(template_seq_mask_prob) <= 1.0:
+            raise ValueError(f"template_seq_mask_prob must be in [0, 1], got {template_seq_mask_prob}")
         self.reference_mode = reference_mode
         self.chunk_size = int(chunk_size)
         self.dssp_def = dssp_def
+        self.template_seq_mask_prob = float(template_seq_mask_prob)
+        self.template_pool_dir = template_pool_dir
+        self.chain_alias_path = chain_alias_path
+        self.native_pack_path = native_pack_path
+        self._alias_map = None
+        self._pack_idx = None
+        self._pack_mm = None
+        self._pack_fh = None
         self.index_path = index_path
         self.max_topology_len = max_topology_len
         self.max_topology_he_len = max_topology_he_len
@@ -225,6 +248,123 @@ class TopologyReferenceTransform(T.BaseTransform):
             # the identity. The other modes need a rebuilt index to be meaningful.
             self._feat_mean = torch.zeros(N_PAIR_FEATURES)
             self._feat_std = torch.ones(N_PAIR_FEATURES)
+        if self.chain_alias_path and self._alias_map is None and os.path.exists(self.chain_alias_path):
+            alias = {}
+            with open(self.chain_alias_path) as fh:
+                head = fh.readline().rstrip("\n").split("\t")
+                il = head.index("label_id")
+                ia = head.index("auth_id")
+                for line in fh:
+                    f = line.rstrip("\n").split("\t")
+                    if len(f) > max(il, ia) and f[ia]:
+                        alias[f[il]] = f[ia]
+            self._alias_map = alias
+        if (
+            self.native_pack_path
+            and self._pack_idx is None
+            and os.path.exists(self.native_pack_path)
+            and os.path.exists(self.native_pack_path + ".idx.npz")
+        ):
+            z = np.load(self.native_pack_path + ".idx.npz", allow_pickle=True)
+            self._pack_idx = {
+                str(s): (int(o), int(l)) for s, o, l in zip(z["stems"], z["offsets"], z["lengths"])
+            }
+            self._pack_fh = open(self.native_pack_path, "rb")
+            self._pack_mm = mmap.mmap(self._pack_fh.fileno(), 0, access=mmap.ACCESS_READ)
+
+    def _template_res_tensors_for(
+        self, t_row: int, target_T: int, augment: bool
+    ) -> Dict[str, torch.Tensor]:
+        """Return template residue-level tensors (coords, mask, aatype, residue_idx) for mpnn_chunk9 mode."""
+        idx = self._index
+        cap_res = max(target_T * self.chunk_size, 1)
+        x4 = None
+        m4 = None
+        aatype = None
+        res_idx = None
+
+        if "tmpl_atom4_flat" in idx and "tmpl_res_offset" in idx:
+            a, b = int(idx["tmpl_res_offset"][t_row]), int(idx["tmpl_res_offset"][t_row + 1])
+            if b > a:
+                x4 = idx["tmpl_atom4_flat"][a:b].float().clone()
+                m4 = idx["tmpl_mask_flat"][a:b].float().clone()
+                aatype = idx["tmpl_aatype_flat"][a:b].long().clone()
+                if "tmpl_res_idx_flat" in idx:
+                    res_idx = idx["tmpl_res_idx_flat"][a:b].long().clone()
+                else:
+                    res_idx = torch.arange(b - a, dtype=torch.long)
+
+        if x4 is None:
+            row_id = str(idx["ids"][t_row]) if t_row < len(idx["ids"]) else ""
+            if "@" in row_id and "#" in row_id and self.template_pool_dir:
+                stem, rest = row_id.split("@", 1)
+                k = int(rest.split("#", 1)[1])
+                auth_stem = self._alias_map.get(stem, stem) if self._alias_map is not None else stem
+                npz_path = os.path.join(
+                    self.template_pool_dir,
+                    f"shard{zlib.crc32(auth_stem.encode()) % 1000:04d}",
+                    f"{auth_stem}.npz",
+                )
+                if os.path.exists(npz_path):
+                    z = np.load(npz_path)
+                    amask = torch.from_numpy(z["atom_mask"].astype(bool))
+                    L_t = int(amask.shape[0])
+                    full = torch.zeros(L_t, 37, 3, dtype=torch.float32)
+                    full[amask] = torch.from_numpy(z["coords"][k]).float()
+                    x4 = full[:, list(MPNN_ATOM4_INDICES), :]
+                    m4 = amask[:, list(MPNN_ATOM4_INDICES)].all(dim=-1).float()
+                    if "aatype" in z:
+                        aatype = torch.from_numpy(np.asarray(z["aatype"], dtype=np.int64)).clamp(0, 20)
+                    else:
+                        aatype = torch.full((L_t,), TEMPLATE_SEQ_PAD_TOKEN, dtype=torch.long)
+                    if "residue_index" in z:
+                        r_idx = torch.from_numpy(np.asarray(z["residue_index"], dtype=np.int64))
+                        res_idx = r_idx - r_idx[0] if r_idx.numel() > 0 else torch.zeros(0, dtype=torch.long)
+                    else:
+                        res_idx = torch.arange(L_t, dtype=torch.long)
+            elif self._pack_idx is not None and row_id in self._pack_idx:
+                off, ln = self._pack_idx[row_id]
+                g = torch.load(io.BytesIO(self._pack_mm[off : off + ln]), map_location="cpu", weights_only=False)
+                coords = getattr(g, "coords", None)
+                cmask = getattr(g, "coord_mask", None)
+                if coords is not None and cmask is not None:
+                    L_t = int(coords.shape[0])
+                    # Native pack stores ATOM_NUMBERING order where N=0, CA=1, C=2, O=3
+                    x4 = coords[:, [0, 1, 2, 3], :].float().clone()
+                    m4 = (cmask[:, [0, 1, 2, 3]].float() > 0.5).all(dim=-1).float()
+                    rt = getattr(g, "residue_type", None)
+                    if rt is not None:
+                        aatype = torch.as_tensor(rt, dtype=torch.long).clamp(0, 20).clone()
+                    else:
+                        aatype = torch.full((L_t,), TEMPLATE_SEQ_PAD_TOKEN, dtype=torch.long)
+                    res_idx = torch.arange(L_t, dtype=torch.long)
+
+        if x4 is None or x4.shape[0] == 0:
+            x4 = torch.zeros((cap_res, 4, 3), dtype=torch.float32)
+            m4 = torch.zeros((cap_res,), dtype=torch.float32)
+            aatype = torch.full((cap_res,), TEMPLATE_SEQ_MASK_TOKEN, dtype=torch.long)
+            res_idx = torch.arange(cap_res, dtype=torch.long)
+        else:
+            x4 = x4[:cap_res]
+            m4 = m4[:cap_res]
+            aatype = aatype[:cap_res]
+            res_idx = res_idx[:cap_res]
+            # 25% i.i.d. per-residue template sequence identity masking during training;
+            # coordinate features (x4, m4) are never masked (user directive 2026-11-07).
+            if augment and self.template_seq_mask_prob > 0.0 and aatype.numel() > 0:
+                seq_masked = torch.rand(aatype.shape, generator=self._generator) < self.template_seq_mask_prob
+                aatype = torch.where(
+                    seq_masked,
+                    torch.full_like(aatype, TEMPLATE_SEQ_MASK_TOKEN),
+                    aatype,
+                )
+
+        return {
+            "template_backbone_coords": x4,
+            "template_backbone_mask": m4,
+            "template_aatype": aatype,
+            "template_residue_idx": res_idx,
+        }
 
     def _runs_for(self, row: int):
         idx = self._index
@@ -408,7 +548,7 @@ class TopologyReferenceTransform(T.BaseTransform):
         runs = self._runs_for(t_row)
         he_contact = self._he_contact_for(t_row)
         structural = self._he_structural_for(t_row, he_contact.shape[0])
-        if not runs or self.dssp_def == "h_bond":
+        if not runs or self.reference_mode == "mpnn_chunk9" or self.dssp_def == "h_bond":
             return runs, he_contact, structural, None, None
         idx_dssp_def = str(idx.get("dssp_def", "h_bond"))
         if idx_dssp_def == self.dssp_def:
@@ -496,7 +636,7 @@ class TopologyReferenceTransform(T.BaseTransform):
             structural = torch.zeros(len(keep), len(keep), len(STRUCTURAL_PAIR_FEATURES))
 
         length_aug = self.mutate_prob > 0.0 and self.sigma_frac > 0.0
-        if augment and (length_aug or self.type_mutate_prob > 0.0):
+        if self.reference_mode == "sse" and augment and (length_aug or self.type_mutate_prob > 0.0):
             runs = perturb_runs(
                 runs,
                 self.sigma_frac,
@@ -580,7 +720,11 @@ class TopologyReferenceTransform(T.BaseTransform):
         runs, he_contact, structural, old_to_new, new_elem_of_res = self._resolve_row_reference_inputs(t_row)
         self._last_old_to_new_elem = old_to_new
         self._last_new_elem_of_res = new_elem_of_res
-        return self.assemble_reference(runs, he_contact, structural, length, augment)
+        out = self.assemble_reference(runs, he_contact, structural, length, augment)
+        if self.reference_mode == "mpnn_chunk9":
+            target_T = int(out["topology_he_tokens"].numel())
+            out.update(self._template_res_tensors_for(t_row, target_T=target_T, augment=augment))
+        return out
 
     def self_reference(self, stem: str, length: int) -> Optional[Dict[str, torch.Tensor]]:
         """The chain's OWN topology, unaugmented and never dropped.
@@ -661,6 +805,13 @@ class TopologyReferenceTransform(T.BaseTransform):
                 "topology_he_pos", "topology_he_pos_raw", "topology_he_contact", "topology_he_feat"]
         if self.elem_features:
             keys.append("topology_he_elem_feat")
+        if self.reference_mode == "mpnn_chunk9":
+            keys.extend([
+                "template_backbone_coords",
+                "template_backbone_mask",
+                "template_aatype",
+                "template_residue_idx",
+            ])
         return {k: getattr(g, k) for k in keys}
 
     def forward(self, graph: Data) -> Data:
@@ -800,6 +951,12 @@ class TopologyReferenceTransform(T.BaseTransform):
         # All zero on purpose: 0 is PAD, and the trainer's `sel = m_tgt > 1` therefore selects
         # nothing, so no MLM loss is taken on a reference the model was never shown.
         graph.topology_he_tokens_target = torch.zeros(n_el, dtype=torch.long)
+        if self.reference_mode == "mpnn_chunk9":
+            n_res_empty = max(1, n_el * self.chunk_size)
+            graph.template_backbone_coords = torch.zeros((n_res_empty, 4, 3), dtype=torch.float32)
+            graph.template_backbone_mask = torch.zeros((n_res_empty,), dtype=torch.float32)
+            graph.template_aatype = torch.full((n_res_empty,), TEMPLATE_SEQ_MASK_TOKEN, dtype=torch.long)
+            graph.template_residue_idx = torch.arange(n_res_empty, dtype=torch.long)
         graph.ref_align_target = torch.full((L,), ALIGN_NONE, dtype=torch.long)
         graph.topology_missing_ref = torch.tensor([1 if missing else 0], dtype=torch.long)
         return graph
