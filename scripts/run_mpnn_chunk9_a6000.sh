@@ -68,7 +68,6 @@ exec "$ENV_DIR/bin/torchrun" --standalone --nproc_per_node=4 \
   --config_name training_contact_tri_v2_confind_mpnn_chunk9 \
   --ngpus_per_node 4 \
   --nnodes 1 \
-  --batch_size 1 \
   --accumulate_grad_batches 8 \
   "run_name_=$RUN" \
   "$@"
