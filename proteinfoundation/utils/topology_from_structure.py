@@ -72,13 +72,13 @@ def parse_structure(structure_path: str, chain: str = "all") -> "Data":
 def load_structure(
     structure_path: str,
     chain: str = "all",
-    dssp_def: str = "h_bond",
+    dssp_def: str = "tmalign_smooth",
 ):
     """PDB/CIF -> (coords [L, 37, 3] in OpenFold atom order, coord_mask [L, 37], dssp [L])."""
     return atom37_and_dssp(parse_structure(structure_path, chain=chain), dssp_def=dssp_def)
 
 
-def atom37_and_dssp(graph, dssp_def: str = "h_bond"):
+def atom37_and_dssp(graph, dssp_def: str = "tmalign_smooth"):
     """Graph in PDB atom order -> the atom37 view the topology featurisation expects, plus DSSP.
 
     Mirrors ``pdb_data.PDBDataset`` exactly: same reorder, and DSSP read from the atom37 layout
@@ -111,7 +111,7 @@ def structure_to_topology_source(
     rotlib_path: Optional[str] = None,
     confind_bin: str = "confind",
     raw_contact_map: Optional[torch.Tensor] = None,
-    dssp_def: str = "h_bond",
+    dssp_def: str = "tmalign_smooth",
 ) -> Tuple[Sequence[Tuple[int, int]], torch.Tensor, torch.Tensor]:
     """Structure file -> (runs, element contact map, structural pair features).
 
@@ -176,7 +176,7 @@ def topology_reference_from_structure(
     rotlib_path: Optional[str] = None,
     confind_bin: str = "confind",
     raw_contact_map: Optional[torch.Tensor] = None,
-    dssp_def: str = "h_bond",
+    dssp_def: str = "tmalign_smooth",
 ) -> Dict[str, torch.Tensor]:
     """The six ``topology_*`` tensors for a structure file, rescaled onto ``target_len``.
 
@@ -201,5 +201,6 @@ def topology_reference_from_structure(
         mutate_prob=0.0,
         sigma_frac=0.0,
         drop_prob=0.0,
+        dssp_def=dssp_def,
     )
     return transform.assemble_reference(runs, ref, structural, target_len, augment=False)
