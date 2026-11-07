@@ -71,20 +71,32 @@ def load_entry_tensors(store, entry_id):
     return e, full, mask
 
 
-def entry_rows(store, eid, entry_members, cm, element_types, loop_axis, min_len):
-    """Member rows of one entry from its whole-chain contact map `cm` ([L, L] float 0/1): whole-chain DSSP, then each
-    member's domain view -> topology_row. Returns (rows, skip lines)."""
+def entry_rows(store, eid, entry_members, cm, element_types, loop_axis, min_len, dssp_def="tmalign_smooth"):
+    """Member rows of one entry from its whole-chain contact map `cm` ([L, L] float 0/1): domain-cropped TM-align
+    smooth DSSP (`aln_then_dssp`) when dssp_def in ('tmalign', 'tmalign_smooth'), or whole-chain PyDSSP when
+    dssp_def == 'h_bond', then each member's domain view -> topology_row. Returns (rows, skip lines)."""
     e, f, m = load_entry_tensors(store, eid)
-    aatype = torch.from_numpy(np.array(e["aatype"])).long()
-    dssp = compute_dssp_target(f[None], m[:, CA_IDX][None], coord_mask=m[None], coord_layout="atom37",
-                               donor_mask=(aatype != PRO_IDX)[None])
-    if dssp is None:
-        return [], [f"{eid}\tentry\tdssp_none"]
-    dssp = dssp[0]
+    dssp_whole = None
+    if dssp_def == "h_bond":
+        aatype = torch.from_numpy(np.array(e["aatype"])).long()
+        dssp_whole = compute_dssp_target(f[None], m[:, CA_IDX][None], coord_mask=m[None], coord_layout="atom37",
+                                         donor_mask=(aatype != PRO_IDX)[None], dssp_def="h_bond")
+        if dssp_whole is None:
+            return [], [f"{eid}\tentry\tdssp_none"]
+        dssp_whole = dssp_whole[0]
     rows, skips = [], []
     for mem in entry_members.itertuples():
         pos = torch.from_numpy(seg_positions(mem.seg)).long()
-        got = topology_row(cm[pos][:, pos], f[pos], m[pos], dssp[pos], min_len, element_types=element_types, loop_axis=loop_axis)
+        if dssp_def in ("tmalign", "tmalign_smooth"):
+            dssp_m = compute_dssp_target(f[pos][None], m[pos, CA_IDX][None], coord_mask=m[pos][None],
+                                         coord_layout="atom37", dssp_def=dssp_def)
+            if dssp_m is None:
+                skips.append(f"{mem.member_id}\tmember\tdssp_none")
+                continue
+            dssp_sub = dssp_m[0]
+        else:
+            dssp_sub = dssp_whole[pos]
+        got = topology_row(cm[pos][:, pos], f[pos], m[pos], dssp_sub, min_len, element_types=element_types, loop_axis=loop_axis)
         if got is None:
             skips.append(f"{mem.member_id}\tmember\tdssp_all_ignore")
             continue
@@ -123,7 +135,7 @@ def cmd_build(args):
             L = int(m.shape[0])
             cm = (probs[j, :L, :L] >= CONFIND_THRESHOLD).float()
             cbits[eid] = np.packbits(cm.numpy().astype(bool).reshape(-1))
-            got, sk = entry_rows(store, eid, by_entry[eid], cm, element_types, loop_axis, min_len)
+            got, sk = entry_rows(store, eid, by_entry[eid], cm, element_types, loop_axis, min_len, dssp_def=args.dssp_def)
             rows += got
             skips += sk
         if (i // args.batch_size) % 20 == 0:
@@ -268,6 +280,8 @@ def main():
     b.add_argument("--f2c-parent", default="~", help="directory containing the Frame2ConFind package")
     b.add_argument("--amp-dtype", default="bf16")
     b.add_argument("--batch-size", type=int, default=8, help="entries per Frame2ConFind forward (T8 winner rerun: 8)")
+    b.add_argument("--dssp-def", choices=("h_bond", "tmalign", "tmalign_smooth"), default="tmalign_smooth",
+                   help="SSE classifier for domain topology featurization (default: tmalign_smooth on domain CA)")
     m = sub.add_parser("merge")
     m.add_argument("--store", required=True)
     m.add_argument("--meta", required=True)

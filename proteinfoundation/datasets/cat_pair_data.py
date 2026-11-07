@@ -81,7 +81,12 @@ class CATPairReferenceTransform(TopologyReferenceTransform):
         idx = self._index
         L = int(graph.coords.shape[0])
         a, b = int(idx["ca_offset"][t_row]), int(idx["ca_offset"][t_row + 1])
-        t_ca, t_elem = idx["ca_flat"][a:b].numpy(), idx["elem_flat"][a:b].numpy()
+        t_ca = idx["ca_flat"][a:b].numpy()
+        new_elem = getattr(self, "_last_new_elem_of_res", None)
+        if new_elem is not None and int(new_elem.numel()) == (b - a):
+            t_elem = new_elem.numpy()
+        else:
+            t_elem = idx["elem_flat"][a:b].numpy()
         q_ca = graph.coords[:, CA_IDX].numpy()
         q_present = graph.coord_mask[:, CA_IDX].numpy().astype(bool)
         align = np.full((L,), ALIGN_NONE, dtype=np.int64)

@@ -173,9 +173,94 @@ def test_robustness_under_backbone_distortion():
     assert struct_feat.shape[:2] == (len(keep), len(keep))
 
 
+def test_topology_reference_transform_tmalign_smooth():
+    """Verify TopologyReferenceTransform(dssp_def='tmalign_smooth') projects runs, pair features, and align targets."""
+    import tempfile
+    from proteinfoundation.datasets.sse_topology import N_PAIR_FEATURES, STRUCTURAL_PAIR_FEATURES
+    from proteinfoundation.datasets.topology_reference import TopologyReferenceTransform
+
+    # Create a fragmented synthetic index row: loop(2), H(5), loop(1), H(6), loop(2), H(1), loop(2), E(4), loop(2) -> L=25
+    # Old elements (H/E): 0=H(5) [2:7], 1=H(6) [8:14], 2=H(1) [16:17], 3=E(4) [19:23] (4 elements)
+    # After smooth_tmalign_dssp: H(5)+loop(1)+H(6) merges into H(12) [2:14]; H(1) [16:17] is erased to loop; E(4) [19:23] stays!
+    # So new elements: 0=H(12) [2:14], 1=E(4) [19:23] (2 elements!)
+    runs = [(0, 2), (1, 5), (0, 1), (1, 6), (0, 2), (1, 1), (0, 2), (2, 4), (0, 2)]
+    old_he = torch.tensor(
+        [[1, 1, 0, 1],
+         [1, 1, 0, 1],
+         [0, 0, 1, 0],
+         [1, 1, 0, 1]], dtype=torch.uint8
+    )
+    n_s = len(STRUCTURAL_PAIR_FEATURES)
+    old_struct = torch.ones((4, 4, n_s), dtype=torch.float16) * 0.5
+    # Align target of length 25 pointing to old elements {0, 1, 2, 3, -1}
+    align_raw = torch.full((25,), -1, dtype=torch.int16)
+    align_raw[2:7] = 0
+    align_raw[8:14] = 1
+    align_raw[16:17] = 2   # junk 1-res helix -> should remap to -1!
+    align_raw[19:23] = 3   # strand -> should remap to new element 1!
+
+    with tempfile.TemporaryDirectory() as td:
+        idx_path = os.path.join(td, "synth_idx.pt")
+        torch.save({
+            "ids": ["1abc_A", "1abc_A@rw100#0"],
+            "cluster_of": torch.tensor([0, 0], dtype=torch.int32),
+            "members_flat": torch.tensor([1], dtype=torch.int32),
+            "members_offset": torch.tensor([0, 1], dtype=torch.int64),
+            "seq_hash": torch.tensor([123, 123], dtype=torch.int64),
+            "runs_flat": torch.tensor(runs + runs, dtype=torch.int16),
+            "runs_offset": torch.tensor([0, len(runs), 2 * len(runs)], dtype=torch.int64),
+            "he_offset": torch.tensor([0, 16, 32], dtype=torch.int64),
+            "he_size": torch.tensor([4, 4], dtype=torch.int16),
+            "he_flat": torch.cat([old_he.flatten(), old_he.flatten()]),
+            "feat_offset": torch.tensor([0, 4 * 4 * n_s, 2 * 4 * 4 * n_s], dtype=torch.int64),
+            "feat_flat": torch.cat([old_struct.flatten(), old_struct.flatten()]),
+            "align_offset": torch.tensor([0, 0, 25], dtype=torch.int64),
+            "align_flat": align_raw,
+            "row_tm": torch.tensor([1.0, 0.7], dtype=torch.float16),
+            "row_is_native": torch.tensor([True, False], dtype=torch.bool),
+            "row_rewind": torch.tensor([0, 100], dtype=torch.int16),
+            "row_usalign_tm": torch.tensor([1.0, 0.7], dtype=torch.float16),
+            "pair_feature_names": ["contact"] + list(STRUCTURAL_PAIR_FEATURES) + ["rel_seq_pos"],
+            "structural_feature_names": list(STRUCTURAL_PAIR_FEATURES),
+            "pair_feature_mean": torch.zeros(N_PAIR_FEATURES, dtype=torch.float32),
+            "pair_feature_std": torch.ones(N_PAIR_FEATURES, dtype=torch.float32),
+            "elem_feature_names": ["length"],
+            "elem_feature_mean": torch.tensor(0.0, dtype=torch.float32),
+            "elem_feature_std": torch.tensor(1.0, dtype=torch.float32),
+            "min_len": 1,
+            "contact_threshold": 0.5,
+            "contact_def": "ConFind via Frame2ConFind, prob >= 0.01 (native: stored contact_map_confind)",
+            "dssp_def": "native: stored dssp_target; templates: pydssp; no donor mask",
+            "reference_source": "synthetic",
+            "element_types": [1, 2],
+            "loop_axis": None,
+            "template_gate": "none",
+        }, idx_path)
+
+        tf_smooth = TopologyReferenceTransform(
+            index_path=idx_path,
+            reference_source="synthetic",
+            tm_range=(0.5, 0.9),
+            mutate_prob=0.0,
+            sigma_frac=0.0,
+            drop_prob=0.0,
+            dssp_def="tmalign_smooth",
+        )
+        tf_smooth._ensure_loaded()
+        new_runs, new_he, new_struct, old_to_new, _ = tf_smooth._resolve_row_reference_inputs(1)
+        assert int(new_he.shape[0]) == 2, f"Expected 2 merged elements after tmalign_smooth, got {new_he.shape}"
+        assert new_struct.shape == (2, 2, n_s)
+        assert old_to_new.tolist() == [0, 0, -1, 1], f"Unexpected old_to_new map: {old_to_new.tolist()}"
+        align_mapped = tf_smooth._align_for(1, length=25, n_he=2, old_to_new_elem=old_to_new)
+        assert torch.all(align_mapped[2:7] == 0) and torch.all(align_mapped[8:14] == 0)
+        assert int(align_mapped[16].item()) == -1
+        assert torch.all(align_mapped[19:23] == 1)
+
+
 if __name__ == "__main__":
     test_helix_and_strand_classification()
     test_usalign_scalar_equivalence_and_mask()
     test_smooth_passes()
     test_robustness_under_backbone_distortion()
+    test_topology_reference_transform_tmalign_smooth()
     print("ALL TMALIGN DSSP TESTS PASSED")
