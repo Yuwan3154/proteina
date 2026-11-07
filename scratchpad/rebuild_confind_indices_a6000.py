@@ -294,34 +294,14 @@ def _process_row_range(row_range):
                 runs_c = chunk9_runs(L_n, chunk_size=CHUNK_SIZE)
                 keep_c = list(range(len(runs_c)))
 
-                cm_raw = getattr(g, "contact_map_confind", None)
-                if cm_raw is not None and tuple(cm_raw.shape) == (L_n, L_n):
-                    cm_n = (cm_raw.float() >= CONFIND_THRESHOLD).float()
-                    cm_n = torch.maximum(cm_n, cm_n.T)
-                    cm_n.fill_diagonal_(1.0)
-                    has_ca = ca_mask.bool()
-                    cm_n = cm_n * (has_ca[:, None] & has_ca[None, :]).float()
-
-                    ref_s, _ = sse_contact_reference(cm_n, runs_s, keep_types=(DSSP_HELIX, DSSP_STRAND))
-                    str_s = sse_structural_pair_features(cm_n, coords, cmask, runs_s, keep_s)
-                    ref_s_u8 = ref_s.to(torch.uint8)
-                    str_s_f16 = str_s.to(torch.float16)
-                    al_s = align_old
-
-                    ref_c, _ = sse_contact_reference(cm_n, runs_c, keep_types=(DSSP_HELIX,))
-                    str_c = sse_structural_pair_features(cm_n, coords, cmask, runs_c, keep_c)
-                    ref_c_u8 = ref_c.to(torch.uint8)
-                    str_c_f16 = str_c.to(torch.float16)
-                    al_c = align_old
-                else:
-                    ref_s_u8, str_s_f16, al_s = _project_element_features_and_align(
-                        old_runs, old_keep, runs_s, keep_s, he_old, struct_old, align_old,
-                        require_same_type=True,
-                    )
-                    ref_c_u8, str_c_f16, al_c = _project_element_features_and_align(
-                        old_runs, old_keep, runs_c, keep_c, he_old, struct_old, align_old,
-                        require_same_type=False,
-                    )
+                ref_s_u8, str_s_f16, al_s = _project_element_features_and_align(
+                    old_runs, old_keep, runs_s, keep_s, he_old, struct_old, align_old,
+                    require_same_type=True,
+                )
+                ref_c_u8, str_c_f16, al_c = _project_element_features_and_align(
+                    old_runs, old_keep, runs_c, keep_c, he_old, struct_old, align_old,
+                    require_same_type=False,
+                )
             else:
                 dssp_old = _runs_to_dssp_tensor(old_runs)
                 dssp_s = smooth_tmalign_dssp(dssp_old[None])[0] if dssp_old.numel() > 0 else dssp_old
@@ -426,42 +406,42 @@ def _process_row_range(row_range):
         c_align_flat.append(al_c.reshape(-1))
 
     smooth_chunk = {
-        "runs_flat": torch.tensor(s_runs_flat, dtype=torch.int16) if s_runs_flat else torch.zeros((0, 2), dtype=torch.int16),
-        "runs_len": torch.tensor(s_runs_len, dtype=torch.int64),
-        "he_size": torch.tensor(s_he_size, dtype=torch.int16),
-        "he_flat": torch.cat(s_he_flat) if s_he_flat else torch.zeros(0, dtype=torch.uint8),
-        "feat_flat": torch.cat(s_feat_flat) if s_feat_flat else torch.zeros(0, dtype=torch.float16),
-        "align_flat": torch.cat(s_align_flat) if s_align_flat else torch.zeros(0, dtype=torch.int16),
-        "feat_sum": s_feat_sum,
-        "feat_sumsq": s_feat_sumsq,
-        "feat_cnt": s_feat_cnt,
-        "elem_sum": s_elem_sum,
-        "elem_sumsq": s_elem_sumsq,
-        "elem_cnt": s_elem_cnt,
+        "runs_flat": np.asarray(s_runs_flat, dtype=np.int16) if s_runs_flat else np.zeros((0, 2), dtype=np.int16),
+        "runs_len": np.asarray(s_runs_len, dtype=np.int64),
+        "he_size": np.asarray(s_he_size, dtype=np.int16),
+        "he_flat": torch.cat(s_he_flat).numpy() if s_he_flat else np.zeros(0, dtype=np.uint8),
+        "feat_flat": torch.cat(s_feat_flat).numpy() if s_feat_flat else np.zeros(0, dtype=np.float16),
+        "align_flat": torch.cat(s_align_flat).numpy() if s_align_flat else np.zeros(0, dtype=np.int16),
+        "feat_sum": s_feat_sum.numpy(),
+        "feat_sumsq": s_feat_sumsq.numpy(),
+        "feat_cnt": int(s_feat_cnt),
+        "elem_sum": float(s_elem_sum),
+        "elem_sumsq": float(s_elem_sumsq),
+        "elem_cnt": int(s_elem_cnt),
     }
     chunk9_chunk = {
-        "runs_flat": torch.tensor(c_runs_flat, dtype=torch.int16) if c_runs_flat else torch.zeros((0, 2), dtype=torch.int16),
-        "runs_len": torch.tensor(c_runs_len, dtype=torch.int64),
-        "he_size": torch.tensor(c_he_size, dtype=torch.int16),
-        "he_flat": torch.cat(c_he_flat) if c_he_flat else torch.zeros(0, dtype=torch.uint8),
-        "feat_flat": torch.cat(c_feat_flat) if c_feat_flat else torch.zeros(0, dtype=torch.float16),
-        "align_flat": torch.cat(c_align_flat) if c_align_flat else torch.zeros(0, dtype=torch.int16),
-        "feat_sum": c_feat_sum,
-        "feat_sumsq": c_feat_sumsq,
-        "feat_cnt": c_feat_cnt,
-        "elem_sum": c_elem_sum,
-        "elem_sumsq": c_elem_sumsq,
-        "elem_cnt": c_elem_cnt,
+        "runs_flat": np.asarray(c_runs_flat, dtype=np.int16) if c_runs_flat else np.zeros((0, 2), dtype=np.int16),
+        "runs_len": np.asarray(c_runs_len, dtype=np.int64),
+        "he_size": np.asarray(c_he_size, dtype=np.int16),
+        "he_flat": torch.cat(c_he_flat).numpy() if c_he_flat else np.zeros(0, dtype=np.uint8),
+        "feat_flat": torch.cat(c_feat_flat).numpy() if c_feat_flat else np.zeros(0, dtype=np.float16),
+        "align_flat": torch.cat(c_align_flat).numpy() if c_align_flat else np.zeros(0, dtype=np.int16),
+        "feat_sum": c_feat_sum.numpy(),
+        "feat_sumsq": c_feat_sumsq.numpy(),
+        "feat_cnt": int(c_feat_cnt),
+        "elem_sum": float(c_elem_sum),
+        "elem_sumsq": float(c_elem_sumsq),
+        "elem_cnt": int(c_elem_cnt),
     }
     return smooth_chunk, chunk9_chunk
 
 
 def _assemble_index_from_chunks(src_idx, chunks, dssp_def: str, element_types):
-    runs_len = torch.cat([c["runs_len"] for c in chunks])
+    runs_len = torch.from_numpy(np.concatenate([c["runs_len"] for c in chunks]))
     runs_offset = torch.zeros(runs_len.numel() + 1, dtype=torch.int64)
     runs_offset[1:] = torch.cumsum(runs_len, dim=0)
 
-    he_size = torch.cat([c["he_size"] for c in chunks])
+    he_size = torch.from_numpy(np.concatenate([c["he_size"] for c in chunks]))
     he_counts = he_size.to(torch.int64) ** 2
     he_offset = torch.zeros(he_size.numel() + 1, dtype=torch.int64)
     he_offset[1:] = torch.cumsum(he_counts, dim=0)
@@ -471,13 +451,13 @@ def _assemble_index_from_chunks(src_idx, chunks, dssp_def: str, element_types):
     feat_offset = torch.zeros(he_size.numel() + 1, dtype=torch.int64)
     feat_offset[1:] = torch.cumsum(feat_counts, dim=0)
 
-    runs_flat = torch.cat([c["runs_flat"] for c in chunks], dim=0)
-    he_flat = torch.cat([c["he_flat"] for c in chunks], dim=0)
-    feat_flat = torch.cat([c["feat_flat"] for c in chunks], dim=0)
-    align_flat = torch.cat([c["align_flat"] for c in chunks], dim=0)
+    runs_flat = torch.from_numpy(np.concatenate([c["runs_flat"] for c in chunks], axis=0))
+    he_flat = torch.from_numpy(np.concatenate([c["he_flat"] for c in chunks], axis=0))
+    feat_flat = torch.from_numpy(np.concatenate([c["feat_flat"] for c in chunks], axis=0))
+    align_flat = torch.from_numpy(np.concatenate([c["align_flat"] for c in chunks], axis=0))
 
-    feat_sum = sum((c["feat_sum"] for c in chunks), torch.zeros(N_PAIR_FEATURES, dtype=torch.float64))
-    feat_sumsq = sum((c["feat_sumsq"] for c in chunks), torch.zeros(N_PAIR_FEATURES, dtype=torch.float64))
+    feat_sum = sum((torch.from_numpy(c["feat_sum"]) for c in chunks), torch.zeros(N_PAIR_FEATURES, dtype=torch.float64))
+    feat_sumsq = sum((torch.from_numpy(c["feat_sumsq"]) for c in chunks), torch.zeros(N_PAIR_FEATURES, dtype=torch.float64))
     feat_cnt = sum(c["feat_cnt"] for c in chunks)
     elem_sum = sum(c["elem_sum"] for c in chunks)
     elem_sumsq = sum(c["elem_sumsq"] for c in chunks)
