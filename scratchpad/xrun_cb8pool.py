@@ -18,9 +18,16 @@ of_run T2 tree survives byte-exact on SuperCloud ~/pp1c_work/templates_band (400
            band_equal.npz (pool band rows of the picked auths, every other rung's slot -1), band_control.npz (full pool
            band rows of the control chains), pairs_equal.tsv, chains_equal.txt, control_chains.txt, report.tsv.
 Control chains: the first N_CONTROL (sorted) of the equal-arm chains that xrun_select.py marked base-round-only.
+
+  pick-t7  (T8b eval 2026-11-07) the T7-NEWEST template of each chain instead of a random pick: (rewind, slot) parsed
+           from the ref_id of the T7 c2c rows (--t7-jsonl, every file must agree, all samples of a chain one ref_id),
+           no window / clash gate (T7 applied none; the clash count is reported only). Writes band_t7.npz, chains_t7.txt,
+           pairs_t7.tsv into --out-dir and the private pool links into --xpool.
 """
 
 import argparse
+import glob
+import json
 import os
 import zlib
 from collections import Counter
@@ -202,10 +209,69 @@ def cmd_pick(a):
     print("XRUN_PICK_DONE")
 
 
+def cmd_pick_t7(a):
+    res = {}
+    with open(os.path.join(a.out_dir, "resolve.tsv")) as fh:
+        fh.readline()
+        for line in fh:
+            s, au, tgt, src = line.rstrip("\n").split("\t")
+            res[s] = (au, tgt, src)
+    files = sorted(glob.glob(a.t7_jsonl))
+    assert files, f"no file matches {a.t7_jsonl}"
+    ref = {}
+    for fp in files:
+        got = {}
+        for line in open(fp):
+            if line.strip():
+                r = json.loads(line)
+                got.setdefault(r["stem"], set()).add(r["ref_id"])
+        for st, ids in got.items():
+            assert len(ids) == 1, f"{fp} {st}: several ref_ids {ids}"
+            rid = ids.pop()
+            assert ref.setdefault(st, rid) == rid, f"{st}: {fp} ref_id {rid} != {ref[st]}"
+    print(f"[t7] {len(files)} jsonl files, {len(ref)} chains with one ref_id each", flush=True)
+    band, brow = load_band(a.pool_band)
+    keep, rows = {}, []
+    for s in sorted(res):
+        au, tgt, src = res[s]
+        assert src != "none", f"{s}: not resolvable in the v4 pool"
+        rid = ref[s]
+        stem, rest = rid.split("@rw")
+        assert stem == s, rid
+        rw, slot = (int(x) for x in rest.split("#"))
+        i = brow[au]
+        hit = [j for j, k in enumerate(band["slot"][i]) if int(k) == slot]
+        assert len(hit) == 1 and int(band["rewind"][i][hit[0]]) == rw, f"{s}: {rid} is not a pool band rung of {au}"
+        f = os.path.join(a.sc_copy, os.path.relpath(tgt, T2_ORIG)) if src == "t2_partner" else tgt
+        assert os.path.exists(f), f"{s}: resolved template {f} missing (rsync?)"
+        dst = os.path.join(a.xpool, shard_rel(au))
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if not os.path.islink(dst):
+            os.symlink(f, dst)
+        assert os.path.realpath(dst) == os.path.realpath(f), f"{dst} points elsewhere"
+        z = np.load(f)
+        amask = z["atom_mask"].astype(bool)
+        full = np.zeros((amask.shape[0], 37, 3), dtype=np.float32)
+        full[amask] = z["coords"][slot]
+        n_clash = ca_clash_pairs(full[:, CA_IDX], amask[:, CA_IDX], CLASH_A)
+        assert au not in keep, f"two chains share auth {au}"
+        keep[au] = {slot}
+        rows.append((s, slot, float(band["tm"][i][hit[0]]), rw, int(amask.shape[0]), au, src, n_clash))
+    write_band(os.path.join(a.out_dir, "band_t7.npz"), band, brow, keep)
+    with open(os.path.join(a.out_dir, "chains_t7.txt"), "w") as fh:
+        fh.write("".join(r[0] + "\n" for r in rows))
+    with open(os.path.join(a.out_dir, "pairs_t7.tsv"), "w") as fh:
+        fh.write("stem\tslot\ttm_native\trewind\tL_template\tauth\tsource\tca_clash_pairs\n")
+        fh.write("".join(f"{s}\t{k}\t{t:.4f}\t{r}\t{L}\t{au}\t{src}\t{c}\n" for s, k, t, r, L, au, src, c in rows))
+    print(f"chains {len(rows)}; over the clash gate (> {CLASH_MAX} pairs < {CLASH_A} A, info only): "
+          f"{sum(r[7] > CLASH_MAX for r in rows)}")
+    print("XRUN_PICK_T7_DONE")
+
+
 def main():
     S = "/orcd/scratch/orcd/011/chenxiou"
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=("resolve", "pick"))
+    ap.add_argument("cmd", choices=("resolve", "pick", "pick-t7"))
     ap.add_argument("--chains", default="")
     ap.add_argument("--control-candidates", default="")
     ap.add_argument("--v4-index", default=f"{S}/synth_index_v4/topology_index_cb8_synth.pt")
@@ -214,9 +280,10 @@ def main():
     ap.add_argument("--pool-band", default=f"{S}/t2_pool_auth_band.npz")
     ap.add_argument("--sc-copy", default="", help="local copy of SuperCloud ~/pp1c_work/templates_band (pick)")
     ap.add_argument("--xpool", default="", help="private symlink pool to write (pick)")
+    ap.add_argument("--t7-jsonl", default="", help="glob of the T7 c2c rows (pick-t7)")
     ap.add_argument("--out-dir", required=True)
     a = ap.parse_args()
-    {"resolve": cmd_resolve, "pick": cmd_pick}[a.cmd](a)
+    {"resolve": cmd_resolve, "pick": cmd_pick, "pick-t7": cmd_pick_t7}[a.cmd](a)
 
 
 if __name__ == "__main__":

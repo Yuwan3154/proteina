@@ -12,6 +12,10 @@
 #   MODE=build    CPU: MODEL=cb8|t8|t8b ARM=equal|indel -> $X/index/<model>_<arm>/ (build + merge + coverage check)
 #   MODE=control  CPU: MODEL=cb8|t8|t8b: the control chains rebuilt with the PRODUCTION args, torch.equal vs production
 #   MODE=compare  CPU: every eval index's natives vs production; t8b indel template rows vs production
+#   T8b eval on the T7-NEWEST pairs (2026-11-07; outputs under $E, nothing in $X is touched):
+#   MODE=t7prep   CPU: chains = T7 quick chunk lists minus 1ffk_G (no T8b native) -> resolve -> rsync -> pick-t7
+#   MODE=t7f2c    GPU: Frame2ConFind maps of the T7 templates at batch size 1 -> $MAPS_T7
+#   MODE=t7build  CPU: MODEL=t8b TDSSP=h_bond|tmalign|tmalign_smooth (template SSE classifier) -> $E/index/t8b_<TDSSP>/
 # Pass --gres / --partition / cpus / mem / time at submit.
 set -uo pipefail
 S=/orcd/scratch/orcd/011/chenxiou
@@ -29,6 +33,12 @@ CTL=$X/cb8pool/control_chains.txt
 USALIGN=/home/chenxiou/.local/bin/USalign
 PDB=/orcd/pool/006/chenxiou/proteina/data
 PY="python -m proteinfoundation.utils.precompute_synthetic_topology_index"
+E=$S/t8b_eval                                # T8b eval on the T7-NEWEST pairs
+EPOOL=$E/pool
+XPOOL_T7=$C/t8b_eval_pool                   # private symlink pool of the T7 templates
+MAPS_T7=$C/t8b_eval_f2c_maps
+T7_JSONL="$S/t7/x141030_out/B_t7qx_*_c0?.jsonl"   # CB-8 141,030 + ConFind 60,505 rows (ref_ids must agree)
+T7_TPL=(--templates "$XPOOL_T7:$EPOOL/band_t7.npz" --chain-alias "$ALIAS")
 MODE="${MODE:?MODE}"
 cd "$REPO" || exit 3
 git log --oneline -1
@@ -177,6 +187,95 @@ PYEOF
     echo "== t8b indel template rows vs production (same final-selection templates; maps recomputed at bs 1)"
     python scratchpad/xrun_index_compare.py --a "$X/index/t8b_indel/$(basename "$PROD")" --b "$PROD" --require-all \
         --min-rows "$(( 2 * $(grep -c . "$SEL/chains.txt") ))" || RC=7
+    ;;
+  t7prep)
+    cpu_env
+    [ -e "$EPOOL" ] && { echo "FATAL: $EPOOL exists"; exit 78; }
+    mkdir -p "$EPOOL"
+    cat "$S"/t7/quick/chunk0?_q.txt | grep -vx 1ffk_G > "$EPOOL/chains_in.txt"
+    echo "[t7prep] chains $(grep -c . "$EPOOL/chains_in.txt") (T7 99 minus 1ffk_G)"
+    python scratchpad/xrun_cb8pool.py resolve --chains "$EPOOL/chains_in.txt" --out-dir "$EPOOL" || exit 5
+    mkdir -p "$PP1C"
+    rsync -a --files-from="$EPOOL/sc_relpaths.txt" SuperCloud:pp1c_work/templates_band/ "$PP1C/" || exit 6
+    python scratchpad/xrun_cb8pool.py pick-t7 --t7-jsonl "$T7_JSONL" --sc-copy "$PP1C" --xpool "$XPOOL_T7" --out-dir "$EPOOL"
+    RC=$?
+    # T7's own chunk lists minus 1ffk_G (pass lists: 8 lines per chain; c2c lists: _q)
+    mkdir -p "$E/chunks"
+    for k in 0 1 2 3; do
+      grep -vx 1ffk_G "$S/t7/quick/chunk0${k}.txt" > "$E/chunks/c$k.txt"
+      grep -vx 1ffk_G "$S/t7/quick/chunk0${k}_q.txt" > "$E/chunks/c${k}_q.txt"
+    done
+    cmp -s <(sort -u "$E"/chunks/c?.txt) <(sort "$EPOOL/chains_t7.txt") || { echo "FATAL: chunk lists != chains_t7"; RC=7; }
+    [ "$(sort "$E"/chunks/c?.txt | uniq -c | awk '$1!=8' | wc -l)" -eq 0 ] || { echo "FATAL: not 8 samples per chain"; RC=7; }
+    # freeze the final T8b weights (training complete 11-04; read-only copy, step read from the checkpoint)
+    mkdir -p "$E/ckpt"
+    SRC=$S/proteina_t8b_launch/store/tri_t8b_confind_v1/checkpoints/last-EMA.ckpt
+    STEP=$(python -c "import torch,sys; print(torch.load(sys.argv[1], map_location='cpu', weights_only=False)['global_step'])" "$SRC") || RC=8
+    DST=$E/ckpt/t8b_last-EMA_step$STEP.ckpt
+    cp -p "$SRC" "$DST" && chmod a-w "$DST" || RC=8
+    [ "$(md5sum < "$SRC" | cut -c1-32)" = "$(md5sum < "$DST" | cut -c1-32)" ] || { echo "FATAL: ckpt copy md5"; RC=8; }
+    echo "[t7prep] frozen $DST md5 $(md5sum < "$DST" | cut -c1-32) global_step $STEP"
+    # ContactEBM checkpoint of the regimes session (SuperCloud; md5 asserted again by t8b_eval_cebm.py)
+    rsync -a SuperCloud:c2cbench/yard/ckpt/confind_a1_prod100_epoch82.pt "$E/ckpt/" || RC=9
+    echo "[t7prep] ContactEBM ckpt md5 $(md5sum < "$E/ckpt/confind_a1_prod100_epoch82.pt" | cut -c1-32) (want 2affbf45e2b28fecbc5f4d2a1dbe3b09)"
+    ;;
+  t7f2c)
+    GPU=$(nvidia-smi --query-gpu=name --format=csv,noheader | sort -u)
+    echo "$GPU" | grep -Eq 'L40S|H100|H200' || { echo "FATAL: GPU '$GPU' not L40S / H100 / H200"; exit 79; }
+    CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | tr -d ' ' | sort -u)
+    [ -n "$CC" ] && [ "$(echo "$CC" | wc -l)" -eq 1 ] || { echo "FATAL: need exactly one GPU arch, got: '$CC'"; exit 79; }
+    export CUE_HOST=engaging TORCH_CUDA_ARCH_LIST="$CC"
+    source /home/chenxiou/cue-openfold-env-sm120/.venv/bin/activate
+    source /home/chenxiou/cue-openfold-env-sm120/activate.sh
+    export DATA_PATH=$PDB SKIP_CONFIND_PRECOMPUTE=1 PYTHONPATH=$REPO
+    DS=(--processed-dir "$PDB/pdb_train_t8b/processed" --manifest "$PDB/pdb_train_t8b/shard_manifest.json")
+    $PY f2c --chain-list "$EPOOL/chains_t7.txt" "${DS[@]}" "${T7_TPL[@]}" \
+        --n-parts 1 --part 0 --batch-size 1 --maps-out "$MAPS_T7"
+    RC=$?
+    ;;
+  t7build)
+    cpu_env; model_args
+    [ "$MODEL" = t8b ] || { echo "FATAL: t7build is for MODEL=t8b"; exit 2; }
+    case "${TDSSP:?TDSSP}" in h_bond|tmalign|tmalign_smooth) ;; *) echo "FATAL: TDSSP=$TDSSP"; exit 2;; esac
+    O=$E/index/t8b_$TDSSP
+    [ -e "$O" ] && { echo "FATAL: $O exists (one fresh dir per build)"; exit 78; }
+    CL=$EPOOL/chains_t7.txt
+    # no window / gate: the band holds exactly T7's rung (T7 applied none), as in the equal arm
+    $PY build --chain-list "$CL" "${DS[@]}" "${T7_TPL[@]}" --n-parts 1 --part 0 \
+        "${B[@]}" --template-dssp "$TDSSP" --f2c-maps "$MAPS_T7" --out-dir "$O/parts"
+    RC=$?
+    if [ $RC -eq 0 ]; then
+      F=$(basename "$PROD")
+      $PY merge --parts-dir "$O/parts" --n-parts 1 --out "$O/$F" --eligible-out "$O/eligible_ids_tm0.5-0.9.txt" \
+          --tm-range 0.5 0.9 --stats-from "$PROD"
+      RC=$?
+      echo "[build] skips:"; cat "$O/parts/skips_0000.tsv"
+    fi
+    if [ $RC -eq 0 ]; then
+      python - "$O/$F" "$CL" "$EPOOL/pairs_t7.tsv" "$TDSSP" <<'PYEOF' || RC=5
+import sys, torch
+idx = torch.load(sys.argv[1], map_location="cpu", weights_only=False, mmap=True)
+want = [l.strip() for l in open(sys.argv[2]) if l.strip()]
+pairs = {}
+with open(sys.argv[3]) as fh:
+    fh.readline()
+    for line in fh:
+        f = line.rstrip("\n").split("\t")
+        pairs[f[0]] = f"{f[0]}@rw{f[3]}#{f[1]}"
+td = idx.get("template_dssp", "h_bond")
+assert td == sys.argv[4], f"index template_dssp {td!r} != TDSSP {sys.argv[4]!r}"
+ids, nat = list(idx["ids"]), idx["row_is_native"].tolist()
+natives = {s for s, n in zip(ids, nat) if n}
+tpl = {}
+for s, n in zip(ids, nat):
+    if not n:
+        tpl.setdefault(s.split("@")[0], []).append(s)
+bad = [s for s in want if s not in natives or tpl.get(s) != [pairs[s]]]
+print(f"[build-check] template_dssp={td}; {len(want)} chains, {len(natives)} natives, "
+      f"{sum(map(len, tpl.values()))} template rows; chains without exactly native + T7's template: {len(bad)} {bad[:10]}")
+sys.exit(1 if bad else 0)
+PYEOF
+    fi
     ;;
   *) echo "unknown MODE=$MODE"; RC=2;;
 esac

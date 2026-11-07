@@ -106,6 +106,9 @@ _USALIGN = "/home/chenxiou/.local/bin/USalign"
 _CONTACT_SOURCE = "cb8"
 # --proline-donor-mask (user 2026-10-09): recompute every DSSP (native too) with proline unable to donate a backbone H-bond
 _PRO_DONOR_MASK = False
+# --template-dssp (T8b eval 2026-11-07, user: sse_ens24 regime): template SSE classifier; natives keep the build's own
+# definition. Non-default values are stamped as `template_dssp` in parts + index (absent = h_bond)
+_TEMPLATE_DSSP = "h_bond"
 PRO_IDX = 14                         # openfold restype order
 DSSP_DEF = "native: stored dssp_target; templates: pydssp; no donor mask"
 DSSP_DEF_PRO = "native + templates: pydssp with donor_mask = (aatype != PRO); native validity = N/CA/C/O coord_mask > 0.5"
@@ -587,12 +590,12 @@ def _template_row(full, amask, t_aatype, cm_t, pq, qmap, L_n, td, k, min_len):
     """One template (atom37 coords [L_t, 37, 3], mask [L_t, 37], its own aatype) -> ((topology row[:5], USalign alignment
     bytes, USalign TM), None), or (None, skip reason). cm_t None = CB-8 contacts from the coordinates."""
     donor = None
-    if _PRO_DONOR_MASK:
+    if _PRO_DONOR_MASK and _TEMPLATE_DSSP == "h_bond":
         if t_aatype is None or len(t_aatype) != int(amask.shape[0]):
             return None, "no_aatype_for_donor_mask"
         donor = torch.from_numpy(np.asarray(t_aatype) != PRO_IDX)[None]
     dssp_t = compute_dssp_target(full[None], amask[:, CA_IDX][None], coord_mask=amask[None], coord_layout="atom37",
-                                 donor_mask=donor)
+                                 donor_mask=donor, dssp_def=_TEMPLATE_DSSP)
     if dssp_t is None:
         return None, "tpl_dssp_none"
     if cm_t is None:
@@ -827,7 +830,8 @@ def _gate_def():
 
 def cmd_build(args):
     global _USALIGN, _CONTACT_SOURCE, _MAPS_ROOT, _ROOTS, _PRO_DONOR_MASK, _PACK_IDX, _PACK_MM, _ELEMENT_TYPES, _LOOP_AXIS
-    global _CA_CLASH_GATE, _MAP_EXPECT
+    global _CA_CLASH_GATE, _MAP_EXPECT, _TEMPLATE_DSSP
+    _TEMPLATE_DSSP = args.template_dssp
     _USALIGN = args.usalign
     if (args.max_ca_clashes is None) != (args.ca_clash_a is None):
         raise SystemExit("give --max-ca-clashes and --ca-clash-a together (T8: 4 and 3.4, user 2026-10-13)")
@@ -875,6 +879,8 @@ def cmd_build(args):
             "contact_def": CONTACT_DEF_CONFIND if _CONTACT_SOURCE == "confind" else CONTACT_DEF,
             "dssp_def": DSSP_DEF_PRO if _PRO_DONOR_MASK else DSSP_DEF,
             "element_types": list(_ELEMENT_TYPES), "loop_axis": _LOOP_AXIS, "template_gate": _gate_def()}
+    if _TEMPLATE_DSSP != "h_bond":  # default parts stay byte-identical
+        part["template_dssp"] = _TEMPLATE_DSSP
     if _TEMPLATE_SOURCE is not None:
         part["template_source"] = _TEMPLATE_SOURCE
         if args.native_pack:  # final-selection mode only (T8 parts stay byte-identical): which natives built the rows
@@ -1279,6 +1285,7 @@ def cmd_merge(args):
 
     min_len, contact_def, dssp_defs, elem_defs, gate_defs, src_defs = None, None, set(), set(), set(), set()
     nat_defs = set()
+    tdssp_defs = set()
     for part in range(args.n_parts):
         p = os.path.join(args.parts_dir, f"part_{part:04d}.pt")
         if not os.path.exists(p):
@@ -1289,6 +1296,7 @@ def cmd_merge(args):
         elem_defs.add((tuple(d.get("element_types", (DSSP_HELIX, DSSP_STRAND))), d.get("loop_axis", None)))
         gate_defs.add(d.get("template_gate", "none"))  # parts written before the key existed had no gate
         src_defs.add(d.get("template_source"))  # None = not final-selection mode
+        tdssp_defs.add(d.get("template_dssp"))  # None = h_bond
         nat_defs.add(d.get("native_source"))  # None = parts without the stamp (T8 / pre-stamp final-selection)
         for ch in d["chains"]:
             if ch["native"] is None:
@@ -1375,6 +1383,11 @@ def cmd_merge(args):
         "loop_axis": loop_axis,
         "template_gate": gate_defs.pop(),
     }
+    if len(tdssp_defs) != 1:
+        raise ValueError(f"parts disagree on the template DSSP: {sorted(tdssp_defs, key=str)}")
+    template_dssp = tdssp_defs.pop()
+    if template_dssp is not None:
+        out["template_dssp"] = template_dssp
     template_source = src_defs.pop()
     if template_source is not None:
         out["template_source"] = template_source
@@ -1468,6 +1481,8 @@ def main():
                    help="loop element axis when loops are elements (required then): zero | end_to_end")
     b.add_argument("--proline-donor-mask", action="store_true",
                    help="recompute native + template DSSP with proline as a non-donor (default: v4 behaviour)")
+    b.add_argument("--template-dssp", choices=("h_bond", "tmalign", "tmalign_smooth"), default="h_bond",
+                   help="template SSE classifier (natives unchanged); tmalign* = dssp_utils.compute_tmalign_dssp, no donor mask")
     b.add_argument("--f2c-maps", default="", help="maps root written by `f2c` (required for --contact-source confind)")
     b.add_argument("--f2c-batch-size", type=int, default=None,
                    help="final-selection confind: the f2c run's --batch-size; every maps file must carry it")

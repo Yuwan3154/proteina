@@ -47,10 +47,17 @@ case "${ARM:?}" in
   self)  IDX=$X/index/${MODEL}_indel; TARM=self ;;
   equal) IDX=$X/index/${MODEL}_equal; TARM=nonself ;;
   indel) IDX=$X/index/${MODEL}_indel; TARM=nonself ;;
+  # T8b eval on the T7-NEWEST pairs (2026-11-07): one eval index per template SSE classifier, T7's own chunk lists
+  t7_h_bond|t7_tmalign|t7_tmalign_smooth)
+         [ "$MODEL" = t8b ] || { echo "FATAL: $ARM is T8b only"; exit 77; }
+         X=$S/t8b_eval; IDX=$X/index/t8b_${ARM#t7_}; TARM=nonself ;;
   *) echo "FATAL: ARM=$ARM"; exit 77 ;;
 esac
 export SYNTH_INDEX_DIR=$IDX
-CHAINS=$X/chunks/${ARM}_c${CHUNK:?}.txt
+case "$ARM" in
+  t7_*) CHAINS=$X/chunks/c${CHUNK:?}.txt ;;
+  *)    CHAINS=$X/chunks/${ARM}_c${CHUNK:?}.txt ;;
+esac
 LABEL=${MODEL}_${ARM}_c${CHUNK}
 DUMP=$X/dumps/$LABEL
 [ -f "$CHAINS" ] || { echo "FATAL: no chain list $CHAINS"; exit 77; }
