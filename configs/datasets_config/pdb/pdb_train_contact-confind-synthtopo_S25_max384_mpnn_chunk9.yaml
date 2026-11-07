@@ -11,7 +11,7 @@ datamodule:
   pack_path: ${oc.env:PACK_PATH,/home/jupyter-chenxi/sse1d_data/orcd/compute/so3/002/chenxi/proteina_pack/tri_v2.pack}
   format: "cif"
   overwrite: False
-  regenerate_missing: True
+  regenerate_missing: False
   batch_padding: True
   sampling_mode: "cluster-random"
   eligible_ids_file: ${oc.env:SYNTH_INDEX_DIR}/eligible_ids_tm0.5-0.9.txt
