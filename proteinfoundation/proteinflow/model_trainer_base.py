@@ -196,8 +196,6 @@ class ModelTrainerBase(L.LightningModule):
             for name, param in self.named_parameters():
                 if name.startswith("nn_sc."):
                     param.requires_grad = False
-                else:
-                    param.requires_grad = True
             trainable_params = [p for p in self.parameters() if p.requires_grad]
             optimizer = self._create_optimizer(trainable_params, optimizer_type)
         
