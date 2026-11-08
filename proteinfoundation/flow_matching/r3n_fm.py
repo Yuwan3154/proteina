@@ -188,7 +188,7 @@ class _CoordinateFlowMatcher:
         t: Float[Tensor, "*"],
         mask: Optional[Bool[Tensor, "* n"]] = None,
     ) -> Dict[str, Tensor]:
-        """
+        r"""
         Computes \dot{x_t} for the interpolation scheme defined
         above. This is the target used in flow matching loss.
 
@@ -226,7 +226,7 @@ class _CoordinateFlowMatcher:
         sc_scale_score: float,
         mask: Optional[Bool[Tensor, "* n"]] = None,
     ) -> Tuple[Float[Tensor, "* n 3"], Float[Tensor, "*"]]:
-        """
+        r"""
         Single integration step of ODE \dot{x_t} = v(x_t, t) using Euler integration scheme.
 
         Args:
@@ -280,7 +280,7 @@ class _CoordinateFlowMatcher:
         sc_scale_noise: float,
         sc_scale_score: float,
     ) -> tuple[Float[Tensor, "* n 3"], Float[Tensor, "* n"]]:
-        """
+        r"""
         Single integration step of ODE
 
         eq. (1): d x_t = v(x_t, t) dt

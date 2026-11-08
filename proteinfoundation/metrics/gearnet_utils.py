@@ -237,7 +237,7 @@ class GearNet(nn.Module):
         max_len: Optional[int] = 3000,
         ca_only: Optional[bool] = False,
     ) -> None:
-        """
+        r"""
         GearNet for protein structure reprentation learning and fold classification from
         `Protein Representation Learning by Geometric Structure Pretraining`_.
 

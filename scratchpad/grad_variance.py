@@ -1,4 +1,4 @@
-"""Measure how much the diffusion mini-batch (n) actually reduces gradient variance.
+r"""Measure how much the diffusion mini-batch (n) actually reduces gradient variance.
 
 The question: our optimizer step averages B_struct structures x n noise copies. Linear LR scaling
 assumes the average is over i.i.d. samples, so Var ~ 1/(B*n). But the n copies share a structure,
