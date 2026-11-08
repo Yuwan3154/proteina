@@ -35,8 +35,9 @@ PDB=/orcd/pool/006/chenxiou/proteina/data
 PY="python -m proteinfoundation.utils.precompute_synthetic_topology_index"
 E=$S/t8b_eval                                # T8b eval on the T7-NEWEST pairs
 EPOOL=$E/pool
-XPOOL_T7=$C/t8b_eval_pool                   # private symlink pool of the T7 templates
-MAPS_T7=$C/t8b_eval_f2c_maps
+# on scratch: so3/002 hit its quota 2026-11-07 (symlink write refused); both are tiny (98 links, 1 maps file per chain)
+XPOOL_T7=$E/xpool                           # private symlink pool of the T7 templates
+MAPS_T7=$E/f2c_maps
 T7_JSONL="$S/t7/x141030_out/B_t7qx_*_c0?.jsonl"   # CB-8 141,030 + ConFind 60,505 rows (ref_ids must agree)
 T7_TPL=(--templates "$XPOOL_T7:$EPOOL/band_t7.npz" --chain-alias "$ALIAS")
 MODE="${MODE:?MODE}"
@@ -212,7 +213,7 @@ PYEOF
     SRC=$S/proteina_t8b_launch/store/tri_t8b_confind_v1/checkpoints/last-EMA.ckpt
     STEP=$(python -c "import torch,sys; print(torch.load(sys.argv[1], map_location='cpu', weights_only=False)['global_step'])" "$SRC") || RC=8
     DST=$E/ckpt/t8b_last-EMA_step$STEP.ckpt
-    cp -p "$SRC" "$DST" && chmod a-w "$DST" || RC=8
+    [ -e "$DST" ] || { cp -p "$SRC" "$DST" && chmod a-w "$DST"; } || RC=8   # a rerun keeps the frozen copy
     [ "$(md5sum < "$SRC" | cut -c1-32)" = "$(md5sum < "$DST" | cut -c1-32)" ] || { echo "FATAL: ckpt copy md5"; RC=8; }
     echo "[t7prep] frozen $DST md5 $(md5sum < "$DST" | cut -c1-32) global_step $STEP"
     # ContactEBM checkpoint of the regimes session (SuperCloud; md5 asserted again by t8b_eval_cebm.py)
