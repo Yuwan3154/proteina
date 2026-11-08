@@ -8,7 +8,6 @@ Computes 3-state DSSP targets (loop, helix, strand) from backbone coordinates.
 
 from typing import Literal, Optional
 
-import pydssp
 import torch
 
 # Exact CA-distance thresholds from TMalign / USalign sec_str(d13, d14, d15, d24, d25, d35)
@@ -214,6 +213,8 @@ def compute_dssp_target(
 
     if coords.shape[2] < min_atoms:
         return None
+
+    import pydssp  # lazy, as before the TMalign port: the GPU env (cue-openfold-env-sm120) has no pydssp
 
     # Extract N, CA, C, O
     ncao = coords[:, :, [0, 1, 2, o_idx], :]  # [b, n, 4, 3]
