@@ -21,7 +21,10 @@ module load cuda/12.8 2>/dev/null || module load cuda/12.6 2>/dev/null || true
 export CUE_HOST=engaging
 export TORCH_CUDA_ARCH_LIST="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d ' ')"
 [ -n "$TORCH_CUDA_ARCH_LIST" ] || { echo "FATAL: could not read compute_cap"; exit 79; }
-nvidia-smi --query-gpu=name --format=csv,noheader | grep -q L40S || { echo "FATAL: not an L40S (user 2026-10-28)"; exit 79; }
+# xrun: L40S only (user 2026-10-28); T8b eval t7_* arms: any approved type (user 2026-10-13 list; 2026-11-08 per-partition jobs)
+GPUOK=L40S
+case "${ARM:-}" in t7_*) GPUOK='L40S|H100|H200|RTX PRO 6000' ;; esac
+nvidia-smi --query-gpu=name --format=csv,noheader | grep -Eq "$GPUOK" || { echo "FATAL: GPU not in ($GPUOK)"; exit 79; }
 source "$ENV_DIR/.venv/bin/activate"
 source "$ENV_DIR/activate.sh"
 export DATA_PATH=/orcd/pool/006/chenxiou/proteina/data SKIP_CONFIND_PRECOMPUTE=1

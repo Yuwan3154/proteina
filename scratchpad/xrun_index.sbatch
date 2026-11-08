@@ -222,7 +222,7 @@ PYEOF
     ;;
   t7f2c)
     GPU=$(nvidia-smi --query-gpu=name --format=csv,noheader | sort -u)
-    echo "$GPU" | grep -Eq 'L40S|H100|H200' || { echo "FATAL: GPU '$GPU' not L40S / H100 / H200"; exit 79; }
+    echo "$GPU" | grep -Eq 'L40S|H100|H200|RTX PRO 6000' || { echo "FATAL: GPU '$GPU' not an approved type"; exit 79; }
     CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | tr -d ' ' | sort -u)
     [ -n "$CC" ] && [ "$(echo "$CC" | wc -l)" -eq 1 ] || { echo "FATAL: need exactly one GPU arch, got: '$CC'"; exit 79; }
     export CUE_HOST=engaging TORCH_CUDA_ARCH_LIST="$CC"

@@ -15,7 +15,7 @@ REPO=$S/proteina_xrun
 module load cuda/12.8 2>/dev/null || module load cuda/12.6 2>/dev/null || true
 export CUE_HOST=engaging
 export TORCH_CUDA_ARCH_LIST="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d ' ')"
-nvidia-smi --query-gpu=name --format=csv,noheader | grep -q L40S || { echo "FATAL: not an L40S"; exit 79; }
+nvidia-smi --query-gpu=name --format=csv,noheader | grep -Eq "L40S|H100|H200|RTX PRO 6000" || { echo "FATAL: GPU type not approved"; exit 79; }
 source "$ENV_DIR/.venv/bin/activate"
 source "$ENV_DIR/activate.sh"
 export PYTHONPATH=$REPO
