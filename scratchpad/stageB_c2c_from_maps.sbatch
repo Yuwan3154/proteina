@@ -57,6 +57,7 @@ ARGS=(--ckpt "$CKPT" --weights "${WEIGHTS:-ema}" --dataset "$DATASET" --chains "
       --n_seeds "$N_SEEDS" --out "$OUT" --label "$LABEL")
 if [ "$NATIVE" = 1 ]; then ARGS+=(--native); else ARGS+=(--maps_dir "$MAPS_DIR"); fi
 if [ -n "${STEPS:-}" ]; then ARGS+=(--steps "$STEPS"); fi
+if [ "${RECORD_GT_MISMATCH:-0}" = 1 ]; then ARGS+=(--record_gt_mismatch); fi
 if [ -n "${PDB_DIR:-}" ]; then ARGS+=(--pdb_dir "$PDB_DIR"); fi
 if [ -n "${USALIGN:-}" ]; then ARGS+=(--usalign "$USALIGN"); fi
 # T7 (a): optional corruption of the native map (only with NATIVE=1); CORRUPT_RATE unset = off

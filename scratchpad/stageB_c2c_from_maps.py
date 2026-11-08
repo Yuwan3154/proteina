@@ -84,6 +84,9 @@ def main():
     ap.add_argument("--corrupt_seed", type=int, default=0)
     # independent corruption draws per chain, each fed like one tri sample (c2c seed stays chain-only, as in the tri arm)
     ap.add_argument("--n_corrupt", type=int, default=1)
+    # T8b eval (user 2026-11-08 "Both: 70 primary + 98"): control (b) mismatches are RECORDED per row (gt_mismatch =
+    # differing entries) instead of aborting; control (c) stays fatal. Off = the T7 behaviour.
+    ap.add_argument("--record_gt_mismatch", action="store_true")
     args = ap.parse_args()
     assert args.corrupt_rate == 0.0 or args.native, "--corrupt_rate applies to the --native arm only"
 
@@ -173,6 +176,7 @@ def main():
 
     # ── build every batch and run controls (b)/(c) before any GPU work ───────────────────────────
     chains, bad_b, bad_c = [], [], []
+    gt_ndiff = {}
     n_checked = 0
     for ci, (stem, raw) in enumerate(zip(stems, loader)):
         pid = str(raw["protein_id"][0])
@@ -197,6 +201,7 @@ def main():
                 continue
             gt = z["contact_gt"]
             ndiff = int((gt != native).sum())
+            gt_ndiff[(stem, r["sample_index"])] = ndiff
             if ndiff:
                 bad_b.append(f"{stem} s{r['sample_index']:02d}: {ndiff}/{L * L} entries differ "
                              f"(off-diag density dumped {offdiag_density(gt):.4f} vs "
@@ -216,6 +221,10 @@ def main():
           f"(over {len(stems)} chains, {n_checked} maps)", flush=True)
     for x in bad_c:
         print(f"  FAIL {x}", flush=True)
+    if bad_b and args.record_gt_mismatch and not bad_c:
+        print(f"[control b] --record_gt_mismatch: {len(bad_b)} mismatching maps RECORDED (gt_mismatch per row), "
+              f"not fatal", flush=True)
+        bad_b = []
     if bad_b or bad_c:
         print("FATAL: control (b) or (c) failed -- no rollout run, no row written.", flush=True)
         return 2
@@ -316,6 +325,7 @@ def main():
                         dist_mae=mae, rg_ratio=rg,
                     )
                     if isinstance(r, dict):
+                        rec["gt_mismatch"] = gt_ndiff[(stem, r["sample_index"])]   # 0 = control (b) passed
                         rec.update({f"tri_{k}": v for k, v in (r.get("metrics") or {}).items()})
                     fh.write(json.dumps(rec) + "\n")
                     fh.flush()
