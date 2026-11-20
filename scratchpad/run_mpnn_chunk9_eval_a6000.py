@@ -150,8 +150,8 @@ def prepare_inputs(out_dir):
 
 
 def gpu_worker(gpu_id, tasks, config_name, ema_ckpt, out_dir, seed):
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    dev = torch.device("cuda:0")
+    torch.cuda.set_device(gpu_id)
+    dev = torch.device(f"cuda:{gpu_id}")
     t0 = time.time()
 
     with hydra.initialize_config_dir(os.path.join(REPO, "configs", "experiment_config"), version_base=hydra.__version__):
