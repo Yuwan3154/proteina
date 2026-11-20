@@ -40,9 +40,9 @@ def worker_loop(gpu_id, tasks, ckpt, dataset, out_dir, usalign, python_bin):
     for label, chains_file, maps_dir in tasks:
         out_jsonl = os.path.join(sb_dir, f"{label}.jsonl")
         if os.path.exists(out_jsonl) and os.path.getsize(out_jsonl) > 0:
-            n_stems = len({l.split()[0] for l in open(chains_file) if l.strip()})
+            n_want = sum(1 for l in open(os.path.join(maps_dir, "samples.jsonl")) if l.strip())
             n_rows = sum(1 for l in open(out_jsonl) if l.strip())
-            if n_rows == n_stems * 8:
+            if n_rows == n_want:
                 print(f"[GPU {gpu_id}] SKIP {label} (already complete: {n_rows} rows)", flush=True)
                 continue
             os.remove(out_jsonl)
