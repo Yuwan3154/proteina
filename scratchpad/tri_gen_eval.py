@@ -114,6 +114,7 @@ def main():
     # and the fourth on an unconditioned-contaminated mixture. Pass val_fixed_nonself.txt to restrict
     # every arm to the 22 chains that actually have a different-sequence mate.
     ap.add_argument("--fixed_chain_list", default=None)
+    ap.add_argument("--ref_map", default=None, help="JSON mapping query stem -> template ref_id in the index")
     ap.add_argument("--seed", type=int, default=None, help="seed_everything before validate")
     ap.add_argument("--dump_dir", default=None, help="write per-sample maps + samples.jsonl here")
     ap.add_argument("--zero_ca_features", action="store_true",
@@ -143,6 +144,8 @@ def main():
     cfg_exp.validation_sampling.topology_nonself_seed = args.nonself_seed
     if args.fixed_chain_list is not None:
         cfg_exp.validation_sampling.fixed_chain_list = args.fixed_chain_list
+    if args.ref_map is not None:
+        cfg_exp.validation_sampling.topology_reference_map = args.ref_map
     if args.dump_dir is not None:
         cfg_exp.validation_sampling.contact_dump_dir = args.dump_dir
     if args.dump_align:

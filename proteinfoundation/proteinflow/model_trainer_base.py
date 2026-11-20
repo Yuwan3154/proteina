@@ -3369,6 +3369,7 @@ class ModelTrainerBase(L.LightningModule):
             transform=dm.transform,
             format=dm.format,
             in_memory=False,
+            pack_path=getattr(dm, "pack_path", None),
             file_names=stems,
             num_workers=0,
         )
