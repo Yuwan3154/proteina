@@ -547,12 +547,10 @@ def main():
     cebm_160k_tasks = [[] for _ in range(args.ngpus)]
     c2c_cebm_160k_tasks = [[] for _ in range(args.ngpus)]
     for k in range(4):
-        c_file = os.path.join(args.out_dir, "chunks", f"t7_c{k}.txt")
         q_file = os.path.join(args.out_dir, "chunks", f"t7_c{k}_q.txt")
-        ref_map = os.path.join(args.out_dir, "t7_ref_map.json")
         dump_160 = os.path.join(args.out_dir, "dumps", f"mpnn_s160k_t7_c{k}")
         dump_75 = os.path.join(args.out_dir, "dumps", f"mpnn_t7_c{k}")
-        s160k_t7_stageA[k % args.ngpus].append((f"mpnn_s160k_t7_c{k}", "nonself", c_file, ref_map))
+        s160k_t7_stageA[k % args.ngpus].append(("t7", k))
         s160k_t7_stageB[k % args.ngpus].append((f"mpnn_s160k_t7_c{k}", q_file, dump_160))
 
         out_cebm_160 = os.path.join(args.out_dir, "dumps", f"mpnn_s160k_cebm_t7_c{k}")
@@ -564,7 +562,7 @@ def main():
 
     run_parallel(
         stageA_gpu_worker,
-        [(s160k_t7_stageA[g], args.config_name, args.ckpt_160k, args.out_dir, args.seed) for g in range(args.ngpus)],
+        [(s160k_t7_stageA[g], args.config_name, args.ckpt_160k, args.out_dir, args.seed, "mpnn_s160k") for g in range(args.ngpus)],
     )
     run_parallel(
         stageB_worker_loop,
@@ -584,19 +582,17 @@ def main():
     print("=== PHASE 3: Step=160,148 Stage-A + Stage-B c2c on toporef_xrun (equal and self) ===", flush=True)
     s160k_xrun_stageA = [[] for _ in range(args.ngpus)]
     s160k_xrun_stageB = [[] for _ in range(args.ngpus)]
-    eq_map = os.path.join(args.out_dir, "equal_ref_map.json")
-    for idx_t, (arm, tarm, rmap) in enumerate((("equal", "nonself", eq_map), ("self", "self", None))):
+    for idx_t, arm in enumerate(("equal", "self")):
         for k in range(8):
-            c_file = os.path.join(args.out_dir, "chunks", f"{arm}_c{k}.txt")
             q_file = os.path.join(args.out_dir, "chunks", f"{arm}_c{k}_q.txt")
             dump_160 = os.path.join(args.out_dir, "dumps", f"mpnn_s160k_{arm}_c{k}")
             g = (idx_t * 8 + k) % args.ngpus
-            s160k_xrun_stageA[g].append((f"mpnn_s160k_{arm}_c{k}", tarm, c_file, rmap))
+            s160k_xrun_stageA[g].append((arm, k))
             s160k_xrun_stageB[g].append((f"mpnn_s160k_{arm}_c{k}", q_file, dump_160))
 
     run_parallel(
         stageA_gpu_worker,
-        [(s160k_xrun_stageA[g], args.config_name, args.ckpt_160k, args.out_dir, args.seed) for g in range(args.ngpus)],
+        [(s160k_xrun_stageA[g], args.config_name, args.ckpt_160k, args.out_dir, args.seed, "mpnn_s160k") for g in range(args.ngpus)],
     )
     run_parallel(
         stageB_worker_loop,

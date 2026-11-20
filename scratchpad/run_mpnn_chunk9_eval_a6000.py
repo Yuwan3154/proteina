@@ -149,7 +149,7 @@ def prepare_inputs(out_dir):
         json.dump(T7_MAP, fh, indent=2)
 
 
-def gpu_worker(gpu_id, tasks, config_name, ema_ckpt, out_dir, seed):
+def gpu_worker(gpu_id, tasks, config_name, ema_ckpt, out_dir, seed, label_prefix="mpnn"):
     torch.cuda.set_device(gpu_id)
     dev = torch.device(f"cuda:{gpu_id}")
     t0 = time.time()
@@ -196,7 +196,7 @@ def gpu_worker(gpu_id, tasks, config_name, ema_ckpt, out_dir, seed):
     print(f"[GPU {gpu_id}] Model & index loaded in {time.time() - t0:.1f}s; running {len(tasks)} tasks", flush=True)
 
     for arm, chunk_id in tasks:
-        label = f"mpnn_{arm}_c{chunk_id}"
+        label = f"{label_prefix}_{arm}_c{chunk_id}"
         dump_dir = os.path.join(out_dir, "dumps", label)
         samples_path = os.path.join(dump_dir, "samples.jsonl")
         q_file = os.path.join(out_dir, "chunks", f"{arm}_c{chunk_id}_q.txt")
