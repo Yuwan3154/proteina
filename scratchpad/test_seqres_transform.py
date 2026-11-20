@@ -16,16 +16,17 @@
 Run: python scratchpad/test_seqres_transform.py
 """
 
+import contextlib
 import hashlib
 import os
 import pathlib
+import re
 import sys
 import tempfile
 import zlib
 
 import hydra
 import numpy as np
-import pytest
 import torch
 from omegaconf import OmegaConf
 from torch_geometric.data import Data
@@ -37,6 +38,20 @@ from proteinfoundation.openfold_stub.np.residue_constants import restypes  # noq
 from proteinfoundation.datasets.sse_topology import STRUCTURAL_PAIR_FEATURES  # noqa: E402
 from proteinfoundation.datasets.topology_reference import TopologyReferenceTransform  # noqa: E402
 from proteinfoundation.datasets.transforms import SeqresIndexError, SeqresIndexTransform  # noqa: E402
+
+
+
+@contextlib.contextmanager
+def raises(exc_type, match=None):
+    """Stand-in for the pytest raises helper (pytest is absent in cue_openfold): the block must raise exc_type with
+    re.search(match, str(e))."""
+    try:
+        yield
+    except exc_type as e:
+        assert match is None or re.search(match, str(e)), f"raised {e!r}, which does not match {match!r}"
+        return
+    raise AssertionError(f"did not raise {exc_type.__name__}")
+
 
 TMP = pathlib.Path(tempfile.mkdtemp(prefix="t8b_seqres_test_"))
 # stem -> (status, label_seq_id positions or None, modelled length L)
@@ -94,29 +109,29 @@ def test_transform():
     assert g.residue_seqres_idx.tolist() == [0, 1, 2, 6, 7, 17], g.residue_seqres_idx
     assert tr(graph("1abc_B", 5)).residue_seqres_idx.tolist() == [0, 1, 2, 3, 4]
     print("PASS gapped chain: label_seq [3,4,5,9,10,20] -> [0,1,2,6,7,17] (first modelled = 0); contiguous -> arange")
-    with pytest.raises(SeqresIndexError, match="6 SEQRES positions"):
+    with raises(SeqresIndexError, match="6 SEQRES positions"):
         tr(graph("1abc_A", 5))
-    with pytest.raises(SeqresIndexError, match="not strictly increasing"):
+    with raises(SeqresIndexError, match="not strictly increasing"):
         tr(graph("2xyz_C", 4))
-    with pytest.raises(SeqresIndexError, match="0 SEQRES positions"):
+    with raises(SeqresIndexError, match="0 SEQRES positions"):
         tr(graph("3mrg_D", 4))
-    with pytest.raises(SeqresIndexError, match="not in the SEQRES side table"):
+    with raises(SeqresIndexError, match="not in the SEQRES side table"):
         tr(graph("9zzz_Z", 4))
     print("PASS raises SeqresIndexError: length mismatch, nonmonotone, merged (no positions), missing stem")
     SeqresIndexTransform(TABLE, required_ids_files=[write_ids("ok.txt", ["1abc_A", "1abc_B"])])
     for bad in ("3mrg_D", "2xyz_C", "9zzz_Z"):
-        with pytest.raises(SeqresIndexError):
+        with raises(SeqresIndexError):
             SeqresIndexTransform(TABLE, required_ids_files=[write_ids("bad.txt", ["1abc_A", bad])])
     print("PASS load-time coverage: 2 of 2 covered ids pass; a list holding a merged / nonmonotone / missing stem raises")
     swapped = torch.arange(6) % 20
     swapped[[3, 4]] = swapped[[4, 3]]  # same residues, two swapped: positions and length still pass
-    with pytest.raises(SeqresIndexError, match="residue sequence differs"):
+    with raises(SeqresIndexError, match="residue sequence differs"):
         tr(graph("1abc_A", 6, residue_type=swapped))
-    with pytest.raises(SeqresIndexError, match="residue sequence differs"):
+    with raises(SeqresIndexError, match="residue sequence differs"):
         tr(graph("1abc_A", 6, residue_type=torch.full((6,), 7)))
     old = str(TMP / "seqres_index_no_sha1.pt")
     torch.save({k: v for k, v in TABLE_DICT.items() if k != "seq_sha1"}, old)
-    with pytest.raises(SeqresIndexError, match="no seq_sha1"):
+    with raises(SeqresIndexError, match="no seq_sha1"):
         SeqresIndexTransform(old)
     print("PASS seq_sha1: matching sequence passes; two swapped residues / a different sequence raise; a table "
           "without seq_sha1 raises at load")
@@ -139,7 +154,7 @@ def test_pdbdataset_no_swap():
               file_names=stems, num_workers=0)
     ds = PDBDataset(transform=SeqresIndexTransform(TABLE), **kw)
     assert ds[0].protein_id == "1abc_A" and ds[0].residue_seqres_idx.tolist() == [0, 1, 2, 6, 7, 17]
-    with pytest.raises(SeqresIndexError, match="9zzz_Z"):
+    with raises(SeqresIndexError, match="9zzz_Z"):
         ds[2]
     ctrl = PDBDataset(transform=Boom(), **kw)
     assert ctrl[1].protein_id == "9zzz_Z", ctrl[1].protein_id
@@ -192,9 +207,9 @@ def test_placeholder_spread_and_frame_c():
     tr._generator = torch.Generator().manual_seed((seed + zlib.crc32(stem.encode())) % (2**63))
     tr._set_empty(h, L=6)
     assert all(torch.equal(getattr(h, k), v) for k, v in ref.items()), sorted(ref)
-    with pytest.raises(ValueError, match="seqres_idx"):
+    with raises(ValueError, match="seqres_idx"):
         tr.masked_reference(stem, 6, seed=seed)
-    with pytest.raises(SeqresIndexError, match="residue_seqres_idx"):
+    with raises(SeqresIndexError, match="residue_seqres_idx"):
         tr._set_empty(Data(), L=6)
     print("PASS masked_reference == _set_empty (same seed + positions); raises without positions; _set_empty raises "
           "without residue_seqres_idx")
