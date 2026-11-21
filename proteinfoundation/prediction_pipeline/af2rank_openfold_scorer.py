@@ -839,14 +839,18 @@ class OpenFoldAF2Rank:
         use_mlm: bool = False,  # AF2Rank protocol: leave masked_msa at the config default (~0.15, training distribution); False forces 0 (proteina deterministic inference)
         mask_sidechains: bool = True,  # AF2Rank protocol: mask decoy template sidechains to backbone+CB (+Gly CB) so they don't leak the native sequence
         precision: str = "tf32",  # "tf32" (default), "bf16", or "fp16" -- see openfold.utils.precision_utils.wrap_for_precision
+        template_seq_mask: str = "x",  # "x": post-pipeline all-X (production); "none": real template sequence; "gap": AF2Rank paper's pre-pipeline gap token
     ):
         if chain is None:
             chain = "A"
+        if template_seq_mask not in ("x", "none", "gap"):
+            raise ValueError(f"template_seq_mask must be 'x', 'none' or 'gap', got {template_seq_mask!r}")
         self.chain = chain
         self.model_name = model_name
         self.debug = debug
         self.recycles = recycles
         self.mask_sidechains = mask_sidechains
+        self.template_seq_mask = template_seq_mask
         self.skip_ref_metrics = skip_ref_metrics
         self._segments = None
         self._mask_inter_segment = mask_inter_segment
@@ -1017,7 +1021,8 @@ class OpenFoldAF2Rank:
                 template_mmcif_path=temp_cif,
                 template_chain_id=cif_chain,
                 kalign_binary_path=KALIGN_BINARY_PATH,
-                mask_template_aatype=True,  # AF2Rank: mask template sequence to all-X post-pipeline
+                mask_template_aatype=(self.template_seq_mask == "x"),  # AF2Rank: mask template sequence to all-X post-pipeline
+                gap_template_aatype=(self.template_seq_mask == "gap"),
                 segment_mask=seg_mask,
                 segment_ids=(seg_ids if self._mask_inter_segment else None),
                 # skip_template_alignment (1:1 decoy->query) is valid only when the decoy
@@ -1152,7 +1157,8 @@ class OpenFoldAF2Rank:
                 template_mmcif_path=temp_cif,
                 template_chain_id=cif_chain,
                 kalign_binary_path=KALIGN_BINARY_PATH,
-                mask_template_aatype=True,
+                mask_template_aatype=(self.template_seq_mask == "x"),
+                gap_template_aatype=(self.template_seq_mask == "gap"),
                 segment_mask=seg_mask,
                 segment_ids=(seg_ids if self._mask_inter_segment else None),
             )

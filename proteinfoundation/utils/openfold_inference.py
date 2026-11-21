@@ -827,6 +827,7 @@ class OpenFoldTemplateInference(nn.Module):
         template_chain_id: Optional[str] = None,
         kalign_binary_path: Optional[str] = None,
         mask_template_aatype: bool = False,
+        gap_template_aatype: bool = False,
         zero_template_unit_vector: bool = False,
         zero_template_torsion_angles: bool = False,
         _pad_to_length: Optional[int] = None,
@@ -850,6 +851,13 @@ class OpenFoldTemplateInference(nn.Module):
                 The feature pipeline otherwise introduces randomness via
                 make_masked_msa (15% random MSA masking) even with a
                 single-sequence MSA.
+            gap_template_aatype: AF2Rank paper recipe (jproney/AF2Rank
+                test_templates.py `--seq_replacement -`): the raw template
+                one-hot is replaced by the gap token (HHBLITS id 21) BEFORE
+                the feature pipeline, so template pseudo-beta (CB for every
+                residue, incl. Gly) and torsion masks are derived from it.
+                Mutually exclusive with mask_template_aatype (post-pipeline
+                all-X, index 20).
         Returns:
             dict of tensors (no batch dim) ready for the AlphaFold model.
         """
@@ -951,6 +959,12 @@ class OpenFoldTemplateInference(nn.Module):
             raise ValueError(
                 "Unknown template_mode. Expected one of: distogram_only, full_template, full_template_zero_coords"
             )
+        if gap_template_aatype:
+            if mask_template_aatype:
+                raise ValueError("gap_template_aatype and mask_template_aatype are mutually exclusive")
+            gap = np.zeros_like(raw["template_aatype"])
+            gap[..., rc.HHBLITS_AA_TO_ID["-"]] = 1.0
+            raw["template_aatype"] = gap
         # Seed all RNG sources so the feature pipeline is deterministic.
         # The primary source of randomness is make_masked_msa (randomly
         # replaces 15% of MSA positions) and ensemble_seed in
