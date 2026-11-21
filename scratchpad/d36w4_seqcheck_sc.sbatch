@@ -6,6 +6,7 @@
 #SBATCH -o /home/gridsan/cou/d36/w4_seqcheck/logs/%x-%j.out
 # D36 W4 candidate sequence eligibility on SuperCloud (CPU): the SuperCloud-hosted candidates of candidates_all.csv.
 D=/home/gridsan/cou/d36/w4_seqcheck
+source /etc/profile  # batch shells lack `module` without it (job 6298904); idiom of ~/d36/d36_score.sbatch
 module load conda/Python-ML-2025b-pytorch
 conda deactivate 2>/dev/null
 source activate cathfold
