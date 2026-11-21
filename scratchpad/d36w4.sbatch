@@ -3,7 +3,8 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --output=/orcd/scratch/orcd/011/chenxiou/d36_af2rank_mask/w4_20261121/logs/%x-%A_%a.out
-# D36 W4 (Q6). MODE=stage (CPU) | control (GPU: feature unit test, control i, control ii + shakedown, gate) |
+# D36 W4 (Q6). MODE=precheck (GPU: params + imports of every W4 module) | stage (GPU node: the scorer module's
+# openfold/deepspeed import needs a GPU driver; no GPU compute) | control (GPU: feature unit test, control i, control ii + shakedown, gate) |
 # prod (GPU array, 20 tasks: task i -> cell ORDER[i/4], model (i/2)%2, chunk i%2; resumable per target).
 # Partition/gres/time/mem/name/array on the sbatch command line.
 set -uo pipefail
@@ -25,7 +26,12 @@ params_gate() {
   done
 }
 
-if [ "$MODE" = stage ]; then
+if [ "$MODE" = precheck ]; then
+  # openfold -> deepspeed -> triton autotune needs a GPU driver at IMPORT time (stage 29937396 failed on a CPU node)
+  params_gate
+  python -c "import scratchpad.d36w4_stage, scratchpad.d36w4_af2rank, scratchpad.d36w4_feature_test, scratchpad.d36w4_control_prod, scratchpad.d36w4_gate; print('[precheck] imports OK')"
+  rc=$?
+elif [ "$MODE" = stage ]; then
   python -m scratchpad.d36w4_stage --selected "$R/templates_selected.csv" --root "$R"
   rc=$?
 elif [ "$MODE" = control ]; then
