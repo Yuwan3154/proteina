@@ -10,7 +10,7 @@ G="-p mit_preemptable,mit_normal_gpu --gres=gpu:l40s:1 --exclude=$X"
 K=plain
 j0=$(sbatch --parsable -J d36w4b_pre $G --cpus-per-task=4 --mem=16G --time=00:10:00 --requeue \
   --export=ALL,MODE=precheck "$S") || exit 1
-j2=$(sbatch --parsable -J d36w4b_ctrl $G --mem=96G --time=02:00:00 --requeue \
+j2=$(sbatch --parsable -J d36w4b_ctrl $G --mem=96G --time=03:00:00 --requeue \
   --dependency=afterok:$j0 --export=ALL,MODE=control,KERNELS=$K "$S") || exit 1
 j3=$(sbatch --parsable -J d36w4b_prod $G --mem=96G --time=04:00:00 --requeue --array=0-19 \
   --dependency=afterok:$j2 --export=ALL,MODE=prod,KERNELS=$K "$S") || exit 1

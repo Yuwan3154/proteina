@@ -30,7 +30,8 @@ KERNELS = {"cueq": (True, True), "plain": (False, False)}  # (use_cuequivariance
 
 def check_done(df, rows_in, p, kernels):
     """Post-conditions of a finished target; also re-run on resume so a failed target is never skipped."""
-    assert "kernels" in df.columns and (df["kernels"] == kernels).all(), f"{p}: csv kernels differ from --kernels {kernels}"
+    assert "kernels" in df.columns and (df["kernels"] == kernels).all(), \
+        f"{p}: csv kernels differ from --kernels {kernels}"
     assert len(df) == len(rows_in) and \
         df[["ptm", "plddt", "tm_template_pred", "tm_ref_pred", "tm_ref_template"]].notna().all().all(), \
         f"{p}: incomplete step-5 csv"
@@ -68,8 +69,8 @@ def main():
         assert len(tdirs) == 1, f"{p}: templates in {len(tdirs)} dirs"
     n_tot = sum(len(man[p]) for p in pids)
     print(f"[w4] cell {args.cell} (mask_sidechains={mask_sc}, template_seq_mask={seq_mask}) {args.model}: "
-          f"kernels {args.kernels} (cuEq attention={cue_attn}, mult-update={cue_mul}): {len(pids)} targets, {n_tot} templates",
-          flush=True)
+          f"kernels {args.kernels} (cuEq attention={cue_attn}, mult-update={cue_mul}): {len(pids)} targets, "
+          f"{n_tot} templates", flush=True)
 
     scorer = None
     for p in pids:

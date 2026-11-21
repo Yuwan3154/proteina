@@ -8,7 +8,7 @@
 # prod (GPU array, 20 tasks: task i -> cell ORDER[i/4], model (i/2)%2, chunk i%2; resumable per target).
 # KERNELS (control/prod, required) = run-wide AF2 kernel set: cueq (d36tc production) | plain (D36ab); controls go to
 # $R/ctrl_$KERNELS (prod/ = control i, always the default cuEq path; native/ = control ii; prod_$KERNELS/ = control iii,
-# only when KERNELS != cueq), production to $R/out_$KERNELS.
+# only when KERNELS != cueq, after a passing gate, report-only), production to $R/out_$KERNELS.
 # Partition/gres/time/mem/name/array on the sbatch command line.
 set -uo pipefail
 R=/orcd/scratch/orcd/011/chenxiou/d36_af2rank_mask/w4_20261121
@@ -53,15 +53,6 @@ elif [ "$MODE" = control ]; then
     python -m scratchpad.d36w4_control_prod --label d36tc_A_tmpl --stems "$STEMS" --model $m --out "$CR/prod"
     rc=$?; [ $rc -eq 0 ] || { echo "CONTROL_PROD_RC=$rc"; exit $rc; }
   done
-  if [ "$KERNELS" != cueq ]; then
-    for m in model_1_ptm model_2_ptm; do
-      python -m scratchpad.d36w4_control_prod --label d36tc_A_tmpl --stems "$STEMS" --model $m --out "$CR/prod_$KERNELS" \
-        --kernels "$KERNELS"
-      rc=$?; [ $rc -eq 0 ] || { echo "CONTROL_III_RC=$rc"; exit $rc; }
-    done
-    python -m scratchpad.d36w4_gate kernel_report --manifest "$M" --ctrl-dir "$CR" --kernels "$KERNELS"
-    rc=$?; [ $rc -eq 0 ] || { echo "KERNEL_REPORT_RC=$rc"; exit $rc; }
-  fi
   for c in none seqx sc both gapsc; do
     for m in model_1_ptm model_2_ptm; do
       python -m scratchpad.d36w4_af2rank --cell $c --model $m --pids "$PIDS" --manifest "$M" \
@@ -72,6 +63,15 @@ elif [ "$MODE" = control ]; then
   python -m scratchpad.d36w4_gate check --manifest "$M" --ctrl-dir "$CR" --kernels "$KERNELS" \
     --factorial-dir "$R/inputs/factorial"
   rc=$?
+  # control (iii) is report-only: it runs after the gate and never changes the job's exit code
+  if [ $rc -eq 0 ] && [ "$KERNELS" != cueq ]; then
+    for m in model_1_ptm model_2_ptm; do
+      python -m scratchpad.d36w4_control_prod --label d36tc_A_tmpl --stems "$STEMS" --model $m --out "$CR/prod_$KERNELS" \
+        --kernels "$KERNELS" || echo "CONTROL_III_RC=$? ($m)"
+    done
+    python -m scratchpad.d36w4_gate kernel_report --manifest "$M" --ctrl-dir "$CR" --kernels "$KERNELS" \
+      || echo "KERNEL_REPORT_RC=$?"
+  fi
 elif [ "$MODE" = prod ]; then
   params_gate
   ORDER=(none both seqx sc gapsc)

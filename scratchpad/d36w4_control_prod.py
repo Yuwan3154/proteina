@@ -72,7 +72,8 @@ def main():
     pd.DataFrame(cmp_rows).to_csv(out_csv, index=False)
     df = pd.DataFrame(cmp_rows)
     for c in COLS:
-        print(f"[controlP] {args.kernels} {args.model} {c}: max |new - published| {(df[c + '_new'] - df[c + '_pub']).abs().max():.6f}")
+        print(f"[controlP] {args.kernels} {args.model} {c}: max |new - published| "
+              f"{(df[c + '_new'] - df[c + '_pub']).abs().max():.6f}")
     print("D36W4_CONTROL_PROD_DONE", flush=True)
 
 
