@@ -9,6 +9,7 @@
 # KERNELS (control/prod, required) = run-wide AF2 kernel set: cueq (d36tc production) | plain (D36ab); controls go to
 # $R/ctrl_$KERNELS (prod/ = control i, always the default cuEq path; native/ = control ii; prod_$KERNELS/ = control iii,
 # only when KERNELS != cueq, after a passing gate, report-only), production to $R/out_$KERNELS.
+# MODE=control3 (KERNELS != cueq): control (iii) alone as its own job (report-only; exit != 0 only if it could not run).
 # Partition/gres/time/mem/name/array on the sbatch command line.
 set -uo pipefail
 R=/orcd/scratch/orcd/011/chenxiou/d36_af2rank_mask/w4_20261121
@@ -20,7 +21,7 @@ export TMPDIR=/tmp/chenxiou_w4_${SLURM_JOB_ID}; mkdir -p "$TMPDIR"; trap 'rm -rf
 cd "$REPO"; git log -1 --format="[repo] $REPO HEAD %h"
 python -c "import proteinfoundation, openfold; print('[import]', proteinfoundation.__file__, openfold.__file__)"
 M=$R/templates_manifest.csv
-if [ "$MODE" = control ] || [ "$MODE" = prod ]; then
+if [ "$MODE" = control ] || [ "$MODE" = control3 ] || [ "$MODE" = prod ]; then
   case "${KERNELS:-}" in cueq|plain) ;; *) echo "FATAL: KERNELS must be cueq or plain, got '${KERNELS:-}'"; exit 2;; esac
   CR=$R/ctrl_$KERNELS
   echo "[kernels] $KERNELS ; controls $CR ; production $R/out_$KERNELS"
@@ -71,6 +72,21 @@ elif [ "$MODE" = control ]; then
     done
     python -m scratchpad.d36w4_gate kernel_report --manifest "$M" --ctrl-dir "$CR" --kernels "$KERNELS" \
       || echo "KERNEL_REPORT_RC=$?"
+  fi
+elif [ "$MODE" = control3 ]; then
+  [ "$KERNELS" != cueq ] || { echo "FATAL: control (iii) compares $KERNELS with the published cuEq pools; needs plain"; exit 2; }
+  params_gate
+  STEMS=$(python -m scratchpad.d36w4_gate plan --manifest "$M" --what ctrl_stems) || exit 3
+  echo "[control3] control (iii) stems $STEMS"
+  rc=0
+  for m in model_1_ptm model_2_ptm; do
+    python -m scratchpad.d36w4_control_prod --label d36tc_A_tmpl --stems "$STEMS" --model $m --out "$CR/prod_$KERNELS" \
+      --kernels "$KERNELS"
+    r=$?; [ $r -eq 0 ] || { echo "CONTROL_III_RC=$r ($m)"; rc=$r; }
+  done
+  if [ $rc -eq 0 ]; then
+    python -m scratchpad.d36w4_gate kernel_report --manifest "$M" --ctrl-dir "$CR" --kernels "$KERNELS"
+    rc=$?
   fi
 elif [ "$MODE" = prod ]; then
   params_gate
