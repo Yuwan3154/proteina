@@ -6,9 +6,10 @@ Cells (template sequence mask x side-chain strip; ledger 6c):
   sc     real sequence, side chains stripped to N/CA/C/O/CB (+Gly CB)
   both   all-X + stripped = the production recipe
   gapsc  AF2Rank paper's gap-token sequence (pre-pipeline) + stripped
-Per target: OpenFoldAF2Rank(native cif, chain, recycles 6, cuEq attention + mult-update ON, DeepSpeed OFF) exactly as
-d36tc_af2rank.py, whole chain, score_structure(..., output_pdb=...), then step 5 = enrich_af2rank_output_dir (file-based,
-sequence-paired USalign -TMscore 5). Resumable per (cell, model, pid). Templates and fixed labels from the manifest.
+Per target: OpenFoldAF2Rank(native cif, chain, recycles 6, DeepSpeed OFF) as d36tc_af2rank.py, whole chain; --kernels
+cueq (default = d36tc production: cuEq attention + mult-update ON) or plain (both OFF = the D36ab native-template driver,
+the configuration control (ii) validates); score_structure(..., output_pdb=...), then step 5 =
+enrich_af2rank_output_dir (file-based, sequence-paired USalign -TMscore 5). Resumable per (cell, model, pid). Templates and fixed labels from the manifest.
 """
 import argparse
 import csv
@@ -24,10 +25,12 @@ from proteinfoundation.prediction_pipeline.proteina_analysis import enrich_af2ra
 CELLS = {"none": (False, "none"), "seqx": (False, "x"), "sc": (True, "none"), "both": (True, "x"),
          "gapsc": (True, "gap")}
 MODELS = ("model_1_ptm", "model_2_ptm")
+KERNELS = {"cueq": (True, True), "plain": (False, False)}  # (use_cuequivariance_attention, ..._multiplicative_update)
 
 
-def check_done(df, rows_in, p):
+def check_done(df, rows_in, p, kernels):
     """Post-conditions of a finished target; also re-run on resume so a failed target is never skipped."""
+    assert "kernels" in df.columns and (df["kernels"] == kernels).all(), f"{p}: csv kernels differ from --kernels {kernels}"
     assert len(df) == len(rows_in) and \
         df[["ptm", "plddt", "tm_template_pred", "tm_ref_pred", "tm_ref_template"]].notna().all().all(), \
         f"{p}: incomplete step-5 csv"
@@ -46,10 +49,12 @@ def main():
     ap.add_argument("--out", required=True, help="output root; writes <out>/<cell>/<model>/<pid>/")
     ap.add_argument("--natives", default="/orcd/scratch/orcd/011/chenxiou/d36u/natives")
     ap.add_argument("--template-ids", default=None, help="optional comma list restricting the templates (controls)")
+    ap.add_argument("--kernels", choices=sorted(KERNELS), default="cueq", help="cueq = d36tc production; plain = D36ab")
     args = ap.parse_args()
     usalign = shutil.which("USalign")
     assert usalign, "USalign not on PATH"
     mask_sc, seq_mask = CELLS[args.cell]
+    cue_attn, cue_mul = KERNELS[args.kernels]
     keep_ids = set(args.template_ids.split(",")) if args.template_ids else None
 
     man = {}
@@ -63,7 +68,8 @@ def main():
         assert len(tdirs) == 1, f"{p}: templates in {len(tdirs)} dirs"
     n_tot = sum(len(man[p]) for p in pids)
     print(f"[w4] cell {args.cell} (mask_sidechains={mask_sc}, template_seq_mask={seq_mask}) {args.model}: "
-          f"{len(pids)} targets, {n_tot} templates", flush=True)
+          f"kernels {args.kernels} (cuEq attention={cue_attn}, mult-update={cue_mul}): {len(pids)} targets, {n_tot} templates",
+          flush=True)
 
     scorer = None
     for p in pids:
@@ -79,13 +85,13 @@ def main():
             preds = [os.path.join(out_dir, "predicted_structures", n) for n in names]
             if sorted(df["structure_file"]) == names and all(os.path.exists(x) for x in preds) \
                     and "gdt_template_pred" in df.columns:
-                check_done(df, rows_in, p)
+                check_done(df, rows_in, p, args.kernels)
                 print(f"[w4] skip {p} (complete)", flush=True)
                 continue
         if scorer is None:
             scorer = OpenFoldAF2Rank(native, chain=chain, model_name=args.model, recycles=6,
-                                     use_deepspeed_evoformer_attention=False, use_cuequivariance_attention=True,
-                                     use_cuequivariance_multiplicative_update=True, mask_sidechains=mask_sc,
+                                     use_deepspeed_evoformer_attention=False, use_cuequivariance_attention=cue_attn,
+                                     use_cuequivariance_multiplicative_update=cue_mul, mask_sidechains=mask_sc,
                                      usalign_path=usalign, template_seq_mask=seq_mask)
         else:
             scorer.reset_reference(native, chain)
@@ -99,12 +105,13 @@ def main():
                                        output_pdb=os.path.join(out_dir, "predicted_structures", os.path.basename(pdb)))
             assert "error" not in s, f"{p} {r['template_id']}: {s}"
             s.update({"protein_id": p, "structure_file": os.path.basename(pdb), "structure_path": pdb,
-                      "template_id": r["template_id"], "cell": args.cell, "model": args.model})
+                      "template_id": r["template_id"], "cell": args.cell, "model": args.model,
+                      "kernels": args.kernels})
             rows.append(s)
         save_af2rank_scores(rows, out_dir, p)
         enrich_af2rank_output_dir(p, os.path.dirname(rows_in[0]["path"]), out_dir, native, chain, usalign_path=usalign)
         df = pd.read_csv(csv_path)
-        dlab = check_done(df, rows_in, p)
+        dlab = check_done(df, rows_in, p, args.kernels)
         print(f"[w4] {p} {args.cell} {args.model}: {len(df)} scored; max|label diff| {dlab:.5f}", flush=True)
     print("D36W4_AF2RANK_DONE", flush=True)
 
