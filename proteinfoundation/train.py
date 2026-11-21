@@ -716,6 +716,19 @@ if __name__ == "__main__":
             }
             callbacks.append(CadencedEmaModelCheckpoint(**args_ckpt_best_contact))
 
+        if cfg_exp.log.get("checkpoint_best_contact_f1", False):
+            args_ckpt_best_f1 = {
+                "dirpath": checkpoint_path_store,
+                "save_last": False,
+                "save_weights_only": True,
+                "filename": "chk_best_contact_f1_{epoch:08d}_{step:012d}",
+                "monitor": "validation_sampling/contact_f1_median",
+                "save_top_k": int(cfg_exp.log.get("checkpoint_best_contact_f1_save_top_k", 5)),
+                "mode": "max",  # higher threshold-0.5 F1 = better for c2c (contacts > 0.5)
+                "save_on_train_epoch_end": False,
+            }
+            callbacks.append(CadencedEmaModelCheckpoint(**args_ckpt_best_f1))
+
         # Save and log config files
         path_configs = [
             (
