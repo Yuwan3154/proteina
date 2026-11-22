@@ -20,6 +20,20 @@
 source /etc/profile >/dev/null 2>&1 || true
 set -uo pipefail
 trap 'echo "[$(date)] SIGUSR1 received; waiting for SIGTERM."' USR1
+# Duplicate submissions of one run on different partitions (user 2026-11-22): the first job to start claims the run; it cancels its
+# siblings only after the preflight checks and the run lock (commit point below), and releases the claim if it dies before that.
+# The claim file keeps the owner id so a --requeue of the owner passes; successors never carry SIBLING_FILE.
+if [ -n "${SIBLING_FILE:-}" ]; then
+    CLAIM="$SIBLING_FILE.claim"
+    if ( set -C; echo "$SLURM_JOB_ID" > "$CLAIM" ) 2>/dev/null; then
+        :
+    elif [ -e "$CLAIM" ]; then
+        [ "$(cat "$CLAIM")" = "$SLURM_JOB_ID" ] || { echo "run already claimed by job '$(cat "$CLAIM")'; exiting"; exit 0; }
+    else
+        echo "FATAL: cannot create claim $CLAIM"; exit 83
+    fi
+    trap 'rm -f "$CLAIM"' EXIT
+fi
 
 REPO="${REPO:-/orcd/scratch/orcd/011/chenxiou/proteina_t2cat}"
 ENV_DIR="${ENV_DIR:-/home/chenxiou/cue-openfold-env-sm120}"
@@ -93,6 +107,11 @@ mkdir -p "$LOCK"
 echo "$SLURM_JOB_ID" > "$LOCK/jobid"
 LOCK_PID=$BASHPID
 trap '[ "$BASHPID" = "$LOCK_PID" ] && rm -rf "$LOCK"' EXIT
+if [ -n "${SIBLING_FILE:-}" ]; then
+    # commit point: the EXIT trap above replaced the claim-release trap, so the claim now stays for good
+    for j in $(cat "$SIBLING_FILE"); do [ "$j" != "$SLURM_JOB_ID" ] && scancel "$j"; done
+    unset SIBLING_FILE
+fi
 echo "[lock] held by $SLURM_JOB_ID on $(hostname)"
 
 # the GPU type stays pinned for the whole run (user 2026-10-14): every segment, not only chaining ones, needs a typed gres
