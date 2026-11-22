@@ -22,7 +22,7 @@ set -uo pipefail
 trap 'echo "[$(date)] SIGUSR1 received; waiting for SIGTERM."' USR1
 
 REPO="${REPO:-/orcd/scratch/orcd/011/chenxiou/proteina_t2cat}"
-ENV_DIR=/home/chenxiou/cue-openfold-env-sm120
+ENV_DIR="${ENV_DIR:-/home/chenxiou/cue-openfold-env-sm120}"
 export DATA_PATH=/orcd/pool/006/chenxiou/proteina/data
 export CAT_STORE_DIR="${CAT_STORE_DIR:-/orcd/compute/so3/002/chenxi/t2_cat/cat_store}"
 export USALIGN_BIN="${USALIGN_BIN:-/home/chenxiou/.local/bin/USalign}"
@@ -109,7 +109,7 @@ if [ "$CHAIN" -gt 0 ] && [ -e "$CHAIN_MARK" ]; then
 fi
 if [ "$CHAIN" -gt 0 ]; then
     CHAIN=$((CHAIN - 1)) CONFIG="$CONFIG" RUN="$RUN" BATCH="$BATCH" ACCUM="$ACCUM" REPO="$REPO" OVERRIDES="${OVERRIDES:-}" \
-    CAT_STORE_DIR="$CAT_STORE_DIR" USALIGN_BIN="$USALIGN_BIN" ALIGN_W="$ALIGN_W" MLM_W="$MLM_W" \
+    ENV_DIR="$ENV_DIR" CAT_STORE_DIR="$CAT_STORE_DIR" USALIGN_BIN="$USALIGN_BIN" ALIGN_W="$ALIGN_W" MLM_W="$MLM_W" \
         sbatch --dependency=afterany:${SLURM_JOB_ID} --partition="$SLURM_JOB_PARTITION" --gres="$CHAIN_GRES" \
                --cpus-per-task="${SLURM_CPUS_PER_TASK:-16}" --mem="${SLURM_MEM_PER_NODE}M" --time="$CHAIN_TIME" \
                --job-name="$SLURM_JOB_NAME" "$REPO/run_tri_cat.sbatch" \
