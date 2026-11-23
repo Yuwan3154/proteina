@@ -7,6 +7,8 @@ segments None, `score_structure(pdb, "A", output_pdb=...)` (the production call,
 step 5 = proteina_analysis.enrich_af2rank_output_dir (file-based, sequence-paired USalign -TMscore 5; rewrites
 tm_ref_template / tm_ref_pred / tm_template_pred and composite = ptm * plddt * tm_template_pred).
 Reference = $S/d36u/natives/<ENTRY>.cif (the D36 scoring natives). Resumable per (label, stem, model).
+--kernels plain (W8 re-score) turns both cuEq kernels off; it needs its own --out (never the production dir) and
+refuses to resume from a CSV written with another kernel set. --stems restricts the pools to those stems.
 """
 import argparse
 import glob
@@ -20,6 +22,8 @@ from proteinfoundation.prediction_pipeline.af2rank_openfold_scorer import OpenFo
 from proteinfoundation.prediction_pipeline.proteina_analysis import enrich_af2rank_output_dir
 
 SUB = {"model_1_ptm": "af2rank_analysis", "model_2_ptm": "af2rank_analysis_model_2_ptm"}
+KERNELS = {"cueq": (True, True), "plain": (False, False)}  # (use_cuequivariance_attention, ..._multiplicative_update)
+OUT_PROD = "/orcd/pool/006/chenxiou/d36tc/af2rank"
 
 
 def main():
@@ -27,11 +31,18 @@ def main():
     ap.add_argument("--model", choices=sorted(SUB), required=True)
     ap.add_argument("--labels", required=True, help="comma list of c2c labels")
     ap.add_argument("--c2c-pdb", default="/orcd/pool/006/chenxiou/d36tc/c2c_pdb")
-    ap.add_argument("--out", default="/orcd/pool/006/chenxiou/d36tc/af2rank")
+    ap.add_argument("--out", default=OUT_PROD)
     ap.add_argument("--natives", default="/orcd/scratch/orcd/011/chenxiou/d36u/natives")
     ap.add_argument("--n", type=int, default=8)
     ap.add_argument("--expect-pools", type=int, required=True, help="number of (label, stem) pools over --labels")
+    ap.add_argument("--kernels", choices=sorted(KERNELS), default="cueq", help="cueq = d36tc production; plain = D36ab")
+    ap.add_argument("--stems", default="", help="optional comma list: score only these stems")
     args = ap.parse_args()
+    cue_attn, cue_mul = KERNELS[args.kernels]
+    prod = os.path.realpath(OUT_PROD)
+    assert args.kernels == "cueq" or os.path.commonpath([os.path.realpath(args.out), prod]) != prod, \
+        "--kernels plain must not write into the production d36tc af2rank dir"
+    keep = set(args.stems.split(",")) if args.stems else None
     usalign = shutil.which("USalign")
     assert usalign, "USalign not on PATH"
 
@@ -41,6 +52,8 @@ def main():
         assert dirs, f"no c2c dirs for {label}"
         for d in dirs:
             stem = os.path.basename(d)
+            if keep is not None and stem not in keep:
+                continue
             pdbs = sorted(glob.glob(os.path.join(d, "*_gen.pdb")))
             assert len(pdbs) == args.n, f"{label}/{stem}: {len(pdbs)} gen PDBs, want {args.n}"
             entry, chain = stem.rsplit("_", 1)
@@ -58,14 +71,16 @@ def main():
         if os.path.exists(csv_path):
             df = pd.read_csv(csv_path)
             preds = [os.path.join(out_dir, "predicted_structures", n) for n in names]
+            done_kernels = set(df["kernels"]) if "kernels" in df.columns else {"cueq"}
+            assert done_kernels == {args.kernels}, f"{csv_path}: written with kernels {done_kernels}, not {args.kernels}"
             if sorted(df["structure_file"]) == names and all(os.path.exists(p) for p in preds) \
                     and "gdt_template_pred" in df.columns:
                 print(f"[af2rank] skip {label}/{stem} (complete)", flush=True)
                 continue
         if scorer is None:
             scorer = OpenFoldAF2Rank(native, chain=chain, model_name=args.model, recycles=6,
-                                     use_deepspeed_evoformer_attention=False, use_cuequivariance_attention=True,
-                                     use_cuequivariance_multiplicative_update=True, mask_sidechains=True,
+                                     use_deepspeed_evoformer_attention=False, use_cuequivariance_attention=cue_attn,
+                                     use_cuequivariance_multiplicative_update=cue_mul, mask_sidechains=True,
                                      usalign_path=usalign)
         else:
             scorer.reset_reference(native, chain)
@@ -76,7 +91,8 @@ def main():
             s = scorer.score_structure(p, decoy_chain="A", recycles=6,
                                        output_pdb=os.path.join(out_dir, "predicted_structures", os.path.basename(p)))
             assert "error" not in s, f"{label}/{stem} {os.path.basename(p)}: {s}"
-            s.update({"protein_id": stem, "structure_file": os.path.basename(p), "structure_path": p})
+            s.update({"protein_id": stem, "structure_file": os.path.basename(p), "structure_path": p,
+                      "kernels": args.kernels})
             rows.append(s)
         save_af2rank_scores(rows, out_dir, stem)
         enrich_af2rank_output_dir(stem, os.path.dirname(pdbs[0]), out_dir, native, chain, usalign_path=usalign)
