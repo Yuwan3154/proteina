@@ -19,10 +19,10 @@ import os
 import re
 import shutil
 
+import torch  # first: libcue_ops.so resolves libcublas.so.12 only once torch has loaded it
 import cuequivariance_ops_torch
 import cuequivariance_torch
 import openfold
-import torch
 from cuequivariance_ops_torch.triangle_attention import CUEQ_TRIATTN_FALLBACK_THRESHOLD
 from cuequivariance_ops_torch.triangle_multiplicative_update import CUEQ_TRIMUL_FALLBACK_THRESHOLD
 from openfold.model.triangular_attention import TriangleAttention
