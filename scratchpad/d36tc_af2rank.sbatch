@@ -23,7 +23,16 @@ for pm in "params_model_1_ptm.npz dfca7cd972028fc6adcc0c8995857a2a" "params_mode
   set -- $pm; h=$(md5sum < "$AF2RANK_PARAMS_DIR/$1" | cut -d' ' -f1); echo "[params] $1 $h (SC $2)"
   [ "$h" = "$2" ] || { echo "FATAL: $1 differs from the SuperCloud production params"; exit 72; }
 done
-python -m scratchpad.d36tc_af2rank --model "$MODEL" --labels "$LABELS" --expect-pools "$EXPECT_POOLS"
+# D36tc-v3: optional passthroughs (unset = published call): TC_C2C_PDB TC_OUT TC_NATIVES TC_KERNELS TC_STEMS TC_SCORE_CHAINS=<json>
+XA=()
+[ -n "${TC_C2C_PDB:-}" ] && XA+=(--c2c-pdb "$TC_C2C_PDB")
+[ -n "${TC_OUT:-}" ] && XA+=(--out "$TC_OUT")
+[ -n "${TC_NATIVES:-}" ] && XA+=(--natives "$TC_NATIVES")
+[ -n "${TC_KERNELS:-}" ] && XA+=(--kernels "$TC_KERNELS")
+[ -n "${TC_STEMS:-}" ] && XA+=(--stems "$TC_STEMS")
+[ -n "${TC_SCORE_CHAINS:-}" ] && XA+=(--score-chains "$TC_SCORE_CHAINS")
+echo "[af2rank] extra args: ${XA[*]:-none}"
+python -m scratchpad.d36tc_af2rank --model "$MODEL" --labels "$LABELS" --expect-pools "$EXPECT_POOLS" "${XA[@]}"
 rc=$?
 echo "AF2RANK_RC=$rc"
 exit $rc

@@ -11,7 +11,7 @@
 # CONTROL A2/A3 on the 3 training chains (index rows from the STORED .pt and from MY .pt vs the training index).
 set -uo pipefail
 S=/orcd/scratch/orcd/011/chenxiou
-P=/orcd/pool/006/chenxiou/d36tc
+P="${P:-/orcd/pool/006/chenxiou/d36tc}"   # D36tc-v3: P overridable (default = published dir)
 REPO="${REPO:-$S/proteina_d36tc}"
 D=$P/data
 I=$P/inputs
@@ -22,10 +22,12 @@ export DATA_PATH=/orcd/pool/006/chenxiou/proteina/data PYTHONPATH=$REPO PYTHONUN
 cd "$REPO"; git log -1 --format="[repo] $REPO HEAD %h"
 [ ! -e "$D/topology_index_d36tc.pt" ] || { echo "FATAL: index exists"; exit 78; }
 
-python - "$I/d36tc_rows.csv" "$I/d36tc_index_stems.txt" <<'PY'
+N_INDEX="${N_INDEX:-65}"   # D36tc-v3: expected index rows overridable (default = published 34 targets + 31 hits)
+python - "$I/d36tc_rows.csv" "$I/d36tc_index_stems.txt" "$N_INDEX" <<'PY'
 import csv, sys
 st = [r["id"] for r in csv.DictReader(open(sys.argv[1])) if r["role"] in ("target", "reference")]
-assert len(st) == 65 == len(set(st)), f"index stems {len(st)} (want 65 distinct = 34 targets + 31 hits)"
+n = int(sys.argv[3])
+assert len(st) == n == len(set(st)), f"index stems {len(st)} (want {n} distinct = targets + hits)"
 open(sys.argv[2], "w").write("\n".join(st) + "\n"); print(f"index stems {len(st)}")
 PY
 src=$?
@@ -36,7 +38,7 @@ irc=$?
 echo "INDEX_RC=$irc"
 
 # D2b record: helix/strand element count per row vs the 64 cap (user: keep the cap, record exceeders)
-python - "$D/topology_index_d36tc.pt" "$P/he_counts.tsv" <<'PY'
+python - "$D/topology_index_d36tc.pt" "$P/he_counts.tsv" "$N_INDEX" <<'PY'
 import sys, torch
 idx = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
 out = []
@@ -48,7 +50,7 @@ for i, s in enumerate(idx["ids"]):
 open(sys.argv[2], "w").write("stem\the_size\tn_helix_strand_runs\tL\n" + "\n".join("\t".join(map(str, r)) for r in out) + "\n")
 ex = [r for r in out if r[1] > 64]
 print(f"[D2b] rows {len(out)}; empty runs {sum(1 for r in out if r[3] == 0)}; he_size > 64 (cap truncates): {len(ex)} {ex}")
-assert len(out) == 65, f"index rows {len(out)}"
+assert len(out) == int(sys.argv[3]), f"index rows {len(out)}"
 PY
 hrc=$?
 echo "HE_COUNTS_RC=$hrc"

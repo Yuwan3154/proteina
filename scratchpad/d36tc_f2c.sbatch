@@ -10,7 +10,7 @@
 # (<=512 bs 8, <=768 bs 4, <=1024 bs 2, <=4096 bs 1; bf16). Each band only picks up .pt still without a map.
 # Partition/gres/time/name (d36tc_gpu, singleton) on the sbatch command line.
 set -uo pipefail
-P=/orcd/pool/006/chenxiou/d36tc
+P="${P:-/orcd/pool/006/chenxiou/d36tc}"   # D36tc-v3: P overridable (default = published dir)
 PROC=$P/data/processed
 I=$P/inputs
 set +u; source /orcd/pool/006/chenxiou/backfill/env.sh; set -u
@@ -28,7 +28,8 @@ echo "F2C_RC=$rc"
 # gate in the build env (the verify script lives in the d36tc clone)
 REPO="${REPO:-/orcd/scratch/orcd/011/chenxiou/proteina_d36tc}"
 PYTHONPATH=$REPO python "$REPO/scratchpad/d36tc_verify_inputs.py" --processed-dir "$PROC" --target-seqs "$I/d36tc_target_seqs.json" \
-  --hit-manifest "$I/d36tc_hit_manifest.json" --extra "$I/controlA_stems.txt" --stage f2c
+  --hit-manifest "$I/d36tc_hit_manifest.json" --extra "$I/controlA_stems.txt" --stage f2c \
+  --n-targets "${N_TARGETS:-34}" --n-hits "${N_HITS:-31}" --n-extra "${N_EXTRA:-3}"   # D36tc-v3: counts overridable
 vrc=$?
 echo "VERIFY_RC=$vrc"
 [ "$rc" -ne 0 ] && exit "$rc"

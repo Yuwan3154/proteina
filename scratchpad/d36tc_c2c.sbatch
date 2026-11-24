@@ -16,7 +16,7 @@
 # Outputs: $P/c2c/B_<LABEL>.jsonl, PDBs under $P/c2c_pdb/<LABEL>/<shard>/<stem>/. Partition/gres/time/name on sbatch.
 set -uo pipefail
 S=/orcd/scratch/orcd/011/chenxiou
-P=/orcd/pool/006/chenxiou/d36tc
+P="${P:-/orcd/pool/006/chenxiou/d36tc}"   # D36tc-v3: P overridable (default = published dir)
 REPO="${REPO:-$S/proteina_d36tc}"
 DATASET="${DATASET:-d36tc_c2c_max384}"
 PROC=$P/data/processed

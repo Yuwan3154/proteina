@@ -13,7 +13,7 @@
 # Partition, --gres, --time and the job name go on the sbatch command line.
 set -uo pipefail
 S=/orcd/scratch/orcd/011/chenxiou
-P=/orcd/pool/006/chenxiou/d36tc
+P="${P:-/orcd/pool/006/chenxiou/d36tc}"   # D36tc-v3: P overridable (default = published dir)
 REPO="${REPO:-$S/proteina_d36tc}"
 DATASET="${DATASET:-d36tc_tri_max384}"
 PROC=$P/data/processed

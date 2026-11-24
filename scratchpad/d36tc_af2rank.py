@@ -9,14 +9,21 @@ tm_ref_template / tm_ref_pred / tm_template_pred and composite = ptm * plddt * t
 Reference = $S/d36u/natives/<ENTRY>.cif (the D36 scoring natives). Resumable per (label, stem, model).
 --kernels plain (W8 re-score) turns both cuEq kernels off; it needs its own --out (never the production dir) and
 refuses to resume from a CSV written with another kernel set. --stems restricts the pools to those stems.
+--score-chains JSON (D36tc-v3; default none = published, stem suffix passed as the chain): {stem: AUTHOR chain to
+score against}. The scorer and step 5 take a LABEL chain (cif_chain_mapping maps label -> auth), so the label_asym_id
+whose ATOM records carry that auth_asym_id is passed (v3: stems are built from LABEL chains; 7KU5_A -> auth O,
+9JKP_A -> auth B, 9HKF_B (label B = the identical auth-A copy, user 2026-11-24) -> auth B = label A).
 """
 import argparse
 import glob
+import json
 import os
 import shutil
 import sys
 
 import pandas as pd
+
+from Bio.PDB.MMCIF2Dict import MMCIF2Dict
 
 from proteinfoundation.prediction_pipeline.af2rank_openfold_scorer import OpenFoldAF2Rank, save_af2rank_scores
 from proteinfoundation.prediction_pipeline.proteina_analysis import enrich_af2rank_output_dir
@@ -24,6 +31,15 @@ from proteinfoundation.prediction_pipeline.proteina_analysis import enrich_af2ra
 SUB = {"model_1_ptm": "af2rank_analysis", "model_2_ptm": "af2rank_analysis_model_2_ptm"}
 KERNELS = {"cueq": (True, True), "plain": (False, False)}  # (use_cuequivariance_attention, ..._multiplicative_update)
 OUT_PROD = "/orcd/pool/006/chenxiou/d36tc/af2rank"
+
+
+def label_chain_for_auth(cif, auth):
+    """The unique label_asym_id of the ATOM records whose auth_asym_id == auth (fails if not exactly one)."""
+    d = MMCIF2Dict(cif)
+    labels = {lab for g, lab, au in zip(d["_atom_site.group_PDB"], d["_atom_site.label_asym_id"],
+                                        d["_atom_site.auth_asym_id"]) if g == "ATOM" and au == auth}
+    assert len(labels) == 1, f"{cif}: auth chain {auth} has ATOM label chains {sorted(labels)}"
+    return labels.pop()
 
 
 def main():
@@ -37,12 +53,14 @@ def main():
     ap.add_argument("--expect-pools", type=int, required=True, help="number of (label, stem) pools over --labels")
     ap.add_argument("--kernels", choices=sorted(KERNELS), default="cueq", help="cueq = d36tc production; plain = D36ab")
     ap.add_argument("--stems", default="", help="optional comma list: score only these stems")
+    ap.add_argument("--score-chains", default="", help="JSON {stem: author chain}; every pooled stem must be a key")
     args = ap.parse_args()
     cue_attn, cue_mul = KERNELS[args.kernels]
     prod = os.path.realpath(OUT_PROD)
     assert args.kernels == "cueq" or os.path.commonpath([os.path.realpath(args.out), prod]) != prod, \
         "--kernels plain must not write into the production d36tc af2rank dir"
     keep = set(args.stems.split(",")) if args.stems else None
+    score_chains = json.load(open(args.score_chains)) if args.score_chains else None
     usalign = shutil.which("USalign")
     assert usalign, "USalign not on PATH"
 
@@ -59,6 +77,10 @@ def main():
             entry, chain = stem.rsplit("_", 1)
             native = os.path.join(args.natives, f"{entry}.cif")
             assert os.path.exists(native), native
+            if score_chains is not None:
+                auth = score_chains[stem]
+                chain = label_chain_for_auth(native, auth)
+                print(f"[af2rank] {stem}: score vs auth chain {auth} = label chain {chain} (passed to the scorer)", flush=True)
             jobs.append((label, stem, chain, native, pdbs))
     assert len(jobs) == args.expect_pools, f"{len(jobs)} pools, want {args.expect_pools}"
     print(f"[af2rank] {args.model}: {len(jobs)} (label, stem) pools, {sum(len(j[4]) for j in jobs)} decoys", flush=True)
@@ -85,6 +107,12 @@ def main():
         else:
             scorer.reset_reference(native, chain)
         scorer.set_segments(None)
+        if score_chains is not None:
+            # the 1:1 template mapping needs decoy length == reference chain length (else a silent kalign fallback)
+            for p in pdbs:
+                n_res = len({ln[22:27] for ln in open(p) if ln.startswith("ATOM") and ln[12:16].strip() == "CA"})
+                assert n_res == len(scorer.reference_sequence), \
+                    f"{label}/{stem} {os.path.basename(p)}: {n_res} residues vs reference {len(scorer.reference_sequence)}"
         os.makedirs(os.path.join(out_dir, "predicted_structures"), exist_ok=True)
         rows = []
         for p in pdbs:

@@ -16,14 +16,17 @@
 #   4  sequence column backfill + datamodule setup (sequence clusters, both splits non-empty)
 set -euo pipefail
 S=/orcd/scratch/orcd/011/chenxiou
-P=/orcd/pool/006/chenxiou/d36tc
+P="${P:-/orcd/pool/006/chenxiou/d36tc}"   # D36tc-v3: P overridable (default = published dir)
 REPO="${REPO:-$S/proteina_d36tc}"
 D=$P/data
 I=$P/inputs
-DS=d36tc_tri_max384
+DS="${DS:-d36tc_tri_max384}"   # D36tc-v3: overridable, like NATIVES and the N_* verify counts (defaults = published)
+NATIVES="${NATIVES:-$S/d36u/natives}"
+VCOUNTS=(--n-targets "${N_TARGETS:-34}" --n-hits "${N_HITS:-31}" --n-extra "${N_EXTRA:-3}")
 module load miniforge
 set +u; source "$(conda info --base)/etc/profile.d/conda.sh"; conda deactivate 2>/dev/null || true; conda activate cue_openfold; set -u
 export DATA_PATH=/orcd/pool/006/chenxiou/proteina/data SKIP_CONFIND_PRECOMPUTE=1 PYTHONPATH=$REPO PYTHONUNBUFFERED=1
+export DS D
 export CUDA_VISIBLE_DEVICES=""
 cd "$REPO"; git log -1 --format="[repo] $REPO HEAD %h"
 [ ! -e "$D" ] || { echo "FATAL: $D exists -- fresh data dir expected"; exit 78; }
@@ -36,16 +39,16 @@ python scratchpad/d36tc_ema_vs_raw.py --step 60505 \
 
 echo "=== STAGE 1: raw cifs ==="
 mkdir -p "$D/raw" "$P/logs"
-python - "$I/d36tc_rows.csv" "$D/raw" "$S" <<'PY'
+python - "$I/d36tc_rows.csv" "$D/raw" "$S" "$NATIVES" <<'PY'
 import csv, gzip, hashlib, os, shutil, sys
-rows, raw, S = sys.argv[1], sys.argv[2], sys.argv[3]
+rows, raw, S, NAT = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 man = []
 for r in csv.DictReader(open(rows)):
     dst = os.path.join(raw, f"{r['pdb']}.cif")
     if os.path.exists(dst):
         continue                                    # an entry shared by two rows (e.g. 4FPQ)
     if r["role"] == "target":
-        src = f"{S}/d36u/natives/{r['pdb']}.cif"
+        src = f"{NAT}/{r['pdb']}.cif"
         shutil.copyfile(src, dst)
         alt = f"{S}/d36m_tri_data/raw/{r['pdb']}.cif"
         same = os.path.exists(alt) and open(alt, "rb").read() == open(src, "rb").read()
@@ -69,19 +72,19 @@ python scratchpad/d36tc_setup_dataset.py --repo "$REPO" --dataset "$DS" --rows "
 python - <<'PY'
 import os, hydra
 with hydra.initialize_config_dir(os.path.join(os.environ["PYTHONPATH"], "configs/datasets_config/pdb"), version_base=hydra.__version__):
-    cfg = hydra.compose(config_name="d36tc_tri_max384")
+    cfg = hydra.compose(config_name=os.environ["DS"])
 dm = hydra.utils.instantiate(cfg.datamodule)
 dm.prepare_data()
 print("prepare_data returned")
 PY
 python scratchpad/d36tc_verify_inputs.py --processed-dir "$D/processed" --target-seqs "$I/d36tc_target_seqs.json" \
-  --hit-manifest "$I/d36tc_hit_manifest.json" --extra "$I/controlA_stems.txt" --stage coords
+  --hit-manifest "$I/d36tc_hit_manifest.json" --extra "$I/controlA_stems.txt" --stage coords "${VCOUNTS[@]}"
 
 echo "=== STAGE 3: DSSP + Control A1 ==="
 python -m proteinfoundation.utils.precompute_dssp_targets --processed-dir "$D/processed" --workers 16 \
   --output-csv "$P/logs/dssp_progress.csv" --log-path "$P/logs/dssp.log"
 python scratchpad/d36tc_verify_inputs.py --processed-dir "$D/processed" --target-seqs "$I/d36tc_target_seqs.json" \
-  --hit-manifest "$I/d36tc_hit_manifest.json" --extra "$I/controlA_stems.txt" --stage dssp
+  --hit-manifest "$I/d36tc_hit_manifest.json" --extra "$I/controlA_stems.txt" --stage dssp "${VCOUNTS[@]}"
 set +e
 python scratchpad/d36tc_controlA.py --part a1 --stems "$I/controlA_stems.txt" --mine "$D/processed" \
   --write-stored-paths "$I/controlA_stored_paths.tsv"
@@ -92,7 +95,7 @@ echo "CONTROL_A1_RC=$a1"
 echo "=== STAGE 4: sequence backfill + datamodule setup (clusters) ==="
 python - <<'PY'
 import glob, os, torch, pandas as pd, hydra
-D = "/orcd/pool/006/chenxiou/d36tc/data"
+D = os.environ["D"]
 cands = glob.glob(os.path.join(D, "df_pdb_*minl40_maxl700*.csv"))
 assert len(cands) == 1, cands
 df = pd.read_csv(cands[0])
@@ -102,7 +105,7 @@ assert (df["sequence"].str.len() > 0).all()
 df.to_csv(cands[0], index=False)
 print(f"backfilled sequence for {len(df)} rows")
 with hydra.initialize_config_dir(os.path.join(os.environ["PYTHONPATH"], "configs/datasets_config/pdb"), version_base=hydra.__version__):
-    cfg = hydra.compose(config_name="d36tc_tri_max384")
+    cfg = hydra.compose(config_name=os.environ["DS"])
 dm = hydra.utils.instantiate(cfg.datamodule)
 dm.prepare_data(); dm.setup("fit")
 print(f"splits: train {len(dm.train_ds)} val {len(dm.val_ds)}")

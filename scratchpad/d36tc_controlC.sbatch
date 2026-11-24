@@ -9,7 +9,7 @@
 # o6w.csv, sc/ = rsync copy of the manifest's /home/gridsan/cou/ files). Partition/gres/time/name on sbatch.
 set -uo pipefail
 S=/orcd/scratch/orcd/011/chenxiou
-P=/orcd/pool/006/chenxiou/d36tc
+P="${P:-/orcd/pool/006/chenxiou/d36tc}"   # D36tc-v3: P overridable (default = published dir)
 C=$P/controlC
 REPO="${REPO:-$S/proteina_d36tc}"
 source "$REPO/scratchpad/d36tc_af2.env.sh"

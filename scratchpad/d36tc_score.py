@@ -9,10 +9,13 @@ arms self + tmpl (AF2Rank-selected) and native (native-map c2c ceiling, c2c TMs 
   headline : tm_ref_pred of the pick (AF2's refold vs the native); beside it the pick's own c2c TM (step-5
              tm_ref_template, cross-checked against the independent USalign call).
 Counts >= 0.7 / >= 0.9 / < 0.5 are printed before medians.
+D36tc-v3: --groups / --expect-sizes / --selftest-natives (defaults = the published A/B/C design and natives);
+--score-chains JSON {stem: AUTHOR chain} replaces the stem suffix as USalign -chain1 (v3 stems use LABEL chains).
 """
 import argparse
 import csv
 import glob
+import json
 import os
 import subprocess
 import sys
@@ -20,11 +23,12 @@ import sys
 import numpy as np
 import pandas as pd
 
-GROUPS = {"A": ("self", "tmpl", "native"), "B": ("self", "native"), "C": ("self", "tmpl", "native")}
+GROUPS_PUBLISHED = "A=self,tmpl,native;B=self,native;C=self,tmpl,native"
+SIZES_PUBLISHED = "A=30,B=2,C=2"
 
 
 def native_for(natives, pid):
-    """score_arm.py's native resolution and chain: <natives>/<entry>.cif, chain = the pid suffix (none of the 42 D36
+    """(v3: --score-chains overrides the chain returned here.) score_arm.py's native resolution and chain: <natives>/<entry>.cif, chain = the pid suffix (none of the 42 D36
     natives has label_asym_id != auth_asym_id on its ATOM records, checked 2026-10-09)."""
     entry, chain = pid.rsplit("_", 1)
     native = os.path.join(natives, entry + ".cif")
@@ -48,7 +52,7 @@ def selftest(args):
     stored oracle_tm = max TM over the pool, on 8AUC_B (chain B of a 2-chain native) and 6QBL_A (modified residues)."""
     ref = {r["protein_id"]: float(r["oracle_tm"]) for r in csv.DictReader(open(args.selftest_csv))}
     for pid in ("8AUC_B", "6QBL_A"):
-        native, chain = native_for(args.natives, pid)
+        native, chain = native_for(args.selftest_natives, pid)
         pool = glob.glob(os.path.join(args.selftest_pool, pid, "**", "*seed-*sample-*_model.cif"), recursive=True)
         assert len(pool) == 5, f"{pid}: {len(pool)} AF3 samples"
         got = round(max(tm_vs_native(args.usalign, native, chain, p) for p in pool), 4)
@@ -75,10 +79,17 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--selftest-csv", default="/orcd/scratch/orcd/011/chenxiou/d36aq/c5/scores/af3_af3r2_seed0.csv")
     ap.add_argument("--selftest-pool", default="/orcd/scratch/orcd/011/chenxiou/d36aq/c5/af3/af3r2/seed0")
+    ap.add_argument("--selftest-natives", default="/orcd/scratch/orcd/011/chenxiou/d36u/natives")
+    ap.add_argument("--groups", default=GROUPS_PUBLISHED, help="G=arm,arm;... (arms self/tmpl/native)")
+    ap.add_argument("--expect-sizes", default=SIZES_PUBLISHED, help="G=n,... targets per group list")
+    ap.add_argument("--score-chains", default="", help="JSON {stem: author chain}; every stem must be a key")
     args = ap.parse_args()
+    GROUPS = {g: tuple(a.split(",")) for g, a in (x.split("=") for x in args.groups.split(";"))}
+    want = {g: int(n) for g, n in (x.split("=") for x in args.expect_sizes.split(","))}
+    score_chains = json.load(open(args.score_chains)) if args.score_chains else None
     selftest(args)
     sizes = {g: len([l for l in open(os.path.join(args.groups_dir, f"group{g}.txt")) if l.strip()]) for g in GROUPS}
-    assert sizes == {"A": 30, "B": 2, "C": 2}, f"group sizes {sizes} (want A 30, B 2, C 2 = 34)"
+    assert sizes == want, f"group sizes {sizes} (want {want})"
 
     expected, found, problems, out, max_gap = 0, 0, [], [], 0.0
     for g, arms in GROUPS.items():
@@ -87,6 +98,8 @@ def main():
             label = f"{args.prefix}_{g}_{arm}"
             for st in stems:
                 native, ch = native_for(args.natives, st)
+                if score_chains is not None:
+                    ch = score_chains[st]
                 pdbs = sorted(glob.glob(os.path.join(args.c2c_pdb, label, "*", st, "*_gen.pdb")))
                 expected += 8
                 found += len(pdbs)
