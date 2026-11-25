@@ -24,19 +24,19 @@ for pm in "params_model_1_ptm.npz dfca7cd972028fc6adcc0c8995857a2a" "params_mode
   [ "$h" = "$2" ] || { echo "FATAL: $1 differs from the SuperCloud production params"; exit 72; }
 done
 OUT=$W/out_${MODE}_${SLURM_JOB_ID}; mkdir -p "$OUT"
-P="$REPO/scratchpad/d36w11_forensics.py"
+P=scratchpad.d36w11_forensics  # -m from REPO: the script dir holds scratchpad/openfold/ which shadows openfold.utils
 rc=0
 run() { "$@"; local r=$?; echo "[rc] $r : $*"; [ $r -eq 0 ] || rc=$r; }
-cd "$TMPDIR"
+cd "$REPO" || exit 3
 if [ "$MODE" = shake ]; then
-  run python "$P" --out "$OUT" --mode e1 --tag run1
-  run python "$P" --out "$OUT" --mode e2 --e2-pids 6UCK_A
-  run python "$P" --out "$OUT" --mode e3 --sizes 67 101 --stack-sizes 67
+  run python -m "$P" --out "$OUT" --mode e1 --tag run1
+  run python -m "$P" --out "$OUT" --mode e2 --e2-pids 6UCK_A
+  run python -m "$P" --out "$OUT" --mode e3 --sizes 67 101 --stack-sizes 67
 elif [ "$MODE" = full ]; then
-  for t in run1 run2 run3; do run python "$P" --out "$OUT" --mode e1 --tag $t; done
-  run python "$P" --out "$OUT" --mode e1cmp
-  run python "$P" --out "$OUT" --mode e2
-  run python "$P" --out "$OUT" --mode e3
+  for t in run1 run2 run3; do run python -m "$P" --out "$OUT" --mode e1 --tag $t; done
+  run python -m "$P" --out "$OUT" --mode e1cmp
+  run python -m "$P" --out "$OUT" --mode e2
+  run python -m "$P" --out "$OUT" --mode e3
 else
   echo "unknown MODE=$MODE"; rc=2
 fi
