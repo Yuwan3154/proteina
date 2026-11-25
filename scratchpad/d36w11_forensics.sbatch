@@ -9,6 +9,7 @@
 # D36 W11 AF2Rank kernel forensics (scratchpad/d36w11_forensics.py). Partition/time/exclude on the sbatch command line.
 #   MODE=shake : e1 run1, e2 on 6UCK_A only, e3 at N 67/101 and stack N 67 (anchor control: plain/cuEq must reproduce W4-diag)
 #   MODE=full  : e1 x3 processes + e1cmp, e2 (6UCK_A full hooks, 8AUC_B light), e3 (all sizes, captured inputs)
+#   MODE=e2b   : e2 on 8AUC_B only without plain_nochunk (the unchunked L=493 forward OOMs on a 46 GB L40S; job 30401110)
 set -uo pipefail
 W=/orcd/pool/006/chenxiou/d36_w11_forensics
 REPO=$W/repo
@@ -37,6 +38,8 @@ elif [ "$MODE" = full ]; then
   run python -m "$P" --out "$OUT" --mode e1cmp
   run python -m "$P" --out "$OUT" --mode e2
   run python -m "$P" --out "$OUT" --mode e3
+elif [ "$MODE" = e2b ]; then
+  run python -m "$P" --out "$OUT" --mode e2 --e2-pids 8AUC_B --skip-arms plain_nochunk
 else
   echo "unknown MODE=$MODE"; rc=2
 fi

@@ -321,6 +321,8 @@ def run_e2(args):
         ref_ca = native_ca(pid)
         ref = None
         for arm, (_, _, _, tf32, _) in ARMS.items():
+            if arm in args.skip_arms.split(","):
+                continue
             model = models[arm].model
             torch.backends.cuda.matmul.allow_tf32 = tf32
             # untracked warm-up so ChunkSizeTuner trial calls never enter the recorded call indices
@@ -521,7 +523,10 @@ def main():
     ap.add_argument("--sizes", type=int, nargs="+", default=[67, 101, 201])  # below / just above the cuEq fallback thresholds 100 and 200
     ap.add_argument("--stack-sizes", type=int, nargs="+", default=[67, 101])
     ap.add_argument("--e2-pids", default=",".join(p for p, _, _ in E2_CASES))
+    ap.add_argument("--skip-arms", default="")  # e.g. plain_nochunk at L=493 (unchunked forward needs >44 GB)
     args = ap.parse_args()
+    skip = set(filter(None, args.skip_arms.split(",")))
+    assert skip <= set(ARMS) and "plain" not in skip, skip
     assert os.path.realpath(os.environ["AF2RANK_PARAMS_DIR"]) == os.path.realpath(PARAMS)
     assert not torch.backends.cuda.matmul.allow_tf32
     os.makedirs(args.out, exist_ok=True)
