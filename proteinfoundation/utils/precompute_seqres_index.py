@@ -9,6 +9,8 @@ Per chain status (never silent): ok; nonmonotone (label_seq_id not strictly incr
 residue_id covers several label_seq_id -- biopandas 0.5.1 drops insertion codes, so e.g. 82/82A/82B of one resname collapse);
 collide (two graph residues on one label_seq_id, e.g. microheterogeneity); no_label_seq (an ATOM row without label_seq_id);
 unmapped (a residue_id with no ATOM row); no_cif. Positions are stored for ok and nonmonotone only.
+Every chain also gets seq_sha1 = sha1 of its one-letter residue_type sequence in array order (transforms.residue_type_sha1),
+so a reader can detect a graph whose residues differ from the ones the table was built on.
 
 Usage:
   part:  python -m proteinfoundation.utils.precompute_seqres_index part  --pack PACK --data-dir DATA_PATH/pdb_train \
@@ -31,15 +33,17 @@ import torch
 from biopandas.mmcif import PandasMmcif
 
 from proteinfoundation.datasets.pdb_data import _resolve_raw_sharded
+from proteinfoundation.datasets.transforms import residue_type_sha1
 
 DEFINITION = ("label_seq_id (mmCIF _atom_site, 1-based SEQRES position) of each modelled residue in array order, mapped "
               "via residue_id = label_asym_id:resname:auth_seq_id:ins from the same biopandas read as processing")
 STATUSES = ("ok", "nonmonotone", "merged", "collide", "no_label_seq", "unmapped", "no_cif")
 
 
-def residue_label_seq(path: str) -> tuple:
+def residue_label_seq(path: str, real_ins: bool = False) -> tuple:
     """(residue_id -> set of label_seq_id (None if absent), residue_id -> set of real mmCIF insertion codes) over ATOM records,
-    keyed like read_pdb_to_dataframe + protein_to_pyg build residue_id (biopandas 0.5.1 blanks the insertion code there)."""
+    keyed like read_pdb_to_dataframe + protein_to_pyg build residue_id: the default path blanks the insertion code
+    (biopandas 0.5.1); real_ins=True keys on pdbx_PDB_ins_code like the SEQRES-order processing (T8b re-processed graphs)."""
     pmcif = PandasMmcif().read_mmcif(path).get_model(1)
     label_asym, label_seq, ins_code = [], [], []
     for rec in ("ATOM", "HETATM"):
@@ -53,12 +57,15 @@ def residue_label_seq(path: str) -> tuple:
     df["label_seq_id"] = np.concatenate(label_seq)
     df["ins_code"] = np.concatenate(ins_code)
     df = df.loc[df.record_name == "ATOM"]
-    rid = df["chain_id"] + ":" + df["residue_name"] + ":" + df["residue_number"].astype(str) + ":" + df["insertion"]
+    # biopandas 0.5.1 maps '?'/'.' to None, then astype(str) turns that into the string 'None'
+    ic = pd.Series(df["ins_code"].values, dtype=object)
+    real = ic.where(ic.notna() & ~ic.isin(["?", ".", "None"]), "").astype(str).to_numpy()  # = read_pdb_to_dataframe(mmcif_seqres_fields)
+    key_ins = real if real_ins else df["insertion"].astype(str).to_numpy()
+    rid = df["chain_id"] + ":" + df["residue_name"] + ":" + df["residue_number"].astype(str) + ":" + key_ins
     out, ins = collections.defaultdict(set), collections.defaultdict(set)
-    for r, s, c in zip(rid.values, df["label_seq_id"].values, df["ins_code"].values):
+    for r, s, c in zip(rid.values, df["label_seq_id"].values, real):
         out[r].add(None if s is None else int(s))
-        # biopandas 0.5.1 maps '?'/'.' to None, then astype(str) turns that into the string 'None'
-        ins[r].add("" if c is None or c in ("?", ".", "None") else str(c))
+        ins[r].add(c)
     return out, ins
 
 
@@ -96,7 +103,7 @@ def cmd_part(a):
     t0 = time.time()
     for k, pdb in enumerate(pdbs):
         path = _resolve_raw_sharded(raw_dir, pdb.lower(), "cif", man) or _resolve_raw_sharded(raw_dir, pdb, "cif", man)
-        mapping, ins = residue_label_seq(str(path)) if path is not None else (None, None)
+        mapping, ins = residue_label_seq(str(path), a.real_ins) if path is not None else (None, None)
         for stem in by_pdb[pdb]:
             assert stem in ent, f"{stem} not in pack"
             off, n = ent[stem]
@@ -110,11 +117,11 @@ def cmd_part(a):
             n_gaps = int((np.diff(pos) > 1).sum()) if status == "ok" else -1
             n_ins = sum(1 for r in rids if any(ins.get(r, ()))) if mapping is not None else -1
             rows.append({"stem": stem, "status": status, "L": len(rids), "pos": pos, "n_gaps": n_gaps,
-                         "n_merged": n_merged, "n_ins": n_ins})
+                         "n_merged": n_merged, "n_ins": n_ins, "seq_sha1": residue_type_sha1(g["residue_type"])})
         if (k + 1) % 200 == 0:
             print(f"[part {a.part}] {k + 1}/{len(pdbs)} entries {time.time() - t0:.0f} s", flush=True)
     out = pathlib.Path(a.out_dir) / f"part_{a.part:04d}_of_{a.n_parts:04d}.pt"
-    torch.save({"rows": rows, "n_entries": len(pdbs), "seconds": time.time() - t0}, out)
+    torch.save({"rows": rows, "n_entries": len(pdbs), "seconds": time.time() - t0, "real_ins": a.real_ins}, out)
     c = collections.Counter(r["status"] for r in rows)
     print(f"[part {a.part}] DONE {len(pdbs)} entries, {len(rows)} chains, {time.time() - t0:.0f} s, status {dict(c)} -> {out}")
 
@@ -125,7 +132,11 @@ def cmd_merge(a):
     n_parts = {p.name.split("_of_")[1] for p in parts}
     assert len(n_parts) == 1, f"parts from different splits: {n_parts}"
     assert len(parts) == int(next(iter(n_parts))[:-3]), f"{len(parts)} part files, expected {next(iter(n_parts))[:-3]}"
-    rows = [r for p in parts for r in torch.load(p, weights_only=False)["rows"]]
+    loaded = [torch.load(p, weights_only=False) for p in parts]
+    modes = {x.get("real_ins", False) for x in loaded}
+    assert len(modes) == 1, f"parts built with different insertion-code keying: {modes}"
+    real_ins = modes.pop()
+    rows = [r for x in loaded for r in x["rows"]]
     got = [r["stem"] for r in rows]
     assert len(got) == len(set(got)), "a stem appears in two parts"
     assert sorted(got) == stems, f"coverage: {len(set(stems) - set(got))} missing, {len(set(got) - set(stems))} extra"
@@ -149,12 +160,14 @@ def cmd_merge(a):
         "pandas": pd.__version__,
     }
     torch.save({
-        "def": DEFINITION,
+        "def": DEFINITION + ("; ins = real pdbx_PDB_ins_code" if real_ins else "; ins = biopandas insertion (blank)"),
+        "real_ins": real_ins,
         "stems": [r["stem"] for r in rows],
         "status": [r["status"] for r in rows],
         "offset": torch.from_numpy(offset),
         "label_seq_flat": torch.from_numpy(np.concatenate(flat) if flat else np.zeros(0, dtype=np.int32)),
         "length": torch.tensor([r["L"] for r in rows], dtype=torch.int32),
+        "seq_sha1": [r["seq_sha1"] for r in rows],  # residue-order fingerprint, checked by SeqresIndexTransform
         "audit": audit,
     }, a.out)
     with open(a.out + ".audit.tsv", "w") as f:
@@ -174,6 +187,7 @@ def main():
     p.add_argument("--part", type=int, required=True)
     p.add_argument("--n-parts", type=int, required=True)
     p.add_argument("--out-dir", required=True)
+    p.add_argument("--real-ins", action="store_true", help="key residue_id on the real mmCIF insertion code (T8b re-processed graphs)")
     m = sub.add_parser("merge")
     m.add_argument("--stems", required=True)
     m.add_argument("--parts-dir", required=True)

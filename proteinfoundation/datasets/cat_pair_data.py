@@ -10,25 +10,35 @@ both CATH and TED query entries, else the available source. The query is the
 member's domain, cropped here (no DomainCropTransform: residue_pdb_idx stays un-renumbered, like DomainCrop). Its
 reference is a random NON-SELF member of the same (CAT, split) pool -- a different entry, which may be a synthetic
 template -- served through TopologyReferenceTransform.assemble_reference from the per-member index built by
-utils/precompute_cat_pair_index. The per-residue alignment target (ref_align_target) is the USalign of the query
-domain's CA onto the template domain's CA, made online with the reference binary: it is pair-specific, so it cannot be
-baked in the way the per-native T8 index bakes it.
+utils/precompute_cat_pair_index (or on-the-fly from UnitStore in reference_mode="mpnn_chunk9"). The per-residue
+alignment target (ref_align_target) is the USalign of the query domain's CA onto the template domain's CA, made online
+with the reference binary: it is pair-specific, so it cannot be baked in the way the per-native T8 index bakes it.
 """
 
 import os
-import tempfile
-import zlib
 from pathlib import Path
-from typing import List, Optional
+import tempfile
+from typing import Dict, List, Optional, Tuple
+import zlib
 
+from loguru import logger
 import numpy as np
 import torch
-from loguru import logger
 from torch_geometric.data import Data
 
 from proteinfoundation.datasets.base_data import BaseLightningDataModule
 from proteinfoundation.datasets.cat_unit_store import UnitStore, prime_page_cache, seg_positions
+from proteinfoundation.datasets.sse_topology import (
+    DSSP_HELIX,
+    sse_contact_reference,
+    sse_structural_pair_features,
+)
 from proteinfoundation.datasets.topology_reference import ALIGN_NONE, MASK_REF_ID, TopologyReferenceTransform
+from proteinfoundation.nn.mpnn_topology_encoder import (
+    MPNN_ATOM4_INDICES,
+    TEMPLATE_SEQ_MASK_TOKEN,
+    chunk9_runs,
+)
 from proteinfoundation.utils.cluster_utils import CATUniformSampler
 from proteinfoundation.utils.precompute_synthetic_topology_index import usalign_pairs
 
@@ -53,36 +63,155 @@ def _tmpdir() -> str:
 
 class CATPairReferenceTransform(TopologyReferenceTransform):
     """TopologyReferenceTransform whose template is a same-(CAT, split) non-self member and whose alignment target is an
-    online USalign. Everything else (augmentation, caps, standardisation, drop / MASK reference, the missing-reference
-    flag and warning) is inherited unchanged, so the model sees the T8 reference in the T8 format.
+    online USalign. Supports both SSE references (`reference_mode="sse"`) and fixed 9-residue ProteinMPNN chunk
+    references (`reference_mode="mpnn_chunk9"`), serving template backbone coordinates, sequences (with 25% i.i.d.
+    residue masking during training), and domain-cropped chunk9 coarse pair features directly from `UnitStore`.
 
     Args:
         usalign: path of the USalign binary.
         exclude_own_synthetic: also refuse synthetic templates edited from the query's own unit (a synthetic template of
             the query is a DIFFERENT entry, so by default it is allowed, as in the T8 regime).
-        All other arguments: TopologyReferenceTransform (its ``reference_source`` is fixed to "synthetic" so the
-        parent's constructor accepts it; template choice and alignment are overridden here).
+        store_dir: optional path to the CAT `UnitStore` directory (defaults to `dirname(index_path)` if `entries.tsv`
+            and `members.tsv` exist there). Used in `reference_mode="mpnn_chunk9"` to read template backbone coordinates,
+            sequences, residue numbers, and precomputed Frame2ConFind contact maps without rebuilding `cat_pair_index.pt`.
+        All other arguments: TopologyReferenceTransform (`reference_source` is fixed to "synthetic" so the parent's
+            constructor accepts it; template choice and alignment are overridden here).
     """
 
-    def __init__(self, index_path: str, usalign: str, exclude_own_synthetic: bool = False, **kwargs):
+    def __init__(
+        self,
+        index_path: str,
+        usalign: str,
+        exclude_own_synthetic: bool = False,
+        store_dir: Optional[str] = None,
+        **kwargs,
+    ):
         super().__init__(index_path, reference_source="synthetic", **kwargs)
         self.usalign = usalign
         self.exclude_own_synthetic = bool(exclude_own_synthetic)
+        if store_dir is None:
+            cand = os.path.dirname(os.path.abspath(index_path))
+            if os.path.exists(os.path.join(cand, "entries.tsv")) and os.path.exists(os.path.join(cand, "members.tsv")):
+                store_dir = cand
+        self.store_dir = store_dir
+        self._unit_store: Optional[UnitStore] = None
+        self._member_meta: Optional[Dict[str, Tuple[str, str]]] = None
+        if self.reference_mode == "mpnn_chunk9" and self.store_dir is not None:
+            # Allow loading CAT pool topology from an existing SSE cat_pair_index.pt while building
+            # 9-residue chunk features + template coordinates on the fly from UnitStore.
+            self._allow_element_type_mismatch = True
 
     def __getstate__(self):
-        # a spawn-context DataLoader pickles the dataset into every worker; the preloaded multi-GB index must not travel through
-        # shared memory, the worker reloads it lazily. Forked workers inherit it without any pickling.
+        # a spawn-context DataLoader pickles the dataset into every worker; the preloaded multi-GB index and UnitStore
+        # mmaps must not travel through shared memory, the worker reloads them lazily.
         state = self.__dict__.copy()
-        state.update(_index=None, _id_to_row=None, _generator=None, _generator_pid=None)
+        state.update(
+            _index=None,
+            _id_to_row=None,
+            _generator=None,
+            _generator_pid=None,
+            _unit_store=None,
+            _member_meta=None,
+        )
         return state
 
     def _ensure_loaded(self) -> None:
         fresh = self._index is None  # an early return here would skip the base class's per-worker generator re-seed
         super()._ensure_loaded()
-        if not fresh:
-            return
-        for key in ("ca_flat", "elem_flat", "ca_offset", "row_entry", "row_pool", "pool_members_flat", "pool_members_offset", "row_src"):
-            assert key in self._index, f"{self.index_path} lacks {key}: not an index of utils/precompute_cat_pair_index"
+        if fresh:
+            for key in ("ca_flat", "elem_flat", "ca_offset", "row_entry", "row_pool", "pool_members_flat", "pool_members_offset", "row_src"):
+                assert key in self._index, f"{self.index_path} lacks {key}: not an index of utils/precompute_cat_pair_index"
+        if self.reference_mode == "mpnn_chunk9" and self._unit_store is None and self.store_dir is not None:
+            st = UnitStore(self.store_dir)
+            self._unit_store = st
+            self._member_meta = {
+                str(m): (str(e), str(s))
+                for m, e, s in zip(st.members.member_id, st.members.entry_id, st.members.seg)
+            }
+
+    def _template_res_tensors_for(
+        self, t_row: int, target_T: int, augment: bool
+    ) -> Dict[str, torch.Tensor]:
+        """Serve template domain backbone coords, mask, sequence (with 25% i.i.d. masking), and un-renumbered residue_idx from UnitStore."""
+        if self._unit_store is None or self._member_meta is None:
+            return super()._template_res_tensors_for(t_row, target_T=target_T, augment=augment)
+
+        cap_res = max(target_T * self.chunk_size, 1)
+        row_id = str(self._index["ids"][t_row]) if t_row < len(self._index["ids"]) else ""
+        meta = self._member_meta.get(row_id)
+        if meta is None:
+            return super()._template_res_tensors_for(t_row, target_T=target_T, augment=augment)
+
+        entry_id, seg = meta
+        pos = seg_positions(seg)
+        e = self._unit_store.entry(entry_id)
+        full = torch.from_numpy(np.array(e["coords"][pos])).float()
+        amask = torch.from_numpy(np.array(e["mask"][pos])).bool()
+        aatype = torch.from_numpy(np.array(e["aatype"][pos])).long().clamp(0, 20)
+        resnum = torch.from_numpy(np.array(e["resnum"][pos])).long()
+        res_idx = (resnum - resnum[0]) if resnum.numel() > 0 else torch.zeros(0, dtype=torch.long)
+
+        x4 = full[:cap_res, list(MPNN_ATOM4_INDICES), :]
+        m4 = amask[:cap_res, list(MPNN_ATOM4_INDICES)].all(dim=-1).float()
+        aatype = aatype[:cap_res]
+        res_idx = res_idx[:cap_res]
+
+        if x4.shape[0] == 0:
+            x4 = torch.zeros((cap_res, 4, 3), dtype=torch.float32)
+            m4 = torch.zeros((cap_res,), dtype=torch.float32)
+            aatype = torch.full((cap_res,), TEMPLATE_SEQ_MASK_TOKEN, dtype=torch.long)
+            res_idx = torch.arange(cap_res, dtype=torch.long)
+        elif augment and self.template_seq_mask_prob > 0.0 and aatype.numel() > 0:
+            seq_masked = torch.rand(aatype.shape, generator=self._generator) < self.template_seq_mask_prob
+            aatype = torch.where(
+                seq_masked,
+                torch.full_like(aatype, TEMPLATE_SEQ_MASK_TOKEN),
+                aatype,
+            )
+
+        return {
+            "template_backbone_coords": x4,
+            "template_backbone_mask": m4,
+            "template_aatype": aatype,
+            "template_residue_idx": res_idx,
+        }
+
+    def _resolve_row_reference_inputs(self, t_row: int):
+        """In mpnn_chunk9 mode, either read precomputed chunk9 rows from the index or build them on the fly from UnitStore."""
+        idx = self._index
+        if self.reference_mode == "mpnn_chunk9":
+            idx_dssp = str(idx.get("dssp_def", ""))
+            built_elems = tuple(int(t) for t in idx.get("element_types", ()))
+            if idx_dssp == "mpnn_chunk9" and sorted(built_elems) == sorted(self.element_types):
+                a, b = int(idx["ca_offset"][t_row]), int(idx["ca_offset"][t_row + 1])
+                L_t = max(b - a, 0)
+                elem_chunk = torch.arange(L_t, dtype=torch.long) // self.chunk_size
+                return self._runs_for(t_row), self._he_contact_for(t_row), self._he_structural_for(t_row, int(idx["he_size"][t_row])), None, elem_chunk
+
+            if self._unit_store is not None and self._member_meta is not None:
+                row_id = str(idx["ids"][t_row])
+                entry_id, seg = self._member_meta[row_id]
+                pos = seg_positions(seg)
+                e = self._unit_store.entry(entry_id)
+                full = torch.from_numpy(np.array(e["coords"][pos])).float()
+                amask = torch.from_numpy(np.array(e["mask"][pos])).float()
+                cm_t = torch.from_numpy(self._unit_store.contact_map(entry_id)[np.ix_(pos, pos)]).float()
+                L_t = int(full.shape[0])
+                runs = chunk9_runs(L_t, chunk_size=self.chunk_size)
+                he_contact, keep = sse_contact_reference(cm_t, runs, keep_types=(DSSP_HELIX,))
+                structural = sse_structural_pair_features(cm_t, full, amask, runs, keep)
+                elem_chunk = torch.arange(L_t, dtype=torch.long) // self.chunk_size
+                return runs, he_contact, structural, None, elem_chunk
+
+        return super()._resolve_row_reference_inputs(t_row)
+
+    def _has_valid_template_row(self, t_row: int) -> bool:
+        if t_row < 0:
+            return False
+        if self.reference_mode == "mpnn_chunk9" and self._member_meta is not None:
+            row_id = str(self._index["ids"][t_row]) if t_row < len(self._index["ids"]) else ""
+            return row_id in self._member_meta
+        return bool(self._runs_for(t_row))
 
     def _pick_cat_template(self, row: int) -> int:
         """Uniform draw over the members of row's (CAT, split) pool that belong to another entry; -1 when none."""
@@ -107,19 +236,28 @@ class CATPairReferenceTransform(TopologyReferenceTransform):
             return None
         if seed is not None:
             saved, self._generator = self._generator, torch.Generator().manual_seed((seed + row) % (2**63))
-        t_row = self._pick_cat_template(row)
-        if seed is not None:
-            self._generator = saved
-        if t_row < 0 or not self._runs_for(t_row):
+        try:
+            t_row = self._pick_cat_template(row)
+        finally:
+            if seed is not None:
+                self._generator = saved
+        if not self._has_valid_template_row(t_row):
             return None
         return self._build_reference(t_row, length, augment=False), str(self._index["ids"][t_row])
 
     def _cat_align(self, graph: Data, t_row: int, n_he: int) -> torch.Tensor:
-        """Per-query-residue element index of the template (before the helix/strand cap), ALIGN_NONE where unaligned."""
+        """Per-query-residue element index of the template (before the helix/strand or chunk9 cap), ALIGN_NONE where unaligned."""
         idx = self._index
         L = int(graph.coords.shape[0])
         a, b = int(idx["ca_offset"][t_row]), int(idx["ca_offset"][t_row + 1])
-        t_ca, t_elem = idx["ca_flat"][a:b].numpy(), idx["elem_flat"][a:b].numpy()
+        t_ca = idx["ca_flat"][a:b].numpy()
+        new_elem = getattr(self, "_last_new_elem_of_res", None)
+        if new_elem is not None and int(new_elem.numel()) == (b - a):
+            t_elem = new_elem.numpy()
+        elif self.reference_mode == "mpnn_chunk9":
+            t_elem = np.arange(b - a, dtype=np.int64) // self.chunk_size
+        else:
+            t_elem = idx["elem_flat"][a:b].numpy()
         q_ca = graph.coords[:, CA_IDX].numpy()
         q_present = graph.coord_mask[:, CA_IDX].numpy().astype(bool)
         align = np.full((L,), ALIGN_NONE, dtype=np.int64)
@@ -146,7 +284,7 @@ class CATPairReferenceTransform(TopologyReferenceTransform):
         drop = float(torch.rand(1, generator=self._generator)) < self.drop_prob
         # resolved BEFORE the drop is honoured, as in synthetic mode: topology_missing_ref then reports coverage, not coverage after dropout
         t_row = self._pick_cat_template(row) if row is not None else -1
-        missing = t_row < 0 or not self._runs_for(t_row)
+        missing = not self._has_valid_template_row(t_row)
         if row is None or drop or missing:
             graph.topology_ref_id = MASK_REF_ID
             graph = self._set_empty(graph, L=L, missing=missing, stem=stem) if missing else self._set_empty(graph, L=L)

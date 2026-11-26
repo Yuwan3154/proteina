@@ -1,0 +1,58 @@
+# CAT-topology regime dataset (T2 CATH v4.4 + TED units + synthetic templates) paired with
+# fixed 9-residue ProteinMPNN chunk topology featurization (reference_mode: mpnn_chunk9),
+# template sequence input with 25% i.i.d. residue masking (coordinate features unmasked),
+# 10% chunk token masking without MLM loss, and tmalign_smooth DSSP targets.
+# Serves template backbone coordinates, sequences, and chunk9 coarse features directly from
+# CAT_STORE_DIR (UnitStore + cat_pair_index.pt) with zero index rebuild required.
+datamodule:
+  _target_: "proteinfoundation.datasets.cat_pair_data.CATPairLightningDataModule"
+  prime_store: True
+  cath_draw_prob: 0.3
+  store_dir: ${oc.env:CAT_STORE_DIR}
+  batch_padding: True
+  epoch_batch_plan: True
+  epoch_batch_plan_len_edges: [64, 128, 192, 256, 320, 384, 448, 512]
+  cluster_sampler_seed: 0
+  cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/
+  multilabel_mode: "sample"
+  transforms:
+    - _target_: "proteinfoundation.datasets.transforms.GlobalRotationTransform"
+    - _target_: "proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform"
+    - _target_: "proteinfoundation.datasets.transforms.CATHToIndicesTransform"
+      cath_code_dir: ${oc.env:DATA_PATH}/cath_shared/
+    - _target_: "proteinfoundation.datasets.transforms.DSSPTargetTransform"
+      dssp_def: tmalign_smooth
+      overwrite: True
+    - _target_: "proteinfoundation.datasets.transforms.ContactMapTransform"
+      contact_method: confind
+      confind_rotamer_lib: ${oc.env:DATA_PATH}/rotlibs
+      confind_contact_threshold: 0.01
+    - _target_: "proteinfoundation.datasets.transforms.SequenceDropoutTransform"
+      prob: 0.25
+    - _target_: "proteinfoundation.datasets.cat_pair_data.CATPairReferenceTransform"
+      index_path: ${oc.env:CAT_INDEX_PATH,${oc.env:CAT_STORE_DIR}/cat_pair_index.pt}
+      store_dir: ${oc.env:CAT_STORE_DIR}
+      usalign: ${oc.env:USALIGN_BIN}
+      index_mmap: False
+      exclude_own_synthetic: False
+      reference_mode: mpnn_chunk9
+      chunk_size: 9
+      dssp_def: tmalign_smooth
+      template_seq_mask_prob: 0.25
+      stats_override_path: ${oc.env:MPNN_CHUNK9_STATS_PATH,null}
+      sse_types: [1, 2]
+      element_types: [1]
+      elem_features: True
+      max_topology_len: 128
+      max_topology_he_len: 64
+      sigma_frac: 0.0
+      mutate_prob: 0.0
+      type_mutate_prob: 0.0
+      token_mask_prob: 0.1
+      drop_prob: 0.25
+      drop_ref_len_range: [5, 57]
+      min_len: 1
+  batch_size: 1
+  num_workers: 8
+  pin_memory: True
+  prefetch_factor: 2

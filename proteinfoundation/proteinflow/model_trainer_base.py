@@ -196,8 +196,6 @@ class ModelTrainerBase(L.LightningModule):
             for name, param in self.named_parameters():
                 if name.startswith("nn_sc."):
                     param.requires_grad = False
-                else:
-                    param.requires_grad = True
             trainable_params = [p for p in self.parameters() if p.requires_grad]
             optimizer = self._create_optimizer(trainable_params, optimizer_type)
         
@@ -2788,14 +2786,23 @@ class ModelTrainerBase(L.LightningModule):
     )
 
     def _topology_keys(self) -> Tuple[str, ...]:
-        """TOPOLOGY_KEYS, plus the per-element feature key when the nn consumes one (T8: n_elem_features).
+        """TOPOLOGY_KEYS, plus the per-element feature key when the nn consumes one (T8: n_elem_features),
+        and template residue keys when reference_mode == 'mpnn_chunk9'.
 
         Only then: every reference builder emits that key only when its transform has elem_features on, and the old
         arms' batches must keep exactly the key set they always had.
         """
+        keys = self.TOPOLOGY_KEYS
         if self.cfg_exp.model.nn.get("n_elem_features", None):
-            return self.TOPOLOGY_KEYS + ("topology_he_elem_feat",)
-        return self.TOPOLOGY_KEYS
+            keys = keys + ("topology_he_elem_feat",)
+        if self.cfg_exp.model.nn.get("reference_mode", "sse") == "mpnn_chunk9":
+            keys = keys + (
+                "template_backbone_coords",
+                "template_backbone_mask",
+                "template_aatype",
+                "template_residue_idx",
+            )
+        return keys
 
     def _find_topology_transform(self) -> Optional[TopologyReferenceTransform]:
         """The TopologyReferenceTransform in the datamodule's transform pipeline, or None."""
@@ -2809,17 +2816,24 @@ class ModelTrainerBase(L.LightningModule):
         return None
 
     @staticmethod
-    def _stack_topology(values: List[Tensor]) -> Tensor:
+    def _stack_topology(values: List[Tensor], key: str = "") -> Tensor:
         """Pad a per-sample list to the batch maximum on every axis and stack.
 
         Uses the dense collate's padding values so the model's ``tokens > 0`` validity test means
         exactly the same thing for a reference built here as for one that came off the dataloader.
         """
-        pad_v = (
-            FLOAT_PADDING_VALUE
-            if torch.is_floating_point(values[0])
-            else NON_FLOAT_PADDING_VALUE
-        )
+        if key == "template_backbone_mask":
+            pad_v = 0.0
+        elif key == "template_aatype":
+            pad_v = 20
+        elif key == "template_residue_idx":
+            pad_v = 0
+        else:
+            pad_v = (
+                FLOAT_PADDING_VALUE
+                if torch.is_floating_point(values[0])
+                else NON_FLOAT_PADDING_VALUE
+            )
         sizes = [max(v.shape[d] for v in values) for d in range(values[0].dim())]
         out = []
         for v in values:
@@ -2906,9 +2920,11 @@ class ModelTrainerBase(L.LightningModule):
             # ⭐ mask arm under THIS model's own no-reference convention (variable-length, fully
             # masked; see TopologyReferenceTransform.masked_reference). Opt-in; default off.
             if self.cfg_exp.validation_sampling.get("topology_masked", False):
+                q_seqres = batch.get("residue_seqres_idx")
                 ref = transform.masked_reference(
                     stem, int(mask[s].sum()),
                     seed=int(self.cfg_exp.validation_sampling.get("topology_nonself_seed", 0)),
+                    seqres_idx=None if q_seqres is None else q_seqres[s].to(mask.device)[mask[s].bool()].cpu(),
                 )
                 logger.info(f"validation_sampling[masked]: {stem} L={int(mask[s].sum())} "
                             f"n_el={int(ref['topology_he_tokens'].numel())}")
@@ -2965,13 +2981,15 @@ class ModelTrainerBase(L.LightningModule):
         if "topology_he_tokens" in blank:
             blank["topology_he_tokens"] = torch.full_like(present["topology_he_tokens"],
                                                           TOPOLOGY_MASK_TOKEN)
+        if "template_aatype" in blank:
+            blank["template_aatype"] = torch.full_like(present["template_aatype"], 21)
         n_blank = sum(1 for r in refs if r is None)
         if n_blank:
             logger.warning(f"validation_sampling: {n_blank} of {len(refs)} chains sample "
                            "unconditioned (masked reference); the others are conditioned.")
         refs = [r if r is not None else blank for r in refs]
         return {
-            k: self._stack_topology([r[k] for r in refs]).to(self.device)
+            k: self._stack_topology([r[k] for r in refs], key=k).to(self.device)
             for k in self._topology_keys()
         }
 
@@ -3110,8 +3128,11 @@ class ModelTrainerBase(L.LightningModule):
                 he_pos_raw = batch.get("topology_he_pos_raw")
                 pb = []
                 if he_pos_raw is not None:
-                    q_idx = torch.arange(L, device=a_logits.device, dtype=torch.float32)
-                    pos_score = -(q_idx[None, :, None] - he_pos_raw[:, None, :T].float()).abs()
+                    if getattr(self.nn, "query_pos", "index") == "seqres":  # T8b: the positions the model reads
+                        q_idx = batch["residue_seqres_idx"][:, :L].float()
+                    else:
+                        q_idx = torch.arange(L, device=a_logits.device, dtype=torch.float32)[None]
+                    pos_score = -(q_idx[:, :, None] - he_pos_raw[:, None, :T].float()).abs()
                     pos_score = pos_score.masked_fill(~qt_valid, float("-inf")).reshape(B, -1)
                     for b in range(B):
                         qb = int(Q[b])
@@ -3351,6 +3372,7 @@ class ModelTrainerBase(L.LightningModule):
                 transform=dm.transform,
                 format=dm.format,
                 in_memory=False,
+                pack_path=getattr(dm, "pack_path", None),
                 file_names=stems,
                 num_workers=0,
             )
@@ -3518,6 +3540,10 @@ class ModelTrainerBase(L.LightningModule):
         # Inputs stay padded to max length (fixed shapes for compile); only ``mask`` is set so
         # positions [L:] are invalid (False), matching the sampled sequence length L.
         min_l, max_l = self._resolve_validation_length_bounds(val_sampling_cfg)
+        # T8b validation sampling (a): the chains' modelled residues at their SEQRES positions
+        residue_positions = batch.get("residue_seqres_idx")
+        if residue_positions is not None:
+            residue_positions = residue_positions[:nsamples].to(self.device)
         if topology is not None:
             # A self-reference describes THIS chain at ITS length: its element positions were
             # rescaled onto mask.sum(), and the GT structure and contact map it is scored against
@@ -3537,6 +3563,7 @@ class ModelTrainerBase(L.LightningModule):
                 )
             mask = torch.zeros(nsamples, n_pad, dtype=torch.bool, device=self.device)
             mask[:, :L] = True
+            residue_positions = None  # a redrawn length has no SEQRES positions; a seqres model raises
             # n, residue_type, cath_*, motif tensors unchanged — full padded width for static shapes
             logger.info(
                 f"validation_sampling: variable length L={L} (bounds [{min_l}, {max_l}]), "
@@ -3600,6 +3627,7 @@ class ModelTrainerBase(L.LightningModule):
                 # Keep val trajectory's pos-emb behavior consistent with training:
                 # if training zeros sinusoidal pos embs, val must too (and vice versa).
                 zero_sin_pos_emb=bool(self.cfg_exp.training.get("zero_sin_pos_emb", False)),
+                residue_positions=residue_positions,
             )
         finally:
             if prev_sampling_grid is not None:
@@ -3809,6 +3837,8 @@ class ModelTrainerBase(L.LightningModule):
         ref_id = str(ref_ids[s]) if s < len(ref_ids) else None
         path = os.path.join(dump_dir, f"{stem}_s{k:02d}.npz")
         extra = {}
+        if batch.get("residue_seqres_idx") is not None:  # T8b: the positions the sample was generated at
+            extra["residue_seqres_idx"] = batch["residue_seqres_idx"][s, :L].detach().cpu().numpy()
         rec = getattr(self, "_align_calls", None)
         if rec is not None and rec["first"] is not None:
             topo = self._align_topology
@@ -4217,6 +4247,7 @@ class ModelTrainerBase(L.LightningModule):
         trajectory_stride: int = 1,
         verbose: bool = False,
         zero_sin_pos_emb: bool = False,
+        residue_positions: Optional[Tensor] = None,
     ) -> Dict[str, Tensor]:
         """
         Generates samples by integrating ODE with learned vector field.
@@ -4226,6 +4257,8 @@ class ModelTrainerBase(L.LightningModule):
                 every step's ``nn_in``. Drawn once by the caller and held fixed for the whole
                 trajectory -- a reference that changed between steps would be a different
                 conditioning signal at each step of one sample.
+            residue_positions: [nsamples, n] per-residue positions (T8b: rebased SEQRES index), forwarded as
+                ``residue_seqres_idx`` into every step's ``nn_in`` with the topology tensors.
             zero_sin_pos_emb: when True, set ``nn_in["_zero_idx_emb"] = True`` so
                 ``SeqPosEmbFeature`` zeros out the sinusoidal positional embedding
                 at every trajectory step. Must match the training-time setting
@@ -4251,6 +4284,8 @@ class ModelTrainerBase(L.LightningModule):
         )
         if mask is None:
             mask = torch.ones(nsamples, n).long().bool().to(self.device)
+        if residue_positions is not None:
+            topology = {**(topology or {}), "residue_seqres_idx": residue_positions}
 
         contact_map_mode = getattr(self, "contact_map_mode", False)
         discrete_enabled = contact_map_mode and self._discrete_diffusion_enabled()

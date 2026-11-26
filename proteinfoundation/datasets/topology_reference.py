@@ -19,16 +19,20 @@ non-self reference regardless of cluster size; a chain that still has none falls
 unconditional MASK reference and says so loudly (topology_missing_ref = 1 + a warning).
 """
 
+import io
+import mmap
 import os
 import zlib
 from typing import Dict, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 import torch_geometric.transforms as T
 from loguru import logger
 from torch_geometric.data import Data
 
 from proteinfoundation.datasets.sse_topology import (
+    DSSP_GAP,
     DSSP_HELIX,
     DSSP_LOOP,
     DSSP_STRAND,
@@ -39,11 +43,24 @@ from proteinfoundation.datasets.sse_topology import (
     STRUCTURAL_PAIR_FEATURES,
     SSEAlphabet,
     circuit_topology_features,
+    dssp_to_runs,
     element_lengths,
     element_positions,
     perturb_runs,
+    runs_to_spans,
     sse_sequence_gap,
 )
+from proteinfoundation.nn.mpnn_topology_encoder import (
+    MPNN_ATOM4_INDICES,
+    TEMPLATE_SEQ_MASK_TOKEN,
+    TEMPLATE_SEQ_PAD_TOKEN,
+)
+try:
+    from proteinfoundation.datasets.transforms import SeqresIndexError
+except ImportError:
+    class SeqresIndexError(KeyError):
+        pass
+from proteinfoundation.utils.dssp_utils import compute_tmalign_dssp, smooth_tmalign_dssp
 
 # Sentinel written to graph.topology_ref_id when the sample is unconditioned (dropped, no index
 # row, or -- under require_nonself -- no non-self template available). Downstream, a sample is
@@ -88,6 +105,9 @@ class TopologyReferenceTransform(T.BaseTransform):
         single_token_types: alphabet types with one token regardless of length (T8: loops).
         elem_features: emit ``topology_he_elem_feat`` [T, 1] = element length, standardised by the index's
             ``elem_feature_mean`` / ``elem_feature_std`` (T8, user 2026-10-09: "Add a per-element length feature").
+        placeholder_span: span the dropped / masked reference's midpoints are spread over. "length" = the query's
+            modelled length L (T8); "seqres" = the query's SEQRES span last - first + 1, from
+            ``graph.residue_seqres_idx`` (T8b, user 2026-10-20; needs SeqresIndexTransform before this one).
     """
 
     def __init__(
@@ -115,9 +135,37 @@ class TopologyReferenceTransform(T.BaseTransform):
         single_token_types: Sequence[int] = (),
         elem_features: bool = False,
         index_mmap: bool = True,
+        placeholder_span: str = "length",
+        reference_mode: str = "sse",
+        chunk_size: int = 9,
+        dssp_def: str = "tmalign_smooth",
+        template_seq_mask_prob: float = 0.25,
+        template_pool_dir: Optional[str] = None,
+        chain_alias_path: Optional[str] = None,
+        native_pack_path: Optional[str] = None,
+        stats_override_path: Optional[str] = None,
     ):
         if reference_source not in ("cluster", "synthetic"):
             raise ValueError(f"reference_source must be 'cluster' or 'synthetic', got {reference_source!r}")
+        if reference_mode not in ("sse", "mpnn_chunk9"):
+            raise ValueError(f"reference_mode must be 'sse' or 'mpnn_chunk9', got {reference_mode!r}")
+        if dssp_def not in ("h_bond", "tmalign", "tmalign_smooth"):
+            raise ValueError(f"dssp_def must be 'h_bond', 'tmalign', or 'tmalign_smooth', got {dssp_def!r}")
+        if not 0.0 <= float(template_seq_mask_prob) <= 1.0:
+            raise ValueError(f"template_seq_mask_prob must be in [0, 1], got {template_seq_mask_prob}")
+        self.reference_mode = reference_mode
+        self.chunk_size = int(chunk_size)
+        self.dssp_def = dssp_def
+        self.template_seq_mask_prob = float(template_seq_mask_prob)
+        self.template_pool_dir = template_pool_dir
+        self.chain_alias_path = chain_alias_path
+        self.native_pack_path = native_pack_path
+        self.stats_override_path = stats_override_path
+        self._allow_element_type_mismatch = False
+        self._alias_map = None
+        self._pack_idx = None
+        self._pack_mm = None
+        self._pack_fh = None
         self.index_path = index_path
         self.max_topology_len = max_topology_len
         self.max_topology_he_len = max_topology_he_len
@@ -148,6 +196,9 @@ class TopologyReferenceTransform(T.BaseTransform):
         if not set(self.element_types) <= set(self.alphabet.types):
             raise ValueError(f"element_types {self.element_types} must all be tokenised by the alphabet {self.alphabet.types}")
         self.elem_features = bool(elem_features)
+        if placeholder_span not in ("length", "seqres"):
+            raise ValueError(f"placeholder_span must be 'length' or 'seqres', got {placeholder_span!r}")
+        self.placeholder_span = placeholder_span
         self._elem_mean, self._elem_std = 0.0, 1.0
         self.seed = seed
         self.index_mmap = bool(index_mmap)  # False: the index is read into RAM (a datamodule that preloads it in the parent shares it with forked workers)
@@ -173,7 +224,7 @@ class TopologyReferenceTransform(T.BaseTransform):
         index = torch.load(self.index_path, map_location="cpu", weights_only=False, mmap=self.index_mmap)
         # validated BEFORE it is kept: a failed check must not leave a half-initialised transform behind
         built = tuple(int(t) for t in index.get("element_types", (DSSP_HELIX, DSSP_STRAND)))
-        if sorted(built) != sorted(self.element_types):
+        if sorted(built) != sorted(self.element_types) and not self._allow_element_type_mismatch:
             raise ValueError(f"{self.index_path} was built with element_types {built}, the transform asks for "
                              f"{self.element_types}; the stored element contacts / features / alignment targets would not line up")
         if self.elem_features:
@@ -207,6 +258,135 @@ class TopologyReferenceTransform(T.BaseTransform):
             # the identity. The other modes need a rebuilt index to be meaningful.
             self._feat_mean = torch.zeros(N_PAIR_FEATURES)
             self._feat_std = torch.ones(N_PAIR_FEATURES)
+        if self.stats_override_path and os.path.exists(self.stats_override_path):
+            import json as _json
+            meta = (
+                _json.load(open(self.stats_override_path))
+                if self.stats_override_path.endswith(".json")
+                else torch.load(self.stats_override_path, map_location="cpu", weights_only=False, mmap=True)
+            )
+            self._feat_mean = torch.as_tensor(meta["pair_feature_mean"], dtype=torch.float32)
+            self._feat_std = torch.as_tensor(meta["pair_feature_std"], dtype=torch.float32).clamp(min=1e-6)
+            if self.elem_features and "elem_feature_mean" in meta:
+                self._elem_mean = float(meta["elem_feature_mean"])
+                self._elem_std = max(float(meta["elem_feature_std"]), 1e-6)
+        if self.chain_alias_path and self._alias_map is None and os.path.exists(self.chain_alias_path):
+            alias = {}
+            with open(self.chain_alias_path) as fh:
+                head = fh.readline().rstrip("\n").split("\t")
+                il = head.index("label_id")
+                ia = head.index("auth_id")
+                for line in fh:
+                    f = line.rstrip("\n").split("\t")
+                    if len(f) > max(il, ia) and f[ia]:
+                        alias[f[il]] = f[ia]
+            self._alias_map = alias
+        if (
+            self.native_pack_path
+            and self._pack_idx is None
+            and os.path.exists(self.native_pack_path)
+            and os.path.exists(self.native_pack_path + ".idx.npz")
+        ):
+            z = np.load(self.native_pack_path + ".idx.npz", allow_pickle=True)
+            self._pack_idx = {
+                str(s): (int(o), int(l)) for s, o, l in zip(z["stems"], z["offsets"], z["lengths"])
+            }
+            self._pack_fh = open(self.native_pack_path, "rb")
+            self._pack_mm = mmap.mmap(self._pack_fh.fileno(), 0, access=mmap.ACCESS_READ)
+
+    def _template_res_tensors_for(
+        self, t_row: int, target_T: int, augment: bool
+    ) -> Dict[str, torch.Tensor]:
+        """Return template residue-level tensors (coords, mask, aatype, residue_idx) for mpnn_chunk9 mode."""
+        idx = self._index
+        cap_res = max(target_T * self.chunk_size, 1)
+        x4 = None
+        m4 = None
+        aatype = None
+        res_idx = None
+
+        if "tmpl_atom4_flat" in idx and "tmpl_res_offset" in idx:
+            a, b = int(idx["tmpl_res_offset"][t_row]), int(idx["tmpl_res_offset"][t_row + 1])
+            if b > a:
+                x4 = idx["tmpl_atom4_flat"][a:b].float().clone()
+                m4 = idx["tmpl_mask_flat"][a:b].float().clone()
+                aatype = idx["tmpl_aatype_flat"][a:b].long().clone()
+                if "tmpl_res_idx_flat" in idx:
+                    res_idx = idx["tmpl_res_idx_flat"][a:b].long().clone()
+                else:
+                    res_idx = torch.arange(b - a, dtype=torch.long)
+
+        if x4 is None:
+            row_id = str(idx["ids"][t_row]) if t_row < len(idx["ids"]) else ""
+            if "@" in row_id and "#" in row_id and self.template_pool_dir:
+                stem, rest = row_id.split("@", 1)
+                k = int(rest.split("#", 1)[1])
+                auth_stem = self._alias_map.get(stem, stem) if self._alias_map is not None else stem
+                npz_path = os.path.join(
+                    self.template_pool_dir,
+                    f"shard{zlib.crc32(auth_stem.encode()) % 1000:04d}",
+                    f"{auth_stem}.npz",
+                )
+                if os.path.exists(npz_path):
+                    z = np.load(npz_path)
+                    amask = torch.from_numpy(z["atom_mask"].astype(bool))
+                    L_t = int(amask.shape[0])
+                    full = torch.zeros(L_t, 37, 3, dtype=torch.float32)
+                    full[amask] = torch.from_numpy(z["coords"][k]).float()
+                    x4 = full[:, list(MPNN_ATOM4_INDICES), :]
+                    m4 = amask[:, list(MPNN_ATOM4_INDICES)].all(dim=-1).float()
+                    if "aatype" in z:
+                        aatype = torch.from_numpy(np.asarray(z["aatype"], dtype=np.int64)).clamp(0, 20)
+                    else:
+                        aatype = torch.full((L_t,), TEMPLATE_SEQ_PAD_TOKEN, dtype=torch.long)
+                    if "residue_index" in z:
+                        r_idx = torch.from_numpy(np.asarray(z["residue_index"], dtype=np.int64))
+                        res_idx = r_idx - r_idx[0] if r_idx.numel() > 0 else torch.zeros(0, dtype=torch.long)
+                    else:
+                        res_idx = torch.arange(L_t, dtype=torch.long)
+            elif self._pack_idx is not None and row_id in self._pack_idx:
+                off, ln = self._pack_idx[row_id]
+                g = torch.load(io.BytesIO(self._pack_mm[off : off + ln]), map_location="cpu", weights_only=False)
+                coords = getattr(g, "coords", None)
+                cmask = getattr(g, "coord_mask", None)
+                if coords is not None and cmask is not None:
+                    L_t = int(coords.shape[0])
+                    # Native pack stores ATOM_NUMBERING order where N=0, CA=1, C=2, O=3
+                    x4 = coords[:, [0, 1, 2, 3], :].float().clone()
+                    m4 = (cmask[:, [0, 1, 2, 3]].float() > 0.5).all(dim=-1).float()
+                    rt = getattr(g, "residue_type", None)
+                    if rt is not None:
+                        aatype = torch.as_tensor(rt, dtype=torch.long).clamp(0, 20).clone()
+                    else:
+                        aatype = torch.full((L_t,), TEMPLATE_SEQ_PAD_TOKEN, dtype=torch.long)
+                    res_idx = torch.arange(L_t, dtype=torch.long)
+
+        if x4 is None or x4.shape[0] == 0:
+            x4 = torch.zeros((cap_res, 4, 3), dtype=torch.float32)
+            m4 = torch.zeros((cap_res,), dtype=torch.float32)
+            aatype = torch.full((cap_res,), TEMPLATE_SEQ_MASK_TOKEN, dtype=torch.long)
+            res_idx = torch.arange(cap_res, dtype=torch.long)
+        else:
+            x4 = x4[:cap_res]
+            m4 = m4[:cap_res]
+            aatype = aatype[:cap_res]
+            res_idx = res_idx[:cap_res]
+            # 25% i.i.d. per-residue template sequence identity masking during training;
+            # coordinate features (x4, m4) are never masked (user directive 2026-11-07).
+            if augment and self.template_seq_mask_prob > 0.0 and aatype.numel() > 0:
+                seq_masked = torch.rand(aatype.shape, generator=self._generator) < self.template_seq_mask_prob
+                aatype = torch.where(
+                    seq_masked,
+                    torch.full_like(aatype, TEMPLATE_SEQ_MASK_TOKEN),
+                    aatype,
+                )
+
+        return {
+            "template_backbone_coords": x4,
+            "template_backbone_mask": m4,
+            "template_aatype": aatype,
+            "template_residue_idx": res_idx,
+        }
 
     def _runs_for(self, row: int):
         idx = self._index
@@ -287,7 +467,142 @@ class TopologyReferenceTransform(T.BaseTransform):
         j = int(torch.randint(cand.numel(), (1,), generator=self._generator))
         return int(cand[j])
 
-    def _align_for(self, t_row: int, length: int, n_he: int) -> torch.Tensor:
+    @staticmethod
+    def _runs_to_dssp(runs) -> torch.Tensor:
+        if not runs:
+            return torch.zeros(0, dtype=torch.long)
+        parts = [torch.full((int(n),), int(t), dtype=torch.long) for t, n in runs if int(n) > 0]
+        return torch.cat(parts, dim=0) if parts else torch.zeros(0, dtype=torch.long)
+
+    def _project_runs_and_features(
+        self,
+        old_runs,
+        dssp_new: torch.Tensor,
+        he_contact: torch.Tensor,
+        structural: torch.Tensor,
+    ):
+        """Project stored element-level (he_contact, structural) from ``old_runs`` onto ``dssp_new`` runs.
+
+        Returns ``(new_runs, new_contact, new_structural, old_to_new_elem, new_elem_of_res)``.
+        When ``dssp_new`` yields identical runs to ``old_runs``, returns all inputs unchanged in O(1).
+        """
+        new_runs = dssp_to_runs(dssp_new, min_len=self.alphabet.min_len)
+        old_keep = [i for i, (t, _) in enumerate(old_runs) if t in self.element_types]
+        new_keep = [i for i, (t, _) in enumerate(new_runs) if t in self.element_types]
+        T_old, T_new = len(old_keep), len(new_keep)
+        L_t = int(dssp_new.numel())
+
+        new_spans = runs_to_spans(new_runs)
+        new_elem_of_res = torch.full((L_t,), ALIGN_NONE, dtype=torch.long)
+        for a, ia in enumerate(new_keep):
+            s, e = new_spans[ia]
+            new_elem_of_res[s:e] = a
+
+        if new_runs == old_runs:
+            return old_runs, he_contact, structural, torch.arange(T_old, dtype=torch.long), new_elem_of_res
+
+        old_spans = runs_to_spans(old_runs)
+        old_elem_of_res = torch.full((L_t,), ALIGN_NONE, dtype=torch.long)
+        old_type_of_elem = []
+        for e_old, ia in enumerate(old_keep):
+            s, e = old_spans[ia]
+            old_elem_of_res[s:e] = e_old
+            old_type_of_elem.append(int(old_runs[ia][0]))
+
+        old_to_new_elem = torch.full((T_old,), ALIGN_NONE, dtype=torch.long)
+        for e_old, ia in enumerate(old_keep):
+            s, e = old_spans[ia]
+            sub_new = new_elem_of_res[s:e]
+            valid = sub_new[sub_new >= 0]
+            if valid.numel() > 0:
+                vals, counts = torch.unique(valid, return_counts=True)
+                best_new = int(vals[torch.argmax(counts)].item())
+                if int(new_runs[new_keep[best_new]][0]) == old_type_of_elem[e_old]:
+                    old_to_new_elem[e_old] = best_new
+
+        n_struct = len(STRUCTURAL_PAIR_FEATURES)
+        if T_new == 0 or T_old == 0 or he_contact.numel() == 0:
+            return (
+                new_runs,
+                torch.zeros(T_new, T_new, dtype=torch.float32),
+                torch.zeros(T_new, T_new, n_struct, dtype=torch.float32),
+                old_to_new_elem,
+                new_elem_of_res,
+            )
+
+        W = torch.zeros(T_new, T_old, dtype=torch.float32)
+        for a, ia in enumerate(new_keep):
+            s, e = new_spans[ia]
+            t_a = int(new_runs[ia][0])
+            sub_old = old_elem_of_res[s:e]
+            for e_old in torch.unique(sub_old[sub_old >= 0]).tolist():
+                if old_type_of_elem[e_old] == t_a:
+                    W[a, e_old] = float((sub_old == e_old).sum().item())
+            if W[a].sum() == 0:
+                for e_old in torch.unique(sub_old[sub_old >= 0]).tolist():
+                    W[a, e_old] = float((sub_old == e_old).sum().item())
+
+        row_sum = W.sum(dim=-1, keepdim=True)
+        has_overlap = (row_sum.squeeze(-1) > 0)
+        W_norm = W / row_sum.clamp(min=1.0)
+        M = (W > 0).float()
+
+        new_contact = ((M @ he_contact.float() @ M.T) > 0).float()
+        new_structural = torch.einsum("ai,ijk,bj->abk", W_norm, structural.float(), W_norm)
+
+        diag_idx = torch.arange(T_new)
+        diag_he = torch.tensor(
+            [int(new_runs[ia][0]) in (DSSP_HELIX, DSSP_STRAND) for ia in new_keep],
+            dtype=torch.bool,
+        ) & has_overlap
+        if float(he_contact.diagonal().max().item()) > 0.5:
+            new_contact[diag_idx[has_overlap], diag_idx[has_overlap]] = 1.0
+        if n_struct >= 2:
+            new_structural[diag_idx, diag_idx, 0] = 0.0
+            new_structural[diag_idx[diag_he], diag_idx[diag_he], 1] = 1.0
+
+        return new_runs, new_contact, new_structural, old_to_new_elem, new_elem_of_res
+
+    def _resolve_row_reference_inputs(self, t_row: int):
+        """Return ``(runs, he_contact, structural, old_to_new_elem, new_elem_of_res)`` for ``t_row``,
+        applying ``self.dssp_def`` when it differs from the index's stored DSSP definition."""
+        idx = self._index
+        runs = self._runs_for(t_row)
+        he_contact = self._he_contact_for(t_row)
+        structural = self._he_structural_for(t_row, he_contact.shape[0])
+        if not runs or self.reference_mode == "mpnn_chunk9" or self.dssp_def == "h_bond":
+            return runs, he_contact, structural, None, None
+        idx_dssp_def = str(idx.get("dssp_def", "h_bond"))
+        if idx_dssp_def == self.dssp_def:
+            return runs, he_contact, structural, None, None
+
+        if "ca_flat" in idx and "ca_offset" in idx:
+            ca_a, ca_b = int(idx["ca_offset"][t_row]), int(idx["ca_offset"][t_row + 1])
+            if ca_b > ca_a:
+                t_ca = idx["ca_flat"][ca_a:ca_b].float()
+                L_t = int(t_ca.shape[0])
+                dssp_new = compute_tmalign_dssp(
+                    t_ca[None],
+                    torch.ones(1, L_t, dtype=torch.bool),
+                    smooth=(self.dssp_def == "tmalign_smooth"),
+                )[0]
+                return self._project_runs_and_features(runs, dssp_new, he_contact, structural)
+
+        if self.dssp_def == "tmalign_smooth":
+            dssp_old = self._runs_to_dssp(runs)
+            if dssp_old.numel() > 0:
+                dssp_new = smooth_tmalign_dssp(dssp_old[None])[0]
+                return self._project_runs_and_features(runs, dssp_new, he_contact, structural)
+
+        return runs, he_contact, structural, None, None
+
+    def _align_for(
+        self,
+        t_row: int,
+        length: int,
+        n_he: int,
+        old_to_new_elem: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Per-query-residue reference element index (into the helix/strand axis, before the cap)
         or ALIGN_NONE, from the index's USalign ground truth. All-NONE when the index has none or
         the stored vector was built for a different chain length."""
@@ -303,6 +618,11 @@ class TopologyReferenceTransform(T.BaseTransform):
                 )
             return torch.full((length,), ALIGN_NONE, dtype=torch.long)
         align = idx["align_flat"][a:b].long()
+        if old_to_new_elem is not None and old_to_new_elem.numel() > 0:
+            valid = (align >= 0) & (align < old_to_new_elem.numel())
+            mapped = torch.full_like(align, ALIGN_NONE)
+            mapped[valid] = old_to_new_elem[align[valid]]
+            align = mapped
         # elements beyond the helix/strand cap were never shown to the model
         return torch.where(align < n_he, align, torch.full_like(align, ALIGN_NONE))
 
@@ -338,7 +658,7 @@ class TopologyReferenceTransform(T.BaseTransform):
             structural = torch.zeros(len(keep), len(keep), len(STRUCTURAL_PAIR_FEATURES))
 
         length_aug = self.mutate_prob > 0.0 and self.sigma_frac > 0.0
-        if augment and (length_aug or self.type_mutate_prob > 0.0):
+        if self.reference_mode == "sse" and augment and (length_aug or self.type_mutate_prob > 0.0):
             runs = perturb_runs(
                 runs,
                 self.sigma_frac,
@@ -382,13 +702,16 @@ class TopologyReferenceTransform(T.BaseTransform):
 
         # Token masking (BERT-style, token identity only; positions and pair features stay): the
         # pre-mask token is the target for the masked-token loss, 0 (= PAD) where not masked.
+        # In mpnn_chunk9 mode (user 2026-10-28, answer 3d), random chunk token masking is kept
+        # without MLM loss (he_target stays all 0).
         he_target = torch.zeros_like(he_tokens)
         if augment and self.token_mask_prob > 0.0 and he_tokens.numel():
             masked = torch.rand(he_tokens.shape, generator=self._generator) < self.token_mask_prob
-            if self.alphabet.single_token_types:  # T8 (user 2026-10-10): a one-token type (loop) is never an MLM target
+            if self.reference_mode == "sse" and self.alphabet.single_token_types:
                 single = torch.tensor([self.alphabet.token(t, 1) for t in self.alphabet.single_token_types])
                 masked = masked & ~torch.isin(he_tokens, single)
-            he_target = torch.where(masked, he_tokens, he_target)
+            if self.reference_mode == "sse":
+                he_target = torch.where(masked, he_tokens, he_target)
             he_tokens = torch.where(masked, torch.full_like(he_tokens, MASK_TOKEN), he_tokens)
             if self.elem_features:  # T8 (user 2026-10-10): hide a masked element's length, else it gives the length slot away
                 elem_feat = torch.where(masked[:, None], torch.zeros_like(elem_feat), elem_feat)
@@ -416,12 +739,14 @@ class TopologyReferenceTransform(T.BaseTransform):
 
     def _build_reference(self, t_row: int, length: int, augment: bool) -> Dict[str, torch.Tensor]:
         """``assemble_reference`` fed from index row ``t_row``."""
-        runs = self._runs_for(t_row)
-        he_contact = self._he_contact_for(t_row)
-        # The stored map was built from the unperturbed runs, so its axis must stay aligned with
-        # them even if augmentation changes element lengths (which never changes their count).
-        structural = self._he_structural_for(t_row, he_contact.shape[0])
-        return self.assemble_reference(runs, he_contact, structural, length, augment)
+        runs, he_contact, structural, old_to_new, new_elem_of_res = self._resolve_row_reference_inputs(t_row)
+        self._last_old_to_new_elem = old_to_new
+        self._last_new_elem_of_res = new_elem_of_res
+        out = self.assemble_reference(runs, he_contact, structural, length, augment)
+        if self.reference_mode == "mpnn_chunk9":
+            target_T = int(out["topology_he_tokens"].numel())
+            out.update(self._template_res_tensors_for(t_row, target_T=target_T, augment=augment))
+        return out
 
     def self_reference(self, stem: str, length: int) -> Optional[Dict[str, torch.Tensor]]:
         """The chain's OWN topology, unaugmented and never dropped.
@@ -474,7 +799,8 @@ class TopologyReferenceTransform(T.BaseTransform):
             return None
         return self._build_reference(t_row, length, augment=False), str(self._index["ids"][t_row])
 
-    def masked_reference(self, stem: str, length: int, seed: int = 0) -> Dict[str, torch.Tensor]:
+    def masked_reference(self, stem: str, length: int, seed: int = 0,
+                         seqres_idx: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """This model's TRAINING-TIME no-reference case (``_set_empty``), served as a validation
         reference for the unconditional ("mask") arm.
 
@@ -484,8 +810,13 @@ class TopologyReferenceTransform(T.BaseTransform):
         path), which is the OLD model's convention, so a floor measured that way is out of this
         model's training distribution (user 2026-09-22). Built by ``_set_empty`` itself so the two
         cannot drift apart; seeded per (seed, stem) so every pass draws the same element count.
+        ``seqres_idx``: the query's rebased SEQRES positions, required when placeholder_span == "seqres".
         """
         g = Data()
+        if self.placeholder_span == "seqres":
+            if seqres_idx is None:
+                raise ValueError("placeholder_span='seqres' needs the query's seqres_idx")
+            g.residue_seqres_idx = seqres_idx
         saved = self._generator
         self._generator = torch.Generator().manual_seed((seed + zlib.crc32(stem.encode())) % (2**63))
         try:
@@ -496,6 +827,13 @@ class TopologyReferenceTransform(T.BaseTransform):
                 "topology_he_pos", "topology_he_pos_raw", "topology_he_contact", "topology_he_feat"]
         if self.elem_features:
             keys.append("topology_he_elem_feat")
+        if self.reference_mode == "mpnn_chunk9":
+            keys.extend([
+                "template_backbone_coords",
+                "template_backbone_mask",
+                "template_aatype",
+                "template_residue_idx",
+            ])
         return {k: getattr(g, k) for k in keys}
 
     def forward(self, graph: Data) -> Data:
@@ -532,7 +870,9 @@ class TopologyReferenceTransform(T.BaseTransform):
             for key, value in feats.items():
                 setattr(graph, key, value)
             n_he = int(feats["topology_he_tokens"].numel())
-            graph.ref_align_target = self._align_for(t_row, L, n_he)
+            graph.ref_align_target = self._align_for(
+                t_row, L, n_he, old_to_new_elem=getattr(self, "_last_old_to_new_elem", None)
+            )
             graph.topology_missing_ref = torch.zeros(1, dtype=torch.long)
             return graph
 
@@ -561,7 +901,12 @@ class TopologyReferenceTransform(T.BaseTransform):
         for key, value in feats.items():
             setattr(graph, key, value)
         # cluster mode carries no alignment ground truth unless the index was built with one
-        graph.ref_align_target = self._align_for(t_row, L, int(feats["topology_he_tokens"].numel()))
+        graph.ref_align_target = self._align_for(
+            t_row,
+            L,
+            int(feats["topology_he_tokens"].numel()),
+            old_to_new_elem=getattr(self, "_last_old_to_new_elem", None),
+        )
         graph.topology_missing_ref = torch.zeros(1, dtype=torch.long)
         return graph
 
@@ -591,14 +936,24 @@ class TopologyReferenceTransform(T.BaseTransform):
         """
         if L is None:
             L = int(graph.coords.shape[0])
-        lo, hi = self.drop_ref_len_range
-        if hi >= lo >= 1:
-            n_el = int(torch.randint(int(lo), int(hi) + 1, (1,), generator=self._generator))
+        span = L
+        if self.placeholder_span == "seqres":  # T8b: the query's SEQRES span [0, last - first + 1)
+            if getattr(graph, "residue_seqres_idx", None) is None:
+                raise SeqresIndexError("placeholder_span='seqres' needs graph.residue_seqres_idx (SeqresIndexTransform)")
+            q = graph.residue_seqres_idx
+            span = int(q[-1] - q[0]) + 1
+        if self.reference_mode == "mpnn_chunk9":
+            # User 2026-10-28 (answer 3d): fixed-length learned mask embedding (ceil(span / 9) chunks).
+            n_el = (max(span, 1) + self.chunk_size - 1) // self.chunk_size
         else:
-            n_el = 1
+            lo, hi = self.drop_ref_len_range
+            if hi >= lo >= 1:
+                n_el = int(torch.randint(int(lo), int(hi) + 1, (1,), generator=self._generator))
+            else:
+                n_el = 1
         n_el = max(1, min(n_el, self.max_topology_he_len))
-        # Midpoints of n_el equal slices of the query: (i + 0.5) * L / n_el.
-        pos = (torch.arange(n_el, dtype=torch.float32) + 0.5) * (float(L) / max(n_el, 1))
+        # Midpoints of n_el equal slices of the query: (i + 0.5) * span / n_el.
+        pos = (torch.arange(n_el, dtype=torch.float32) + 0.5) * (float(span) / max(n_el, 1))
         if missing:
             logger.warning(
                 f"[topology] NO synthetic reference for {stem!r} (TM range {self.tm_range}) -- "
@@ -618,6 +973,12 @@ class TopologyReferenceTransform(T.BaseTransform):
         # All zero on purpose: 0 is PAD, and the trainer's `sel = m_tgt > 1` therefore selects
         # nothing, so no MLM loss is taken on a reference the model was never shown.
         graph.topology_he_tokens_target = torch.zeros(n_el, dtype=torch.long)
+        if self.reference_mode == "mpnn_chunk9":
+            n_res_empty = max(1, n_el * self.chunk_size)
+            graph.template_backbone_coords = torch.zeros((n_res_empty, 4, 3), dtype=torch.float32)
+            graph.template_backbone_mask = torch.zeros((n_res_empty,), dtype=torch.float32)
+            graph.template_aatype = torch.full((n_res_empty,), TEMPLATE_SEQ_MASK_TOKEN, dtype=torch.long)
+            graph.template_residue_idx = torch.arange(n_res_empty, dtype=torch.long)
         graph.ref_align_target = torch.full((L,), ALIGN_NONE, dtype=torch.long)
         graph.topology_missing_ref = torch.tensor([1 if missing else 0], dtype=torch.long)
         return graph

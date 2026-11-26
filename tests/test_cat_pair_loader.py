@@ -331,3 +331,222 @@ def test_topology_row_defaults_unchanged(toy):
     a = pre.topology_row(cm, f, m, dssp, 1)
     b = pre.topology_row(cm, f, m, dssp, 1, element_types=pre._ELEMENT_TYPES, loop_axis=pre._LOOP_AXIS)
     assert a[0] == b[0] and a[1] == b[1] and a[2] == b[2] and a[3] == b[3] and np.array_equal(a[5], b[5])
+
+
+def test_cat_pair_mpnn_chunk9_end_to_end(tmp_path):
+    """CPU integration test for CATPairReferenceTransform(reference_mode='mpnn_chunk9') + DensePaddingDataLoader + ContactMapTriV2."""
+    import stat
+    from proteinfoundation.datasets.cat_pair_data import CATPairLightningDataModule, CATPairReferenceTransform, CATUnitDataset
+    from proteinfoundation.datasets.sse_topology import N_PAIR_FEATURES, PAIR_FEATURE_NAMES, STRUCTURAL_PAIR_FEATURES
+    from proteinfoundation.datasets.transforms import ChainBreakPerResidueTransform, ContactMapTransform, DSSPTargetTransform
+    from proteinfoundation.nn.mpnn_topology_encoder import TEMPLATE_SEQ_MASK_TOKEN
+    from proteinfoundation.utils.precompute_cat_pair_index import entry_rows, merge_rows
+
+    # 1. Build a realistic synthetic UnitStore with 2 CATs, 4 entries (including a discontinuous two-segment domain)
+    store_dir = tmp_path / "store"
+    rng = np.random.default_rng(7)
+    entries, ents = [], []
+    lengths = [22, 30, 19, 25]
+    for k, n in enumerate(lengths):
+        # Idealised alpha-carbon trace so TMalign smooth DSSP & ProteinMPNN distances are well-formed
+        t_idx = np.arange(n, dtype=np.float32)
+        ca = np.stack([1.5 * t_idx, 2.3 * np.cos(t_idx * 1.7), 2.3 * np.sin(t_idx * 1.7)], axis=-1)
+        coords = np.zeros((n, 37, 3), dtype=np.float32)
+        coords[:, 0] = ca + np.array([-0.5, 0.4, 0.0], dtype=np.float32)  # N
+        coords[:, 1] = ca                                                  # CA
+        coords[:, 2] = ca + np.array([0.6, 0.3, 0.0], dtype=np.float32)    # C
+        coords[:, 4] = ca + np.array([0.8, 1.4, 0.2], dtype=np.float32)    # O
+        mask = np.zeros((n, 37), dtype=bool)
+        mask[:, [0, 1, 2, 4]] = True
+        entries.append(dict(
+            aatype=rng.integers(0, 20, n),
+            resnum=np.arange(n) + 100,
+            mask=mask,
+            coords=coords,
+        ))
+        ents.append(dict(entry_id=f"u{k}", kind="cath" if k % 2 == 0 else "ted", src_unit=f"u{k}", n_res=n, shard=0, row=k))
+    cus.write_shard(str(store_dir / "shards" / "s0000"), entries)
+    pd.DataFrame(ents).to_csv(store_dir / "entries.tsv", sep="\t", index=False)
+    pd.DataFrame(dict(
+        member_id=["u0@1.10.8", "u1@1.10.8", "u2@2.40.10", "u3@2.40.10"],
+        entry_id=["u0", "u1", "u2", "u3"],
+        cat=["1.10.8", "1.10.8", "2.40.10", "2.40.10"],
+        split=["train", "train", "train", "train"],
+        role=["query", "query", "query", "query"],
+        seg=["0-22", "0-12;16-30", "0-19", "0-25"],  # u1@1.10.8 is discontinuous (gap of 4 residues)
+    )).to_csv(store_dir / "members.tsv", sep="\t", index=False)
+
+    store = cus.UnitStore(str(store_dir))
+    by_entry = {e: g for e, g in store.members.groupby("entry_id")}
+
+    # Lightweight deterministic USalign stub emitting exact default USalign text format for `usalign_pairs`
+    import sys as _sys
+    fake_usalign = tmp_path / "fake_usalign"
+    fake_usalign.write_text(
+        f"#!{_sys.executable}\n"
+        "import sys\n"
+        "args = [a for a in sys.argv[1:] if not a.startswith('-') and a != '0']\n"
+        "def n_ca(p):\n"
+        "    return sum(1 for ln in open(p) if ln.startswith('ATOM') and ln[12:16].strip() == 'CA')\n"
+        "nq, nr = n_ca(args[0]), n_ca(args[1])\n"
+        "m = min(nq, nr)\n"
+        "print(f'TM-score= 0.75000 (normalized by length of Structure_1: L={nq}, d0=5.00)')\n"
+        'print(\'(":" denotes residue pairs of d < 5.0 Angstrom, "." denotes other aligned residues)\')\n'
+        "print('G' * m + 'G' * (nq - m) + '-' * max(0, nr - m))\n"
+        "print(':' * m + ' ' * abs(nq - nr))\n"
+        "print('G' * m + '-' * max(0, nq - m) + 'G' * (nr - m))\n"
+    )
+    fake_usalign.chmod(fake_usalign.stat().st_mode | stat.S_IEXEC)
+
+    # 2. Build BOTH an SSE index (element_types=[0,1,2]) AND a native mpnn_chunk9 index (element_types=[1])
+    sse_meta = dict(
+        pair_feature_mean=[0.0] * N_PAIR_FEATURES,
+        pair_feature_std=[1.0] * N_PAIR_FEATURES,
+        elem_feature_mean=8.0,
+        elem_feature_std=2.0,
+        element_types=[0, 1, 2],
+        loop_axis="end_to_end",
+        min_len=1,
+        dssp_def="tmalign_smooth",
+        contact_def="confind",
+        pair_feature_names=list(PAIR_FEATURE_NAMES),
+        structural_feature_names=list(STRUCTURAL_PAIR_FEATURES),
+    )
+    c9_meta = dict(sse_meta, element_types=[1], loop_axis=None, dssp_def="mpnn_chunk9")
+
+    for idx_name, meta, ddef in (("sse_cat.pt", sse_meta, "tmalign_smooth"), ("c9_cat.pt", c9_meta, "mpnn_chunk9")):
+        rows, cbits, skips = {}, {}, []
+        for k, eid in enumerate(store.entries.entry_id):
+            n = lengths[k]
+            cm = torch.from_numpy((np.abs(np.arange(n)[:, None] - np.arange(n)[None, :]) <= 5).astype(np.float32))
+            cm.fill_diagonal_(0.0)
+            got, sk = entry_rows(store, eid, by_entry[eid], cm, tuple(meta["element_types"]), meta["loop_axis"], 1, dssp_def=ddef)
+            rows.update({r["member_id"]: r for r in got})
+            cbits[eid] = np.packbits((cm.numpy() > 0.5).reshape(-1))
+            skips += sk
+        merge_rows(store, rows, cbits, skips, meta, str(tmp_path / idx_name))
+
+    # 3. Verify CATPairReferenceTransform(reference_mode="mpnn_chunk9") works identically on BOTH indices!
+    for idx_file in ("sse_cat.pt", "c9_cat.pt"):
+        tr = CATPairReferenceTransform(
+            str(tmp_path / idx_file),
+            usalign=str(fake_usalign),
+            store_dir=str(store_dir),
+            reference_mode="mpnn_chunk9",
+            chunk_size=9,
+            template_seq_mask_prob=0.25,
+            sse_types=[1, 2],
+            element_types=[1],
+            elem_features=True,
+            token_mask_prob=0.1,
+            drop_prob=0.0,
+            seed=42,
+        )
+        ds = CATUnitDataset(str(store_dir), "train", transform=tr)
+        g0 = ds[0]  # query u0@1.10.8 -> must pick template u1@1.10.8 (discontinuous seg "0-12;16-30", L_t = 26 -> 3 chunks)
+        assert g0.topology_ref_id == "u1@1.10.8"
+        assert int(g0.topology_he_tokens.numel()) == 3  # ceil(26 / 9) = 3 chunks
+        assert g0.template_backbone_coords.shape == (26, 4, 3)
+        assert g0.template_backbone_mask.shape == (26,)
+        assert bool((g0.template_backbone_mask == 1.0).all()), "coordinate mask must remain unmasked"
+        # Discontinuous segment gap in template_residue_idx must be preserved (jump of 5 at boundary 12)
+        diffs = torch.diff(g0.template_residue_idx)
+        assert int(diffs.max().item()) == 5
+        # Alignment target maps query residues onto chunk indices 0..2
+        assert int(g0.ref_align_target.max().item()) < 3 and int(g0.ref_align_target.min().item()) >= -1
+
+        # Verify 25% i.i.d. sequence masking is active in forward (augment=True) and OFF in nonself_reference (augment=False)
+        masked_fracs = [float((ds[0].template_aatype == TEMPLATE_SEQ_MASK_TOKEN).float().mean()) for _ in range(40)]
+        assert 0.10 < np.mean(masked_fracs) < 0.40
+        ns_feats, ns_id = tr.nonself_reference("u0@1.10.8", 22, seed=0)
+        assert ns_id == "u1@1.10.8"
+        assert not bool((ns_feats["template_aatype"] == TEMPLATE_SEQ_MASK_TOKEN).any())
+
+        # Verify dropped/masked reference emits fixed ceil(L / 9) chunks
+        tr_drop = CATPairReferenceTransform(
+            str(tmp_path / idx_file),
+            usalign=str(fake_usalign),
+            store_dir=str(store_dir),
+            reference_mode="mpnn_chunk9",
+            chunk_size=9,
+            sse_types=[1, 2],
+            element_types=[1],
+            elem_features=True,
+            drop_prob=1.0,
+        )
+        gd = CATUnitDataset(str(store_dir), "train", transform=tr_drop)[0]
+        assert int(gd.topology_he_tokens.numel()) == 3  # ceil(22 / 9) = 3
+        assert gd.template_backbone_coords.shape == (27, 4, 3)
+        assert bool((gd.template_aatype == TEMPLATE_SEQ_MASK_TOKEN).all())
+
+    # 4. Verify DensePaddingDataLoader batching + ContactMapTriV2(reference_mode="mpnn_chunk9") forward & backward!
+    from proteinfoundation.nn.contact_map_tri_v2 import ContactMapTriV2
+
+    tr_batch = CATPairReferenceTransform(
+        str(tmp_path / "sse_cat.pt"),
+        usalign=str(fake_usalign),
+        store_dir=str(store_dir),
+        reference_mode="mpnn_chunk9",
+        chunk_size=9,
+        template_seq_mask_prob=0.25,
+        sse_types=[1, 2],
+        element_types=[1],
+        elem_features=True,
+        token_mask_prob=0.1,
+        drop_prob=0.25,
+        seed=9,
+    )
+    chain = [
+        ChainBreakPerResidueTransform(),
+        DSSPTargetTransform(dssp_def="tmalign_smooth", overwrite=True),
+        ContactMapTransform(contact_method="confind", confind_contact_threshold=0.01),
+        tr_batch,
+    ]
+    dm = CATPairLightningDataModule(
+        str(store_dir),
+        cath_draw_prob=0.5,
+        transforms=chain,
+        batch_size=2,
+        num_workers=2,
+        epoch_batch_plan=False,
+        cluster_sampler_seed=0,
+    )
+    dm.setup("fit")
+    batch = next(iter(dm.train_dataloader()))
+    for k in ("template_backbone_coords", "template_backbone_mask", "template_aatype", "template_residue_idx"):
+        assert k in batch, f"missing {k} after DensePaddingDataLoader collate"
+
+    B, Lp = batch["residue_type"].shape
+    net = ContactMapTriV2(
+        pair_dim=64,
+        tri_hidden=64,
+        n_blocks_ref=1,
+        n_blocks_query=1,
+        transition_hidden=128,
+        dim_cond=64,
+        max_topology_he_len=32,
+        max_rel_pos=32,
+        topology_vocab_size=45,
+        n_elem_features=1,
+        pair_ref_features="both",
+        query_pos="index",
+        reference_mode="mpnn_chunk9",
+        align_head={"enabled": True},
+        mlm_head={"enabled": True},
+        compile={"enabled": False},
+    )
+    with torch.no_grad():
+        torch.nn.init.normal_(net.out.weight, std=0.02)
+        torch.nn.init.normal_(net.align_head.weight, std=0.02)
+        torch.nn.init.normal_(net.align_none.weight, std=0.02)
+    nn_in = dict(batch)
+    nn_in["mask"] = batch["mask_dict"]["coords"][..., 0, 0].bool()
+    nn_in["contact_map_t"] = torch.rand(B, Lp, Lp)
+    nn_in["t"] = torch.rand(B)
+    out = net(nn_in)
+    assert "mlm_logits" not in out
+    loss = out["contact_map_logits"].mean() + out["align_logits"].mean() + out["align_none_logits"].mean()
+    loss.backward()
+    trainable_no_grad = [n for n, p in net.mpnn_topo.named_parameters() if p.requires_grad and p.grad is None]
+    assert not trainable_no_grad, f"MPNNChunk9TopologyModule trainable params missing grad: {trainable_no_grad}"
+

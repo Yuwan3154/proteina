@@ -87,9 +87,12 @@ _USALIGN = "/home/chenxiou/.local/bin/USalign"
 _CONTACT_SOURCE = "cb8"
 # --proline-donor-mask (user 2026-10-09): recompute every DSSP (native too) with proline unable to donate a backbone H-bond
 _PRO_DONOR_MASK = False
+_DSSP_MODE = "tmalign_smooth"
 PRO_IDX = 14                         # openfold restype order
 DSSP_DEF = "native: stored dssp_target; templates: pydssp; no donor mask"
 DSSP_DEF_PRO = "native + templates: pydssp with donor_mask = (aatype != PRO); native validity = N/CA/C/O coord_mask > 0.5"
+DSSP_DEF_TMALIGN = "native + templates: TMalign/USalign make_sec CA-only geometry"
+DSSP_DEF_TMALIGN_SMOOTH = "native + templates: TMalign/USalign make_sec + 3-pass smooth + H>=3, E>=2"
 _MAPS_ROOT = ""
 _ROOTS = []
 # --template-pack (T8, user 2026-10-12/13): templates from the t2 template pack (TemplatePack, keyed by the dataset's own
@@ -300,7 +303,14 @@ def _chain_job(args):
         return stem, None, [], [("native", "no_coords")], seq
     if dssp is None:
         return stem, None, [], [("native", "no_dssp_attr")], seq
-    if _PRO_DONOR_MASK:
+    if _DSSP_MODE in ("tmalign", "tmalign_smooth"):
+        dssp = compute_dssp_target(coords[None].float(), torch.ones(1, int(coords.shape[0]), dtype=torch.bool),
+                                   coord_mask=(cmask.float() > 0.5)[None], coord_layout="pdb",
+                                   dssp_def=_DSSP_MODE)
+        if dssp is None:
+            return stem, None, [], [("native", "native_dssp_none")], seq
+        dssp = dssp[0]
+    elif _PRO_DONOR_MASK:
         if seq_ref is None or len(seq_ref) != int(coords.shape[0]):
             return stem, None, [], [("native", "no_residue_type_for_donor_mask")], seq
         # same atoms and validity as precompute_dssp_targets._compute_dssp (disk order, O = 3), plus the donor mask
@@ -460,12 +470,12 @@ def _template_row(full, amask, t_aatype, cm_t, pq, qmap, L_n, td, k, min_len):
     """One template (atom37 coords [L_t, 37, 3], mask [L_t, 37], its own aatype) -> ((topology row[:5], USalign alignment
     bytes, USalign TM), None), or (None, skip reason). cm_t None = CB-8 contacts from the coordinates."""
     donor = None
-    if _PRO_DONOR_MASK:
+    if _DSSP_MODE == "h_bond" and _PRO_DONOR_MASK:
         if t_aatype is None or len(t_aatype) != int(amask.shape[0]):
             return None, "no_aatype_for_donor_mask"
         donor = torch.from_numpy(np.asarray(t_aatype) != PRO_IDX)[None]
     dssp_t = compute_dssp_target(full[None], amask[:, CA_IDX][None], coord_mask=amask[None], coord_layout="atom37",
-                                 donor_mask=donor)
+                                 donor_mask=donor, dssp_def=_DSSP_MODE)
     if dssp_t is None:
         return None, "tpl_dssp_none"
     if cm_t is None:
@@ -605,7 +615,7 @@ def _gate_def():
 
 
 def cmd_build(args):
-    global _USALIGN, _CONTACT_SOURCE, _MAPS_ROOT, _ROOTS, _PRO_DONOR_MASK, _PACK_IDX, _PACK_MM, _ELEMENT_TYPES, _LOOP_AXIS
+    global _USALIGN, _CONTACT_SOURCE, _MAPS_ROOT, _ROOTS, _PRO_DONOR_MASK, _DSSP_MODE, _PACK_IDX, _PACK_MM, _ELEMENT_TYPES, _LOOP_AXIS
     global _CA_CLASH_GATE
     _USALIGN = args.usalign
     if (args.max_ca_clashes is None) != (args.ca_clash_a is None):
@@ -615,6 +625,7 @@ def cmd_build(args):
             raise SystemExit("--max-ca-clashes applies to pack mode only")
         _CA_CLASH_GATE = (args.max_ca_clashes, args.ca_clash_a, args.max_templates, args.tm_min, args.tm_max)
     _PRO_DONOR_MASK = args.proline_donor_mask
+    _DSSP_MODE = args.dssp_def
     _ELEMENT_TYPES = tuple(int(x) for x in args.element_types.split(","))
     _LOOP_AXIS = args.loop_axis
     if (DSSP_LOOP in _ELEMENT_TYPES) != (_LOOP_AXIS is not None):
@@ -644,10 +655,15 @@ def cmd_build(args):
                 print(f"  {j + 1}/{len(mine)} chains, {n_tpl} template rows, {len(skip_lines)} skips", flush=True)
     os.makedirs(args.out_dir, exist_ok=True)
     part_path = os.path.join(args.out_dir, f"part_{args.part:04d}.pt")
+    dssp_def_str = (
+        DSSP_DEF_TMALIGN_SMOOTH if _DSSP_MODE == "tmalign_smooth"
+        else DSSP_DEF_TMALIGN if _DSSP_MODE == "tmalign"
+        else DSSP_DEF_PRO if _PRO_DONOR_MASK else DSSP_DEF
+    )
     torch.save({"chains": out_rows, "n_parts": args.n_parts, "part": args.part, "min_len": args.min_len,
                 "tm_build_range": (args.tm_min, args.tm_max),
                 "contact_def": CONTACT_DEF_CONFIND if _CONTACT_SOURCE == "confind" else CONTACT_DEF,
-                "dssp_def": DSSP_DEF_PRO if _PRO_DONOR_MASK else DSSP_DEF,
+                "dssp_def": dssp_def_str,
                 "element_types": list(_ELEMENT_TYPES), "loop_axis": _LOOP_AXIS, "template_gate": _gate_def()}, part_path)
     with open(os.path.join(args.out_dir, f"skips_{args.part:04d}.tsv"), "w") as fh:
         fh.write("\n".join(skip_lines) + ("\n" if skip_lines else ""))
@@ -1016,6 +1032,8 @@ def main():
                    help="loop element axis when loops are elements (required then): zero | end_to_end")
     b.add_argument("--proline-donor-mask", action="store_true",
                    help="recompute native + template DSSP with proline as a non-donor (default: v4 behaviour)")
+    b.add_argument("--dssp-def", choices=("h_bond", "tmalign", "tmalign_smooth"), default="tmalign_smooth",
+                   help="SSE classifier for native and template topology featurization (default: tmalign_smooth)")
     b.add_argument("--f2c-maps", default="", help="maps root written by `f2c` (required for --contact-source confind)")
     b.add_argument("--max-ca-clashes", type=int, default=None,
                    help="pack mode: drop templates with more than this many non-bonded CA-CA clashes, before the cap")

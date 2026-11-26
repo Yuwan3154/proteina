@@ -75,8 +75,9 @@ def make_batch():
 class Stub:
     """Just enough of the trainer for the unbound helper: a loss config and a recording log()."""
 
-    def __init__(self, **loss):
+    def __init__(self, nn=None, **loss):
         self.cfg_exp = types.SimpleNamespace(loss=loss)
+        self.nn = nn  # the helper reads nn.query_pos (T8b); None -> the default "index"
         self.logged = {}
 
     def log(self, name, value, **kw):
@@ -92,8 +93,8 @@ def trunk_grad_norm(model):
     return tot
 
 
-def run_helper(nn_out, batch, **loss):
-    stub = Stub(**loss)
+def run_helper(nn_out, batch, nn=None, **loss):
+    stub = Stub(nn=nn, **loss)
     total = ModelTrainerBase._topology_aux_losses(stub, nn_out, batch, batch["mask"], "train")
     return total, stub.logged
 
@@ -188,6 +189,22 @@ def main():
     tb.backward()
     check("bce: align_none still gets a (zero) gradient (DDP)",
           both.align_none.weight.grad is not None and float(both.align_none.weight.grad.abs().sum()) == 0.0)
+
+    # 7. T8b position baseline under query_pos='seqres': it reads batch["residue_seqres_idx"]
+    seqres_nn = types.SimpleNamespace(query_pos="seqres")
+    index_nn = types.SimpleNamespace(query_pos="index")
+    key = "train/align_precision_at_q_pos_baseline"
+    _, lg_idx = run_helper(perfect, batch, align_loss_weight=1.0, align_loss="softmax")
+    b_ar = dict(batch, residue_seqres_idx=torch.arange(L)[None].expand(B, L).clone())
+    _, lg_ar = run_helper(perfect, b_ar, nn=seqres_nn, align_loss_weight=1.0, align_loss="softmax")
+    check("seqres baseline on positions 0..L-1 == index baseline", lg_ar[key] == lg_idx[key], f"{lg_ar[key]:.4f}")
+    b_2i = dict(batch, residue_seqres_idx=2 * torch.arange(L)[None].expand(B, L).clone())
+    _, lg_2i = run_helper(perfect, b_2i, nn=seqres_nn, align_loss_weight=1.0, align_loss="softmax")
+    _, lg_2i_index = run_helper(perfect, b_2i, nn=index_nn, align_loss_weight=1.0, align_loss="softmax")
+    # positions 2i vs midpoints [3, 8, 11]: |d| <= 2 picks exactly 7 cells (Q = 7), next distance 3:
+    # (4,e1) d0; (1,e0) (2,e0) (5,e2) (6,e2) d1; (3,e1) (5,e1) d2 -> true cells (r 0-3 -> e0, r 5-7 -> e2): 4 of 7
+    check("seqres baseline on positions 2i == hand-computed 4/7", abs(lg_2i[key] - 4 / 7) < 1e-6, f"{lg_2i[key]:.4f}")
+    check("index mode ignores residue_seqres_idx", lg_2i_index[key] == lg_idx[key])
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     sys.exit(1 if FAIL else 0)

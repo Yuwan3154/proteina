@@ -5,12 +5,13 @@ Synthetic mmCIF 9zzz, run through the REAL read_pdb_to_dataframe + protein_to_py
     insertion codes -> residue_id B:THR:13:), unobserved label 6-7, LEU 16 -> label_seq_id [1, 2, 4, 5, 8], status ok;
   chain C (auth C): ALA 20, LYS 21, LYS 21A (same resname + insertion -> ONE graph residue covering label 3 and 4) -> merged;
   a HOH HETATM with label_seq_id '.' (object-dtype column, must not crash).
-Then cmd_part + cmd_merge on a 2-chain pack written like build_pack.py (object-dtype stems in idx.npz).
+Then cmd_part + cmd_merge on a 2-chain pack written like build_pack.py (object-dtype stems in idx.npz), incl. seq_sha1.
 Hand-made mappings: nonmonotone, collide, no_label_seq, unmapped.
 Usage: python scratchpad/test_seqres_index.py   (CPU, temp dir only)
 """
 
 import argparse
+import hashlib
 import io
 import json
 import os
@@ -20,6 +21,7 @@ import numpy as np
 import torch
 
 from proteinfoundation.graphein_utils.graphein_utils import protein_to_pyg, read_pdb_to_dataframe
+from proteinfoundation.openfold_stub.np.residue_constants import resname_to_idx, restype_3to1
 from proteinfoundation.utils.precompute_seqres_index import chain_positions, cmd_merge, cmd_part, residue_label_seq
 
 HEADER = ["data_9ZZZ", "_entry.id 9ZZZ", "#", "loop_"] + [f"_atom_site.{c}" for c in (
@@ -64,6 +66,19 @@ def main():
     assert chain_positions(rids_c, mapping) == ("merged", None, 1)
     print(f"PASS chain C: LYS 21 + 21A collapse into {rids_c[1]} -> merged (label_seq {sorted(mapping[rids_c[1]])})")
 
+    # SEQRES-order processing (T8b re-process) keeps the real insertion code in residue_id -> key the table the same way
+    real_map, _ = residue_label_seq(path, real_ins=True)
+    for ch, want in (("B", [1, 2, 4, 5, 8]), ("C", None)):
+        gr = protein_to_pyg(df=read_pdb_to_dataframe(path=path, mmcif_seqres_fields=True), path=path, chain_selection=[ch],
+                            keep_insertions=True, residue_order="label_seq", resolve_altlocs=True)
+        rids_r = list(gr.residue_id)
+        status, pos, _ = chain_positions(rids_r, real_map)
+        assert status == "ok" and (want is None or pos.tolist() == want), (ch, rids_r, status, pos)
+        assert ch != "C" or len(rids_r) == 3, rids_r  # LYS 21 and 21A are separate residues again
+        assert any(r.split(":")[3] for r in rids_r), (ch, rids_r)
+        assert chain_positions(rids_r, mapping)[0] == "unmapped", ch  # blank keying cannot match real insertion codes
+        print(f"PASS real insertion codes, chain {ch}: {rids_r} -> label_seq_id {pos.tolist()}; blank keying -> unmapped")
+
     status, pos, _ = chain_positions(["X:ALA:1:", "X:GLY:2:", "X:SER:3:"], {"X:ALA:1:": {3}, "X:GLY:2:": {1}, "X:SER:3:": {2}})
     assert status == "nonmonotone" and pos.tolist() == [3, 1, 2], (status, pos)
     assert chain_positions(["X:VAL:2:", "X:ILE:2:"], {"X:VAL:2:": {2}, "X:ILE:2:": {2}}) == ("collide", None, 0)
@@ -75,7 +90,9 @@ def main():
     blobs = []
     for stem, g in (("9zzz_B", gb), ("9zzz_C", gc)):
         buf = io.BytesIO()
-        torch.save({"residue_id": list(g.residue_id), "coords": g.coords}, buf)
+        # residue_type as processing stores it (pdb_data: resname_to_idx over graph.residues), not graphein's own vocab
+        rt = torch.tensor([resname_to_idx[r] for r in g.residues]).long()
+        torch.save({"residue_id": list(g.residue_id), "coords": g.coords, "residue_type": rt}, buf)
         blobs.append((stem, buf.getvalue()))
     with open(pack, "wb") as fh:
         for _, b in blobs:
@@ -88,7 +105,7 @@ def main():
     open(stems, "w").write("9zzz_B\n9zzz_C\n")
     parts = os.path.join(d, "parts")
     os.makedirs(parts)
-    cmd_part(argparse.Namespace(pack=pack, data_dir=os.path.join(d, "pdb_train"), stems=stems, part=0, n_parts=1,
+    cmd_part(argparse.Namespace(pack=pack, data_dir=os.path.join(d, "pdb_train"), stems=stems, part=0, n_parts=1, real_ins=False,
                                 out_dir=parts))
     out = os.path.join(d, "seqres.pt")
     cmd_merge(argparse.Namespace(stems=stems, parts_dir=parts, out=out))
@@ -98,6 +115,10 @@ def main():
     assert t["label_seq_flat"].tolist() == [1, 2, 4, 5, 8], t["label_seq_flat"]
     assert t["audit"]["merged_residue_ids"] == 1 and t["audit"]["gapped_ok"] == 1, t["audit"]
     assert t["audit"]["ok_with_insertion_codes"] == 1, t["audit"]  # chain B: THR 13A (distinct resname, never merged)
+    seqs = ["".join(restype_3to1[r] for r in g.residues) for g in (gb, gc)]
+    assert seqs == ["AGSTL", "AK"], seqs
+    assert t["seq_sha1"] == [hashlib.sha1(q.encode()).hexdigest() for q in seqs], t["seq_sha1"]
+    print(f"PASS seq_sha1 per stem = sha1 of the one-letter sequence in array order ({seqs[0]}, {seqs[1]})")
     print(f"PASS cmd_part + cmd_merge on a 2-chain pack: audit {t['audit']}")
     print("ALL PASS")
 

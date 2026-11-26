@@ -16,11 +16,15 @@ float32 (its time embedding casts to float32, as ContactMapTriSiT's does), toler
    loss reaches both.
 6. With all weights randomised, every parameter gets a gradient from the summed losses (nothing unused for DDP).
 7. Parameter count at the user's sizes (4 + 4 blocks, width 128, tri hidden 128, SwiGLU 512, 96 elements).
+8. T8b query_pos: "seqres" relpos == the AF2 formula clip(p_i - p_j, -32, 32) + 32 on a gapped toy (query-query and
+   query-reference); "index" ignores residue_seqres_idx and equals "seqres" with contiguous positions; seqres padding
+   invariance and pad-bucket path; a missing residue_seqres_idx raises.
 Run: python scratchpad/test_contact_map_tri_v2.py
 """
 
 import math
 
+import pytest
 import torch
 
 from proteinfoundation.nn.af3_fourier_constants import AF3_FOURIER_BIAS, AF3_FOURIER_WEIGHT
@@ -367,6 +371,75 @@ def test_param_count():
     assert len(m.blocks_ref) == 4 and len(m.blocks_query) == 4
 
 
+GAPPED = torch.tensor([0, 1, 2, 3, 40, 41, 42, 80, 81, 82, 120])  # 3 gaps > 32 (the AF2 clip) and one inside it
+
+
+def _rel_seen(m, b):
+    got = []
+    h = m.z_embed.rel_pos.register_forward_pre_hook(lambda mod, a: got.append(a[0].clone()))
+    with torch.no_grad():
+        m(b)
+    h.remove()
+    return got[0]
+
+
+def test_query_pos_seqres():
+    b = batch()
+    L = b["contact_map_t"].shape[1]
+    assert L == len(GAPPED)
+    qp = torch.stack([GAPPED, GAPPED.clone()])
+    qp[1, 4:] -= 20  # second sample: the 37-residue jump becomes 17, inside the clip
+    bs = dict(b, residue_seqres_idx=qp)
+    m = ContactMapTriV2(**CFG, query_pos="seqres").eval()
+    randomise_(m)
+    rel = _rel_seen(m, bs)
+    pos = torch.cat([qp.double(), b["topology_he_pos_raw"].double()], 1)
+    want = []  # AF2 relpos written out per pair (AF2 InputEmbedder: clip(offset, -32, 32) + 32)
+    for k in range(2):
+        want.append(torch.tensor([[min(max(round(float(pos[k, i] - pos[k, j])), -32), 32) + 32
+                                   for j in range(pos.shape[1])] for i in range(pos.shape[1])]))
+    want = torch.stack(want)
+    assert torch.equal(rel, want), (rel - want).abs().max()
+    assert int(rel[0, 3, 4]) == 0 and int(rel[1, 3, 4]) == 32 - 17, (rel[0, 3, 4], rel[1, 3, 4])
+    print("PASS seqres relpos == AF2 clip(p_i - p_j, -32, 32) + 32 on a gapped toy (query-query + query-reference); "
+          "a 37-residue SEQRES jump saturates the clip, a 17-residue one does not")
+
+    mi = ContactMapTriV2(**CFG).eval()
+    mi.load_state_dict(m.state_dict())
+    assert mi.query_pos == "index"
+    with torch.no_grad():
+        o_plain, o_key = mi(b), mi(bs)
+        o_contig = m(dict(b, residue_seqres_idx=torch.arange(L)[None].expand(2, L)))
+    for k in o_plain:
+        assert torch.equal(o_plain[k], o_key[k]), k
+        assert torch.equal(o_plain[k], o_contig[k]), k
+    print("PASS index mode ignores residue_seqres_idx (bit-identical) and == seqres mode on contiguous positions")
+
+    with torch.no_grad():
+        o1 = m(bs)
+        bp = pad_one(bs)
+        bp["residue_seqres_idx"] = torch.nn.functional.pad(qp, (0, 1), value=-1)  # dense collate pads longs with -1
+        o2 = m(bp)
+        m.pad_len_buckets, m.pad_topo_buckets = [16], [8]
+        o3 = m(bs)
+    T = b["topology_he_tokens"].shape[1]
+    for k, sl in (("contact_map_logits", (slice(None), slice(0, L), slice(0, L))),
+                  ("align_logits", (slice(None), slice(0, L), slice(0, T))),
+                  ("align_none_logits", (slice(None), slice(0, L))),
+                  ("mlm_logits", (slice(None), slice(0, T)))):
+        d = (o1[k] - o2[k][sl]).abs().max().item()
+        d3 = (o1[k] - o3[k]).abs().max().item()
+        assert d < 1e-5 and o1[k].shape == o3[k].shape and d3 < 1e-5, (k, d, d3)
+    assert not torch.allclose(o1["contact_map_logits"], o_plain["contact_map_logits"]), "seqres positions must matter"
+    print("PASS seqres: padding invariance (extra masked residue at position -1) and pad-bucket path (L 11->16) == unpadded")
+
+    with pytest.raises(KeyError, match="residue_seqres_idx"):
+        m(b)
+    with pytest.raises(ValueError, match="query_pos"):
+        ContactMapTriV2(**CFG, query_pos="label")
+    print("PASS seqres without residue_seqres_idx raises KeyError; unknown query_pos raises ValueError")
+
+
 if __name__ == "__main__":
     test_fused_trimul()
     test_swiglu()
@@ -378,4 +451,5 @@ if __name__ == "__main__":
     test_sc_dtype_unified()
     test_every_param_gets_grad()
     test_param_count()
+    test_query_pos_seqres()
     print("ALL PASS")
