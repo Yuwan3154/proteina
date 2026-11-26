@@ -91,6 +91,7 @@ def prepare_bad_afdb_bundle(raw_json_path, out_pt_path, f2c_ckpt, f2c_root="/hom
         return
     if not os.path.exists(raw_json_path):
         return
+    os.environ.setdefault("FRAME2SEQ_HOME", os.path.join(f2c_root, "Frame2seq"))
     for p in (f2c_root, os.path.join(f2c_root, "Frame2seq")):
         if os.path.isdir(p) and p not in sys.path:
             sys.path.insert(0, p)
