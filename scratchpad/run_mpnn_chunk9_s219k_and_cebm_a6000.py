@@ -85,22 +85,34 @@ C2C_SEED_BASE = 1234
 F2C_MD5 = "e928f9bff6a6020538e8dbc56e928202"
 
 
-def prepare_bad_afdb_bundle(raw_json_path, out_pt_path, f2c_ckpt, f2c_root="/home/jupyter-chenxi"):
-    """Build bad_afdb_10targets_inputs.pt on GPU 0 from raw PDB texts using Frame2ConFind."""
+def prepare_bad_afdb_bundle(raw_json_path, out_pt_path, f2c_ckpt, f2c_root="/home/jupyter-chenxi", device=None):
+    """Build bad_afdb_10targets_inputs.pt from raw PDB texts using Frame2ConFind."""
     if os.path.exists(out_pt_path) and os.path.getsize(out_pt_path) > 0:
         return
     if not os.path.exists(raw_json_path):
         return
-    os.environ.setdefault("FRAME2SEQ_HOME", os.path.join(f2c_root, "Frame2seq"))
-    for p in (f2c_root, os.path.join(f2c_root, "Frame2seq")):
+    f2s_dir = os.path.join(f2c_root, "Frame2seq")
+    f2s_ckpt = os.path.join(f2s_dir, "frame2seq", "trained_models", "model1.ckpt")
+    os.environ.setdefault("FRAME2SEQ_HOME", f2s_dir)
+    os.environ.setdefault("F2S_CHECKPOINT", f2s_ckpt)
+    for p in (f2c_root, f2s_dir):
         if os.path.isdir(p) and p not in sys.path:
             sys.path.insert(0, p)
     with open(f2c_ckpt, "rb") as fh:
         md5 = hashlib.file_digest(fh, "md5").hexdigest()
     assert md5 == F2C_MD5, f"Frame2ConFind ckpt md5 {md5} != {F2C_MD5}"
+    import Frame2ConFind.models.frame2seq_contact as f2c_mod
     from Frame2ConFind.inference.api import Frame2ConFindPredictor
 
-    pred = Frame2ConFindPredictor(checkpoint=f2c_ckpt, amp_dtype="fp32", compile_model=False)
+    if os.path.exists(f2s_ckpt):
+        f2c_mod.F2S_CHECKPOINT = f2s_ckpt
+        if f2c_mod.load_pretrained_f2s.__defaults__:
+            f2c_mod.load_pretrained_f2s.__defaults__ = (f2s_ckpt, *f2c_mod.load_pretrained_f2s.__defaults__[1:])
+        if f2c_mod.Frame2seqContact.__init__.__defaults__:
+            f2c_mod.Frame2seqContact.__init__.__defaults__ = (f2s_ckpt, *f2c_mod.Frame2seqContact.__init__.__defaults__[1:])
+
+    pred = Frame2ConFindPredictor(checkpoint=f2c_ckpt, device=device, amp_dtype="fp32", compile_model=False)
+    dev_t = torch.device(pred.device)
     raw = json.load(open(raw_json_path))
     cache = {}
 
