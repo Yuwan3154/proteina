@@ -629,6 +629,7 @@ def q_bad_afdb_worker(
     ckpt_219k,
     ckpt_230k,
     ckpt_231k,
+    ckpt_246k,
     c2c_ckpt,
     cebm_repo,
     cebm_ckpt,
@@ -670,14 +671,16 @@ def q_bad_afdb_worker(
         m.load_state_dict(sd["state_dict"] if "state_dict" in sd else sd, strict=True)
         return m.to(dev).eval()
 
-    models = {
-        "s189k": _load_tri(ckpt_189k, "189"),
-        "s219k": _load_tri(ckpt_219k, "219"),
-    }
-    if ckpt_230k and os.path.exists(ckpt_230k):
-        models["s230k"] = _load_tri(ckpt_230k, "230")
-    if ckpt_231k and os.path.exists(ckpt_231k):
-        models["s231k"] = _load_tri(ckpt_231k, "231")
+    models = {}
+    for t_name, ck_p, sfx in (
+        ("s189k", ckpt_189k, "189"),
+        ("s219k", ckpt_219k, "219"),
+        ("s230k", ckpt_230k, "230"),
+        ("s231k", ckpt_231k, "231"),
+        ("s246k", ckpt_246k, "246"),
+    ):
+        if ck_p and os.path.exists(ck_p):
+            models[t_name] = _load_tri(ck_p, sfx)
 
     c2c = ContactToCoordTrainer(model_cfg=MODEL_CFG)
     ck_c2c = torch.load(c2c_ckpt, map_location="cpu", weights_only=False)
@@ -716,14 +719,15 @@ def q_bad_afdb_worker(
         )
 
         probs, pls, f1s, es = {}, {}, {}, {}
-        ordered_tags = [t for t in ("s189k", "s219k", "s230k", "s231k") if t in models]
+        ordered_tags = [t for t in ("s189k", "s219k", "s230k", "s231k", "s246k") if t in models]
         for t in ordered_tags:
             probs[t] = _generate_mpnn_maps(models[t], cfg_exp, ref, aatype_q, Lq, K_SAMPLES, TRI_SEED, dev)
             pls[t], f1s[t] = _contact_stats(probs[t], cm_nat)
             es[t] = score_clean(cebm_model, probs[t], aatype_q, Lq, T_EVAL, dev)
 
-        pool16 = np.concatenate([probs["s189k"], probs["s219k"]], axis=0)
-        e_pool16 = np.concatenate([es["s189k"], es["s219k"]], axis=0)
+        p16_tags = [t for t in ("s189k", "s219k") if t in probs] or ordered_tags[:2]
+        pool16 = np.concatenate([probs[t] for t in p16_tags], axis=0)
+        e_pool16 = np.concatenate([es[t] for t in p16_tags], axis=0)
         pool_all = np.concatenate([probs[t] for t in ordered_tags], axis=0)
         e_pool_all = np.concatenate([es[t] for t in ordered_tags], axis=0)
 
@@ -736,7 +740,7 @@ def q_bad_afdb_worker(
                 t: [_fold_and_tm(c2c, probs[t][i], aatype_q, Lq, c2c_seed, nat_pdb, usalign, td, f"{t}_{i}", dev) for i in range(K_SAMPLES)]
                 for t in ordered_tags
             }
-            tms_pool16 = tms_by_tag["s189k"] + tms_by_tag["s219k"]
+            tms_pool16 = sum((tms_by_tag[t] for t in p16_tags), [])
             tms_pool_all = sum((tms_by_tag[t] for t in ordered_tags), [])
 
             rec = {
@@ -797,14 +801,14 @@ def q_bad_afdb_worker(
         os.replace(tmp_json, out_json)
         print(
             f"[GPU {gpu_id}] DONE bad_afdb {arm}/{pid} (L={Lq}) in {time.time() - t0_p:.1f}s | "
-            f"s219k={rec['s219k_mean8']:.4f} | poolAll_pick={rec['poolAll_cebm_pick']:.4f} | poolAll_minE={rec['poolAll_cebm_minE']:.4f}",
+            f"s246k={rec.get('s246k_mean8', np.nan):.4f} | poolAll_pick={rec['poolAll_cebm_pick']:.4f} | poolAll_minE={rec['poolAll_cebm_minE']:.4f}",
             flush=True,
         )
 
 
 # ───────────────────────── Comprehensive Summary Report ─────────────────────────
 def summarize_s219k(out_dir, bad_afdb_bundle=None):
-    lines = ["=== MPNN_CHUNK9 S75K..S231K & CONTACTEBM + BAD_AFDB REPORT ==="]
+    lines = ["=== MPNN_CHUNK9 S75K..S249K & CONTACTEBM + BAD_AFDB REPORT ==="]
 
     # 1. Stage-A comparison across t7, equal, self
     stageA_data = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
@@ -816,6 +820,8 @@ def summarize_s219k(out_dir, bad_afdb_bundle=None):
         ("s219k", "mpnn_s219k"),
         ("s230k", "mpnn_s230k"),
         ("s231k", "mpnn_s231k"),
+        ("s246k", "mpnn_s246k"),
+        ("s249k", "mpnn_s249k"),
     ):
         for arm, n_c in (("t7", 4), ("equal", 8), ("self", 8)):
             for c in range(n_c):
@@ -857,12 +863,12 @@ def summarize_s219k(out_dir, bad_afdb_bundle=None):
                 a189 = np.array([np.mean(stageA_data[f"{arm}{mkey}"]["s189k"][s]) for s in S])
                 a219 = np.array([np.mean(stageA_data[f"{arm}{mkey}"]["s219k"][s]) for s in S])
                 extra_strs = []
-                for xtag in ("s208k", "s230k", "s231k"):
+                for xtag in ("s208k", "s230k", "s231k", "s246k", "s249k"):
                     if xtag in stageA_data[arm] and all(s in stageA_data[f"{arm}{mkey}"][xtag] for s in S):
                         ax = np.array([np.mean(stageA_data[f"{arm}{mkey}"][xtag][s]) for s in S])
                         extra_strs.append(f"{xtag}: {np.mean(ax):.4f} (med {np.median(ax):.4f})")
                 ext_part = (" | " + " | ".join(extra_strs)) if extra_strs else ""
-                top_tag = "s231k" if ("s231k" in stageA_data[arm] and all(s in stageA_data[f"{arm}{mkey}"]["s231k"] for s in S)) else "s219k"
+                top_tag = "s246k" if ("s246k" in stageA_data[arm] and all(s in stageA_data[f"{arm}{mkey}"]["s246k"] for s in S)) else "s231k"
                 atop = np.array([np.mean(stageA_data[f"{arm}{mkey}"][top_tag][s]) for s in S])
                 mutop, lotop, hitop = boot_ci(atop, rng)
                 d_top_75 = atop - a75
@@ -887,6 +893,8 @@ def summarize_s219k(out_dir, bad_afdb_bundle=None):
         ("s219k", "mpnn_s219k_t7"),
         ("s230k", "mpnn_s230k_t7"),
         ("s231k", "mpnn_s231k_t7"),
+        ("s246k", "mpnn_s246k_t7"),
+        ("s249k", "mpnn_s249k_t7"),
     ):
         for c in range(4):
             p = os.path.join(sb_dir, f"{prefix}_c{c}.jsonl")
@@ -897,14 +905,12 @@ def summarize_s219k(out_dir, bad_afdb_bundle=None):
                         tm_by_arm[tag][r["stem"]].append(float(r["tm"]))
 
     for pool_name, tags in (
-        ("pool16_160_189_mean", ("s160k", "s189k")),
-        ("pool16_189_219_mean", ("s189k", "s219k")),
-        ("pool16_208_230_mean", ("s208k", "s230k")),
         ("pool16_230_231_mean", ("s230k", "s231k")),
-        ("pool24_189_208_219_mean", ("s189k", "s208k", "s219k")),
+        ("pool16_246_249_mean", ("s246k", "s249k")),
         ("pool32_160_189_208_219_mean", ("s160k", "s189k", "s208k", "s219k")),
-        ("pool40_160_189_208_219_230_mean", ("s160k", "s189k", "s208k", "s219k", "s230k")),
         ("pool48_all6_mean", ("s160k", "s189k", "s208k", "s219k", "s230k", "s231k")),
+        ("pool56_all7_mean", ("s160k", "s189k", "s208k", "s219k", "s230k", "s231k", "s246k")),
+        ("pool64_all8_mean", ("s160k", "s189k", "s208k", "s219k", "s230k", "s231k", "s246k", "s249k")),
     ):
         if all(t in tm_by_arm for t in tags):
             common = set.intersection(*(set(tm_by_arm[t].keys()) for t in tags))
@@ -920,15 +926,14 @@ def summarize_s219k(out_dir, bad_afdb_bundle=None):
         ("s219k", "mpnn_s219k_cebm_t7"),
         ("s230k", "mpnn_s230k_cebm_t7"),
         ("s231k", "mpnn_s231k_cebm_t7"),
-        ("pool16_160_189", "mpnn_pool16_160_189_cebm_t7"),
-        ("pool16_189_219", "mpnn_pool16_189_219_cebm_t7"),
-        ("pool16_208_230", "mpnn_pool16_208_230_cebm_t7"),
+        ("s246k", "mpnn_s246k_cebm_t7"),
+        ("s249k", "mpnn_s249k_cebm_t7"),
         ("pool16_230_231", "mpnn_pool16_230_231_cebm_t7"),
-        ("pool24_160_189_219", "mpnn_pool24_160_189_219_cebm_t7"),
-        ("pool24_189_208_219", "mpnn_pool24_189_208_219_cebm_t7"),
+        ("pool16_246_249", "mpnn_pool16_246_249_cebm_t7"),
         ("pool32_160_189_208_219", "mpnn_pool32_160_189_208_219_cebm_t7"),
-        ("pool40_160_189_208_219_230", "mpnn_pool40_160_189_208_219_230_cebm_t7"),
         ("pool48_all6", "mpnn_pool48_all6_cebm_t7"),
+        ("pool56_all7", "mpnn_pool56_all7_cebm_t7"),
+        ("pool64_all8", "mpnn_pool64_all8_cebm_t7"),
     ):
         for c in range(4):
             p = os.path.join(sb_dir, f"{prefix}_c{c}.jsonl")
@@ -954,34 +959,32 @@ def summarize_s219k(out_dir, bad_afdb_bundle=None):
                 "s219k",
                 "s230k",
                 "s231k",
-                "pool16_208_230_mean",
-                "pool16_230_231_mean",
-                "pool32_160_189_208_219_mean",
-                "pool40_160_189_208_219_230_mean",
+                "s246k",
+                "s249k",
+                "pool16_246_249_mean",
                 "pool48_all6_mean",
+                "pool56_all7_mean",
+                "pool64_all8_mean",
                 "s75k_cebm_pick",
-                "s160k_cebm_pick",
                 "s189k_cebm_pick",
-                "s189k_cebm_minE",
                 "s208k_cebm_pick",
-                "s208k_cebm_minE",
                 "s219k_cebm_pick",
-                "s219k_cebm_minE",
                 "s230k_cebm_pick",
-                "s230k_cebm_minE",
                 "s231k_cebm_pick",
-                "s231k_cebm_minE",
-                "pool16_208_230_cebm_pick",
-                "pool16_208_230_cebm_minE",
-                "pool16_230_231_cebm_pick",
-                "pool16_230_231_cebm_minE",
+                "s246k_cebm_pick",
+                "s246k_cebm_minE",
+                "s249k_cebm_pick",
+                "s249k_cebm_minE",
+                "pool16_246_249_cebm_pick",
+                "pool16_246_249_cebm_minE",
                 "pool32_160_189_208_219_cebm_pick",
-                "pool32_160_189_208_219_cebm_minE",
-                "pool40_160_189_208_219_230_cebm_pick",
-                "pool40_160_189_208_219_230_cebm_minE",
                 "pool48_all6_cebm_pick",
                 "pool48_all6_cebm_minE",
-                "pool48_all6_cebm_final",
+                "pool56_all7_cebm_pick",
+                "pool56_all7_cebm_minE",
+                "pool64_all8_cebm_pick",
+                "pool64_all8_cebm_minE",
+                "pool64_all8_cebm_final",
             ):
                 if arm_name not in tm_by_arm or any(s not in tm_by_arm[arm_name] for s in S):
                     continue
@@ -997,18 +1000,16 @@ def summarize_s219k(out_dir, bad_afdb_bundle=None):
                 )
             lines.append("paired difference B - A (per chain)                       mean [95% CI]            chains B>A / n")
             for b_, a_ in (
-                ("s208k", "s75k"),
-                ("s230k", "s75k"),
-                ("s231k", "s75k"),
-                ("s230k", "s208k"),
-                ("s231k", "s219k"),
-                ("s230k_cebm_pick", "s75k"),
-                ("s231k_cebm_pick", "s75k"),
-                ("pool16_208_230_cebm_pick", "s75k"),
-                ("pool40_160_189_208_219_230_cebm_pick", "s75k"),
-                ("pool48_all6_cebm_pick", "s75k"),
-                ("pool48_all6_cebm_pick", "pool32_160_189_208_219_cebm_pick"),
-                ("pool48_all6_cebm_minE", "s75k"),
+                ("s246k", "s75k"),
+                ("s249k", "s75k"),
+                ("s246k", "s231k"),
+                ("s246k_cebm_pick", "s75k"),
+                ("s249k_cebm_pick", "s75k"),
+                ("s246k_cebm_pick", "s231k_cebm_pick"),
+                ("pool16_246_249_cebm_pick", "s75k"),
+                ("pool56_all7_cebm_pick", "s75k"),
+                ("pool64_all8_cebm_pick", "s75k"),
+                ("pool64_all8_cebm_pick", "pool48_all6_cebm_pick"),
             ):
                 if b_ in means and a_ in means:
                     rng = np.random.default_rng(0)
@@ -1018,7 +1019,7 @@ def summarize_s219k(out_dir, bad_afdb_bundle=None):
                         f"  {b_:>36} - {a_:<32} {mu:+.4f} [{lo:+.4f}, {hi:+.4f}]   {int((d > 0).sum())}/{len(d)}"
                     )
 
-    # 3. toporef_xrun Stage-B c2c TM comparison (equal and self: s75k, s160k, s189k, s219k, s231k, pool24)
+    # 3. toporef_xrun Stage-B c2c TM comparison
     for xarm in ("equal", "self"):
         x_tm = defaultdict(lambda: defaultdict(list))
         for tag, prefix in (
@@ -1027,6 +1028,7 @@ def summarize_s219k(out_dir, bad_afdb_bundle=None):
             ("s189k", f"mpnn_s189k_{xarm}"),
             ("s219k", f"mpnn_s219k_{xarm}"),
             ("s231k", f"mpnn_s231k_{xarm}"),
+            ("s246k", f"mpnn_s246k_{xarm}"),
         ):
             for c in range(8):
                 p = os.path.join(sb_dir, f"{prefix}_c{c}.jsonl")
@@ -1038,15 +1040,15 @@ def summarize_s219k(out_dir, bad_afdb_bundle=None):
         if not x_tm["s75k"]:
             continue
         S = sorted(x_tm["s75k"].keys())
-        if all(s in x_tm["s189k"] and s in x_tm["s219k"] for s in S):
-            for s in S:
-                x_tm["pool16_189_219"][s] = x_tm["s189k"][s] + x_tm["s219k"][s]
         if all(s in x_tm["s189k"] and s in x_tm["s219k"] and s in x_tm["s231k"] for s in S):
             for s in S:
                 x_tm["pool24_189_219_231"][s] = x_tm["s189k"][s] + x_tm["s219k"][s] + x_tm["s231k"][s]
+        if all(s in x_tm[t] for t in ("s189k", "s219k", "s231k", "s246k") for s in S):
+            for s in S:
+                x_tm["pool32_189_219_231_246"][s] = x_tm["s189k"][s] + x_tm["s219k"][s] + x_tm["s231k"][s] + x_tm["s246k"][s]
         lines.append(f"\n=== Held-Out Eval Set (toporef_xrun) Stage-B c2c TM: {xarm} (n={len(S)} chains) ===")
         means = {}
-        for tag in ("s75k", "s160k", "s189k", "s219k", "s231k", "pool16_189_219", "pool24_189_219_231"):
+        for tag in ("s75k", "s160k", "s189k", "s219k", "s231k", "s246k", "pool24_189_219_231", "pool32_189_219_231_246"):
             if any(s not in x_tm[tag] for s in S):
                 continue
             rng = np.random.default_rng(0)
@@ -1056,16 +1058,16 @@ def summarize_s219k(out_dir, bad_afdb_bundle=None):
             allv = np.concatenate([x_tm[tag][s] for s in S])
             mu, lo, hi = boot_ci(m, rng)
             lines.append(
-                f"  {tag:<20} samples={len(allv):4d}  TM>=0.5={int((allv>=0.5).sum()):4d}  "
+                f"  {tag:<24} samples={len(allv):4d}  TM>=0.5={int((allv>=0.5).sum()):4d}  "
                 f"chains>=0.5={int((m>=0.5).sum()):2d}/{len(S)}  mean TM={mu:.4f} [{lo:.4f}, {hi:.4f}]  "
                 f"med={np.median(m):.4f}  bestK={np.mean(b):.4f}"
             )
         for b_, a_ in (
-            ("s219k", "s75k"),
-            ("s231k", "s75k"),
-            ("s231k", "s160k"),
-            ("s231k", "s189k"),
-            ("s231k", "s219k"),
+            ("s246k", "s75k"),
+            ("s246k", "s160k"),
+            ("s246k", "s189k"),
+            ("s246k", "s219k"),
+            ("s246k", "s231k"),
         ):
             if b_ in means and a_ in means:
                 rng = np.random.default_rng(0)
@@ -1073,7 +1075,7 @@ def summarize_s219k(out_dir, bad_afdb_bundle=None):
                 mu, lo, hi = boot_ci(d, rng)
                 lines.append(f"  paired diff {b_:<8} - {a_:<8}: {mu:+.4f} [{lo:+.4f}, {hi:+.4f}]  wins={int((d>0).sum())}/{len(d)}")
 
-    # 4. 10-Target bad_afdb Benchmark Summary (mpnn_chunk9 vs SSE cfft / tmalign_smooth / sse_ens24)
+    # 4. 10-Target bad_afdb Benchmark Summary
     bafdb_dir = os.path.join(out_dir, "bad_afdb")
     if os.path.isdir(bafdb_dir):
         for arm in ("lad_r250", "tmpl", "self"):
@@ -1087,7 +1089,7 @@ def summarize_s219k(out_dir, bad_afdb_bundle=None):
             lines.append(f"\n=== 10-Target bad_afdb Benchmark ({arm}, n={len(recs)} targets) ===")
             lines.append(
                 f"{'pid':<9} {'Lq':>4} | {'cfft_hb8':>8} {'cfft_tmS':>8} {'hb_pick':>8} | "
-                f"{'s219_m8':>8} {'s230_m8':>8} {'s231_m8':>8} {'pAll_pk':>8} {'pAll_mnE':>8} {'pAll_bK':>8}"
+                f"{'s231_m8':>8} {'s246_m8':>8} {'s246_pk':>8} {'pAll_pk':>8} {'pAll_mnE':>8} {'pAll_bK':>8}"
             )
             for r in recs:
                 bs = r.get("baselines", {})
@@ -1096,10 +1098,10 @@ def summarize_s219k(out_dir, bad_afdb_bundle=None):
                 hb_pk = bs.get("h_bond", {}).get("cebm_pick_tm", float("nan"))
                 lines.append(
                     f"{r['pid']:<9} {r['Lq']:>4d} | {hb8:>8.4f} {tms:>8.4f} {hb_pk:>8.4f} | "
-                    f"{r.get('s219k_mean8', np.nan):>8.4f} {r.get('s230k_mean8', np.nan):>8.4f} {r.get('s231k_mean8', np.nan):>8.4f} "
-                    f"{r.get('poolAll_cebm_pick', r.get('pool16_cebm_pick', np.nan)):>8.4f} "
-                    f"{r.get('poolAll_cebm_minE', r.get('pool16_cebm_minE', np.nan)):>8.4f} "
-                    f"{r.get('poolAll_bestK', r.get('pool16_best16', np.nan)):>8.4f}"
+                    f"{r.get('s231k_mean8', np.nan):>8.4f} {r.get('s246k_mean8', np.nan):>8.4f} {r.get('s246k_cebm_pick', np.nan):>8.4f} "
+                    f"{r.get('poolAll_cebm_pick', np.nan):>8.4f} "
+                    f"{r.get('poolAll_cebm_minE', np.nan):>8.4f} "
+                    f"{r.get('poolAll_bestK', np.nan):>8.4f}"
                 )
             metrics_to_avg = [
                 ("cfft_h_bond_mean8", [r.get("baselines", {}).get("h_bond", {}).get("mean8_tm", np.nan) for r in recs]),
@@ -1109,19 +1111,13 @@ def summarize_s219k(out_dir, bad_afdb_bundle=None):
                 ("cfft_tmalign_smooth_mean8", [r.get("baselines", {}).get("tmalign_smooth", {}).get("mean8_tm", np.nan) for r in recs]),
                 ("cfft_tmalign_smooth_pick", [r.get("baselines", {}).get("tmalign_smooth", {}).get("cebm_pick_tm", np.nan) for r in recs]),
                 ("mpnn_s189k_mean8", [r.get("s189k_mean8", np.nan) for r in recs]),
-                ("mpnn_s189k_cebm_pick", [r.get("s189k_cebm_pick", np.nan) for r in recs]),
-                ("mpnn_s189k_cebm_minE", [r.get("s189k_cebm_minE", np.nan) for r in recs]),
                 ("mpnn_s219k_mean8", [r.get("s219k_mean8", np.nan) for r in recs]),
-                ("mpnn_s219k_cebm_pick", [r.get("s219k_cebm_pick", np.nan) for r in recs]),
-                ("mpnn_s219k_cebm_minE", [r.get("s219k_cebm_minE", np.nan) for r in recs]),
                 ("mpnn_s230k_mean8", [r.get("s230k_mean8", np.nan) for r in recs]),
-                ("mpnn_s230k_cebm_pick", [r.get("s230k_cebm_pick", np.nan) for r in recs]),
-                ("mpnn_s230k_cebm_minE", [r.get("s230k_cebm_minE", np.nan) for r in recs]),
                 ("mpnn_s231k_mean8", [r.get("s231k_mean8", np.nan) for r in recs]),
                 ("mpnn_s231k_cebm_pick", [r.get("s231k_cebm_pick", np.nan) for r in recs]),
-                ("mpnn_s231k_cebm_minE", [r.get("s231k_cebm_minE", np.nan) for r in recs]),
-                ("mpnn_pool16_cebm_pick", [r.get("pool16_cebm_pick", np.nan) for r in recs]),
-                ("mpnn_pool16_cebm_minE", [r.get("pool16_cebm_minE", np.nan) for r in recs]),
+                ("mpnn_s246k_mean8", [r.get("s246k_mean8", np.nan) for r in recs]),
+                ("mpnn_s246k_cebm_pick", [r.get("s246k_cebm_pick", np.nan) for r in recs]),
+                ("mpnn_s246k_cebm_minE", [r.get("s246k_cebm_minE", np.nan) for r in recs]),
                 ("mpnn_poolAll_mean", [r.get("poolAll_mean", np.nan) for r in recs]),
                 ("mpnn_poolAll_bestK", [r.get("poolAll_bestK", np.nan) for r in recs]),
                 ("mpnn_poolAll_cebm_pick", [r.get("poolAll_cebm_pick", np.nan) for r in recs]),
@@ -1171,6 +1167,14 @@ def main():
         "--ckpt_231k",
         default="/home/jupyter-chenxi/proteina_mpnn_chunk9/store/tri_v2_confind_mpnn_chunk9_seqmask25_tmsmooth/checkpoints/chk_best_contact_f1_epoch=00000571_step=000000230914-EMA.ckpt",
     )
+    ap.add_argument(
+        "--ckpt_246k",
+        default="/home/jupyter-chenxi/proteina_mpnn_chunk9/store/tri_v2_confind_mpnn_chunk9_seqmask25_tmsmooth/checkpoints/chk_best_contact_f1_epoch=00000607_step=000000245627-EMA.ckpt",
+    )
+    ap.add_argument(
+        "--ckpt_249k",
+        default="/home/jupyter-chenxi/proteina_mpnn_chunk9/store/tri_v2_confind_mpnn_chunk9_seqmask25_tmsmooth/checkpoints/chk_best_contact_f1_epoch=00000615_step=000000248630-EMA.ckpt",
+    )
     ap.add_argument("--c2c_ckpt", default="/home/jupyter-chenxi/mpnn_chunk9_eval/ckpt/final_twin_s29000_ema_only.ckpt")
     ap.add_argument("--c2c_dataset", default="pdb_train_contact-confind_S25_max384_purge-test_cutoff-190828")
     ap.add_argument("--pack_path", default="/home/jupyter-chenxi/sse1d_data/orcd/compute/so3/002/chenxi/proteina_pack/tri_v2.pack")
@@ -1195,57 +1199,30 @@ def main():
     def _has_dumps(prefix, arm="t7", n_c=4):
         return all(os.path.exists(os.path.join(args.out_dir, "dumps", f"{prefix}_{arm}_c{k}", "samples.jsonl")) for k in range(n_c))
 
-    # Phase 1a: Dynamic-queue Stage-A for s219k across T7-NEWEST (4 chunks) + toporef_xrun (16 chunks)
-    if not (_has_dumps("mpnn_s219k", "t7", 4) and _has_dumps("mpnn_s219k", "equal", 8) and _has_dumps("mpnn_s219k", "self", 8)):
-        print("=== PHASE 1A: Dynamic-Queue Stage-A for s219k (t7 + equal + self, 20 chunks) ===", flush=True)
-        s219k_stageA_tasks = (
-            [("t7", k) for k in range(4)]
-            + [("equal", k) for k in range(8)]
-            + [("self", k) for k in range(8)]
-        )
-        run_queue_workers(
-            q_stageA_worker,
-            s219k_stageA_tasks,
-            args.ngpus,
-            extra_args=(args.config_name, args.ckpt_219k, args.out_dir, args.seed, "mpnn_s219k"),
-        )
-
-    # Phase 1b: Dynamic-queue Stage-A for s208k on T7-NEWEST (4 chunks)
-    if os.path.exists(args.ckpt_208k) and not _has_dumps("mpnn_s208k", "t7", 4):
-        print("=== PHASE 1B: Dynamic-Queue Stage-A for s208k on T7-NEWEST (4 chunks) ===", flush=True)
-        run_queue_workers(
-            q_stageA_worker,
-            [("t7", k) for k in range(4)],
-            args.ngpus,
-            extra_args=(args.config_name, args.ckpt_208k, args.out_dir, args.seed, "mpnn_s208k"),
-        )
-
-    # Phase 1c: Dynamic-queue Stage-A for s231k (all-time #1 contact_f1_median = 0.5533) across t7 + equal + self
-    if os.path.exists(args.ckpt_231k) and not (
-        _has_dumps("mpnn_s231k", "t7", 4) and _has_dumps("mpnn_s231k", "equal", 8) and _has_dumps("mpnn_s231k", "self", 8)
+    for tag_lbl, ck_p, full_arms in (
+        ("mpnn_s219k", args.ckpt_219k, True),
+        ("mpnn_s208k", args.ckpt_208k, False),
+        ("mpnn_s231k", args.ckpt_231k, True),
+        ("mpnn_s230k", args.ckpt_230k, False),
+        ("mpnn_s246k", args.ckpt_246k, True),
+        ("mpnn_s249k", args.ckpt_249k, False),
     ):
-        print("=== PHASE 1C: Dynamic-Queue Stage-A for s231k (t7 + equal + self, 20 chunks) ===", flush=True)
-        s231k_stageA_tasks = (
-            [("t7", k) for k in range(4)]
-            + [("equal", k) for k in range(8)]
-            + [("self", k) for k in range(8)]
-        )
-        run_queue_workers(
-            q_stageA_worker,
-            s231k_stageA_tasks,
-            args.ngpus,
-            extra_args=(args.config_name, args.ckpt_231k, args.out_dir, args.seed, "mpnn_s231k"),
-        )
-
-    # Phase 1d: Dynamic-queue Stage-A for s230k (#2 all-time P@L median = 0.5441) on T7-NEWEST (4 chunks)
-    if os.path.exists(args.ckpt_230k) and not _has_dumps("mpnn_s230k", "t7", 4):
-        print("=== PHASE 1D: Dynamic-Queue Stage-A for s230k on T7-NEWEST (4 chunks) ===", flush=True)
-        run_queue_workers(
-            q_stageA_worker,
-            [("t7", k) for k in range(4)],
-            args.ngpus,
-            extra_args=(args.config_name, args.ckpt_230k, args.out_dir, args.seed, "mpnn_s230k"),
-        )
+        if not os.path.exists(ck_p):
+            continue
+        if full_arms:
+            done = _has_dumps(tag_lbl, "t7", 4) and _has_dumps(tag_lbl, "equal", 8) and _has_dumps(tag_lbl, "self", 8)
+            tasks = [("t7", k) for k in range(4)] + [("equal", k) for k in range(8)] + [("self", k) for k in range(8)]
+        else:
+            done = _has_dumps(tag_lbl, "t7", 4)
+            tasks = [("t7", k) for k in range(4)]
+        if not done:
+            print(f"=== PHASE 1: Dynamic-Queue Stage-A for {tag_lbl} ({len(tasks)} chunks) ===", flush=True)
+            run_queue_workers(
+                q_stageA_worker,
+                tasks,
+                args.ngpus,
+                extra_args=(args.config_name, ck_p, args.out_dir, args.seed, tag_lbl),
+            )
 
     # Phase 2: Dynamic-queue ContactEBM on T7-NEWEST (largest pools first)
     print("=== PHASE 2: Dynamic-Queue ContactEBM on T7-NEWEST ===", flush=True)
@@ -1254,19 +1231,27 @@ def main():
     has_208 = _has_dumps("mpnn_s208k", "t7", 4)
     has_230 = _has_dumps("mpnn_s230k", "t7", 4)
     has_231 = _has_dumps("mpnn_s231k", "t7", 4)
+    has_246 = _has_dumps("mpnn_s246k", "t7", 4)
+    has_249 = _has_dumps("mpnn_s249k", "t7", 4)
     pool_specs = []
+    if has_208 and has_230 and has_231 and has_246 and has_249:
+        pool_specs.append((
+            "mpnn_pool64_all8_cebm_t7",
+            ("mpnn_s160k", "mpnn_s189k", "mpnn_s208k", "mpnn_s219k", "mpnn_s230k", "mpnn_s231k", "mpnn_s246k", "mpnn_s249k"),
+        ))
+    if has_208 and has_230 and has_231 and has_246:
+        pool_specs.append((
+            "mpnn_pool56_all7_cebm_t7",
+            ("mpnn_s160k", "mpnn_s189k", "mpnn_s208k", "mpnn_s219k", "mpnn_s230k", "mpnn_s231k", "mpnn_s246k"),
+        ))
+    if has_246 and has_249:
+        pool_specs.append(("mpnn_pool16_246_249_cebm_t7", ("mpnn_s246k", "mpnn_s249k")))
     if has_208 and has_230 and has_231:
         pool_specs.append(("mpnn_pool48_all6_cebm_t7", ("mpnn_s160k", "mpnn_s189k", "mpnn_s208k", "mpnn_s219k", "mpnn_s230k", "mpnn_s231k")))
-    if has_208 and has_230:
-        pool_specs.append(("mpnn_pool40_160_189_208_219_230_cebm_t7", ("mpnn_s160k", "mpnn_s189k", "mpnn_s208k", "mpnn_s219k", "mpnn_s230k")))
-        pool_specs.append(("mpnn_pool16_208_230_cebm_t7", ("mpnn_s208k", "mpnn_s230k")))
-    if has_230 and has_231:
-        pool_specs.append(("mpnn_pool16_230_231_cebm_t7", ("mpnn_s230k", "mpnn_s231k")))
-    if has_208:
-        pool_specs.append(("mpnn_pool32_160_189_208_219_cebm_t7", ("mpnn_s160k", "mpnn_s189k", "mpnn_s208k", "mpnn_s219k")))
-        pool_specs.append(("mpnn_pool24_189_208_219_cebm_t7", ("mpnn_s189k", "mpnn_s208k", "mpnn_s219k")))
-    pool_specs.append(("mpnn_pool24_160_189_219_cebm_t7", ("mpnn_s160k", "mpnn_s189k", "mpnn_s219k")))
-    pool_specs.append(("mpnn_pool16_189_219_cebm_t7", ("mpnn_s189k", "mpnn_s219k")))
+    if has_249:
+        pool_specs.append(("mpnn_s249k_cebm_t7", ("mpnn_s249k",)))
+    if has_246:
+        pool_specs.append(("mpnn_s246k_cebm_t7", ("mpnn_s246k",)))
     if has_231:
         pool_specs.append(("mpnn_s231k_cebm_t7", ("mpnn_s231k",)))
     if has_230:
@@ -1290,24 +1275,27 @@ def main():
         extra_args=(args.pack_path, args.cebm_repo, args.cebm_ckpt),
     )
 
-    # Phase 3: Dynamic-queue Stage-B c2c folding (8-sample chunks first, then 3-sample cebm chunks)
+    # Phase 3: Dynamic-queue Stage-B c2c folding
     print("=== PHASE 3: Dynamic-Queue Stage-B c2c Folding ===", flush=True)
     stageB_tasks = []
     for k in range(4):
         q_file = os.path.join(args.out_dir, "chunks", f"t7_c{k}_q.txt")
-        stageB_tasks.append((f"mpnn_s219k_t7_c{k}", q_file, os.path.join(args.out_dir, "dumps", f"mpnn_s219k_t7_c{k}")))
-        if has_208:
-            stageB_tasks.append((f"mpnn_s208k_t7_c{k}", q_file, os.path.join(args.out_dir, "dumps", f"mpnn_s208k_t7_c{k}")))
-        if has_230:
-            stageB_tasks.append((f"mpnn_s230k_t7_c{k}", q_file, os.path.join(args.out_dir, "dumps", f"mpnn_s230k_t7_c{k}")))
-        if has_231:
-            stageB_tasks.append((f"mpnn_s231k_t7_c{k}", q_file, os.path.join(args.out_dir, "dumps", f"mpnn_s231k_t7_c{k}")))
+        for sp, ok in (
+            ("mpnn_s219k", True),
+            ("mpnn_s208k", has_208),
+            ("mpnn_s230k", has_230),
+            ("mpnn_s231k", has_231),
+            ("mpnn_s246k", has_246),
+            ("mpnn_s249k", has_249),
+        ):
+            if ok:
+                stageB_tasks.append((f"{sp}_t7_c{k}", q_file, os.path.join(args.out_dir, "dumps", f"{sp}_t7_c{k}")))
     for arm in ("equal", "self"):
         for k in range(8):
             q_file = os.path.join(args.out_dir, "chunks", f"{arm}_c{k}_q.txt")
-            stageB_tasks.append((f"mpnn_s219k_{arm}_c{k}", q_file, os.path.join(args.out_dir, "dumps", f"mpnn_s219k_{arm}_c{k}")))
-            if has_231:
-                stageB_tasks.append((f"mpnn_s231k_{arm}_c{k}", q_file, os.path.join(args.out_dir, "dumps", f"mpnn_s231k_{arm}_c{k}")))
+            for sp, ok in (("mpnn_s219k", True), ("mpnn_s231k", has_231), ("mpnn_s246k", has_246)):
+                if ok:
+                    stageB_tasks.append((f"{sp}_{arm}_c{k}", q_file, os.path.join(args.out_dir, "dumps", f"{sp}_{arm}_c{k}")))
     stageB_tasks.extend(c2c_cebm_tasks)
 
     run_queue_workers(
@@ -1317,7 +1305,7 @@ def main():
         extra_args=(args.c2c_ckpt, args.c2c_dataset, args.out_dir, args.usalign, args.python_bin),
     )
 
-    # Phase 4: 10-target bad_afdb benchmark (if raw json or bundle staged)
+    # Phase 4: 10-target bad_afdb benchmark
     if args.bad_afdb_raw and os.path.exists(args.bad_afdb_raw) and not os.path.exists(args.bad_afdb_bundle):
         ctx_b = mp.get_context("spawn")
         pb = ctx_b.Process(target=prepare_bad_afdb_bundle, args=(args.bad_afdb_raw, args.bad_afdb_bundle, args.f2c_ckpt))
@@ -1344,6 +1332,7 @@ def main():
                 args.ckpt_219k,
                 args.ckpt_230k,
                 args.ckpt_231k,
+                args.ckpt_246k,
                 args.c2c_ckpt,
                 args.cebm_repo,
                 args.cebm_ckpt,
